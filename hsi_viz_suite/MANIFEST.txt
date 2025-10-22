@@ -1,0 +1,17 @@
+MANIFEST
+
+hsi_viz_suite/
+  README.md
+  requirements.txt
+  scripts/
+    visualization_utils.py
+    visualize_results.py
+    generate_error_maps.py
+    create_comparison_grid.py
+    plot_spectral_curves.py
+    plot_metrics_statistics.py
+    generate_all_visualizations.py
+  examples/
+    example_usage.py
+  hsi_model/
+    utils.py

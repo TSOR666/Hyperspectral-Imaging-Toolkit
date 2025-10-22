@@ -1,0 +1,42 @@
+# src/configs/config.yaml
+
+# Base training configuration shared by both training scripts.
+
+seed: 42
+
+data_dir: ${oc.env:HSI_DATA_DIR,./data/ARAD_1K}
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}
+
+batch_size: 20
+val_batch_size: 1
+patch_size: 128
+stride: 8
+epochs: 300
+iterations_per_epoch: 1000
+gradient_accumulation_steps: 2
+num_workers: 2
+n_critic: 1
+mixed_precision: true
+memory_mode: standard
+
+warmup_steps: 2000
+generator_lr: 0.0002
+discriminator_lr: 0.00005
+sinkhorn_epsilon: 0.1
+sinkhorn_iters: 50
+sinkhorn_flatten_spatial: true
+use_r1_regularization: true
+r1_gamma: 10.0
+
+lambda_rec: 1.0
+lambda_perceptual: 0.1
+lambda_adversarial: 0.1
+lambda_sam: 0.05
+
+checkpoint_keep: 5
+
+hydra:
+  run:
+    dir: ${log_dir}/hydra/${now:%Y%m%d_%H%M%S}
+  output_subdir: null
