@@ -10,6 +10,7 @@ This monorepo hosts production-ready code and utilities for hyperspectral image 
 | [`HSIFUSION&SHARP/`](HSIFUSION&SHARP/README.md) | Transformer baselines featuring HSIFusionNet v2.5.3 and SHARP v3.2.2 with hardened training scripts. |
 | [`hsi_viz_suite/`](hsi_viz_suite/README.md) | Stand-alone visualization suite for turning reconstruction results into publication-ready figures. |
 | [`mswr_v2/`](mswr_v2/README.md) | Training and inference scripts for the MSWR-Net v2.1.2 architecture with robustness patches. |
+| [`WaveDiff/`](WaveDiff/README.md) | Latent diffusion-based HSI reconstruction with wavelet modules and spectral refinement. |
 
 > 💡 The directory names are preserved from their original projects. Scripts assume you execute them from inside their respective folders (for example `cd mswr_v2` before running a training command).
 
@@ -79,6 +80,22 @@ python train_mswr_v212_logging.py --model_size base --data_root /path/to/ARAD_1K
 
 MSWR scripts expect the legacy `dataloader.py` module on the Python path. The training driver enables EMA, SAM loss, and extensive logging by default; refer to the [MSWR README](mswr_v2/README.md) for CLI flags and inference notes.
 
+### WaveDiff
+
+```bash
+cd WaveDiff
+pip install -r requirements.txt
+# Training (via config)
+python train.py --config configs/example_config.json
+# or minimal CLI example
+python train.py --model_type adaptive_wavelet --train_dir data/ARAD1K/train --val_dir data/ARAD1K/val
+
+# Inference on a single RGB image
+python inference.py --checkpoint checkpoints/<run_id>/final_model.pt --image path/to/rgb.png --output_dir results/
+```
+
+See the [WaveDiff README](WaveDiff/README.md) and [Quick Start](WaveDiff/QUICK_START.md) for detailed setup, configuration, and evaluation.
+
 ## Contributing
 
 - Each subproject retains its own logging directories and checkpoints. Please keep changes scoped to the relevant folder to avoid cross-project regressions.
@@ -89,7 +106,7 @@ MSWR scripts expect the legacy `dataloader.py` module on the Python path. The tr
 
 Issues and improvements typically surface from training runs or visualization gaps. When reporting problems, include:
 
-1. The project folder (`CSWIN v2`, `hsi_viz_suite`, or `mswr_v2`).
+1. The project folder (`CSWIN v2`, `hsi_viz_suite`, `mswr_v2`, or `WaveDiff`).
 2. The command (with arguments) you ran and the environment description (CUDA version, GPU model).
 3. Relevant log excerpts from `artifacts/logs/` or generated figure paths.
 
@@ -115,8 +132,8 @@ The Hyperspectral Imaging Toolkit is released under the [MIT License](LICENSE). 
   - Architecture: U-Net style generator with CSWin spatial attention + spectral attention + adaptive GroupNorm + NaN‑safe blocks; SN transformer discriminator with spectral normalization. See `CSWIN v2/src/hsi_model/models`.
   - Training: Sinkhorn‑GAN pipeline with R1 regularization, mixed precision, EMA logging, Hydra configuration (`CSWIN v2/src/configs/config.yaml`). Entries: `training_script_fixed.py`, `train_optimized.py`.
 
-- WaveDiff (Diffusion/WaveDiff)
-  - Architecture: Latent diffusion models augmented with wavelet transforms (standard/learnable/adaptive) and spectral/pixel refinement heads. See `Diffusion/WaveDiff/modules` and `Diffusion/WaveDiff/models`.
-  - Training: JSON‑driven config (`Diffusion/WaveDiff/configs/example_config.json`), cosine scheduling, combined spectral losses, curriculum masking, visualization hooks. Entry: `Diffusion/WaveDiff/train.py`.
+- WaveDiff (WaveDiff)
+  - Architecture: Latent diffusion models augmented with wavelet transforms (standard/learnable/adaptive) and spectral/pixel refinement heads. See `WaveDiff/modules` and `WaveDiff/models`.
+  - Training: JSON-driven config (`WaveDiff/configs/example_config.json`), cosine scheduling, combined spectral losses, curriculum masking, visualization hooks. Entry: `WaveDiff/train.py`.
 
 See each subfolder README for code‑level details and examples.
