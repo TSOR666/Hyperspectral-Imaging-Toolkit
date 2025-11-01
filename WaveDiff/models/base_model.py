@@ -23,6 +23,10 @@ class HSILatentDiffusionModel(nn.Module):
                  dropout=0.1):
         super().__init__()
 
+        # Store out_channels as instance variable for later reference
+        self.out_channels = out_channels
+        self.latent_dim = latent_dim
+
         self.use_enhanced_attention = use_enhanced_attention
         self.use_domain_adaptation = use_domain_adaptation
 
@@ -32,18 +36,18 @@ class HSILatentDiffusionModel(nn.Module):
             latent_dim=latent_dim,
             use_batchnorm=use_batchnorm
         )
-        
+
         # Latent Denoiser: For reverse diffusion process in latent space
         self.denoiser = UNetDenoiser(
-            channels=latent_dim, 
-            time_embedding_dim=128, 
+            channels=latent_dim,
+            time_embedding_dim=128,
             use_batchnorm=use_batchnorm
         )
-        
+
         # HSI Decoder: Reconstructs HSI from latent space
         self.decoder = HSIDecoder(
-            out_channels=out_channels, 
-            latent_dim=latent_dim, 
+            out_channels=out_channels,
+            latent_dim=latent_dim,
             use_batchnorm=use_batchnorm
         )
         
@@ -126,10 +130,21 @@ class HSILatentDiffusionModel(nn.Module):
     def generate_mask(self, batch_size, height, width, device, inputs=None, num_channels=None, **kwargs):
         """Generate mask using the configured masking strategy"""
         # Determine number of bands for masking (default to inputs if available)
-        if num_channels is None and inputs is not None:
-            num_bands = inputs.shape[1]
+        if num_channels is None:
+            if inputs is not None:
+                num_bands = inputs.shape[1]
+            else:
+                # Use stored out_channels (safe and reliable)
+                num_bands = self.out_channels
         else:
-            num_bands = num_channels or self.decoder.final_conv.out_channels
+            num_bands = num_channels
+
+        # Validate num_bands is reasonable
+        if num_bands <= 0 or num_bands > 1000:  # Sanity check
+            raise ValueError(
+                f"Invalid num_bands={num_bands}. Must be in range (0, 1000]. "
+                f"Check your input dimensions or out_channels configuration."
+            )
 
         return self.masking_manager.generate_mask(
             inputs,

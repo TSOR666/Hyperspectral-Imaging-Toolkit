@@ -121,12 +121,22 @@ class OptimizedCNNWaveletTransform(nn.Module):
         """Intelligent cache management to prevent memory bloat"""
         if len(self._filter_cache) > self._cache_size_limit:
             # Remove least recently used filters
-            sorted_keys = sorted(self._cache_access_count.keys(), 
-                               key=lambda k: self._cache_access_count[k])
-            for key in sorted_keys[:len(self._filter_cache) - self._cache_size_limit]:
-                if key in self._filter_cache:
-                    del self._filter_cache[key]
-                    del self._cache_access_count[key]
+            # Only consider keys that exist in both dicts for consistency
+            valid_keys = set(self._filter_cache.keys()) & set(self._cache_access_count.keys())
+
+            if not valid_keys:
+                # Edge case: no valid keys, clear everything
+                self._filter_cache.clear()
+                self._cache_access_count.clear()
+                return
+
+            sorted_keys = sorted(valid_keys, key=lambda k: self._cache_access_count[k])
+            num_to_remove = len(self._filter_cache) - self._cache_size_limit
+
+            for key in sorted_keys[:num_to_remove]:
+                # Safe deletion - check both dicts
+                self._filter_cache.pop(key, None)
+                self._cache_access_count.pop(key, None)
     
     def _get_conv_filters(self, channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Get cached convolution filters with memory management"""
@@ -678,10 +688,11 @@ class OptimizedLandmarkAttention2D(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        
+
         # Generate queries efficiently
         q = self.q_conv(x)
-        q = rearrange(q, 'b (h d) h_dim w_dim -> b h (h_dim w_dim) d', h=self.num_heads)
+        # Reshape: (B, C, H, W) -> (B, num_heads, H*W, head_dim)
+        q = rearrange(q, 'b (h d) H W -> b h (H W) d', h=self.num_heads, H=H, W=W)
         
         # Efficient landmark generation
         if self.pooling_type == "learned":
@@ -1198,11 +1209,20 @@ class IntegratedMSWRNet(nn.Module):
             # Intelligent gradient checkpointing
             if config.use_checkpoint and i in (config.checkpoint_blocks or []):
                 if hasattr(checkpoint, 'checkpoint_wrapper'):
+                    # Modern PyTorch (1.11+)
                     block = checkpoint.checkpoint_wrapper(block)
                 else:
                     # Fallback for older PyTorch versions
+                    # Create a proper wrapper that captures the original forward method
                     original_forward = block.forward
-                    block.forward = partial(checkpoint.checkpoint, original_forward, use_reentrant=False)
+
+                    def make_checkpointed_forward(orig_fwd):
+                        """Factory to avoid late binding issues"""
+                        def checkpointed_forward(x):
+                            return checkpoint.checkpoint(orig_fwd, x, use_reentrant=False)
+                        return checkpointed_forward
+
+                    block.forward = make_checkpointed_forward(original_forward)
             
             self.encoder_stages.append(block)
             
@@ -1252,10 +1272,20 @@ class IntegratedMSWRNet(nn.Module):
             
             if config.use_checkpoint and decoder_idx in (config.checkpoint_blocks or []):
                 if hasattr(checkpoint, 'checkpoint_wrapper'):
+                    # Modern PyTorch (1.11+)
                     block = checkpoint.checkpoint_wrapper(block)
                 else:
+                    # Fallback for older PyTorch versions
+                    # Create a proper wrapper that captures the original forward method
                     original_forward = block.forward
-                    block.forward = partial(checkpoint.checkpoint, original_forward, use_reentrant=False)
+
+                    def make_checkpointed_forward(orig_fwd):
+                        """Factory to avoid late binding issues"""
+                        def checkpointed_forward(x):
+                            return checkpoint.checkpoint(orig_fwd, x, use_reentrant=False)
+                        return checkpointed_forward
+
+                    block.forward = make_checkpointed_forward(original_forward)
             
             self.decoder_stages.append(block)
             channels = out_ch

@@ -149,8 +149,19 @@ def sparse_attention_topk_streaming(
     # Safety cap for very large sequences
     if N > max_tokens:
         # Fallback to local window attention (ensure odd window_size)
-        window_size = window_size if window_size % 2 == 1 else window_size - 1
-        return local_window_attention(q, k, v, window_size, scale)
+        logger.warning(
+            f"Sequence length N={N} exceeds max_tokens={max_tokens}. "
+            f"Falling back to local window attention with window_size={window_size}. "
+            f"This changes the attention pattern from sparse to local windowed. "
+            f"Consider increasing max_tokens or using a different attention mechanism "
+            f"for very long sequences."
+        )
+
+        adjusted_window_size = window_size if window_size % 2 == 1 else window_size - 1
+        if adjusted_window_size != window_size:
+            logger.debug(f"Adjusted window_size from {window_size} to {adjusted_window_size} (must be odd)")
+
+        return local_window_attention(q, k, v, adjusted_window_size, scale)
     
     # Initialize output tensor with v's dimension
     out = q.new_zeros(BH, N, D_v)
@@ -464,8 +475,26 @@ class OptimizedSparseAttention(nn.Module):
                  key_rbf_mode: str = KeyRBFMode.MEAN,
                  sparsemax_pad_value: Optional[float] = None):
         super().__init__()
-        assert 0.0 <= sparsity_ratio <= 1.0, "sparsity_ratio must be in [0,1]"
-        
+
+        # Proper input validation (not assert - works with python -O)
+        if not (0.0 <= sparsity_ratio <= 1.0):
+            raise ValueError(
+                f"sparsity_ratio must be in range [0.0, 1.0], got {sparsity_ratio}. "
+                f"Use 0.0 for dense attention, 1.0 for maximum sparsity."
+            )
+
+        if dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {num_heads}")
+
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"dim ({dim}) must be divisible by num_heads ({num_heads}). "
+                f"Consider using dim={dim - (dim % num_heads) + num_heads}"
+            )
+
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5

@@ -41,19 +41,25 @@ class NaNSafeAttention(nn.Module):
     def __init__(self, attention_module):
         super().__init__()
         self.attention = attention_module
-        
+        self.nan_count = 0  # Track NaN occurrences for debugging
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Store input for potential recovery
-        x_input = x.clone()
-        
         # Forward through attention
         out = self.attention(x)
-        
+
         # Check for NaN/Inf
         if torch.isnan(out).any() or torch.isinf(out).any():
-            # Fallback to input (skip connection)
-            return x_input
-        
+            # Log this event (rate-limited)
+            self.nan_count += 1
+            if self.nan_count % 100 == 1:  # Log every 100 occurrences
+                import warnings
+                warnings.warn(
+                    f"NaN/Inf detected in attention output (occurrence {self.nan_count}). "
+                    f"Falling back to skip connection."
+                )
+            # Fallback to input (no clone needed - x hasn't been modified)
+            return x
+
         return out
 
 

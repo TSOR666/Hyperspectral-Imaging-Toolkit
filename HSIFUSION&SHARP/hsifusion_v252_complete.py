@@ -276,13 +276,25 @@ class VectorizedSlidingWindowAttention(nn.Module):
         relative_coords[:, :, 0] *= 2 * self.window_size - 1
         relative_position_index = relative_coords.sum(-1)
         
-        # Ensure indices are within bounds
+        # Ensure indices are within bounds (using proper validation instead of assert)
         max_index = (2 * self.window_size - 1) * (2 * self.window_size - 1) - 1
-        assert relative_position_index.max() <= max_index, \
-            f"Index {relative_position_index.max()} exceeds max {max_index}"
-        assert relative_position_index.min() >= 0, \
-            f"Negative index {relative_position_index.min()}"
-        
+        max_idx_value = relative_position_index.max().item()
+        min_idx_value = relative_position_index.min().item()
+
+        if max_idx_value > max_index:
+            raise ValueError(
+                f"Relative position index out of bounds: max index {max_idx_value} "
+                f"exceeds maximum allowed {max_index}. This indicates a bug in "
+                f"relative position computation for window_size={self.window_size}"
+            )
+
+        if min_idx_value < 0:
+            raise ValueError(
+                f"Relative position index out of bounds: negative index {min_idx_value} "
+                f"found. This indicates a bug in relative position computation "
+                f"for window_size={self.window_size}"
+            )
+
         self.register_buffer("relative_position_index", relative_position_index)
     
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -311,10 +323,24 @@ class VectorizedSlidingWindowAttention(nn.Module):
             attn = sdpa_unified(q, k, v, scale=self.scale, 
                                dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
-            # Get relative position bias with bounds checking
-            relative_position_bias_flat = self.relative_position_bias_table[
-                self.relative_position_index.view(-1).clamp(0, self.relative_position_bias_table.size(0) - 1)
-            ]
+            # Get relative position bias with proper error detection
+            idx_flat = self.relative_position_index.view(-1)
+            max_valid_idx = self.relative_position_bias_table.size(0) - 1
+
+            # Check if clamping would occur (indicates a bug)
+            if idx_flat.min() < 0 or idx_flat.max() > max_valid_idx:
+                # This should never happen if initialization is correct
+                throttled_warning(
+                    f"Relative position index out of bounds detected! "
+                    f"Index range: [{idx_flat.min()}, {idx_flat.max()}], "
+                    f"Valid range: [0, {max_valid_idx}]. "
+                    f"This indicates a bug in _init_relative_position_bias(). "
+                    f"Clamping as emergency fallback.",
+                    key="relative_pos_bias_clamp"
+                )
+                idx_flat = idx_flat.clamp(0, max_valid_idx)
+
+            relative_position_bias_flat = self.relative_position_bias_table[idx_flat]
             relative_position_bias = relative_position_bias_flat.view(
                 self.window_size * self.window_size, self.window_size * self.window_size, -1
             )
