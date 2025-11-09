@@ -211,29 +211,30 @@ class CSWinAttentionBlock(nn.Module):
         q_h, k_h, v_h = qkv_h[0], qkv_h[1], qkv_h[2]  # Each shape: [B, h_windows, split_size, W, num_heads, head_dim]
         
         # Reshape for attention computation
-        q_h = rearrange(q_h, 'b hw s w h d -> (b hw) h (s w) d')  # [B*h_windows, num_heads, split_size*W, head_dim]
-        k_h = rearrange(k_h, 'b hw s w h d -> (b hw) h d (s w)')  # [B*h_windows, num_heads, head_dim, split_size*W]
-        v_h = rearrange(v_h, 'b hw s w h d -> (b hw) h (s w) d')  # [B*h_windows, num_heads, split_size*W, head_dim]
+        q_h = rearrange(q_h, 'b hw s w h d -> (b hw) h (s w) d')
+        k_h = rearrange(k_h, 'b hw s w h d -> (b hw) h (s w) d')
+        v_h = rearrange(v_h, 'b hw s w h d -> (b hw) h (s w) d')
         
-        # Apply scaled dot-product attention
-        attn_h = (q_h @ k_h) * self.scale  # [B*h_windows, num_heads, split_size*W, split_size*W]
-        
-        # -------- horizontal relative bias (FIXED v2.0) --------
+        seq_len = self.split_size * padded_W
+        use_sdpa = hasattr(F, "scaled_dot_product_attention")
+
         rel_rows = self._relative_position_index
         bias_ss = self.relative_position_bias_table_h[
             rel_rows, self._relative_center_index, :
         ]
-        
-        # CRITICAL FIX: Use number of windows, not pixel count
-        w_windows = padded_W // self.split_size  # Number of WINDOWS in width
-        bias = self._expand_bias(bias_ss, tiles_long=w_windows).unsqueeze(0)
-        attn_h = attn_h + bias.to(attn_h.dtype)  # Keep everything in same dtype (FP16 with AMP)
-        
-        # Apply softmax
-        attn_h = F.softmax(attn_h, dim=-1)
-        
-        # Apply attention weights
-        out_h = attn_h @ v_h  # [B*h_windows, num_heads, split_size*W, head_dim]
+        w_windows = padded_W // self.split_size
+        bias = self._expand_bias(bias_ss, tiles_long=w_windows)
+
+        if use_sdpa:
+            attn_mask = bias.unsqueeze(0)  # (1, num_heads, seq, seq)
+            out_h = F.scaled_dot_product_attention(
+                q_h, k_h, v_h, attn_mask=attn_mask, scale=self.scale
+            )
+        else:
+            attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
+            attn_h = attn_h + bias.unsqueeze(0).to(attn_h.dtype)
+            attn_h = F.softmax(attn_h, dim=-1)
+            out_h = attn_h @ v_h
         
         # Reshape back to original format
         out_h = rearrange(
@@ -294,29 +295,30 @@ class CSWinAttentionBlock(nn.Module):
         q_v, k_v, v_v = qkv_v[0], qkv_v[1], qkv_v[2]  # Each shape: [B*w_windows, padded_H, split_size, num_heads, head_dim]
         
         # Reshape for attention computation
-        q_v = rearrange(q_v, 'bw ph s h d -> bw h (ph s) d')  # [B*w_windows, num_heads, padded_H*split_size, head_dim]
-        k_v = rearrange(k_v, 'bw ph s h d -> bw h d (ph s)')  # [B*w_windows, num_heads, head_dim, padded_H*split_size]
-        v_v = rearrange(v_v, 'bw ph s h d -> bw h (ph s) d')  # [B*w_windows, num_heads, padded_H*split_size, head_dim]
+        q_v = rearrange(q_v, 'bw ph s h d -> bw h (ph s) d')
+        k_v = rearrange(k_v, 'bw ph s h d -> bw h (ph s) d')
+        v_v = rearrange(v_v, 'bw ph s h d -> bw h (ph s) d')
         
-        # Apply scaled dot-product attention
-        attn_v = (q_v @ k_v) * self.scale  # [B*w_windows, num_heads, padded_H*split_size, padded_H*split_size]
-        
-        # -------- vertical relative bias (FIXED v2.0) --------
+        seq_len = padded_H * self.split_size
+        use_sdpa = hasattr(F, "scaled_dot_product_attention")
+
         rel_cols = self._relative_position_index
         bias_ss = self.relative_position_bias_table_v[
             self._relative_center_index, rel_cols, :
         ]
-        
-        # CRITICAL FIX: Use number of windows, not pixel count
-        h_windows = padded_H // self.split_size  # Number of WINDOWS in height
-        bias = self._expand_bias(bias_ss, tiles_long=h_windows).unsqueeze(0)
-        attn_v = attn_v + bias.to(attn_v.dtype)  # Keep everything in same dtype (FP16 with AMP)
-        
-        # Apply softmax
-        attn_v = F.softmax(attn_v, dim=-1)
-        
-        # Apply attention weights
-        out_v = attn_v @ v_v  # [B*w_windows, num_heads, padded_H*split_size, head_dim]
+        h_windows = padded_H // self.split_size
+        bias = self._expand_bias(bias_ss, tiles_long=h_windows)
+
+        if use_sdpa:
+            attn_mask = bias.unsqueeze(0)
+            out_v = F.scaled_dot_product_attention(
+                q_v, k_v, v_v, attn_mask=attn_mask, scale=self.scale
+            )
+        else:
+            attn_v = (q_v @ k_v.transpose(-2, -1)) * self.scale
+            attn_v = attn_v + bias.unsqueeze(0).to(attn_v.dtype)
+            attn_v = F.softmax(attn_v, dim=-1)
+            out_v = attn_v @ v_v
         
         # Reshape back to original format
         out_v = rearrange(

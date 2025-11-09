@@ -13,8 +13,11 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, Dict
 from functools import lru_cache
 import logging
+from packaging import version
 
 logger = logging.getLogger(__name__)
+cv2.setNumThreads(0)
+TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
 
 
 class OptimizedTrainDataset(Dataset):
@@ -389,6 +392,15 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         np.random.seed(42 + worker_id)
         random.seed(42 + worker_id)
     
+    pin_memory_kwargs: Dict[str, object] = {}
+    if torch.cuda.is_available() and TORCH_VERSION >= version.parse("2.0.0"):
+        pin_memory_kwargs["pin_memory_device"] = "cuda"
+
+    def _prefetch_kwargs(worker_count: int) -> Dict[str, int]:
+        if worker_count > 0:
+            return {"prefetch_factor": max(2, getattr(config, "prefetch_factor", 2))}
+        return {}
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -398,16 +410,22 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         pin_memory=True,
         drop_last=True,
         worker_init_fn=worker_init_fn,
-        persistent_workers=num_workers > 0 and memory_mode == 'lazy'
+        persistent_workers=num_workers > 0 and memory_mode == 'lazy',
+        **_prefetch_kwargs(num_workers),
+        **pin_memory_kwargs,
     )
     
+    val_workers = 2
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,  # Full images for validation
         shuffle=False,
-        num_workers=2,
+        num_workers=val_workers,
         pin_memory=True,
-        worker_init_fn=worker_init_fn
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True,
+        **_prefetch_kwargs(val_workers),
+        **pin_memory_kwargs,
     )
     
     logger.info(f"Created dataloaders:")
