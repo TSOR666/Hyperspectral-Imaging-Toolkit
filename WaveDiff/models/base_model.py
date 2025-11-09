@@ -156,14 +156,31 @@ class HSILatentDiffusionModel(nn.Module):
         """Broadcast or reduce mask to match the requested channel count."""
         if mask is None:
             return None
-        mask_base = mask.float() if mask.dtype == torch.bool else mask
+
+        is_bool = mask.dtype == torch.bool
+        if not mask.is_floating_point() and not is_bool:
+            mask_base = mask.float()
+        else:
+            mask_base = mask
+
         if mask_base.shape[1] == channels:
-            return mask_base
+            return mask_base.float() if mask_base.dtype == torch.bool else mask_base
+
         if channels == 1:
-            return mask_base.mean(dim=1, keepdim=True)
+            if is_bool:
+                reduced = mask_base.all(dim=1, keepdim=True)
+                return reduced.float()
+            reduced = mask_base.amin(dim=1, keepdim=True)
+            return reduced
+
         if mask_base.shape[1] == 1:
-            return mask_base.expand(-1, channels, -1, -1)
-        reduced = mask_base.mean(dim=1, keepdim=True)
+            base = mask_base.float() if mask_base.dtype == torch.bool else mask_base
+            return base.expand(-1, channels, -1, -1)
+
+        if is_bool:
+            reduced = mask_base.all(dim=1, keepdim=True).float()
+        else:
+            reduced = mask_base.amin(dim=1, keepdim=True)
         return reduced.expand(-1, channels, -1, -1)
 
     def apply_mask(self, x, mask):

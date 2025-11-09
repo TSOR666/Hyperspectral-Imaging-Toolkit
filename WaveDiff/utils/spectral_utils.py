@@ -11,21 +11,37 @@ def _collapse_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if mask is None:
         return None
     if mask.shape[1] == 1:
-        return mask.float() if mask.dtype == torch.bool else mask
-    base = mask.float() if mask.dtype == torch.bool else mask
-    return base.mean(dim=1, keepdim=True)
+        if mask.dtype == torch.bool:
+            return mask.float()
+        return mask if mask.is_floating_point() else mask.float()
+
+    if mask.dtype == torch.bool:
+        return mask.all(dim=1, keepdim=True).float()
+
+    base = mask if mask.is_floating_point() else mask.float()
+    return base.amin(dim=1, keepdim=True)
 
 
 def _broadcast_mask(mask: Optional[torch.Tensor], channels: int) -> Optional[torch.Tensor]:
     if mask is None:
         return None
-    mask_base = mask.float() if mask.dtype == torch.bool else mask
+
+    is_bool = mask.dtype == torch.bool
+    if not mask.is_floating_point() and not is_bool:
+        mask_base = mask.float()
+    else:
+        mask_base = mask
+
     if channels == 1:
         return _collapse_mask(mask_base)
+
     if mask_base.shape[1] == channels:
-        return mask_base
+        return mask_base.float() if mask_base.dtype == torch.bool else mask_base
+
     if mask_base.shape[1] == 1:
-        return mask_base.expand(-1, channels, -1, -1)
+        base = mask_base.float() if mask_base.dtype == torch.bool else mask_base
+        return base.expand(-1, channels, -1, -1)
+
     collapsed = _collapse_mask(mask_base)
     if collapsed is None:
         return None
