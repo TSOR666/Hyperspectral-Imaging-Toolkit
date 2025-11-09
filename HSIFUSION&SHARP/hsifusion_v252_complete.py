@@ -165,11 +165,11 @@ def merge_sliding_windows_fixed(windows: torch.Tensor, grid_size: Tuple[int, int
     C = windows.shape[1]
     
     # Reshape windows to (B, C, grid_H, grid_W, window_size, window_size)
-    windows = windows.view(B, grid_H, grid_W, C, window_size, window_size)
+    windows = windows.contiguous().view(B, grid_H, grid_W, C, window_size, window_size)
     windows = windows.permute(0, 3, 1, 2, 4, 5).contiguous()  # (B, C, grid_H, grid_W, ws, ws)
     
     # Reshape for fold: (B*C, window_size*window_size, grid_H*grid_W)
-    windows_for_fold = windows.view(B * C, grid_H * grid_W, window_size * window_size)
+    windows_for_fold = windows.contiguous().view(B * C, grid_H * grid_W, window_size * window_size)
     windows_for_fold = windows_for_fold.transpose(1, 2)  # (B*C, ws*ws, grid_H*grid_W)
     
     # Optimize output size: only pad when necessary
@@ -1482,7 +1482,6 @@ if __name__ == "__main__":
 - Removed unused imports for faster load time
 - Comprehensive edge case handling and warnings
 """
-
 
 
 

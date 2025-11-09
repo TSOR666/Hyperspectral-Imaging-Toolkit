@@ -69,7 +69,15 @@ class DPMOT(nn.Module):
 
         return loss, noise_pred, noise
 
-    def sample(self, shape, device, return_intermediates=False, use_dpm_solver=True, steps=None):
+    def sample(
+        self,
+        shape,
+        device,
+        conditioning: torch.Tensor = None,
+        return_intermediates: bool = False,
+        use_dpm_solver: bool = True,
+        steps: int = None,
+    ):
         """
         Sample from the model
 
@@ -84,15 +92,15 @@ class DPMOT(nn.Module):
             Generated sample
         """
         if use_dpm_solver:
-            return self.sample_dpm_solver(shape, device, steps=steps or 20)
-        return self.sample_ddpm(shape, device, return_intermediates)
+            return self.sample_dpm_solver(shape, device, conditioning=conditioning, steps=steps or 20)
+        return self.sample_ddpm(shape, device, conditioning=conditioning, return_intermediates=return_intermediates)
 
-    def sample_ddpm(self, shape, device, return_intermediates=False):
+    def sample_ddpm(self, shape, device, conditioning=None, return_intermediates=False):
         """Standard DDPM sampling."""
         b = shape[0]
 
         # Start from pure noise
-        x = torch.randn(shape, device=device)
+        x = self._prepare_starting_point(shape, device, conditioning)
 
         intermediates = [x] if return_intermediates else None
 
@@ -131,7 +139,7 @@ class DPMOT(nn.Module):
             return x, intermediates
         return x
 
-    def sample_dpm_solver(self, shape, device, steps=20):
+    def sample_dpm_solver(self, shape, device, conditioning=None, steps=20):
         """
         DPM Solver v3 sampling for faster inference.
 
@@ -143,7 +151,7 @@ class DPMOT(nn.Module):
         Returns:
             Generated sample tensor
         """
-        x = torch.randn(shape, device=device)
+        x = self._prepare_starting_point(shape, device, conditioning)
 
         # Time steps for solver (evenly spaced for simplicity)
         t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)[:-1]
@@ -198,6 +206,21 @@ class DPMOT(nn.Module):
                     x = x_1
 
         return x
+
+    def _prepare_starting_point(self, shape, device, conditioning):
+        """Return initial noisy state, optionally conditioned on an encoder latent."""
+        if conditioning is None:
+            return torch.randn(shape, device=device)
+
+        if list(conditioning.shape) != list(shape):
+            raise ValueError(f"Conditioning shape {tuple(conditioning.shape)} does not match requested {shape}.")
+
+        conditioning = conditioning.to(device)
+        timesteps = torch.full(
+            (conditioning.shape[0],), self.timesteps - 1, device=device, dtype=torch.long
+        )
+        noisy_latent, _ = self.q_sample(conditioning, timesteps)
+        return noisy_latent
 
     def _dpm_solver_update(self, x, noise_pred, t, next_t):
         """First-order DPM-Solver update."""

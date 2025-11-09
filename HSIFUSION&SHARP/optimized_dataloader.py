@@ -42,6 +42,7 @@ class OptimizedTrainDataset(Dataset):
         # Precompute patch indices for faster access
         self.patches_per_image = []
         self.cumulative_patches = [0]
+        self.image_shapes = []
         self._compute_patch_indices()
         
         # Setup caching for lazy mode
@@ -74,13 +75,13 @@ class OptimizedTrainDataset(Dataset):
     def _compute_patch_indices(self):
         """Precompute patch counts for each image"""
         for i in range(len(self.rgb_files)):
-            # Assume standard ARAD-1K size (482x512)
-            h, w = 482, 512
+            h, w = self._infer_image_shape(i)
             # Fix: ensure we don't go beyond image boundaries
             n_patches_h = max(1, (h - self.crop_size) // self.stride + 1)
             n_patches_w = max(1, (w - self.crop_size) // self.stride + 1)
             n_patches = n_patches_h * n_patches_w
             
+            self.image_shapes.append((h, w))
             self.patches_per_image.append(n_patches)
             self.cumulative_patches.append(self.cumulative_patches[-1] + n_patches)
         
@@ -136,7 +137,7 @@ class OptimizedTrainDataset(Dataset):
         patch_idx = idx - self.cumulative_patches[img_idx]
         
         # Get patch coordinates
-        h, w = 482, 512
+        h, w = self.image_shapes[img_idx]
         patches_per_row = max(1, (w - self.crop_size) // self.stride + 1)
         
         patch_row = patch_idx // patches_per_row
@@ -237,8 +238,15 @@ class OptimizedTrainDataset(Dataset):
                 raise RuntimeError(f"Failed to correct HSI patch shape: {e}")
 
         # Ensure contiguous arrays before tensor conversion
-        rgb_patch = np.ascontiguousarray(rgb_patch.transpose(2, 0, 1), dtype=np.float32)
-        hsi_patch = np.ascontiguousarray(hsi_patch, dtype=np.float32)
+        rgb_patch = np.ascontiguousarray(rgb_patch.transpose(2, 0, 1))
+        hsi_patch = np.ascontiguousarray(hsi_patch)
+
+        if self.memory_mode == 'float16':
+            rgb_patch = rgb_patch.astype(np.float16, copy=False)
+            hsi_patch = hsi_patch.astype(np.float16, copy=False)
+        else:
+            rgb_patch = rgb_patch.astype(np.float32, copy=False)
+            hsi_patch = hsi_patch.astype(np.float32, copy=False)
         
         # Convert to tensors
         rgb_tensor = torch.from_numpy(rgb_patch)
@@ -456,3 +464,22 @@ if __name__ == '__main__':
 
 
 
+    def _infer_image_shape(self, idx: int) -> Tuple[int, int]:
+        """Return (height, width) for the idx-th sample without assuming ARAD defaults."""
+        if self.memory_mode != 'lazy' and hasattr(self, 'hsi_data'):
+            data = self.hsi_data[idx]
+            return int(data.shape[1]), int(data.shape[2])
+
+        # Lazy mode: inspect metadata without materialising full array
+        try:
+            with h5py.File(self.hsi_files[idx], 'r') as f:
+                cube = f['cube']
+                bands, dim1, dim2 = cube.shape
+                # After transpose([0,2,1]) we end up with (bands, dim2, dim1)
+                return int(dim2), int(dim1)
+        except Exception:
+            # Fallback to RGB dimensions
+            rgb = cv2.imread(self.rgb_files[idx], cv2.IMREAD_COLOR)
+            if rgb is None:
+                raise
+            return int(rgb.shape[0]), int(rgb.shape[1])

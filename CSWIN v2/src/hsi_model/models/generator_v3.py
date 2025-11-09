@@ -298,7 +298,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
         self.activation_delay_iters = config.get("activation_delay_iters", 20000)
         self.clamp_range = config.get("generator_clamp_range", 10.0)  # Configurable clamp
         self.clamp_after_iters = config.get("clamp_after_iters", 0)  # Can disable clamping after warmup
-        self.register_buffer('iteration_count', torch.tensor(0))
+        self.register_buffer('iteration_count', torch.zeros(1, dtype=torch.long))
         
         # Initial denoising
         self.denoising = nn.Sequential(
@@ -357,6 +357,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
         # Update iteration count during training (torch.jit safe)
         if self.training:
             self.iteration_count.add_(1)
+        iter_idx = int(self.iteration_count.item())
         
         # Initial denoising with residual connection
         x_denoised = self.denoising(x)
@@ -405,14 +406,14 @@ class NoiseRobustCSWinGenerator(nn.Module):
             x = 0.5 * (torch.tanh(x) + 1.0)  # Map to [0, 1]
         elif self.output_activation == "delayed_sigmoid":
             # Only apply sigmoid after specified iterations
-            if self.iteration_count > self.activation_delay_iters:
+            if iter_idx > self.activation_delay_iters:
                 x = torch.sigmoid(x)
         # else: no activation (linear output)
         
         # Optional: Soft clipping to prevent extreme values
         # FIX: Actually use the config values instead of hardcoded ±10!
         if self.training and self.output_activation == "none":
-            if self.clamp_after_iters == 0 or self.iteration_count < self.clamp_after_iters:
+            if self.clamp_after_iters == 0 or iter_idx < self.clamp_after_iters:
                 x = torch.clamp(x, -self.clamp_range, self.clamp_range)
         
         return x

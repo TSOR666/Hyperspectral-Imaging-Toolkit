@@ -932,21 +932,24 @@ class EnhancedTrainer:
                 _ = self.model(dummy_input)
         
         # Profile
-        torch.cuda.synchronize()
+        has_cuda = torch.cuda.is_available()
+        if has_cuda:
+            torch.cuda.synchronize()
         start_time = time.time()
         
         with torch.no_grad():
             for _ in range(50):
                 output = self.model(dummy_input)
         
-        torch.cuda.synchronize()
+        if has_cuda:
+            torch.cuda.synchronize()
         end_time = time.time()
         
         avg_time = (end_time - start_time) / 50 * 1000  # ms
         throughput = 1000 / avg_time  # FPS
         
         # Memory usage
-        if torch.cuda.is_available():
+        if has_cuda:
             max_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
             self.logger.info(f"Average inference time: {avg_time:.2f}ms")
             self.logger.info(f"Throughput: {throughput:.2f} FPS @ {max_memory:.0f} MB")

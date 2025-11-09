@@ -185,6 +185,7 @@ class HSILatentDiffusionModel(nn.Module):
         sampled_latent = self.dpm_ot.sample(
             latent.shape,
             latent.device,
+            conditioning=latent,
             use_dpm_solver=True,
             steps=sampling_steps or 20
         )

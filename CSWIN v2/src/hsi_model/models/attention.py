@@ -43,6 +43,7 @@ import logging
 from typing import Dict, Tuple, Any, Optional
 from einops import rearrange, repeat
 from torch.utils.checkpoint import checkpoint
+from packaging import version
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,9 @@ class CSWinAttentionBlock(nn.Module):
         # Locally enhanced positional encoding
         self.lepe_h = LePEAttention(dim)
         self.lepe_v = LePEAttention(dim)
+
+        torch_version = version.parse(torch.__version__.split('+')[0]) if hasattr(torch, "__version__") else version.parse("0")
+        self._supports_non_reentrant_ckpt = torch_version >= version.parse("2.1")
         
         # v3.0: Default to FP16 bias tables to save memory
         # Check config first, then environment variable, then default to True
@@ -343,7 +347,7 @@ class CSWinAttentionBlock(nn.Module):
         
         # v3.0: Version-aware gradient checkpointing
         if self.training:
-            if hasattr(torch, '__version__') and torch.__version__ >= "2.1":
+            if self._supports_non_reentrant_ckpt:
                 out_h = checkpoint(self._compute_horizontal_attention, x, use_reentrant=False)
                 out_v = checkpoint(self._compute_vertical_attention, x, use_reentrant=False)
             else:

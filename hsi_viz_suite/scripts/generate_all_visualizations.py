@@ -22,7 +22,10 @@ def main():
     samples = sorted([p.stem for p in (rdir/'hsi').glob('*.npy') if not p.stem.endswith('_target')])[:args.max_samples]
 
     out_main = Path(args.output)/"main_figures"; out_main.mkdir(parents=True, exist_ok=True)
-    run_script("visualize_results.py", ["--results", args.results, "--output", str(out_main), "--dpi", str(args.dpi), "--style", args.style])
+    main_cmd = ["--results", args.results, "--output", str(out_main), "--dpi", str(args.dpi), "--style", args.style]
+    if samples:
+        main_cmd += ["--samples"] + samples
+    run_script("visualize_results.py", main_cmd)
 
     out_err = Path(args.output)/"error_maps"; out_err.mkdir(parents=True, exist_ok=True)
     run_script("generate_error_maps.py", ["--results", args.results, "--output", str(out_err), "--samples"] + samples[:min(5,len(samples))])

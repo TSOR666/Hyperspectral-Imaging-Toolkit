@@ -250,6 +250,7 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
             sampled_latent = model.dpm_ot.sample(
                 latent.shape,
                 latent.device,
+                conditioning=latent,
                 use_dpm_solver=True,
                 steps=sampling_steps
             )
