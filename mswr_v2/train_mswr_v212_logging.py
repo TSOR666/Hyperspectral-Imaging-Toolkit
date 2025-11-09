@@ -38,6 +38,7 @@ import argparse
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
+from packaging import version
 
 # Compatibility import for AMP (PyTorch < 2.4 uses torch.cuda.amp)
 try:
@@ -521,7 +522,8 @@ def setup_environment(config: TrainingConfig):
     # Enhanced CUDA settings
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.deterministic = False
+TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
@@ -986,6 +988,19 @@ class EnhancedTrainer:
         )
         
         # Enhanced data loaders
+        pin_memory_kwargs = {}
+        if (
+            torch.cuda.is_available()
+            and TORCH_VERSION >= version.parse("2.0.0")
+            and self.config.pin_memory
+        ):
+            pin_memory_kwargs["pin_memory_device"] = "cuda"
+
+        def _prefetch_kwargs(worker_count: int):
+            if worker_count > 0:
+                return {"prefetch_factor": max(2, getattr(self.config, "prefetch_factor", 2))}
+            return {}
+
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.batch_size,
@@ -993,7 +1008,9 @@ class EnhancedTrainer:
             num_workers=self.config.num_workers,
             pin_memory=self.config.pin_memory,
             drop_last=True,
-            persistent_workers=True if self.config.num_workers > 0 else False
+            persistent_workers=True if self.config.num_workers > 0 else False,
+            **_prefetch_kwargs(self.config.num_workers),
+            **pin_memory_kwargs,
         )
         
         # Validation loader with fixed persistent_workers handling
@@ -1004,7 +1021,9 @@ class EnhancedTrainer:
             shuffle=False,
             num_workers=val_num_workers,
             pin_memory=self.config.pin_memory,
-            persistent_workers=True if val_num_workers > 0 else False
+            persistent_workers=True if val_num_workers > 0 else False,
+            **_prefetch_kwargs(val_num_workers),
+            **pin_memory_kwargs,
         )
         
         self.logger.info(f"Training samples: {len(self.train_dataset):,}")
