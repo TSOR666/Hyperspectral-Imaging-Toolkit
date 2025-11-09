@@ -134,17 +134,26 @@ class CSWinAttentionBlock(nn.Module):
         
         bias_dtype = torch.float16 if use_fp16_bias else torch.float32
         
-        # For storing relative position bias - keep these small (just for the split_size window)
+        table_shape = (2 * split_size - 1, 2 * split_size - 1, num_heads)
         self.relative_position_bias_table_h = nn.Parameter(
-            torch.zeros((2 * split_size - 1, 2 * split_size - 1, num_heads), dtype=bias_dtype))
+            torch.zeros(table_shape, dtype=bias_dtype))
         self.relative_position_bias_table_v = nn.Parameter(
-            torch.zeros((2 * split_size - 1, 2 * split_size - 1, num_heads), dtype=bias_dtype))
-        
-        # Initialize parameters with small random values
+            torch.zeros(table_shape, dtype=bias_dtype))
+
         nn.init.trunc_normal_(self.relative_position_bias_table_h, std=0.02)
         nn.init.trunc_normal_(self.relative_position_bias_table_v, std=0.02)
-        
-        # Log the dtype being used
+
+        idx = torch.arange(split_size, dtype=torch.long)
+        relative_index = idx[:, None] - idx[None, :] + split_size - 1  # (s, s)
+        self.register_buffer(
+            "_relative_position_index", relative_index, persistent=False
+        )
+        self.register_buffer(
+            "_relative_center_index",
+            torch.tensor(split_size - 1, dtype=torch.long),
+            persistent=False,
+        )
+
         logger.debug(f"CSWinAttentionBlock initialized with bias dtype: {bias_dtype}")
         
     def _expand_bias(self, bias_ss_head: torch.Tensor, tiles_long: int) -> torch.Tensor:
@@ -210,9 +219,10 @@ class CSWinAttentionBlock(nn.Module):
         attn_h = (q_h @ k_h) * self.scale  # [B*h_windows, num_heads, split_size*W, split_size*W]
         
         # -------- horizontal relative bias (FIXED v2.0) --------
-        idx = torch.arange(self.split_size, device=x.device)
-        rel_rows = idx[:, None] - idx[None, :] + self.split_size - 1  # (s, s)
-        bias_ss = self.relative_position_bias_table_h[rel_rows, self.split_size - 1, :]  # (s, s, H)
+        rel_rows = self._relative_position_index
+        bias_ss = self.relative_position_bias_table_h[
+            rel_rows, self._relative_center_index, :
+        ]
         
         # CRITICAL FIX: Use number of windows, not pixel count
         w_windows = padded_W // self.split_size  # Number of WINDOWS in width
@@ -292,9 +302,10 @@ class CSWinAttentionBlock(nn.Module):
         attn_v = (q_v @ k_v) * self.scale  # [B*w_windows, num_heads, padded_H*split_size, padded_H*split_size]
         
         # -------- vertical relative bias (FIXED v2.0) --------
-        idx = torch.arange(self.split_size, device=x.device)
-        rel_cols = idx[:, None] - idx[None, :] + self.split_size - 1  # (s, s)
-        bias_ss = self.relative_position_bias_table_v[self.split_size - 1, :, :][rel_cols]  # (s, s, H)
+        rel_cols = self._relative_position_index
+        bias_ss = self.relative_position_bias_table_v[
+            self._relative_center_index, rel_cols, :
+        ]
         
         # CRITICAL FIX: Use number of windows, not pixel count
         h_windows = padded_H // self.split_size  # Number of WINDOWS in height
