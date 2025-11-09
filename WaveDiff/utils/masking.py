@@ -118,10 +118,8 @@ class MaskingManager:
     
     def _spectral_masking(self, batch_size, num_bands, height, width, device, band_mask_ratio=0.3):
         """Spectral masking strategy - masks random spectral bands"""
-        # Initialize mask with all ones (keep all)
         mask = torch.ones(batch_size, num_bands, height, width, device=device)
         
-        # Determine how many bands to mask
         num_bands_to_mask = max(1, int(num_bands * band_mask_ratio))
         
         # Convert importance weights to tensor
@@ -136,15 +134,18 @@ class MaskingManager:
             # Equal probability if importance weights don't match
             selection_probs = torch.ones(num_bands, device=device) / num_bands
         
-        # Select bands to mask for each item in batch
-        for b in range(batch_size):
-            masked_bands = torch.multinomial(
-                selection_probs, 
-                num_bands_to_mask, 
-                replacement=False
-            )
-            # Apply mask (set selected bands to 0)
-            mask[b, masked_bands] = 0.0
+        if num_bands_to_mask == 0:
+            return mask.bool()
+
+        batched_probs = selection_probs.unsqueeze(0).expand(batch_size, -1)
+        masked_bands = torch.multinomial(
+            batched_probs,
+            num_bands_to_mask,
+            replacement=False
+        )
+
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(masked_bands)
+        mask[batch_idx, masked_bands] = 0.0
             
         return mask.bool()
     
