@@ -127,17 +127,10 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
                 self.wavelet_transform = HaarWaveletTransform(hsi_target.shape[1]).to(hsi_target.device)
             
             if mask is not None:
-                # Apply mask to focus loss on non-masked regions
-                if mask.shape[1] == 1:
-                    # Expand mask to HSI channels if needed
-                    mask_expanded = mask.expand(-1, hsi_target.shape[1], -1, -1)
-                else:
-                    mask_expanded = mask
-                
+                mask_expanded = self._align_mask_channels(mask, hsi_target.shape[1])
                 hsi_output_masked = self.apply_mask(hsi_output, mask_expanded)
                 hsi_target_masked = self.apply_mask(hsi_target, mask_expanded)
-                
-                # Transform to wavelet domain
+
                 output_coeffs = self.wavelet_transform(hsi_output_masked)
                 target_coeffs = self.wavelet_transform(hsi_target_masked)
             else:

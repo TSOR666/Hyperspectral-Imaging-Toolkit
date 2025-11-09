@@ -1,8 +1,35 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 import torch.fft
 import numpy as np
 from scipy.stats import wasserstein_distance
+
+
+def _collapse_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    if mask.shape[1] == 1:
+        return mask.float() if mask.dtype == torch.bool else mask
+    base = mask.float() if mask.dtype == torch.bool else mask
+    return base.mean(dim=1, keepdim=True)
+
+
+def _broadcast_mask(mask: Optional[torch.Tensor], channels: int) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    mask_base = mask.float() if mask.dtype == torch.bool else mask
+    if channels == 1:
+        return _collapse_mask(mask_base)
+    if mask_base.shape[1] == channels:
+        return mask_base
+    if mask_base.shape[1] == 1:
+        return mask_base.expand(-1, channels, -1, -1)
+    collapsed = _collapse_mask(mask_base)
+    if collapsed is None:
+        return None
+    return collapsed.expand(-1, channels, -1, -1)
 
 def cycle_consistency_loss(rgb_original, rgb_reconstructed, mask=None):
     """
@@ -16,19 +43,15 @@ def cycle_consistency_loss(rgb_original, rgb_reconstructed, mask=None):
     Returns:
         Cycle consistency loss value
     """
-    if mask is not None:
-        # If mask has only one channel, expand to match RGB
-        if mask.shape[1] == 1:
-            mask = mask.expand(-1, 3, -1, -1)
-        
-        # Apply mask to inputs
-        rgb_original = rgb_original * mask
-        rgb_reconstructed = rgb_reconstructed * mask
+    mask_rgb = _broadcast_mask(mask, 3)
+    if mask_rgb is not None:
+        rgb_original = rgb_original * mask_rgb
+        rgb_reconstructed = rgb_reconstructed * mask_rgb
         
         # Calculate L1 loss on masked regions
         loss = F.l1_loss(rgb_original, rgb_reconstructed, reduction='sum')
         # Normalize by number of valid pixels
-        num_valid_pixels = torch.sum(mask) + 1e-8
+        num_valid_pixels = torch.sum(mask_rgb) + 1e-8
         loss = loss / num_valid_pixels
     else:
         # Regular L1 loss
@@ -69,13 +92,10 @@ def spectral_angular_mapper(pred_hsi, target_hsi, mask=None, eps=1e-8):
     # Calculate angular distance
     sam = torch.acos(cos_sim)
     
-    if mask is not None:
-        # Reshape mask to match output shape
-        mask_flat = mask.reshape(B, -1) if mask.shape[1] == 1 else mask.reshape(B, C, -1).mean(dim=1)
-        
-        # Apply mask to SAM values
+    mask_single = _collapse_mask(mask)
+    if mask_single is not None:
+        mask_flat = mask_single.reshape(B, -1)
         sam = sam * mask_flat
-        # Normalize by number of valid pixels
         num_valid_pixels = torch.sum(mask_flat, dim=1) + eps
         sam = torch.sum(sam, dim=1) / num_valid_pixels
     else:
@@ -97,22 +117,14 @@ def root_mean_square_error(pred_hsi, target_hsi, mask=None):
     Returns:
         RMSE value (lower is better)
     """
-    if mask is not None:
-        # If mask has only one channel, expand to match HSI
-        if mask.shape[1] == 1:
-            mask = mask.expand(-1, pred_hsi.shape[1], -1, -1)
-        
-        # Apply mask to inputs
-        pred_hsi = pred_hsi * mask
-        target_hsi = target_hsi * mask
-        
-        # Calculate MSE on masked regions
+    mask_hsi = _broadcast_mask(mask, pred_hsi.shape[1])
+    if mask_hsi is not None:
+        pred_hsi = pred_hsi * mask_hsi
+        target_hsi = target_hsi * mask_hsi
+
         sq_diff = (pred_hsi - target_hsi) ** 2
-        # Sum across all dimensions except batch
         sum_sq_diff = torch.sum(sq_diff, dim=[1, 2, 3])
-        # Count valid pixels
-        num_valid_pixels = torch.sum(mask, dim=[1, 2, 3]) + 1e-8
-        # Calculate MSE for each sample in batch
+        num_valid_pixels = torch.sum(mask_hsi, dim=[1, 2, 3]) + 1e-8
         mse = sum_sq_diff / num_valid_pixels
     else:
         # Regular MSE
@@ -140,12 +152,9 @@ def peak_signal_to_noise_ratio(pred_hsi, target_hsi, mask=None, data_range=None,
     """
     # Determine appropriate data range when not provided
     if data_range is None:
-        if mask is not None:
-            expanded_mask = mask
-            if mask.shape[1] == 1:
-                expanded_mask = mask.expand(-1, target_hsi.shape[1], -1, -1)
-
-            valid = expanded_mask > 0
+        mask_hsi = _broadcast_mask(mask, target_hsi.shape[1])
+        if mask_hsi is not None:
+            valid = mask_hsi > 0
             if torch.any(valid):
                 target_vals = target_hsi[valid]
             else:
@@ -167,22 +176,14 @@ def peak_signal_to_noise_ratio(pred_hsi, target_hsi, mask=None, data_range=None,
     data_range = torch.clamp(data_range, min=eps)
 
     # Calculate MSE
-    if mask is not None:
-        # If mask has only one channel, expand to match HSI
-        if mask.shape[1] == 1:
-            mask = mask.expand(-1, pred_hsi.shape[1], -1, -1)
-        
-        # Apply mask to inputs
-        pred_masked = pred_hsi * mask
-        target_masked = target_hsi * mask
-        
-        # Calculate MSE on masked regions
+    mask_hsi = _broadcast_mask(mask, pred_hsi.shape[1])
+    if mask_hsi is not None:
+        pred_masked = pred_hsi * mask_hsi
+        target_masked = target_hsi * mask_hsi
+
         sq_diff = (pred_masked - target_masked) ** 2
-        # Sum across all dimensions except batch
         sum_sq_diff = torch.sum(sq_diff, dim=[1, 2, 3])
-        # Count valid pixels
-        num_valid_pixels = torch.sum(mask, dim=[1, 2, 3]) + 1e-8
-        # Calculate MSE for each sample in batch
+        num_valid_pixels = torch.sum(mask_hsi, dim=[1, 2, 3]) + 1e-8
         mse = sum_sq_diff / num_valid_pixels
     else:
         # Regular MSE
@@ -229,13 +230,10 @@ def spectral_information_divergence(pred_hsi, target_hsi, mask=None, eps=1e-8):
     # Sum along spectral dimension
     sid = torch.sum(term1 + term2, dim=1)
     
-    if mask is not None:
-        # Reshape mask to match output shape
-        mask_flat = mask.reshape(B, -1) if mask.shape[1] == 1 else mask.reshape(B, C, -1).mean(dim=1)
-        
-        # Apply mask to SID values
+    mask_single = _collapse_mask(mask)
+    if mask_single is not None:
+        mask_flat = mask_single.reshape(B, -1)
         sid = sid * mask_flat
-        # Normalize by number of valid pixels
         num_valid_pixels = torch.sum(mask_flat, dim=1) + eps
         sid = torch.sum(sid, dim=1) / num_valid_pixels
     else:
@@ -268,9 +266,8 @@ def wasserstein_spectral_loss(pred_hsi, target_hsi, mask=None):
     # If mask is provided, convert to numpy
     mask_np = None
     if mask is not None:
-        mask_np = mask.detach().cpu().numpy()
-        if mask_np.shape[1] == 1:
-            mask_np = np.repeat(mask_np, pred_np.shape[1], axis=1)
+        mask_single = _collapse_mask(mask)
+        mask_np = mask_single.detach().cpu().numpy()
     
     # Calculate Wasserstein distance for each pixel and average
     for b in range(B):
@@ -312,14 +309,10 @@ def frequency_domain_loss(pred_hsi, target_hsi, low_freq_weight=1.0, high_freq_w
         Weighted loss in frequency domain
     """
     # Apply spatial mask if provided
-    if mask is not None:
-        # If mask has only one channel, expand to match HSI
-        if mask.shape[1] == 1:
-            mask = mask.expand(-1, pred_hsi.shape[1], -1, -1)
-        
-        # Apply mask to inputs
-        pred_hsi = pred_hsi * mask
-        target_hsi = target_hsi * mask
+    mask_hsi = _broadcast_mask(mask, pred_hsi.shape[1])
+    if mask_hsi is not None:
+        pred_hsi = pred_hsi * mask_hsi
+        target_hsi = target_hsi * mask_hsi
     
     # Transform to frequency domain
     pred_fft = torch.fft.rfft2(pred_hsi, norm="ortho")
@@ -387,16 +380,10 @@ def mean_relative_absolute_error(pred_hsi, target_hsi, mask=None, eps=1e-6):
     # Calculate relative absolute error
     rel_abs_error = abs_diff / abs_target
     
-    if mask is not None:
-        # If mask has only one channel, expand to match HSI
-        if mask.shape[1] == 1:
-            mask = mask.expand(-1, pred_hsi.shape[1], -1, -1)
-        
-        # Apply mask
-        rel_abs_error = rel_abs_error * mask
-        
-        # Calculate mean over valid regions
-        valid_pixels = torch.sum(mask, dim=[1, 2, 3])
+    mask_hsi = _broadcast_mask(mask, pred_hsi.shape[1])
+    if mask_hsi is not None:
+        rel_abs_error = rel_abs_error * mask_hsi
+        valid_pixels = torch.sum(mask_hsi, dim=[1, 2, 3])
         mrae_per_sample = torch.sum(rel_abs_error, dim=[1, 2, 3]) / (valid_pixels + eps)
     else:
         # Calculate mean over all dimensions except batch

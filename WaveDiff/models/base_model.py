@@ -152,12 +152,28 @@ class HSILatentDiffusionModel(nn.Module):
             **kwargs
         )
     
+    def _align_mask_channels(self, mask: torch.Tensor, channels: int) -> torch.Tensor:
+        """Broadcast or reduce mask to match the requested channel count."""
+        if mask is None:
+            return None
+        mask_base = mask.float() if mask.dtype == torch.bool else mask
+        if mask_base.shape[1] == channels:
+            return mask_base
+        if channels == 1:
+            return mask_base.mean(dim=1, keepdim=True)
+        if mask_base.shape[1] == 1:
+            return mask_base.expand(-1, channels, -1, -1)
+        reduced = mask_base.mean(dim=1, keepdim=True)
+        return reduced.expand(-1, channels, -1, -1)
+
     def apply_mask(self, x, mask):
         """Apply mask to input tensor"""
-        if x.shape[1] != mask.shape[1]:
-            # Expand mask to match channels if needed
-            mask = mask.expand(-1, x.shape[1], -1, -1)
-        return x * mask
+        if mask is None:
+            return x
+        mask_prepared = self._align_mask_channels(mask, x.shape[1])
+        if mask_prepared.dtype != x.dtype:
+            mask_prepared = mask_prepared.to(x.dtype)
+        return x * mask_prepared
     
     def encode(self, rgb):
         """Encode RGB images to latent representations"""
@@ -307,32 +323,21 @@ class HSILatentDiffusionModel(nn.Module):
         mask = outputs['mask']
 
         # Cycle consistency loss (RGB → HSI → RGB)
-        if mask is not None:
-            # Apply mask for cycle consistency loss
+        mask_for_loss = mask
+        if mask_for_loss is not None:
             losses['cycle_loss'] = F.l1_loss(
-                self.apply_mask(rgb_from_hsi, mask.expand(-1, 3, -1, -1)), 
-                self.apply_mask(rgb_target, mask.expand(-1, 3, -1, -1))
+                self.apply_mask(rgb_from_hsi, mask_for_loss),
+                self.apply_mask(rgb_target, mask_for_loss)
             )
         else:
             losses['cycle_loss'] = F.l1_loss(rgb_from_hsi, rgb_target)
         
         # L1 loss for HSI reconstruction (if target available)
         if hsi_target is not None:
-            # CRITICAL FIX: Prepare mask_expanded once for reuse
-            mask_expanded = None
             if mask is not None:
-                # Apply mask to focus loss on non-masked regions
-                if mask.shape[1] == 1:
-                    # Expand mask to HSI channels if needed
-                    mask_expanded = mask.expand(-1, hsi_target.shape[1], -1, -1)
-                else:
-                    mask_expanded = mask
-
-            # Compute L1 loss with or without mask
-            if mask_expanded is not None:
                 losses['l1_loss'] = F.l1_loss(
-                    self.apply_mask(hsi_output, mask_expanded),
-                    self.apply_mask(hsi_target, mask_expanded)
+                    self.apply_mask(hsi_output, mask),
+                    self.apply_mask(hsi_target, mask)
                 )
             else:
                 losses['l1_loss'] = F.l1_loss(hsi_output, hsi_target)
@@ -340,20 +345,20 @@ class HSILatentDiffusionModel(nn.Module):
             # Track intermediate reconstruction losses for analysis
             hsi_initial = outputs.get('hsi_initial')
             if hsi_initial is not None:
-                if mask_expanded is not None:
+                if mask is not None:
                     losses['pre_spectral_l1'] = F.l1_loss(
-                        self.apply_mask(hsi_initial, mask_expanded),
-                        self.apply_mask(hsi_target, mask_expanded)
+                        self.apply_mask(hsi_initial, mask),
+                        self.apply_mask(hsi_target, mask)
                     )
                 else:
                     losses['pre_spectral_l1'] = F.l1_loss(hsi_initial, hsi_target)
 
             hsi_after_spectral = outputs.get('hsi_after_spectral')
             if hsi_after_spectral is not None and hsi_after_spectral is not hsi_output:
-                if mask_expanded is not None:
+                if mask is not None:
                     losses['pre_pixel_l1'] = F.l1_loss(
-                        self.apply_mask(hsi_after_spectral, mask_expanded),
-                        self.apply_mask(hsi_target, mask_expanded)
+                        self.apply_mask(hsi_after_spectral, mask),
+                        self.apply_mask(hsi_target, mask)
                     )
                 else:
                     losses['pre_pixel_l1'] = F.l1_loss(hsi_after_spectral, hsi_target)
