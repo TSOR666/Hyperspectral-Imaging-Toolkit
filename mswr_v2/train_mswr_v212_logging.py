@@ -127,10 +127,14 @@ except ImportError as e:
     early_logger.error("Please ensure utils.py is available in your Python path with the fixed Loss_SAM.")
     sys.exit(1)
 
-# Constants - Update these for your environment
-DATA_ROOT = '/work3/tlidily/data/ARAD_1K/'
-LOG_DIR_BASE = '/work3/tlidily/mswr/logs/'
-CHECKPOINT_DIR_BASE = '/work3/tlidily/mswr/checkpoints/'
+# Workspace defaults (can be overridden via environment variables or CLI)
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.abspath(os.environ.get('MSWR_DATA_ROOT', os.path.join(REPO_ROOT, 'data', 'ARAD_1K')))
+EXPERIMENTS_ROOT = os.path.abspath(os.environ.get('MSWR_EXPERIMENTS_ROOT', os.path.join(REPO_ROOT, 'experiments')))
+LOG_DIR_BASE = os.path.join(EXPERIMENTS_ROOT, 'logs')
+CHECKPOINT_DIR_BASE = os.path.join(EXPERIMENTS_ROOT, 'checkpoints')
+
+TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
 
 # Model size mapping
 MODEL_SIZES = {
@@ -484,6 +488,12 @@ def parse_arguments():
     parser.add_argument("--checkpoint_base", type=str, default=CHECKPOINT_DIR_BASE)
     
     args = parser.parse_args()
+    default_args = parser.parse_args([])
+    args._parser_defaults = default_args
+    args._explicit_cli_args = {
+        key for key, value in vars(args).items()
+        if getattr(default_args, key, None) != value
+    }
     
     # Post-parse fix for wavelet_levels if single value provided
     if args.wavelet_levels is not None and len(args.wavelet_levels) == 1:
@@ -499,10 +509,21 @@ def load_config(args):
         with open(args.config, 'r') as f:
             yaml_cfg = yaml.safe_load(f)
         
+        if not isinstance(yaml_cfg, dict):
+            raise ValueError(f"Configuration file must define a mapping, got {type(yaml_cfg).__name__}")
+        
+        parser_defaults = vars(getattr(args, '_parser_defaults', argparse.Namespace()))
+        explicit_cli = getattr(args, '_explicit_cli_args', set())
+        
         # Update args with yaml config (preserving command line precedence)
-        parser = argparse.ArgumentParser()
         for key, value in yaml_cfg.items():
-            if hasattr(args, key) and getattr(args, key) == parser.get_default(key):
+            if not hasattr(args, key):
+                continue
+            if key in explicit_cli:
+                continue
+            current_value = getattr(args, key)
+            default_value = parser_defaults.get(key, current_value)
+            if current_value == default_value:
                 setattr(args, key, value)
     
     return args
@@ -522,8 +543,7 @@ def setup_environment(config: TrainingConfig):
     # Enhanced CUDA settings
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
+        torch.backends.cudnn.deterministic = False
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
