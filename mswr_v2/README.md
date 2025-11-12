@@ -29,10 +29,16 @@ mswr_v2/
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
    pip install numpy h5py wandb tqdm psutil pyyaml
+   pip install opencv-python hdf5storage fvcore scipy matplotlib seaborn pandas plotly scikit-learn
    ```
 3. The legacy MST++ dataloader is now bundled as [`dataloader.py`](dataloader.py),
    so no additional files are required. Ensure the ARAD-1K dataset follows the
    `Train_RGB` / `Train_Spec` / `split_txt` layout before launching training.
+4. (Optional) Point the tooling at custom folders by setting environment variables before launching:
+   - `MSWR_DATA_ROOT=/path/to/ARAD_1K`
+   - `MSWR_EXPERIMENTS_ROOT=/path/to/output_dir`
+
+By default, logs and checkpoints are stored under `./experiments/{logs,checkpoints}` relative to this directory and the dataset path resolves to `./data/ARAD_1K`. Override them via the CLI flags `--data_root`, `--log_base`, and `--checkpoint_base` or by exporting the environment variables above.
 
 ## Training
 
