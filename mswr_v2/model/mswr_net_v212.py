@@ -81,7 +81,7 @@ class OptimizedCNNWaveletTransform(nn.Module):
     - Support for different precision modes
     - Minimal memory allocations during forward pass
     """
-    def __init__(self, J: int = 1, wave: str = 'db1', mode: str = 'periodic'):
+    def __init__(self, J: int = 1, wave: str = 'db1', mode: str = 'periodic') -> None:
         super().__init__()
         self.J = J
         self.wave = wave
@@ -117,7 +117,7 @@ class OptimizedCNNWaveletTransform(nn.Module):
         h0_list, h1_list = filters.get(wave, filters['haar'])
         return torch.tensor(h0_list, dtype=torch.float32), torch.tensor(h1_list, dtype=torch.float32)
     
-    def _manage_cache_memory(self):
+    def _manage_cache_memory(self) -> None:
         """Intelligent cache management to prevent memory bloat"""
         if len(self._filter_cache) > self._cache_size_limit:
             # Remove least recently used filters
@@ -147,14 +147,14 @@ class OptimizedCNNWaveletTransform(nn.Module):
             return self._filter_cache[cache_key]
         
         # Create 2D separable filters (more memory efficient)
-        h0_2d = self.h0.to(device=device, dtype=dtype).view(-1, 1) * self.h0.to(device=device, dtype=dtype).view(1, -1)
-        h0h1_2d = self.h0.to(device=device, dtype=dtype).view(-1, 1) * self.h1.to(device=device, dtype=dtype).view(1, -1)
-        h1h0_2d = self.h1.to(device=device, dtype=dtype).view(-1, 1) * self.h0.to(device=device, dtype=dtype).view(1, -1)
-        h1_2d = self.h1.to(device=device, dtype=dtype).view(-1, 1) * self.h1.to(device=device, dtype=dtype).view(1, -1)
+        h0_2d = self.h0.to(device=device, dtype=dtype).view(-1, 1) * self.h0.to(device=device, dtype=dtype).view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h0h1_2d = self.h0.to(device=device, dtype=dtype).view(-1, 1) * self.h1.to(device=device, dtype=dtype).view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h1h0_2d = self.h1.to(device=device, dtype=dtype).view(-1, 1) * self.h0.to(device=device, dtype=dtype).view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h1_2d = self.h1.to(device=device, dtype=dtype).view(-1, 1) * self.h1.to(device=device, dtype=dtype).view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
         
         # Stack and reshape for grouped convolution
-        filters = torch.stack([h0_2d, h0h1_2d, h1h0_2d, h1_2d], dim=0)
-        filters = filters.unsqueeze(1).repeat(channels, 1, 1, 1)
+        filters = torch.stack([h0_2d, h0h1_2d, h1h0_2d, h1_2d], dim=0)  # (4, K, K)
+        filters = filters.unsqueeze(1).repeat(channels, 1, 1, 1)  # (4, 1, K, K) -> (4*C, 1, K, K)
         
         # Cache with memory management
         self._manage_cache_memory()
@@ -164,12 +164,21 @@ class OptimizedCNNWaveletTransform(nn.Module):
         return filters
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Optimized multi-level 2D DWT with minimal memory allocations"""
-        B, C, H, W = x.shape
+        """
+        Optimized multi-level 2D DWT with minimal memory allocations.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            yl: Low-frequency tensor (B, C, H/2^J, W/2^J) when H and W are divisible by 2^J.
+            yh: List of high-frequency tensors, each (B, C, 3, H/2^j, W/2^j).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
         device, dtype = x.device, x.dtype
         
         # Get optimized filters
-        filters = self._get_conv_filters(C, device, dtype)
+        filters = self._get_conv_filters(C, device, dtype)  # (4*C, 1, K, K)
         
         yh = []
         current = x
@@ -179,13 +188,13 @@ class OptimizedCNNWaveletTransform(nn.Module):
             padding = (kernel_size - 1) // 2
             
             # Optimized grouped convolution with proper padding
-            coeffs = F.conv2d(current, filters, stride=2, padding=padding, groups=C)
+            coeffs = F.conv2d(current, filters, stride=2, padding=padding, groups=C)  # (B, C, H, W) -> (B, 4*C, H/2, W/2)
             
             # Efficient tensor reshaping
-            coeffs = coeffs.view(B, 4, C, coeffs.shape[2], coeffs.shape[3])
+            coeffs = coeffs.view(B, 4, C, coeffs.shape[2], coeffs.shape[3])  # (B, 4*C, H2, W2) -> (B, 4, C, H2, W2)
             
-            yl_new = coeffs[:, 0]
-            yh_level = coeffs[:, 1:].permute(0, 2, 1, 3, 4)
+            yl_new = coeffs[:, 0]  # (B, C, H2, W2)
+            yh_level = coeffs[:, 1:].permute(0, 2, 1, 3, 4)  # (B, 3, C, H2, W2) -> (B, C, 3, H2, W2)
             yh.append(yh_level)
             
             current = yl_new
@@ -195,7 +204,7 @@ class OptimizedCNNWaveletTransform(nn.Module):
 class OptimizedCNNInverseWaveletTransform(nn.Module):
     """Optimized CNN-based Inverse DWT with enhanced performance"""
     
-    def __init__(self, wave: str = 'db1', mode: str = 'periodic'):
+    def __init__(self, wave: str = 'db1', mode: str = 'periodic') -> None:
         super().__init__()
         self.wave = wave
         self.mode = mode
@@ -218,13 +227,13 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
         h1 = self.forward_transform.h1.to(device=device, dtype=dtype)
         
         # Create 2D synthesis filters
-        h0_2d = h0.view(-1, 1) * h0.view(1, -1)
-        h0h1_2d = h0.view(-1, 1) * h1.view(1, -1)
-        h1h0_2d = h1.view(-1, 1) * h0.view(1, -1)
-        h1_2d = h1.view(-1, 1) * h1.view(1, -1)
+        h0_2d = h0.view(-1, 1) * h0.view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h0h1_2d = h0.view(-1, 1) * h1.view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h1h0_2d = h1.view(-1, 1) * h0.view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
+        h1_2d = h1.view(-1, 1) * h1.view(1, -1)  # (K, 1) * (1, K) -> (K, K), broadcast
         
-        filters = torch.stack([h0_2d, h0h1_2d, h1h0_2d, h1_2d], dim=0)
-        filters = filters.unsqueeze(1).repeat(channels, 1, 1, 1)
+        filters = torch.stack([h0_2d, h0h1_2d, h1h0_2d, h1_2d], dim=0)  # (4, K, K)
+        filters = filters.unsqueeze(1).repeat(channels, 1, 1, 1)  # (4, 1, K, K) -> (4*C, 1, K, K)
         
         self._filter_cache[cache_key] = filters
         self._cache_access_count[cache_key] = 1
@@ -232,12 +241,21 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
         return filters
     
     def forward(self, coeffs: Tuple[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
-        """Optimized multi-level inverse DWT"""
+        """
+        Optimized multi-level inverse DWT.
+
+        Args:
+            coeffs: Tuple of (yl, yh) where yl is (B, C, H/2^J, W/2^J) and
+                yh is a list of (B, C, 3, H/2^j, W/2^j).
+
+        Returns:
+            Reconstructed tensor in NCHW format (B, C, H, W) for inputs divisible by 2^J.
+        """
         yl, yh = coeffs
-        B, C = yl.shape[0], yl.shape[1]
+        B, C = yl.shape[0], yl.shape[1]  # (B, C, H_low, W_low)
         device, dtype = yl.device, yl.dtype
         
-        filters = self._get_conv_filters(C, device, dtype)
+        filters = self._get_conv_filters(C, device, dtype)  # (4*C, 1, K, K)
         current = yl
         
         for j in range(len(yh) - 1, -1, -1):
@@ -245,17 +263,17 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
             H_curr, W_curr = current.shape[-2:]
             
             # Efficient tensor concatenation and reshaping
-            combined = torch.cat([current.unsqueeze(2), yh_level], dim=2)
-            combined = combined.view(B, 4*C, H_curr, W_curr)
+            combined = torch.cat([current.unsqueeze(2), yh_level], dim=2)  # (B, C, 1, H, W) + (B, C, 3, H, W) -> (B, C, 4, H, W)
+            combined = combined.view(B, 4*C, H_curr, W_curr)  # (B, C, 4, H, W) -> (B, 4*C, H, W)
             
             # Optimized transposed convolution
             kernel_size = filters.shape[-1]
             padding = (kernel_size - 1) // 2
             
             current = F.conv_transpose2d(
-                combined, filters, stride=2, padding=padding, 
+                combined, filters, stride=2, padding=padding,
                 output_padding=0, groups=C
-            )
+            )  # (B, 4*C, H, W) -> (B, C, 2*H, 2*W)
         
         return current
 
@@ -264,12 +282,12 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
 class PerformanceMonitor:
     """Enhanced performance monitoring with detailed profiling"""
     
-    def __init__(self, enabled: bool = True, rank: int = 0, profile_memory: bool = True):
+    def __init__(self, enabled: bool = True, rank: int = 0, profile_memory: bool = True) -> None:
         self.enabled = enabled and rank == 0
         self.profile_memory = profile_memory and torch.cuda.is_available()
         self.reset()
     
-    def reset(self):
+    def reset(self) -> None:
         self.stage_times = {}
         self.memory_snapshots = {}
         self.operation_counts = defaultdict(int)
@@ -281,7 +299,7 @@ class PerformanceMonitor:
             torch.cuda.reset_peak_memory_stats()
             self._memory_baseline = torch.cuda.memory_allocated()
     
-    def start_stage(self, stage_name: str):
+    def start_stage(self, stage_name: str) -> None:
         if not self.enabled:
             return
         
@@ -296,7 +314,7 @@ class PerformanceMonitor:
                 'cached_mb': torch.cuda.memory_reserved() / 1024**2
             }
     
-    def end_stage(self, stage_name: str):
+    def end_stage(self, stage_name: str) -> None:
         if not self.enabled or stage_name not in self._start_times:
             return
         
@@ -315,7 +333,7 @@ class PerformanceMonitor:
         
         del self._start_times[stage_name]
     
-    def log_operation(self, op_name: str, tensor_shape: Tuple[int, ...] = None):
+    def log_operation(self, op_name: str, tensor_shape: Optional[Tuple[int, ...]] = None) -> None:
         if not self.enabled:
             return
         
@@ -393,7 +411,7 @@ class MSWRDualConfig:
     norm_type: str = 'layer'  # Default to LayerNorm for better compatibility
     performance_monitoring: bool = True
     
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Enhanced validation with detailed error messages"""
         if self.wavelet_levels is None:
             self.wavelet_levels = list(range(1, self.num_stages + 1))
@@ -442,21 +460,30 @@ class LayerNorm2d(nn.Module):
     
     This is THE KEY FIX for the dimension mismatch error!
     """
-    def __init__(self, num_channels: int, eps: float = 1e-5):
+    def __init__(self, num_channels: int, eps: float = 1e-5) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(num_channels, eps=eps)
         self.num_channels = num_channels
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply LayerNorm over channel dimension for NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Normalized tensor in NCHW format (B, C, H, W).
+        """
         # x is expected to be in NCHW format from Conv2d
         # LayerNorm expects the normalized dimension to be last
         
         # Convert NCHW -> NHWC
-        x = x.permute(0, 2, 3, 1)
+        x = x.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
         # Apply LayerNorm (now channels are last)
-        x = self.norm(x)
+        x = self.norm(x)  # (B, H, W, C) -> (B, H, W, C)
         # Convert back NHWC -> NCHW
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         
         return x
 
@@ -465,7 +492,7 @@ class AdaptiveNorm2d(nn.Module):
     Adaptive normalization that automatically handles different formats
     and selects the appropriate normalization for CNN contexts.
     """
-    def __init__(self, num_channels: int, norm_type: str = 'layer', eps: float = 1e-5):
+    def __init__(self, num_channels: int, norm_type: str = 'layer', eps: float = 1e-5) -> None:
         super().__init__()
         self.norm_type = norm_type
         self.num_channels = num_channels
@@ -494,7 +521,16 @@ class AdaptiveNorm2d(nn.Module):
             self.norm = nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x)
+        """
+        Apply selected normalization to NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Normalized tensor in NCHW format (B, C, H, W).
+        """
+        return self.norm(x)  # (B, C, H, W) -> (B, C, H, W)
 
 def create_norm_layer(dim: int, norm_type: str = "layer", for_conv: bool = False) -> nn.Module:
     """
@@ -537,7 +573,7 @@ class OptimizedWindowAttention2D(nn.Module):
     
     def __init__(self, dim: int, num_heads: int, window_size: int,
                  use_flash: bool = True, dropout: float = 0.0,
-                 fuse_qkv_small_maps: bool = True, memory_efficient: bool = True):
+                 fuse_qkv_small_maps: bool = True, memory_efficient: bool = True) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -558,25 +594,34 @@ class OptimizedWindowAttention2D(nn.Module):
         
         # Optimized relative position encoding
         self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)  # ((2*Ws-1)^2, Heads)
         )
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         
         # Pre-compute relative position indices
-        coords_h = torch.arange(window_size)
-        coords_w = torch.arange(window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
-        coords_flatten = torch.flatten(coords, 1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        coords_h = torch.arange(window_size)  # (Ws,)
+        coords_w = torch.arange(window_size)  # (Ws,)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # (2, Ws, Ws)
+        coords_flatten = torch.flatten(coords, 1)  # (2, Ws*Ws)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # (2, N, N), broadcast
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # (N, N, 2)
         relative_coords[:, :, 0] += window_size - 1
         relative_coords[:, :, 1] += window_size - 1
         relative_coords[:, :, 0] *= 2 * window_size - 1
-        relative_position_index = relative_coords.sum(-1)
+        relative_position_index = relative_coords.sum(-1)  # (N, N)
         self.register_buffer("relative_position_index", relative_position_index, persistent=False)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """
+        Windowed attention over NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
         
         # Dynamic QKV computation based on input size
         use_linear = (self.fuse_qkv_small_maps and 
@@ -591,19 +636,22 @@ class OptimizedWindowAttention2D(nn.Module):
             # SAFE symmetric padding to avoid reflect pad >= input size errors
             ph0, ph1 = pad_h // 2, pad_h - pad_h // 2
             pw0, pw1 = pad_w // 2, pad_w - pad_w // 2
-            x = F.pad(x, (pw0, pw1, ph0, ph1), mode='reflect')
+            pad_mode = 'reflect'
+            if H <= 1 or W <= 1 or ph0 >= H or ph1 >= H or pw0 >= W or pw1 >= W:
+                pad_mode = 'replicate'
+            x = F.pad(x, (pw0, pw1, ph0, ph1), mode=pad_mode)  # (B, C, H, W) -> (B, C, H_pad, W_pad)
             H_pad, W_pad = H + pad_h, W + pad_w
         else:
             H_pad, W_pad = H, W
         
         # Optimized QKV generation
         if use_linear:
-            x_flat = x.permute(0, 2, 3, 1).reshape(B * H_pad * W_pad, C)
-            qkv = self.qkv_linear(x_flat).reshape(B, H_pad, W_pad, 3, C).permute(0, 3, 4, 1, 2)
+            x_flat = x.permute(0, 2, 3, 1).reshape(B * H_pad * W_pad, C)  # (B, C, H_pad, W_pad) -> (B*H_pad*W_pad, C)
+            qkv = self.qkv_linear(x_flat).reshape(B, H_pad, W_pad, 3, C).permute(0, 3, 4, 1, 2)  # (B*H_pad*W_pad, 3*C) -> (B, 3, C, H_pad, W_pad)
             # FIX: Flatten the k=3 dimension with C to get 4D tensor for rearrange
-            qkv = qkv.reshape(B, 3 * C, H_pad, W_pad)
+            qkv = qkv.reshape(B, 3 * C, H_pad, W_pad)  # (B, 3, C, H_pad, W_pad) -> (B, 3*C, H_pad, W_pad)
         else:
-            qkv = self.qkv_conv(x)
+            qkv = self.qkv_conv(x)  # (B, C, H_pad, W_pad) -> (B, 3*C, H_pad, W_pad)
         
         # Efficient window partitioning with optimized tensor operations
         num_windows_h, num_windows_w = H_pad // self.window_size, W_pad // self.window_size
@@ -613,10 +661,10 @@ class OptimizedWindowAttention2D(nn.Module):
             'b (k c) (nh wh) (nw ww) -> (b nh nw) (wh ww) k c',
             k=3, c=C, wh=self.window_size, ww=self.window_size,
             nh=num_windows_h, nw=num_windows_w
-        )
+        )  # (B, 3*C, H_pad, W_pad) -> (B*nh*nw, Ws*Ws, 3, C)
         
-        qkv = rearrange(qkv, 'bw n k (h d) -> k bw h n d', h=self.num_heads)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = rearrange(qkv, 'bw n k (h d) -> k bw h n d', h=self.num_heads)  # (B*nh*nw, N, 3, C) -> (3, B*nh*nw, Heads, N, D)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B*nh*nw, Heads, N, D)
         
         # Enhanced attention computation
         if self.use_flash and self.training:
@@ -625,42 +673,43 @@ class OptimizedWindowAttention2D(nn.Module):
                 q, k, v,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 scale=self.scale
-            )
+            )  # (B*nh*nw, Heads, N, D)
         else:
             # Manual attention with relative position bias
-            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = (q.float() @ k.float().transpose(-2, -1)) * self.scale  # (B*nh*nw, Heads, N, D) @ (B*nh*nw, Heads, D, N) -> (B*nh*nw, Heads, N, N)
             
             # Add relative position bias
             relative_position_bias = self.relative_position_bias_table[
                 self.relative_position_index.view(-1)
-            ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-            attn = attn + relative_position_bias.unsqueeze(0)
+            ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)  # (N, N, Heads)
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # (Heads, N, N)
+            attn = attn + relative_position_bias.unsqueeze(0)  # (1, Heads, N, N) broadcast across batch
             
-            attn = F.softmax(attn, dim=-1)
+            attn = F.softmax(attn, dim=-1)  # (B*nh*nw, Heads, N, N), softmax over last dim
             attn = self.dropout(attn)
-            attn_out = attn @ v
+            attn_out = attn @ v.float()  # (B*nh*nw, Heads, N, N) @ (B*nh*nw, Heads, N, D) -> (B*nh*nw, Heads, N, D)
+            attn_out = attn_out.to(dtype=v.dtype)
         
         # Efficient reverse window partitioning
-        attn_out = rearrange(attn_out, 'bw h n d -> bw n (h d)')
+        attn_out = rearrange(attn_out, 'bw h n d -> bw n (h d)')  # (B*nh*nw, Heads, N, D) -> (B*nh*nw, N, C)
         attn_out = rearrange(
             attn_out,
             '(b nh nw) (wh ww) c -> b c (nh wh) (nw ww)',
             b=B, nh=num_windows_h, nw=num_windows_w,
             wh=self.window_size, ww=self.window_size
-        )
+        )  # (B*nh*nw, N, C) -> (B, C, H_pad, W_pad)
         
         # Remove padding if applied
         if pad_h > 0 or pad_w > 0:
-            attn_out = attn_out[:, :, :H, :W]
+            attn_out = attn_out[:, :, :H, :W]  # (B, C, H_pad, W_pad) -> (B, C, H, W)
         
-        return self.proj(attn_out)
+        return self.proj(attn_out)  # (B, C, H, W) -> (B, C, H, W)
 
 class OptimizedLandmarkAttention2D(nn.Module):
     """Optimized landmark attention with enhanced efficiency"""
     
     def __init__(self, dim: int, num_heads: int, num_landmarks: int,
-                 pooling_type: str = "learned", use_flash: bool = True, dropout: float = 0.0):
+                 pooling_type: str = "learned", use_flash: bool = True, dropout: float = 0.0) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -678,7 +727,7 @@ class OptimizedLandmarkAttention2D(nn.Module):
         
         # Landmark generation
         if pooling_type == "learned":
-            self.landmarks = nn.Parameter(torch.randn(1, num_landmarks, dim) * 0.02)
+            self.landmarks = nn.Parameter(torch.randn(1, num_landmarks, dim) * 0.02)  # (1, L, C)
         elif pooling_type == "adaptive":
             self.landmark_proj = nn.Sequential(
                 nn.Linear(dim, dim // 2),
@@ -687,54 +736,70 @@ class OptimizedLandmarkAttention2D(nn.Module):
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """
+        Landmark attention over NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
 
         # Generate queries efficiently
-        q = self.q_conv(x)
+        q = self.q_conv(x)  # (B, C, H, W) -> (B, C, H, W)
         # Reshape: (B, C, H, W) -> (B, num_heads, H*W, head_dim)
-        q = rearrange(q, 'b (h d) H W -> b h (H W) d', h=self.num_heads, H=H, W=W)
+        q = rearrange(q, 'b (h d) H W -> b h (H W) d', h=self.num_heads, H=H, W=W)  # (B, C, H, W) -> (B, Heads, H*W, D)
         
         # Efficient landmark generation
         if self.pooling_type == "learned":
-            landmarks = self.landmarks.expand(B, -1, -1)
+            landmarks = self.landmarks.expand(B, -1, -1)  # (1, L, C) -> (B, L, C), broadcast
         elif self.pooling_type == "adaptive":
-            x_pool = F.adaptive_avg_pool2d(x, 1).flatten(1)
-            landmark_weights = self.landmark_proj(x_pool).view(B, self.num_landmarks, C)
-            x_flat = rearrange(x, 'b c h w -> b (h w) c')
+            x_pool = F.adaptive_avg_pool2d(x, 1).flatten(1)  # (B, C, 1, 1) -> (B, C)
+            landmark_weights = self.landmark_proj(x_pool).view(B, self.num_landmarks, C)  # (B, C) -> (B, L, C)
+            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
             
             # Efficient landmark selection
-            attn_scores = torch.bmm(landmark_weights, x_flat.transpose(1, 2))
-            attn_weights = F.softmax(attn_scores * (C ** -0.5), dim=-1)
-            landmarks = torch.bmm(attn_weights, x_flat)
+            attn_scores = torch.bmm(landmark_weights.float(), x_flat.transpose(1, 2).float())  # (B, L, C) @ (B, C, H*W) -> (B, L, H*W)
+            attn_scores = attn_scores * (C ** -0.5)  # scale in fp32 for stability
+            attn_weights = F.softmax(attn_scores, dim=-1)  # (B, L, H*W), softmax over tokens
+            landmarks = torch.bmm(attn_weights, x_flat.float()).to(dtype=x_flat.dtype)  # (B, L, H*W) @ (B, H*W, C) -> (B, L, C)
         else:  # uniform
+            if H * W < self.num_landmarks:
+                raise ValueError(
+                    f"uniform landmark pooling requires H*W >= num_landmarks "
+                    f"({H*W} < {self.num_landmarks})"
+                )
             step = max(1, (H * W) // self.num_landmarks)
-            indices = torch.arange(0, H * W, step, device=x.device)[:self.num_landmarks]
-            x_flat = rearrange(x, 'b c h w -> b (h w) c')
-            landmarks = x_flat[:, indices]
+            indices = torch.arange(0, H * W, step, device=x.device)[:self.num_landmarks]  # (L,)
+            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
+            landmarks = x_flat[:, indices]  # (B, L, C)
         
         # Generate keys and values
-        kv = self.kv_linear(landmarks)
-        kv = kv.reshape(B, self.num_landmarks, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0].permute(0, 2, 1, 3), kv[:, :, 1].permute(0, 2, 1, 3)
+        kv = self.kv_linear(landmarks)  # (B, L, C) -> (B, L, 2*C)
+        kv = kv.reshape(B, self.num_landmarks, 2, self.num_heads, self.head_dim)  # (B, L, 2*C) -> (B, L, 2, Heads, D)
+        k, v = kv[:, :, 0].permute(0, 2, 1, 3), kv[:, :, 1].permute(0, 2, 1, 3)  # each (B, Heads, L, D)
         
         # Efficient attention computation
         if self.use_flash and self.training:
-            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)  # (B, Heads, H*W, D)
         else:
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = F.softmax(attn, dim=-1)
+            attn = (q.float() @ k.float().transpose(-2, -1)) * self.scale  # (B, Heads, H*W, D) @ (B, Heads, D, L) -> (B, Heads, H*W, L)
+            attn = F.softmax(attn, dim=-1)  # (B, Heads, H*W, L), softmax over landmarks
             attn = self.dropout(attn)
-            out = attn @ v
+            out = attn @ v.float()  # (B, Heads, H*W, L) @ (B, Heads, L, D) -> (B, Heads, H*W, D)
+            out = out.to(dtype=v.dtype)
         
-        out = rearrange(out, 'b h (h_dim w_dim) d -> b (h d) h_dim w_dim', h_dim=H, w_dim=W)
-        return self.proj(out)
+        out = rearrange(out, 'b h (h_dim w_dim) d -> b (h d) h_dim w_dim', h_dim=H, w_dim=W)  # (B, Heads, H*W, D) -> (B, C, H, W)
+        return self.proj(out)  # (B, C, H, W) -> (B, C, H, W)
 
 class EnhancedDualAttention2D(nn.Module):
     """
     Enhanced dual attention with FIXED normalization handling
     """
     
-    def __init__(self, dim: int, config: MSWRDualConfig):
+    def __init__(self, dim: int, config: MSWRDualConfig) -> None:
         super().__init__()
         self.config = config
         self.dim = dim
@@ -774,53 +839,62 @@ class EnhancedDualAttention2D(nn.Module):
             self.fusion_proj = nn.Conv2d(dim * 2, dim, 1)
         
         self.proj = nn.Conv2d(dim, dim, 1)
-        self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * config.layer_scale_init)
+        self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1) * config.layer_scale_init)  # (1, C, 1, 1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """
+        Dual attention over NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
         identity = x
         
         # Apply normalization with proper format handling
         # FIX: Check if norm expects NCHW (AdaptiveNorm2d) or NHWC (LayerNorm)
         if isinstance(self.norm, AdaptiveNorm2d):
             # AdaptiveNorm2d handles NCHW format internally
-            x_norm = self.norm(x)
+            x_norm = self.norm(x)  # (B, C, H, W) -> (B, C, H, W)
         else:
             # LayerNorm expects NHWC
-            x_norm = x.permute(0, 2, 3, 1)  # NCHW -> NHWC
-            x_norm = self.norm(x_norm)
-            x_norm = x_norm.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            x_norm = x.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+            x_norm = self.norm(x_norm)  # (B, H, W, C) -> (B, H, W, C)
+            x_norm = x_norm.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         
         # Parallel attention computation
-        local_out = self.window_attn(x_norm)
-        global_out = self.landmark_attn(x_norm)
+        local_out = self.window_attn(x_norm)  # (B, C, H, W)
+        global_out = self.landmark_attn(x_norm)  # (B, C, H, W)
         
         # Enhanced fusion
         if self.config.local_global_fusion == 'adaptive':
-            gate = self.fusion_gate(torch.cat([local_out, global_out], dim=1))
-            fused = gate * local_out + (1 - gate) * global_out
+            gate = self.fusion_gate(torch.cat([local_out, global_out], dim=1))  # (B, 2*C, H, W) -> (B, C, H, W)
+            fused = gate * local_out + (1 - gate) * global_out  # broadcast is elementwise (B, C, H, W)
         elif self.config.local_global_fusion == 'gated':
-            combined = torch.cat([local_out, global_out], dim=1)
-            gates = self.gate_proj(combined).chunk(2, dim=1)
-            gate1, gate2 = torch.sigmoid(gates[0]), torch.sigmoid(gates[1])
-            fused = gate1 * local_out + gate2 * global_out
+            combined = torch.cat([local_out, global_out], dim=1)  # (B, 2*C, H, W)
+            gates = self.gate_proj(combined).chunk(2, dim=1)  # 2x (B, C, H, W)
+            gate1, gate2 = torch.sigmoid(gates[0]), torch.sigmoid(gates[1])  # each (B, C, H, W)
+            fused = gate1 * local_out + gate2 * global_out  # elementwise (B, C, H, W)
         elif self.config.local_global_fusion == 'concat':
-            fused = self.fusion_proj(torch.cat([local_out, global_out], dim=1))
+            fused = self.fusion_proj(torch.cat([local_out, global_out], dim=1))  # (B, 2*C, H, W) -> (B, C, H, W)
         else:  # 'add'
-            fused = local_out + global_out
+            fused = local_out + global_out  # (B, C, H, W)
         
-        out = self.proj(fused)
-        out = self.gamma * out
+        out = self.proj(fused)  # (B, C, H, W) -> (B, C, H, W)
+        out = self.gamma * out  # (1, C, 1, 1) broadcast over (B, C, H, W)
         
-        return identity + out
+        return identity + out  # (B, C, H, W)
 
 # ===================== OPTIMIZED FFN =====================
 
 class OptimizedFFN2D(nn.Module):
     """Memory-efficient FFN with gating support"""
     
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, ffn_type: str = 'standard', 
-                 dropout: float = 0.0, memory_efficient: bool = True):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, ffn_type: str = 'standard',
+                 dropout: float = 0.0, memory_efficient: bool = True) -> None:
         super().__init__()
         hidden_dim = int(dim * mlp_ratio)
         self.ffn_type = ffn_type
@@ -844,19 +918,36 @@ class OptimizedFFN2D(nn.Module):
             self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Feed-forward network over NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
         if self.ffn_type == 'standard':
             if self.memory_efficient and self.training:
-                return checkpoint.checkpoint(self.net, x, use_reentrant=False)
+                return checkpoint.checkpoint(self.net, x, use_reentrant=False)  # (B, C, H, W) -> (B, C, H, W)
             else:
-                return self.net(x)
+                return self.net(x)  # (B, C, H, W) -> (B, C, H, W)
         else:
             # Gated FFN
             if self.memory_efficient and self.training:
                 def gated_forward(x):
-                    return self.dropout(self.w3(self.act(self.w1(x)) * self.w2(x)))
+                    w1 = self.w1(x)  # (B, C, H, W) -> (B, hidden, H, W)
+                    w2 = self.w2(x)  # (B, C, H, W) -> (B, hidden, H, W)
+                    gated = self.act(w1) * w2  # (B, hidden, H, W), elementwise
+                    out = self.w3(gated)  # (B, hidden, H, W) -> (B, C, H, W)
+                    return self.dropout(out)  # (B, C, H, W)
                 return checkpoint.checkpoint(gated_forward, x, use_reentrant=False)
             else:
-                return self.dropout(self.w3(self.act(self.w1(x)) * self.w2(x)))
+                w1 = self.w1(x)  # (B, C, H, W) -> (B, hidden, H, W)
+                w2 = self.w2(x)  # (B, C, H, W) -> (B, hidden, H, W)
+                gated = self.act(w1) * w2  # (B, hidden, H, W), elementwise
+                out = self.w3(gated)  # (B, hidden, H, W) -> (B, C, H, W)
+                return self.dropout(out)  # (B, C, H, W)
 
 # ===================== ENHANCED TRANSFORMER BLOCK =====================
 
@@ -865,13 +956,13 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
     Production-ready transformer block with CNN wavelets and optimizations
     """
     
-    def __init__(self, dim: int, config: MSWRDualConfig, stage_idx: int = 0, 
-                 drop_path: float = 0.0, wavelet_gate_cache: Optional[Dict] = None):
+    def __init__(self, dim: int, config: MSWRDualConfig, stage_idx: int = 0,
+                 drop_path: float = 0.0, wavelet_gate_cache: Optional[Dict] = None) -> None:
         super().__init__()
         self.config = config
         self.stage_idx = stage_idx
         self.dim = dim
-        self.wavelet_gate_cache = wavelet_gate_cache or {}
+        self.wavelet_gate_cache = wavelet_gate_cache if wavelet_gate_cache is not None else {}
         
         # CNN Wavelet components
         if (config.use_wavelet and 
@@ -914,10 +1005,19 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         self.norm2 = create_norm_layer(dim, config.norm_type, for_conv=False)
         
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
-        self.gamma2 = nn.Parameter(torch.ones(1, dim, 1, 1) * config.layer_scale_init)
+        self.gamma2 = nn.Parameter(torch.ones(1, dim, 1, 1) * config.layer_scale_init)  # (1, C, 1, 1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """
+        Transformer block over NCHW input with optional wavelet branch.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
         
         # Input validation
         if C != self.dim:
@@ -930,24 +1030,32 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
                 return self._wavelet_forward(x)
         
         # Standard transformer path
-        x = self.attn(x)
-        x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))
+        x = self.attn(x)  # (B, C, H, W)
+        x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))  # gamma2 (1, C, 1, 1) broadcast
         return x
     
     def _wavelet_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Enhanced wavelet processing with error handling"""
+        """
+        Enhanced wavelet processing with error handling.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
         try:
-            B, C, H, W = x.shape
+            B, C, H, W = x.shape  # (B, C, H, W)
             cache_key = f"{H}x{W}_stage{self.stage_idx}"
             
             # Apply wavelet transform
-            yl, yh = self.dwt(x)
+            yl, yh = self.dwt(x)  # yl: (B, C, H/2^J, W/2^J), yh: list of (B, C, 3, H/2^j, W/2^j)
             
             # Generate or retrieve wavelet gate
             if self.config.wavelet_gate_reuse and cache_key in self.wavelet_gate_cache:
-                gate = self.wavelet_gate_cache[cache_key]
+                gate = self.wavelet_gate_cache[cache_key]  # (B, C, H_low, W_low)
             else:
-                gate = self.wavelet_gate(yl)
+                gate = self.wavelet_gate(yl)  # (B, C, H_low, W_low)
                 if self.config.wavelet_gate_reuse:
                     self.wavelet_gate_cache[cache_key] = gate.detach()
             
@@ -959,23 +1067,23 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
                 # Ensure gate matches spatial dimensions
                 if gate.shape[-2:] != (H_level, W_level):
                     gate_resized = F.interpolate(
-                        gate, size=(H_level, W_level), 
+                        gate, size=(H_level, W_level),
                         mode='bilinear', align_corners=False
-                    )
+                    )  # (B, C, H_low, W_low) -> (B, C, H_level, W_level)
                 else:
-                    gate_resized = gate
+                    gate_resized = gate  # (B, C, H_level, W_level)
                 
                 # Apply gate with proper broadcasting
-                gate_expanded = gate_resized.unsqueeze(2)  # (B, C, 1, H, W)
-                h_gated = h_coeffs * gate_expanded
+                gate_expanded = gate_resized.unsqueeze(2)  # (B, C, H_level, W_level) -> (B, C, 1, H_level, W_level)
+                h_gated = h_coeffs * gate_expanded  # (B, C, 3, H_level, W_level), broadcast along band dim
                 yh_gated.append(h_gated)
             
             # Process low-frequency component with attention
-            yl_processed = self.attn(yl)
-            yl_processed = yl_processed + self.drop_path(self.gamma2 * self._ffn_forward(yl_processed))
+            yl_processed = self.attn(yl)  # (B, C, H_low, W_low)
+            yl_processed = yl_processed + self.drop_path(self.gamma2 * self._ffn_forward(yl_processed))  # gamma2 broadcast
             
             # Reconstruct signal
-            x_reconstructed = self.idwt((yl_processed, yh_gated))
+            x_reconstructed = self.idwt((yl_processed, yh_gated))  # (B, C, H, W)
             
             return x_reconstructed
             
@@ -985,49 +1093,66 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             else:
                 logger.warning(f"Wavelet processing failed in stage {self.stage_idx}: {e}")
             # Fallback to standard processing
-            x = self.attn(x)
-            x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))
+            x = self.attn(x)  # (B, C, H, W)
+            x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))  # gamma2 broadcast
             return x
     
     def _ffn_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply FFN with proper normalization"""
+        """
+        Apply FFN with proper normalization.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
         # FIX: Check if norm expects NCHW (AdaptiveNorm2d) or NHWC (LayerNorm)
         if isinstance(self.norm2, AdaptiveNorm2d):
             # AdaptiveNorm2d handles NCHW format internally
-            x_norm = self.norm2(x)
+            x_norm = self.norm2(x)  # (B, C, H, W)
         else:
             # LayerNorm expects NHWC
-            x_norm = x.permute(0, 2, 3, 1)  # NCHW -> NHWC
-            x_norm = self.norm2(x_norm)
-            x_norm = x_norm.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            x_norm = x.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+            x_norm = self.norm2(x_norm)  # (B, H, W, C)
+            x_norm = x_norm.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         
-        return self.ffn(x_norm)
+        return self.ffn(x_norm)  # (B, C, H, W)
 
 # ===================== DROP PATH =====================
 
 class DropPath(nn.Module):
     """Optimized Drop paths (Stochastic Depth) with better performance"""
-    def __init__(self, drop_prob: float = 0.0):
+    def __init__(self, drop_prob: float = 0.0) -> None:
         super().__init__()
         self.drop_prob = drop_prob
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply stochastic depth to NCHW input.
+
+        Args:
+            x: Input tensor (B, C, H, W) or higher-rank tensor.
+
+        Returns:
+            Output tensor with same shape as input.
+        """
         if self.drop_prob == 0. or not self.training:
             return x
         
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)  # (B, 1, ..., 1)
         if keep_prob > 0.0:
             random_tensor.div_(keep_prob)
-        return x * random_tensor
+        return x * random_tensor  # broadcast over non-batch dims
 
 # ===================== INPUT/OUTPUT MODULES =====================
 
 class EnhancedMultiScaleInputProjection(nn.Module):
     """Optimized multi-scale input processing with fixed grouped convolution"""
     
-    def __init__(self, in_channels: int, out_channels: int, memory_efficient: bool = True):
+    def __init__(self, in_channels: int, out_channels: int, memory_efficient: bool = True) -> None:
         super().__init__()
         mid_channels = out_channels // 2
         
@@ -1070,27 +1195,36 @@ class EnhancedMultiScaleInputProjection(nn.Module):
         self.memory_efficient = memory_efficient
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-scale projection for NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C_in, H, W).
+
+        Returns:
+            Projected tensor in NCHW format (B, C_out, H, W).
+        """
         if self.memory_efficient and self.training:
             # Use gradient checkpointing for memory efficiency
-            s1 = checkpoint.checkpoint(self.scale1, x, use_reentrant=False)
-            s2 = checkpoint.checkpoint(self.scale2, x, use_reentrant=False)
-            s3 = checkpoint.checkpoint(self.scale3, x, use_reentrant=False)
+            s1 = checkpoint.checkpoint(self.scale1, x, use_reentrant=False)  # (B, C_in, H, W) -> (B, C_out, H, W)
+            s2 = checkpoint.checkpoint(self.scale2, x, use_reentrant=False)  # (B, C_in, H, W) -> (B, C_out, H, W)
+            s3 = checkpoint.checkpoint(self.scale3, x, use_reentrant=False)  # (B, C_in, H, W) -> (B, C_out, H, W)
         else:
-            s1 = self.scale1(x)
-            s2 = self.scale2(x)
-            s3 = self.scale3(x)
+            s1 = self.scale1(x)  # (B, C_in, H, W) -> (B, C_out, H, W)
+            s2 = self.scale2(x)  # (B, C_in, H, W) -> (B, C_out, H, W)
+            s3 = self.scale3(x)  # (B, C_in, H, W) -> (B, C_out, H, W)
         
-        fused = self.fusion(torch.cat([s1, s2, s3], dim=1))
+        fused = self.fusion(torch.cat([s1, s2, s3], dim=1))  # (B, 3*C_out, H, W) -> (B, C_out, H, W)
         
         # Apply normalization (AdaptiveNorm2d handles format automatically)
-        fused = self.norm(fused)
+        fused = self.norm(fused)  # (B, C_out, H, W)
         
         return fused
 
 class EnhancedOutputProjection(nn.Module):
     """Enhanced output projection with attention and efficiency"""
     
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         
         self.proj1 = nn.Sequential(
@@ -1128,16 +1262,25 @@ class EnhancedOutputProjection(nn.Module):
             nn.init.zeros_(self.proj2.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.proj1(x)
-        refined = self.refine(feat)
-        refined = refined + x
+        """
+        Output projection for NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C_in, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C_out, H, W).
+        """
+        feat = self.proj1(x)  # (B, C_in, H, W) -> (B, 2*C_in, H, W)
+        refined = self.refine(feat)  # (B, 2*C_in, H, W) -> (B, C_in, H, W)
+        refined = refined + x  # (B, C_in, H, W)
         
         # Dual attention
-        ca = self.channel_attn(refined)
-        sa = self.spatial_attn(refined)
-        refined = refined * ca * sa
+        ca = self.channel_attn(refined)  # (B, C_in, H, W) -> (B, C_in, 1, 1)
+        sa = self.spatial_attn(refined)  # (B, C_in, H, W) -> (B, 1, H, W)
+        refined = refined * ca * sa  # broadcast over spatial and channel dims
         
-        return self.proj2(refined)
+        return self.proj2(refined)  # (B, C_in, H, W) -> (B, C_out, H, W)
 
 # ===================== MAIN ENHANCED MODEL =====================
 
@@ -1154,7 +1297,7 @@ class IntegratedMSWRNet(nn.Module):
     - Comprehensive performance monitoring
     """
     
-    def __init__(self, config: Optional[MSWRDualConfig] = None):
+    def __init__(self, config: Optional[MSWRDualConfig] = None) -> None:
         super().__init__()
         
         if config is None:
@@ -1198,7 +1341,7 @@ class IntegratedMSWRNet(nn.Module):
         self.downsamples = nn.ModuleList()
         
         channels = config.base_channels
-        dpr = [x.item() for x in torch.linspace(0, config.drop_path, config.num_stages * 2)]
+        dpr = [x.item() for x in torch.linspace(0, config.drop_path, config.num_stages * 2)]  # (2*num_stages,)
         
         for i in range(config.num_stages):
             block = EnhancedWaveletDualTransformerBlock(
@@ -1321,7 +1464,7 @@ class IntegratedMSWRNet(nn.Module):
         if self.rank == 0:
             self._log_model_info()
     
-    def _init_weights(self, m):
+    def _init_weights(self, m: nn.Module) -> None:
         """Enhanced weight initialization"""
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -1337,7 +1480,7 @@ class IntegratedMSWRNet(nn.Module):
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.zeros_(m.bias)
     
-    def _log_model_info(self):
+    def _log_model_info(self) -> None:
         """Log comprehensive model information"""
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1363,6 +1506,15 @@ class IntegratedMSWRNet(nn.Module):
         logger.info("="*70)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for MSWR-Net.
+
+        Args:
+            x: Input tensor in NCHW format (B, C_in, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C_out, H, W).
+        """
         # Reset performance monitor for clean per-forward metrics
         if self.config.performance_monitoring:
             self.perf_monitor.reset()
@@ -1371,7 +1523,7 @@ class IntegratedMSWRNet(nn.Module):
         self.perf_monitor.start_stage("total")
         
         # Input validation with detailed error messages
-        B, C, H, W = x.shape
+        B, C, H, W = x.shape  # (B, C_in, H, W)
         if C != self.config.input_channels:
             raise ValueError(
                 f"Input channels mismatch: expected {self.config.input_channels}, got {C}"
@@ -1389,11 +1541,11 @@ class IntegratedMSWRNet(nn.Module):
             self.wavelet_gate_cache.clear()
         
         # Generate input skip connection
-        input_skip = self.input_skip(x)
+        input_skip = self.input_skip(x)  # (B, C_in, H, W) -> (B, C_out, H, W)
         
         # Input projection
         self.perf_monitor.start_stage("input_proj")
-        x = self.input_proj(x)
+        x = self.input_proj(x)  # (B, C_in, H, W) -> (B, C_base, H, W)
         self.perf_monitor.end_stage("input_proj")
         self.perf_monitor.log_operation("input_proj", x.shape)
         
@@ -1403,12 +1555,12 @@ class IntegratedMSWRNet(nn.Module):
             self.perf_monitor.start_stage(f"encoder_{i}")
             
             try:
-                x = stage(x)
-                encoder_features.append(x)
+                x = stage(x)  # (B, C_i, H_i, W_i)
+                encoder_features.append(x)  # list of (B, C_i, H_i, W_i)
                 self.perf_monitor.log_operation(f"encoder_{i}", x.shape)
                 
                 if i < len(self.downsamples):
-                    x = self.downsamples[i](x)
+                    x = self.downsamples[i](x)  # (B, C_i, H_i, W_i) -> (B, C_{i+1}, H_i/2, W_i/2)
                     self.perf_monitor.log_operation(f"downsample_{i}", x.shape)
                 
             except Exception as e:
@@ -1425,21 +1577,21 @@ class IntegratedMSWRNet(nn.Module):
             
             try:
                 # Upsampling
-                x = upsample(x)
+                x = upsample(x)  # (B, C_{i+1}, H_i/2, W_i/2) -> (B, C_i, H_i, W_i)
                 
                 # Skip connection with proper size matching
                 skip_idx = -(i + 2)
-                skip_feat = encoder_features[skip_idx]
+                skip_feat = encoder_features[skip_idx]  # (B, C_i, H_i, W_i)
                 
                 if x.shape[-2:] != skip_feat.shape[-2:]:
                     x = F.interpolate(
-                        x, size=skip_feat.shape[-2:], 
+                        x, size=skip_feat.shape[-2:],
                         mode='bilinear', align_corners=False
-                    )
+                    )  # (B, C_i, H_i, W_i) -> (B, C_i, H_i, W_i)
                 
                 # Combine and process
-                x = skip_conv(torch.cat([x, skip_feat], dim=1))
-                x = stage(x)
+                x = skip_conv(torch.cat([x, skip_feat], dim=1))  # (B, 2*C_i, H_i, W_i) -> (B, C_i, H_i, W_i)
+                x = stage(x)  # (B, C_i, H_i, W_i)
                 
                 self.perf_monitor.log_operation(f"decoder_{i}", x.shape)
                 
@@ -1451,16 +1603,16 @@ class IntegratedMSWRNet(nn.Module):
         
         # Output projection
         self.perf_monitor.start_stage("output")
-        x = self.output_proj(x)
+        x = self.output_proj(x)  # (B, C_base, H, W) -> (B, C_out, H, W)
         
         # Add input skip connection
         if x.shape[-2:] != input_skip.shape[-2:]:
             input_skip = F.interpolate(
-                input_skip, size=x.shape[-2:], 
+                input_skip, size=x.shape[-2:],
                 mode='bilinear', align_corners=False
-            )
+            )  # (B, C_out, H_in, W_in) -> (B, C_out, H, W)
         
-        x = x + input_skip
+        x = x + input_skip  # (B, C_out, H, W)
         self.perf_monitor.end_stage("output")
         self.perf_monitor.end_stage("total")
         
@@ -1498,7 +1650,7 @@ class IntegratedMSWRNet(nn.Module):
             }
         }
     
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"IntegratedMSWRNet v2.1.2 (FULLY FIXED)\n"
             f"  Stages: {self.config.num_stages}\n"
@@ -1514,7 +1666,7 @@ class IntegratedMSWRNet(nn.Module):
 
 # ===================== FACTORY FUNCTIONS =====================
 
-def create_mswr_tiny(**kwargs) -> IntegratedMSWRNet:
+def create_mswr_tiny(**kwargs: Any) -> IntegratedMSWRNet:
     """Create tiny MSWR model optimized for speed"""
     config = MSWRDualConfig(
         base_channels=32, num_stages=2, num_heads=4,
@@ -1524,7 +1676,7 @@ def create_mswr_tiny(**kwargs) -> IntegratedMSWRNet:
     )
     return IntegratedMSWRNet(config)
 
-def create_mswr_small(**kwargs) -> IntegratedMSWRNet:
+def create_mswr_small(**kwargs: Any) -> IntegratedMSWRNet:
     """Create small MSWR model balanced for speed/quality"""
     config = MSWRDualConfig(
         base_channels=48, num_stages=3, num_heads=6,
@@ -1534,7 +1686,7 @@ def create_mswr_small(**kwargs) -> IntegratedMSWRNet:
     )
     return IntegratedMSWRNet(config)
 
-def create_mswr_base(**kwargs) -> IntegratedMSWRNet:
+def create_mswr_base(**kwargs: Any) -> IntegratedMSWRNet:
     """Create base MSWR model (recommended)"""
     config = MSWRDualConfig(
         base_channels=64, num_stages=3, num_heads=8,
@@ -1544,7 +1696,7 @@ def create_mswr_base(**kwargs) -> IntegratedMSWRNet:
     )
     return IntegratedMSWRNet(config)
 
-def create_mswr_large(**kwargs) -> IntegratedMSWRNet:
+def create_mswr_large(**kwargs: Any) -> IntegratedMSWRNet:
     """Create large MSWR model for maximum quality"""
     config = MSWRDualConfig(
         base_channels=96, num_stages=4, num_heads=12,
@@ -1593,10 +1745,10 @@ if __name__ == "__main__":
         print("\nTest 1: LayerNorm with batch size 20 (from error scenario)")
         model_layer = create_mswr_base(use_wavelet=True, norm_type='layer')
         model_layer = model_layer.to(device)
-        x = torch.randn(20, 3, 128, 128, device=device)
+        x = torch.randn(20, 3, 128, 128, device=device)  # (B=20, C=3, H=128, W=128)
         
         with torch.no_grad():
-            y = model_layer(x)
+            y = model_layer(x)  # (B, C_out, H, W)
         
         print(f"✅ LayerNorm test passed: Input {x.shape} -> Output {y.shape}")
         
@@ -1606,7 +1758,7 @@ if __name__ == "__main__":
         model_group = model_group.to(device)
         
         with torch.no_grad():
-            y = model_group(x)
+            y = model_group(x)  # (B, C_out, H, W)
         
         print(f"✅ GroupNorm test passed: Input {x.shape} -> Output {y.shape}")
         
@@ -1617,7 +1769,7 @@ if __name__ == "__main__":
         model_batch.eval()  # BatchNorm requires eval mode for inference
         
         with torch.no_grad():
-            y = model_batch(x)
+            y = model_batch(x)  # (B, C_out, H, W)
         
         print(f"✅ BatchNorm test passed: Input {x.shape} -> Output {y.shape}")
         
@@ -1633,16 +1785,16 @@ if __name__ == "__main__":
         if device.type == 'cuda':
             try:
                 # Test with small tensor first
-                test_tensor = torch.randn(1, 3, 512, 512, device=device)
+                test_tensor = torch.randn(1, 3, 512, 512, device=device)  # (B=1, C=3, H=512, W=512)
                 del test_tensor
                 test_sizes.append((1, 3, 512, 512))  # Extra large (reduced batch)
             except torch.cuda.OutOfMemoryError:
                 print("  (Skipping 512x512 test due to memory constraints)")
         
         for size in test_sizes:
-            x_test = torch.randn(*size, device=device)
+            x_test = torch.randn(*size, device=device)  # size = (B, C, H, W)
             with torch.no_grad():
-                y_test = model_layer(x_test)
+                y_test = model_layer(x_test)  # (B, C_out, H, W)
             print(f"✅ Size {size} -> {y_test.shape} (stage 2 would be {size[2]//8}x{size[3]//8})")
             del x_test, y_test  # Free memory
             if device.type == 'cuda':
@@ -1650,7 +1802,7 @@ if __name__ == "__main__":
         
         # Test 5: Specific test for the problematic case (16x16 feature maps)
         print("\nTest 5: Specific test for small feature maps (16x16 case)")
-        x_problem = torch.randn(1, 3, 128, 128, device=device)
+        x_problem = torch.randn(1, 3, 128, 128, device=device)  # (B=1, C=3, H=128, W=128)
         model_test = create_mswr_base(
             use_wavelet=True, 
             fuse_qkv_small_maps=True  # Explicitly enable the linear path
@@ -1658,16 +1810,16 @@ if __name__ == "__main__":
         model_test = model_test.to(device)
         
         with torch.no_grad():
-            y_problem = model_test(x_problem)
+            y_problem = model_test(x_problem)  # (B, C_out, H, W)
         print(f"✅ Small feature map test passed: {x_problem.shape} -> {y_problem.shape}")
         
         # Test 6: Training mode simulation (only on CPU or small batch)
         print("\nTest 6: Training mode with gradient flow")
         model_layer.train()
         batch_size = 1 if device.type == 'cuda' else 2
-        x_train = torch.randn(batch_size, 3, 128, 128, device=device, requires_grad=True)
-        y_train = model_layer(x_train)
-        loss = y_train.mean()
+        x_train = torch.randn(batch_size, 3, 128, 128, device=device, requires_grad=True)  # (B, C=3, H=128, W=128)
+        y_train = model_layer(x_train)  # (B, C_out, H, W)
+        loss = y_train.mean()  # () scalar
         loss.backward()
         print(f"✅ Training mode test passed with gradient flow")
         

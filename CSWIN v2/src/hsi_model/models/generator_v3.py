@@ -1,15 +1,16 @@
 """
-Noise-Robust CSWin Generator for HSI Reconstruction v5
+Noise-Robust CSWin Generator for HSI Reconstruction v5.1
 
 Final production generator with all architectural fixes:
-- Adaptive GroupNorm (no channel mismatches) 
+- Adaptive GroupNorm (no channel mismatches)
 - NaN-safe attention blocks
 - Configurable output activation
 - torch.jit safe operations
 - Configurable clamping with iteration-based disable
 
-No changes from v4 - the generator architecture was already optimal.
-The v5 fixes are all in the training script.
+v5.1 Fixes:
+- Added missing type hints
+- Added torch.no_grad() around buffer updates for safety
 
 Key architectural features:
 - U-Net structure with CSWin transformer blocks
@@ -21,16 +22,16 @@ Key architectural features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, Union
 
 from .attention import CSWinAttentionBlock, EfficientSpectralAttention
 
 
 def adaptive_group_norm(channels: int, base_groups: int = 8) -> nn.GroupNorm:
     """Create GroupNorm with adaptive number of groups to avoid channel mismatches."""
-    # Find the largest divisor of channels that is <= base_groups
+    # Prefer group counts that divide both channels and base_groups for consistency.
     for groups in range(min(base_groups, channels), 0, -1):
-        if channels % groups == 0:
+        if channels % groups == 0 and base_groups % groups == 0:
             return nn.GroupNorm(groups, channels)
     # Fallback to 1 group (equivalent to LayerNorm)
     return nn.GroupNorm(1, channels)
@@ -38,7 +39,7 @@ def adaptive_group_norm(channels: int, base_groups: int = 8) -> nn.GroupNorm:
 
 class NaNSafeAttention(nn.Module):
     """Wrapper for attention modules with NaN protection."""
-    def __init__(self, attention_module):
+    def __init__(self, attention_module: nn.Module) -> None:
         super().__init__()
         self.attention = attention_module
         self.nan_count = 0  # Track NaN occurrences for debugging
@@ -355,8 +356,10 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Update iteration count during training (torch.jit safe)
+        # v5.1: Add torch.no_grad() for safety
         if self.training:
-            self.iteration_count.add_(1)
+            with torch.no_grad():
+                self.iteration_count.add_(1)
         iter_idx = int(self.iteration_count.item())
         
         # Initial denoising with residual connection
