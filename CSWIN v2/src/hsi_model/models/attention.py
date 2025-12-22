@@ -4,23 +4,30 @@ Memory-Efficient Attention Modules for HSI Reconstruction
 CRITICAL MEMORY OPTIMIZATIONS (v3.0):
 ==========================================
 1. CSWinAttentionBlock Bias Fix (SAVES ~50GB):
-   - Fixed bias tiling to use window counts instead of pixel dimensions
-   - Before: bias expanded to (7 × 512) instead of (7 × 73) for 512px image
-   - After: Correct (7 × num_windows) expansion
-   - Memory reduction: 1.2GB → 20MB per attention layer at 128² patches
+   - Bias mask scales with long-axis length (W/H), not s*W/H
+   - Before: bias scaled with s*W/H, inflating attention masks
+   - After: bias scales with W/H, reducing mask size by ~s^2
+   - Memory reduction: ~s^2 on bias masks (attention path dependent)
 
-2. EfficientSpectralAttention: 
-   - Already optimized to compute channel attention per spatial location
+2. EfficientSpectralAttention:
+   - Uses global channel attention applied to spatial features
    - Avoids memory-intensive (H*W) × (H*W) attention matrix
-   - Memory: O(B*H*W*C²/num_heads) instead of O(B*C*(H*W)²)
+   - Memory: O(B*C^2/num_heads + B*C*H*W)
 
 3. PyTorch Version Compatibility (v3.0):
    - Added version check for use_reentrant parameter
    - Works with PyTorch 1.x and 2.x
 
-4. FP16 Bias Tables (v3.0):
-   - Default to FP16 for relative position bias
-   - Saves 50% memory on bias tables
+4. Bias Table Precision (v3.2):
+   - Default to FP32 for relative position bias (FP16 optional via config)
+   - FP16 saves ~50% memory on bias tables when enabled
+
+v3.1 NUMERICAL STABILITY FIXES:
+==========================================
+- Added eps to F.normalize to prevent NaN on zero-norm vectors
+- Added softmax stabilization (subtract max before exp) for non-SDPA path
+- Cast attention computation to fp32 for mixed precision safety
+- Removed inplace=True from ReLU to prevent autograd issues with checkpointing
 
 Additional Memory Tips:
 - Set PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
@@ -32,6 +39,7 @@ Version History:
 - v1.0: Initial implementation with memory-hungry global attention
 - v2.0: Fixed critical bias tiling bug that caused 76GB OOM on A100
 - v3.0: Added PyTorch compatibility and FP16 bias tables
+- v3.1: Added numerical stability fixes (eps, softmax stabilization, fp32 casting)
 """
 
 import os
@@ -46,6 +54,9 @@ from torch.utils.checkpoint import checkpoint
 from packaging import version
 
 logger = logging.getLogger(__name__)
+
+# Numerical stability epsilon - defined once and reused
+EPS = 1e-8
 
 
 class LePEAttention(nn.Module):
@@ -85,9 +96,9 @@ class CSWinAttentionBlock(nn.Module):
     the number of windows, not raw pixel dimensions.
     
     Memory Impact of Fix:
-    - Before: 512×512 image → bias of shape (H, 512, 512) = 134MB per head
-    - After: 512×512 image → bias of shape (H, 73, 73) = 2.7MB per head
-    - Total savings: ~1.2GB per attention layer for typical configurations
+    - Before: bias matched s*W/H (e.g., 3584x3584 for 512px with s=7)
+    - After: bias matches long-axis length (e.g., 512x512 for 512px)
+    - Savings scale with s^2 on the bias mask size
     
     Args:
         dim: Number of input/output channels
@@ -105,10 +116,13 @@ class CSWinAttentionBlock(nn.Module):
         config: Optional[Dict[str, Any]] = None
     ) -> None:
         super(CSWinAttentionBlock, self).__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         self.dim = dim
         self.num_heads = num_heads
         self.split_size = split_size
-        self.scale = (dim // num_heads) ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
         
         # QKV projections
         self.qkv_h = nn.Conv2d(dim, dim*3, kernel_size=1, bias=qkv_bias)
@@ -124,11 +138,11 @@ class CSWinAttentionBlock(nn.Module):
         torch_version = version.parse(torch.__version__.split('+')[0]) if hasattr(torch, "__version__") else version.parse("0")
         self._supports_non_reentrant_ckpt = torch_version >= version.parse("2.1")
         
-        # v3.0: Default to FP16 bias tables to save memory
-        # Check config first, then environment variable, then default to True
-        use_fp16_bias = True  # Default to FP16
+        # Default to FP32 bias tables for numerical stability; allow FP16 opt-in.
+        # Config overrides, otherwise fall back to environment variable for compatibility.
+        use_fp16_bias = False
         if config is not None:
-            use_fp16_bias = config.get('use_fp16_bias', True)
+            use_fp16_bias = config.get('use_fp16_bias', False)
         elif os.environ.get('MST_USE_FP32_BIAS', '').lower() == 'true':
             use_fp16_bias = False
         
@@ -192,7 +206,7 @@ class CSWinAttentionBlock(nn.Module):
         """
         B, C, padded_H, padded_W = x.shape
         h_windows = padded_H // self.split_size
-        head_dim = C // self.num_heads
+        head_dim = self.head_dim
         
         # Process QKV with convolution
         qkv_h = self.qkv_h(x)  # Shape: [B, 3*C, padded_H, padded_W]
@@ -210,36 +224,42 @@ class CSWinAttentionBlock(nn.Module):
         
         q_h, k_h, v_h = qkv_h[0], qkv_h[1], qkv_h[2]  # Each shape: [B, h_windows, split_size, W, num_heads, head_dim]
         
-        # Reshape for attention computation
-        q_h = rearrange(q_h, 'b hw s w h d -> (b hw) h (s w) d')
-        k_h = rearrange(k_h, 'b hw s w h d -> (b hw) h (s w) d')
-        v_h = rearrange(v_h, 'b hw s w h d -> (b hw) h (s w) d')
-        
-        seq_len = self.split_size * padded_W
+        # Reshape for attention computation (treat split rows as batch for width attention)
+        q_h = rearrange(q_h, 'b hw s w h d -> (b hw s) h w d')
+        k_h = rearrange(k_h, 'b hw s w h d -> (b hw s) h w d')
+        v_h = rearrange(v_h, 'b hw s w h d -> (b hw s) h w d')
+
         use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
-        rel_rows = self._relative_position_index
+        rel_cols = self._relative_position_index
         bias_ss = self.relative_position_bias_table_h[
-            rel_rows, self._relative_center_index, :
+            self._relative_center_index, rel_cols, :
         ]
         w_windows = padded_W // self.split_size
         bias = self._expand_bias(bias_ss, tiles_long=w_windows)
 
         if use_sdpa:
-            attn_mask = bias.unsqueeze(0)  # (1, num_heads, seq, seq)
+            # SDPA handles numerical stability internally
+            attn_mask = bias.unsqueeze(0).to(q_h.dtype)  # (1, num_heads, seq, seq)
             out_h = F.scaled_dot_product_attention(
                 q_h, k_h, v_h, attn_mask=attn_mask, scale=self.scale
             )
         else:
+            # Manual attention with numerical stability (v3.1 fix)
+            # (B*hw*s, H, seq, d) @ (B*hw*s, H, d, seq) -> (B*hw*s, H, seq, seq)
             attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
             attn_h = attn_h + bias.unsqueeze(0).to(attn_h.dtype)
+            # Cast to fp32 and stabilize softmax to prevent overflow
+            attn_h = attn_h.float()
+            attn_h = attn_h - attn_h.amax(dim=-1, keepdim=True)
             attn_h = F.softmax(attn_h, dim=-1)
+            attn_h = attn_h.to(q_h.dtype)  # Cast back to compute dtype
             out_h = attn_h @ v_h
         
         # Reshape back to original format
         out_h = rearrange(
             out_h, 
-            '(b hw) h (s w) d -> b (h d) (hw s) w', 
+            '(b hw s) h w d -> b (h d) (hw s) w', 
             b=B, 
             hw=h_windows, 
             s=self.split_size, 
@@ -266,7 +286,7 @@ class CSWinAttentionBlock(nn.Module):
         """
         B, C, padded_H, padded_W = x.shape
         w_windows = padded_W // self.split_size
-        head_dim = C // self.num_heads
+        head_dim = self.head_dim
         
         # Process vertical stripes 
         # Reshape input for vertical attention
@@ -294,36 +314,42 @@ class CSWinAttentionBlock(nn.Module):
         
         q_v, k_v, v_v = qkv_v[0], qkv_v[1], qkv_v[2]  # Each shape: [B*w_windows, padded_H, split_size, num_heads, head_dim]
         
-        # Reshape for attention computation
-        q_v = rearrange(q_v, 'bw ph s h d -> bw h (ph s) d')
-        k_v = rearrange(k_v, 'bw ph s h d -> bw h (ph s) d')
-        v_v = rearrange(v_v, 'bw ph s h d -> bw h (ph s) d')
-        
-        seq_len = padded_H * self.split_size
+        # Reshape for attention computation (treat split columns as batch for height attention)
+        q_v = rearrange(q_v, 'bw ph s h d -> (bw s) h ph d')
+        k_v = rearrange(k_v, 'bw ph s h d -> (bw s) h ph d')
+        v_v = rearrange(v_v, 'bw ph s h d -> (bw s) h ph d')
+
         use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
-        rel_cols = self._relative_position_index
+        rel_rows = self._relative_position_index
         bias_ss = self.relative_position_bias_table_v[
-            self._relative_center_index, rel_cols, :
+            rel_rows, self._relative_center_index, :
         ]
         h_windows = padded_H // self.split_size
         bias = self._expand_bias(bias_ss, tiles_long=h_windows)
 
         if use_sdpa:
-            attn_mask = bias.unsqueeze(0)
+            # SDPA handles numerical stability internally
+            attn_mask = bias.unsqueeze(0).to(q_v.dtype)
             out_v = F.scaled_dot_product_attention(
                 q_v, k_v, v_v, attn_mask=attn_mask, scale=self.scale
             )
         else:
+            # Manual attention with numerical stability (v3.1 fix)
+            # (B*ww*s, H, seq, d) @ (B*ww*s, H, d, seq) -> (B*ww*s, H, seq, seq)
             attn_v = (q_v @ k_v.transpose(-2, -1)) * self.scale
             attn_v = attn_v + bias.unsqueeze(0).to(attn_v.dtype)
+            # Cast to fp32 and stabilize softmax to prevent overflow
+            attn_v = attn_v.float()
+            attn_v = attn_v - attn_v.amax(dim=-1, keepdim=True)
             attn_v = F.softmax(attn_v, dim=-1)
+            attn_v = attn_v.to(q_v.dtype)  # Cast back to compute dtype
             out_v = attn_v @ v_v
         
         # Reshape back to original format
         out_v = rearrange(
             out_v, 
-            '(b ww) h (ph s) d -> b (h d) ph (ww s)', 
+            '(b ww s) h ph d -> b (h d) ph (ww s)', 
             b=B, 
             ww=w_windows, 
             s=self.split_size, 
@@ -385,10 +411,10 @@ class EfficientSpectralAttention(nn.Module):
     """
     Spectral Attention module optimized for hyperspectral data with noise robustness.
     
-    This version computes attention along spectral/channel dimension at each spatial location
-    independently, avoiding the memory-intensive (H*W) x (H*W) attention matrix.
+    This version computes global channel attention and applies it to spatial features,
+    avoiding the memory-intensive (H*W) x (H*W) attention matrix.
     
-    Memory complexity: O(B*H*W*C²/num_heads) instead of O(B*C*(H*W)²)
+    Memory complexity: O(B*C^2/num_heads + B*C*H*W)
     
     Args:
         channels: Number of input/output channels
@@ -403,6 +429,8 @@ class EfficientSpectralAttention(nn.Module):
     ) -> None:
         super(EfficientSpectralAttention, self).__init__()
         self.channels = channels
+        if channels % num_heads != 0:
+            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         
@@ -435,7 +463,7 @@ class EfficientSpectralAttention(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Compute attention along spectral dimension for each spatial location.
+        Compute global channel attention and apply it to spatial features.
         
         Args:
             x: Input tensor of shape (B, C, H, W)
@@ -450,36 +478,31 @@ class EfficientSpectralAttention(nn.Module):
         k = self.to_k(x)  # (B, C, H, W)
         v = self.to_v(x)  # (B, C, H, W)
         
-        # Reshape to process each spatial location independently
-        # Combine batch and spatial dimensions
-        q = rearrange(q, 'b c h w -> (b h w) c')  # (B*H*W, C)
-        k = rearrange(k, 'b c h w -> (b h w) c')  # (B*H*W, C)
-        v = rearrange(v, 'b c h w -> (b h w) c')  # (B*H*W, C)
+        # Global channel descriptors
+        q_global = q.mean(dim=(2, 3))  # (B, C)
+        k_global = k.mean(dim=(2, 3))  # (B, C)
         
         # Reshape for multi-head attention
-        q = rearrange(q, 'bhw (h d) -> bhw h d', h=self.num_heads)  # (B*H*W, num_heads, head_dim)
-        k = rearrange(k, 'bhw (h d) -> bhw h d', h=self.num_heads)  # (B*H*W, num_heads, head_dim)
-        v = rearrange(v, 'bhw (h d) -> bhw h d', h=self.num_heads)  # (B*H*W, num_heads, head_dim)
+        q_global = rearrange(q_global, 'b (h d) -> b h d', h=self.num_heads)
+        k_global = rearrange(k_global, 'b (h d) -> b h d', h=self.num_heads)
         
         # Normalize for cosine similarity (more robust to noise)
-        q_norm = F.normalize(q, dim=-1)
-        k_norm = F.normalize(k, dim=-1)
+        q_norm = F.normalize(q_global, dim=-1, eps=EPS)
+        k_norm = F.normalize(k_global, dim=-1, eps=EPS)
         
-        # Compute attention scores  (n = B*H*W)
-        # Now the attention matrix is only (head_dim x head_dim) for each spatial location
-        # Much smaller! For C=31 and 4 heads, this is just 8x8 per location
+        # Compute channel attention (B, H, d, d)
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.einsum('n h d, n h e -> n h d e', q_norm, k_norm) * scale
+        attn = torch.einsum('b h i, b h j -> b h i j', q_norm.float(), k_norm.float()) * scale
+        attn = attn - attn.amax(dim=-1, keepdim=True)  # Stabilize softmax
         attn = F.softmax(attn, dim=-1)
         
-        # Apply attention to values
-        out = torch.einsum('n h d e, n h e -> n h d', attn, v)
-        
-        # Combine heads back together
-        out  = rearrange(out, 'n h d -> n (h d)') # (n, C)
+        # Apply attention to spatial features
+        v_reshaped = rearrange(v, 'b (h d) H W -> b h d (H W)', h=self.num_heads)
+        out = torch.einsum('b h i j, b h j s -> b h i s', attn, v_reshaped.float())
+        out = out.to(v.dtype)
         
         # Reshape back to image format
-        out = rearrange(out, '(b h w) c -> b c h w', b=B, h=H, w=W)
+        out = rearrange(out, 'b h d (H W) -> b (h d) H W', H=H, W=W)
         
         # Apply position embedding and projection
         pos = self.pos_embed(x)
@@ -513,9 +536,10 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         
         # Channel attention with two FC layers
+        # v3.1: Removed inplace=True to prevent autograd issues with checkpointing
         self.fc = nn.Sequential(
             nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
