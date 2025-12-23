@@ -15,7 +15,7 @@ Version: 3.0 - Consolidated and cleaned
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Mapping, Iterable, Protocol
 import logging
 from einops import rearrange
 
@@ -25,6 +25,7 @@ from ..constants import (
     DEFAULT_SINKHORN_ITERATIONS,
     SINKHORN_EPS_STABILITY,
     EPSILON_LARGE,
+    SAM_COSINE_CLAMP,
     DEFAULT_LAMBDA_REC,
     DEFAULT_LAMBDA_PERCEPTUAL,
     DEFAULT_LAMBDA_ADVERSARIAL,
@@ -33,6 +34,16 @@ from ..constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+ConfigDict = Mapping[str, object]
+
+
+class FeatureExtractor(Protocol):
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        ...
+
+    def parameters(self, recurse: bool = True) -> Iterable[nn.Parameter]:
+        ...
 
 
 # ============================================
@@ -100,7 +111,7 @@ class SAMLoss(nn.Module):
         cosine_sim = torch.sum(pred_norm * target_norm, dim=1)
         
         # Clamp to prevent numerical issues in arccos
-        cosine_sim = torch.clamp(cosine_sim, -0.999, 0.999)
+        cosine_sim = torch.clamp(cosine_sim, -SAM_COSINE_CLAMP, SAM_COSINE_CLAMP)
         
         # Compute angle in radians
         angles = torch.acos(cosine_sim)
@@ -149,10 +160,9 @@ class SinkhornDivergence(nn.Module):
         Returns:
             Cost matrix of shape (n, m)
         """
-        x2 = (x**2).sum(-1, keepdim=True)
-        y2 = (y**2).sum(-1, keepdim=True).transpose(0, 1)
-        xy = x @ y.transpose(0, 1)
-        return torch.clamp(x2 + y2 - 2 * xy, min=0.0)
+        if x.dim() != 2 or y.dim() != 2:
+            raise ValueError("Cost matrix expects 2D tensors of shape (n, d) and (m, d)")
+        return torch.cdist(x, y, p=2) ** 2
 
     def _sinkhorn_cost(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
@@ -169,19 +179,22 @@ class SinkhornDivergence(nn.Module):
         device = X.device
 
         C = self._cost_matrix(X, Y)  # (n, m)
+        if C.dtype in (torch.float16, torch.bfloat16):
+            C = C.float()
         K = torch.exp(-C / self.epsilon)  # (n, m)
 
-        a = torch.full((n,), 1.0 / n, device=device)
-        b = torch.full((m,), 1.0 / m, device=device)
+        a = torch.full((n,), 1.0 / n, device=device, dtype=C.dtype)
+        b = torch.full((m,), 1.0 / m, device=device, dtype=C.dtype)
 
         u = torch.ones_like(a)
         v = torch.ones_like(b)
 
         # Sinkhorn iterations
+        eps_stab = max(self.eps_stab, 1e-6)
         for _ in range(self.n_iters):
-            Kv = K @ v + self.eps_stab
+            Kv = K @ v + eps_stab
             u = a / Kv
-            Ktu = K.transpose(0, 1) @ u + self.eps_stab
+            Ktu = K.transpose(0, 1) @ u + eps_stab
             v = b / Ktu
 
         # Transport plan π = diag(u) K diag(v)
@@ -203,7 +216,14 @@ class SinkhornDivergence(nn.Module):
         ot_xy = self._sinkhorn_cost(X, Y)
         ot_xx = self._sinkhorn_cost(X, X.detach())
         ot_yy = self._sinkhorn_cost(Y, Y.detach())
-        return ot_xy - 0.5 * (ot_xx + ot_yy)
+        divergence = ot_xy - 0.5 * (ot_xx + ot_yy)
+
+        if torch.isnan(divergence) or torch.isinf(divergence):
+            logger.warning("Invalid Sinkhorn divergence detected; returning zero")
+            return torch.zeros_like(divergence)
+        if (divergence < -1e-6).any():
+            logger.warning("Sinkhorn divergence negative (min=%.6f); clamping to zero", divergence.min().item())
+        return torch.clamp(divergence, min=0.0)
 
 
 class SinkhornLoss(nn.Module):
@@ -297,7 +317,7 @@ class ImprovedPerceptualLoss(nn.Module):
     Computes loss on intermediate features from a pre-trained network,
     capturing semantic similarity beyond pixel-wise metrics.
     """
-    def __init__(self, feature_extractor: Optional[nn.Module] = None):
+    def __init__(self, feature_extractor: Optional[FeatureExtractor] = None):
         super().__init__()
         self.feature_extractor = feature_extractor
         if feature_extractor:
@@ -359,7 +379,7 @@ class NoiseRobustLoss(nn.Module):
     - Supports both Sinkhorn and traditional GAN losses
     - Comprehensive NaN handling
     """
-    def __init__(self, config: Dict):
+    def __init__(self, config: ConfigDict):
         super().__init__()
         
         # Loss weights
@@ -383,6 +403,7 @@ class NoiseRobustLoss(nn.Module):
         # Adaptive weighting
         self.use_adaptive_weights = config.get("use_adaptive_weights", True)
         self.warmup_iterations = config.get("loss_warmup_iterations", 5000)
+        self._last_iteration: Optional[int] = None
         
         # Safety parameters
         self.max_loss_value = config.get("max_loss_value", MAX_LOSS_VALUE)
@@ -471,6 +492,15 @@ class NoiseRobustLoss(nn.Module):
                 'adv': self.lambda_adv,
                 'sam': self.lambda_sam
             }
+
+        if self._last_iteration is not None and iteration < self._last_iteration:
+            logger.warning(
+                "Iteration decreased from %s to %s; clamping adaptive progress.",
+                self._last_iteration,
+                iteration,
+            )
+        iteration = max(iteration, 0)
+        self._last_iteration = iteration
         
         # Warmup phase
         if iteration < self.warmup_iterations:

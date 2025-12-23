@@ -23,89 +23,23 @@ Architecture:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional, Tuple
+from typing import Optional, Tuple, Mapping, Callable, Union, overload, Literal
 import math
 from einops import rearrange
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-class SpectralNorm(nn.Module):
-    """Spectral Normalization for Conv2d and Linear layers."""
-    def __init__(self, module, n_power_iterations=1):
-        super().__init__()
-        self.module = module
-        self.n_power_iterations = n_power_iterations
-        if not self._made_params():
-            self._make_params()
-
-    def _update_u_v(self):
-        u = getattr(self.module, self.weight_u)
-        v = getattr(self.module, self.weight_v)
-        w = getattr(self.module, self.weight_orig)
-
-        height = w.data.shape[0]
-        for _ in range(self.n_power_iterations):
-            v.data = F.normalize(torch.mv(torch.t(w.view(height,-1).data), u.data), dim=0, eps=1e-12)
-            u.data = F.normalize(torch.mv(w.view(height,-1).data, v.data), dim=0, eps=1e-12)
-
-        sigma = u.dot(w.view(height, -1).mv(v))
-        setattr(self.module, self.weight, w / (sigma.expand_as(w) + 1e-12))
-
-    def _made_params(self):
-        try:
-            u = getattr(self.module, self.weight_u)
-            v = getattr(self.module, self.weight_v)
-            w = getattr(self.module, self.weight_orig)
-            return True
-        except AttributeError:
-            return False
-
-    def _make_params(self):
-        w = getattr(self.module, self.weight)
-        
-        height = w.data.shape[0]
-        width = w.view(height, -1).data.shape[1]
-
-        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        v = nn.Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
-        u.data = F.normalize(u.data, dim=0, eps=1e-12)
-        v.data = F.normalize(v.data, dim=0, eps=1e-12)
-        w_bar = nn.Parameter(w.data)
-
-        del self.module._parameters[self.weight]
-
-        self.module.register_parameter(self.weight_orig, w_bar)
-        self.module.register_parameter(self.weight_u, u)
-        self.module.register_parameter(self.weight_v, v)
-
-        setattr(self.module, self.weight, w_bar.data)
-
-    @property
-    def weight(self):
-        return "weight"
-
-    @property
-    def weight_u(self):
-        return "weight_u"
-
-    @property
-    def weight_v(self):
-        return "weight_v"
-
-    @property
-    def weight_orig(self):
-        return "weight_orig"
-
-    def forward(self, *args):
-        self._update_u_v()
-        return self.module.forward(*args)
+ConfigDict = Mapping[str, object]
 
 
-def spectral_norm(module, n_power_iterations=1):
+def spectral_norm(module: nn.Module, n_power_iterations: int = 1, eps: float = 1e-6) -> nn.Module:
     """Apply spectral normalization to a module."""
-    return SpectralNorm(module, n_power_iterations)
+    return nn.utils.spectral_norm(module, n_power_iterations=n_power_iterations, eps=eps)
+
+
+def _get_spectral_weight(module: nn.Module) -> torch.Tensor:
+    return module.weight_orig if hasattr(module, "weight_orig") else module.weight
 
 
 class SNConvBlock(nn.Module):
@@ -134,9 +68,9 @@ class SNConvBlock(nn.Module):
     
     def _init_weights(self):
         # Xavier initialization (better for GELU)
-        nn.init.xavier_uniform_(self.conv.module.weight, gain=math.sqrt(2))
-        if self.conv.module.bias is not None:
-            nn.init.constant_(self.conv.module.bias, 0)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.conv), gain=math.sqrt(2))
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.activation(self.conv(x))
@@ -171,13 +105,13 @@ class SpectralSelfAttention(nn.Module):
     
     def _init_weights(self):
         # Smaller initialization for attention layers
-        nn.init.xavier_uniform_(self.qkv.module.weight, gain=1.0)
-        nn.init.xavier_uniform_(self.qkv_dwconv.module.weight, gain=1.0) 
-        nn.init.xavier_uniform_(self.project_out.module.weight, gain=1.0)
-        if self.qkv.module.bias is not None:
-            nn.init.constant_(self.qkv.module.bias, 0)
-            nn.init.constant_(self.qkv_dwconv.module.bias, 0)
-            nn.init.constant_(self.project_out.module.bias, 0)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.qkv), gain=1.0)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.qkv_dwconv), gain=1.0)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.project_out), gain=1.0)
+        if self.qkv.bias is not None:
+            nn.init.constant_(self.qkv.bias, 0)
+            nn.init.constant_(self.qkv_dwconv.bias, 0)
+            nn.init.constant_(self.project_out.bias, 0)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
@@ -319,7 +253,7 @@ class SNTransformerDiscriminator(nn.Module):
     - Adaptive normalization
     - Gradient stability improvements
     """
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: ConfigDict):
         super().__init__()
         
         # Configuration
@@ -355,8 +289,8 @@ class SNTransformerDiscriminator(nn.Module):
         )
         
         # Initialize output layer with smaller weights
-        nn.init.xavier_uniform_(self.output_proj[0].module.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.output_proj[2].module.weight, gain=0.1)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.output_proj[0]), gain=0.1)
+        nn.init.xavier_uniform_(_get_spectral_weight(self.output_proj[2]), gain=0.1)
         
         logger.info(f"Initialized SNTransformerDiscriminator v2 with {sum(num_blocks)} transformer blocks")
     
@@ -409,7 +343,7 @@ class SNTransformerDiscriminator(nn.Module):
 
 
 def compute_gradient_penalty(
-    discriminator: nn.Module,
+    discriminator: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     real_rgb: torch.Tensor,
     real_hsi: torch.Tensor,
     fake_hsi: torch.Tensor,
@@ -461,11 +395,34 @@ def compute_gradient_penalty(
 
 class DiscriminatorWithSinkhorn(nn.Module):
     """Wrapper that combines discriminator with Sinkhorn loss computation."""
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: ConfigDict):
         super().__init__()
         self.discriminator = SNTransformerDiscriminator(config)
 
-    def forward(self, rgb: torch.Tensor, hsi: torch.Tensor, return_features: bool = True):
+    @overload
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+        return_features: Literal[True] = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ...
+
+    @overload
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+        return_features: Literal[False]
+    ) -> torch.Tensor:
+        ...
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        hsi: torch.Tensor,
+        return_features: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass with optional feature extraction.
 

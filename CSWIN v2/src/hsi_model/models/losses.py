@@ -3,7 +3,15 @@
 Loss facade module that re-exports the consolidated loss implementations.
 """
 
-from .losses_consolidated import *  # noqa: F401,F403
+from .losses_consolidated import (
+    CharbonnierLoss,
+    SAMLoss,
+    SinkhornDivergence,
+    SinkhornLoss,
+    ImprovedPerceptualLoss,
+    NoiseRobustLoss,
+    ComputeSinkhornDiscriminatorLoss,
+)
 
 __all__ = [
     "CharbonnierLoss",

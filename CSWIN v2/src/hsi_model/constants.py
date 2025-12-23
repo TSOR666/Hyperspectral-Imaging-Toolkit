@@ -58,7 +58,7 @@ DEFAULT_LAMBDA_SAM = 0.05
 # ============================================
 DEFAULT_SINKHORN_EPSILON = 0.1
 DEFAULT_SINKHORN_ITERATIONS = 50
-SINKHORN_EPS_STABILITY = 1e-9
+SINKHORN_EPS_STABILITY = 1e-6
 
 # ============================================
 # Regularization Constants
@@ -73,6 +73,7 @@ EPSILON_SMALL = 1e-12  # For normalizations
 EPSILON_MEDIUM = 1e-8  # For divisions
 EPSILON_LARGE = 1e-6   # For SAM calculations
 CHARBONNIER_EPSILON = 1e-3
+SAM_COSINE_CLAMP = 0.999
 
 # Attention stability
 ATTENTION_TEMPERATURE_INIT = 1.0
