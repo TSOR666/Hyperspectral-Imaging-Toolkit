@@ -21,7 +21,6 @@ Version: 6.0 - Cleaned and refactored
 import os
 import time
 import logging
-import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -41,7 +40,7 @@ from hsi_model.models import NoiseRobustCSWinModel
 from hsi_model.models.losses import NoiseRobustLoss, ComputeSinkhornDiscriminatorLoss
 from hsi_model.utils import setup_logging, MetricsLogger
 from hsi_model.utils.dataloader import (
-    mst_to_gan_batch, compute_mst_center_crop_metrics
+    mst_to_gan_batch, compute_mst_center_crop_metrics, worker_init_fn_mst
 )
 from hsi_model.constants import (
     DEFAULT_BATCH_SIZE,
@@ -75,30 +74,6 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-
-def fixed_worker_init_fn_mst(worker_id: int, base_seed: int = 42, rank: int = 0):
-    """
-    MST++ style worker initialization with memory fix.
-    
-    Critical: Sets h5py cache to 4MB instead of default 64MB to prevent memory leak.
-    """
-    import h5py
-    
-    worker_seed = base_seed + rank * 100 + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    
-    try:
-        import h5py._hl.base
-        h5py._hl.base.phil.acquire()
-        h5py._hl.base.default_file_cache_size = 4 * 1024 * 1024  # 4MB
-        h5py._hl.base.phil.release()
-    except:
-        pass
-    
-    num_threads = int(os.environ.get('OMP_NUM_THREADS', '2'))
-    torch.set_num_threads(num_threads)
 
 
 # ============================================
@@ -427,7 +402,7 @@ def train_sinkhorn_gan(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: fixed_worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
         persistent_workers=False
     )
     
@@ -506,23 +481,17 @@ def train_sinkhorn_gan(
                         # Emergency recovery
                         logger.warning("Too many NaNs - emergency recovery!")
                         optimizer_g.zero_grad()
-                        
-                        # Reset optimizer state
-                        for group in optimizer_g.param_groups:
-                            for p in group['params']:
-                                state = optimizer_g.state[p]
-                                if 'exp_avg' in state:
-                                    state['exp_avg'].zero_()
-                                if 'exp_avg_sq' in state:
-                                    state['exp_avg_sq'].zero_()
-                        
-                        # Reduce learning rate
+
+                        # Reduce learning rate without mutating optimizer state.
                         for param_group in optimizer_g.param_groups:
                             param_group['lr'] *= 0.5
-                        logger.warning(f"Reset optimizer and reduced generator LR to {optimizer_g.param_groups[0]['lr']:.6f}")
+                        logger.warning(
+                            f"Reduced generator LR to {optimizer_g.param_groups[0]['lr']:.6f}"
+                        )
                         
                         nan_count = 0
-                        scaler_g._scale = torch.tensor(1.0).to(device)
+                        scaler_g.update(new_scale=1.0)
+                        clear_memory()
                     
                     continue
                 else:
@@ -691,7 +660,7 @@ def train_sinkhorn_gan(
                     num_workers=num_workers,
                     pin_memory=True,
                     drop_last=True,
-                    worker_init_fn=lambda w: fixed_worker_init_fn_mst(w, seed, rank),
+                    worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
                     persistent_workers=False
                 )
                 data_iter = iter(train_loader)

@@ -48,12 +48,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import logging
-from typing import Dict, Tuple, Any, Optional
+from typing import Optional, Mapping
 from einops import rearrange, repeat
 from torch.utils.checkpoint import checkpoint
 from packaging import version
 
 logger = logging.getLogger(__name__)
+
+ConfigDict = Mapping[str, object]
 
 # Numerical stability epsilon - defined once and reused
 EPS = 1e-8
@@ -113,7 +115,7 @@ class CSWinAttentionBlock(nn.Module):
         num_heads: int = 8, 
         split_size: int = 7, 
         qkv_bias: bool = True, 
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(CSWinAttentionBlock, self).__init__()
         if dim % num_heads != 0:
@@ -145,6 +147,9 @@ class CSWinAttentionBlock(nn.Module):
             use_fp16_bias = config.get('use_fp16_bias', False)
         elif os.environ.get('MST_USE_FP32_BIAS', '').lower() == 'true':
             use_fp16_bias = False
+
+        if use_fp16_bias:
+            logger.warning("use_fp16_bias=True may reduce attention precision; enable only if memory constrained.")
         
         bias_dtype = torch.float16 if use_fp16_bias else torch.float32
         
@@ -183,6 +188,8 @@ class CSWinAttentionBlock(nn.Module):
         Returns:
             Expanded bias tensor of shape (H, s*tiles_long, s*tiles_long)
         """
+        if tiles_long <= 0:
+            raise ValueError("tiles_long must be a positive integer")
         H = bias_ss_head.shape[-1]
         s = self.split_size
         bias = bias_ss_head.permute(2, 0, 1)  # (H, s, s)
@@ -205,6 +212,8 @@ class CSWinAttentionBlock(nn.Module):
             Attention-processed tensor of same shape
         """
         B, C, padded_H, padded_W = x.shape
+        if padded_H % self.split_size != 0 or padded_W % self.split_size != 0:
+            raise ValueError("Input must be divisible by split_size after padding")
         h_windows = padded_H // self.split_size
         head_dim = self.head_dim
         
@@ -285,6 +294,8 @@ class CSWinAttentionBlock(nn.Module):
             Attention-processed tensor of same shape
         """
         B, C, padded_H, padded_W = x.shape
+        if padded_H % self.split_size != 0 or padded_W % self.split_size != 0:
+            raise ValueError("Input must be divisible by split_size after padding")
         w_windows = padded_W // self.split_size
         head_dim = self.head_dim
         
@@ -425,7 +436,7 @@ class EfficientSpectralAttention(nn.Module):
         self, 
         channels: int, 
         num_heads: int = 4, 
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(EfficientSpectralAttention, self).__init__()
         self.channels = channels
@@ -489,17 +500,26 @@ class EfficientSpectralAttention(nn.Module):
         # Normalize for cosine similarity (more robust to noise)
         q_norm = F.normalize(q_global, dim=-1, eps=EPS)
         k_norm = F.normalize(k_global, dim=-1, eps=EPS)
+        if not torch.isfinite(q_norm).all() or not torch.isfinite(k_norm).all():
+            logger.warning("Non-finite values in normalized Q/K; replacing with zeros")
+            q_norm = torch.nan_to_num(q_norm)
+            k_norm = torch.nan_to_num(k_norm)
         
         # Compute channel attention (B, H, d, d)
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.einsum('b h i, b h j -> b h i j', q_norm.float(), k_norm.float()) * scale
+        attn = torch.einsum('b h i, b h j -> b h i j', q_norm, k_norm) * scale
         attn = attn - attn.amax(dim=-1, keepdim=True)  # Stabilize softmax
-        attn = F.softmax(attn, dim=-1)
+        attn_dtype = attn.dtype
+        if attn_dtype in (torch.float16, torch.bfloat16):
+            attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
+        else:
+            attn = F.softmax(attn, dim=-1)
         
         # Apply attention to spatial features
         v_reshaped = rearrange(v, 'b (h d) H W -> b h d (H W)', h=self.num_heads)
-        out = torch.einsum('b h i j, b h j s -> b h i s', attn, v_reshaped.float())
-        out = out.to(v.dtype)
+        if attn.dtype != v_reshaped.dtype:
+            attn = attn.to(v_reshaped.dtype)
+        out = torch.einsum('b h i j, b h j s -> b h i s', attn, v_reshaped)
         
         # Reshape back to image format
         out = rearrange(out, 'b h d (H W) -> b (h d) H W', H=H, W=W)
@@ -527,7 +547,7 @@ class ChannelAttention(nn.Module):
         self, 
         channels: int, 
         reduction: int = 4,
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(ChannelAttention, self).__init__()
         self.channels = channels

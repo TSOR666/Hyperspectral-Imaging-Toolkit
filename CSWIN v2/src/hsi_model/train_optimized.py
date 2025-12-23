@@ -81,52 +81,11 @@ from hsi_model.utils.metrics import (
     validate_model_architecture, save_metrics, create_error_report
 )
 from hsi_model.utils.dataloader import (
-    mst_to_gan_batch, compute_mst_center_crop_metrics, 
-    show_dataloader_diagnostics
+    mst_to_gan_batch,
+    compute_mst_center_crop_metrics,
+    show_dataloader_diagnostics,
+    worker_init_fn_mst,
 )
-
-
-def fixed_worker_init_fn_mst(worker_id, base_seed=42, rank=0):
-    """
-    MST++ style worker initialization with FIXED h5py configuration.
-    
-    v3.0: Allow 2-4 inter-op threads for better CPU utilization
-    """
-    import h5py
-    
-    worker_seed = base_seed + rank * 100 + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    
-    # ============================================
-    # MEMORY FIX: Reduce h5py cache
-    # Handle different h5py versions gracefully
-    # ============================================
-    try:
-        # Try h5py 3.x approach
-        import h5py._hl.base
-        h5py._hl.base.phil.acquire()
-        h5py._hl.base.default_file_cache_size = 4 * 1024 * 1024  # 4MB
-        h5py._hl.base.phil.release()
-        logging.debug(f"Worker {worker_id}: Set h5py cache to 4MB (h5py 3.x)")
-    except:
-        try:
-            # Try h5py 2.x approach (if supported)
-            if hasattr(h5py.get_config(), 'chunk_cache_mem_size'):
-                h5py.get_config().chunk_cache_mem_size = 4 * 1024 * 1024
-                logging.debug(f"Worker {worker_id}: Set h5py cache to 4MB (h5py 2.x)")
-            else:
-                # For versions that don't support direct cache control
-                logging.debug(f"Worker {worker_id}: h5py cache control not available")
-        except:
-            # If all else fails, just continue without cache control
-            logging.debug(f"Worker {worker_id}: Could not configure h5py cache")
-    
-    # v3.0: Allow 2-4 threads for better CV2/numpy performance
-    num_threads = int(os.environ.get('OMP_NUM_THREADS', '2'))
-    torch.set_num_threads(num_threads)
-    
-    logging.debug(f"Worker {worker_id} initialized with seed {worker_seed}, threads={num_threads}")
 
 
 def report_memory(tag: str):
@@ -298,7 +257,7 @@ def validate_mst_style(
         sampler=val_sampler,
         num_workers=config.get("num_workers", 8),
         pin_memory=True,
-        worker_init_fn=lambda w: fixed_worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
         persistent_workers=False  # KEY: Don't keep validation workers alive
     )
     
@@ -425,7 +384,7 @@ def train_mst_gan_optimized(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: fixed_worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
         persistent_workers=(num_workers > 0)
     )
     

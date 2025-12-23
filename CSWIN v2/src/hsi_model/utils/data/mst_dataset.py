@@ -20,7 +20,7 @@ import h5py
 import cv2
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple, Any
+from typing import Tuple
 
 from ...constants import (
     ARAD1K_FULL_HEIGHT,
@@ -62,7 +62,7 @@ class MST_TrainDataset(Dataset):
         bgr2rgb: bool = True,
         stride: int = DEFAULT_STRIDE,
         memory_mode: str = "standard",
-        **_: Any,
+        **_: object,
     ):
         self.crop_size = crop_size
         self.hypers = []  # All HSI data in memory
@@ -115,8 +115,25 @@ class MST_TrainDataset(Dataset):
             ), "Hyper and RGB come from different scenes."
 
             bgr = cv2.imread(bgr_path)
+            if bgr is None:
+                logger.warning("Failed to read RGB image: %s", bgr_path)
+                continue
             if bgr2rgb:
                 bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            if hyper.ndim != 3 or bgr.ndim != 3:
+                logger.warning("Unexpected shapes for %s: hyper=%s rgb=%s", hyper_path, hyper.shape, bgr.shape)
+                continue
+            hyper_hw = (hyper.shape[1], hyper.shape[2])
+            bgr_hw = (bgr.shape[0], bgr.shape[1])
+            if hyper_hw != bgr_hw and hyper_hw != (bgr_hw[1], bgr_hw[0]):
+                logger.warning(
+                    "Spatial mismatch for %s: hyper=%s rgb=%s",
+                    hyper_path,
+                    hyper_hw,
+                    bgr_hw,
+                )
+                continue
 
             # MST++ RGB normalization: per-image min-max
             bgr = np.float32(bgr)

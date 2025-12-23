@@ -22,9 +22,11 @@ Key architectural features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Any, Optional, Union
+from typing import Dict, Optional, Union, Mapping
 
 from .attention import CSWinAttentionBlock, EfficientSpectralAttention
+
+ConfigDict = Mapping[str, object]
 
 
 def adaptive_group_norm(channels: int, base_groups: int = 8) -> nn.GroupNorm:
@@ -69,7 +71,7 @@ class DepthwiseConvBlock(nn.Module):
     Efficient Depthwise Convolution block using separable convolutions.
     Now with adaptive GroupNorm.
     """
-    def __init__(self, in_channels: int, out_channels: int, config: Dict[str, Any]) -> None:
+    def __init__(self, in_channels: int, out_channels: int, config: ConfigDict) -> None:
         super(DepthwiseConvBlock, self).__init__()
         self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -92,7 +94,7 @@ class NoiseAwareBlock(nn.Module):
     Block that adaptively processes features based on estimated noise levels.
     Fixed with proper channel handling.
     """
-    def __init__(self, channels: int, config: Dict[str, Any]) -> None:
+    def __init__(self, channels: int, config: ConfigDict) -> None:
         super(NoiseAwareBlock, self).__init__()
         
         # Noise estimation produces 1 channel
@@ -134,7 +136,7 @@ class FeedForwardNetwork(nn.Module):
     """
     Feed-forward network with GELU activation and adaptive normalization.
     """
-    def __init__(self, channels: int, expansion_factor: int = 4, config: Dict[str, Any] = None) -> None:
+    def __init__(self, channels: int, expansion_factor: int = 4, config: Optional[ConfigDict] = None) -> None:
         super(FeedForwardNetwork, self).__init__()
         
         if config is None:
@@ -161,7 +163,7 @@ class DualTransformerBlock(nn.Module):
         channels: int, 
         split_size: int = 7, 
         num_heads: int = 4, 
-        config: Dict[str, Any] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(DualTransformerBlock, self).__init__()
         
@@ -211,7 +213,7 @@ class DynamicDownsampleBlock(nn.Module):
         in_channels: int, 
         out_channels: int, 
         scale_factor: int = 2, 
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(DynamicDownsampleBlock, self).__init__()
         self.scale_factor = scale_factor
@@ -243,7 +245,7 @@ class DynamicUpsampleBlock(nn.Module):
         in_channels: int, 
         out_channels: int, 
         scale_factor: int = 2, 
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[ConfigDict] = None
     ) -> None:
         super(DynamicUpsampleBlock, self).__init__()
         self.scale_factor = scale_factor
@@ -283,7 +285,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
             - output_activation: 'none', 'sigmoid', 'tanh', 'delayed_sigmoid'
             - activation_delay_iters: iterations before activating output (for delayed_sigmoid)
     """
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: ConfigDict) -> None:
         super(NoiseRobustCSWinGenerator, self).__init__()
         
         # Extract parameters
@@ -300,6 +302,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
         self.clamp_range = config.get("generator_clamp_range", 10.0)  # Configurable clamp
         self.clamp_after_iters = config.get("clamp_after_iters", 0)  # Can disable clamping after warmup
         self.register_buffer('iteration_count', torch.zeros(1, dtype=torch.long))
+        self._iteration_count: int = 0
         
         # Initial denoising
         self.denoising = nn.Sequential(
@@ -353,14 +356,24 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
         # Output layer
         self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
+        result = super().load_state_dict(state_dict, strict)
+        try:
+            self._iteration_count = int(self.iteration_count.detach().cpu().item())
+        except Exception:
+            self._iteration_count = 0
+        return result
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Update iteration count during training (torch.jit safe)
         # v5.1: Add torch.no_grad() for safety
         if self.training:
-            with torch.no_grad():
-                self.iteration_count.add_(1)
-        iter_idx = int(self.iteration_count.item())
+            self._iteration_count += 1
+            if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+                with torch.no_grad():
+                    self.iteration_count.add_(1)
+        iter_idx = self._iteration_count
         
         # Initial denoising with residual connection
         x_denoised = self.denoising(x)
@@ -383,6 +396,8 @@ class NoiseRobustCSWinGenerator(nn.Module):
         # Decoder with skip connections
         x = self.up1(x)
         if x.shape[2:] != e2.shape[2:]:
+            if e2.shape[2] < 1 or e2.shape[3] < 1:
+                raise ValueError("Invalid spatial size for encoder stage e2")
             x = F.interpolate(x, size=e2.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, e2], dim=1)
         x = self.decoder1(x)
@@ -390,6 +405,8 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
         x = self.up2(x)
         if x.shape[2:] != e1.shape[2:]:
+            if e1.shape[2] < 1 or e1.shape[3] < 1:
+                raise ValueError("Invalid spatial size for encoder stage e1")
             x = F.interpolate(x, size=e1.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, e1], dim=1)
         x = self.compressor2(x)  # Apply before decoder2
@@ -397,6 +414,8 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
         # Handle dynamic spatial dimensions for residual connection
         if x.shape[2:] != emb.shape[2:]:
+            if emb.shape[2] < 1 or emb.shape[3] < 1:
+                raise ValueError("Invalid spatial size for embedding residual")
             x = F.interpolate(x, size=emb.shape[2:], mode='bilinear', align_corners=False)
         
         # Output with residual connection

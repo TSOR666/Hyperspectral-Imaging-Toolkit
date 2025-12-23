@@ -71,6 +71,11 @@ def create_cmf_tensor(
     Returns:
         Color matching function tensor with shape (num_bands, 3)
     """
+    if wavelength_range[1] <= 10:
+        logger.warning(
+            "wavelength_range appears to be in micrometers; expected nm. Got %s",
+            wavelength_range,
+        )
     # More accurate CIE 1931 XYZ to sRGB approximation
     wavelengths = np.linspace(wavelength_range[0], wavelength_range[1], num_bands)
     

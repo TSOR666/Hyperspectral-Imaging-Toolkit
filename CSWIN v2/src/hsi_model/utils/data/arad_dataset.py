@@ -10,7 +10,7 @@ import threading
 import warnings
 import weakref
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict, Any, Set
+from typing import Tuple, Optional, List, Dict, Set, Callable, Union
 
 import numpy as np
 import scipy.io as sio
@@ -22,6 +22,8 @@ from tqdm import tqdm
 from ...constants import ARAD1K_NUM_BANDS
 
 logger = logging.getLogger(__name__)
+
+ImageTransform = Callable[[Image.Image], Union[Image.Image, np.ndarray]]
 
 try:
     import h5py
@@ -90,7 +92,7 @@ class ARAD1KDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
-        transform: Optional[Any] = None,
+        transform: Optional[ImageTransform] = None,
         resize_hsi: bool = False,
         cache_data: bool = False,
         raise_on_size_mismatch: bool = False,
@@ -331,7 +333,7 @@ def create_arad1k_dataloader(
     batch_size: int = 1,
     num_workers: Optional[int] = None,
     shuffle: bool = False,
-    **dataset_kwargs: Any,
+    **dataset_kwargs: object,
 ) -> DataLoader:
     """
     Create DataLoader for ARAD-1K validation dataset.
