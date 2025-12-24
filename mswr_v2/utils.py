@@ -9,7 +9,6 @@ while maintaining complete backward compatibility with existing code.
 import hdf5storage
 import torch
 import torch.nn as nn
-import numpy as np
 from fvcore.nn import FlopCountAnalysis
 import logging
 import os

@@ -13,20 +13,16 @@ High-performance inference script with comprehensive features:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
 import numpy as np
 import argparse
-import os
 import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
-from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 import json
-import yaml
 from tqdm import tqdm
-import warnings
 import cv2
 import h5py
 import scipy.io as sio
@@ -130,10 +126,13 @@ class MemoryManager:
         # Forward pass typically needs 3-4x the model size
         model_size_gb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3
         overhead_factor = 4.0
-        
+
+        # Account for model memory in available memory calculation
+        effective_available = max(0.1, available_gb - model_size_gb * overhead_factor)
+
         # Calculate maximum feasible image area
         bytes_per_pixel = (channels + target_channels) * 4 * overhead_factor
-        max_pixels = (available_gb * 1024**3 * 0.8) / bytes_per_pixel  # Use 80% of available
+        max_pixels = (effective_available * 1024**3 * 0.8) / bytes_per_pixel  # Use 80% of effective available
         
         # Convert to tile size (square tiles)
         tile_size = int(np.sqrt(max_pixels))
@@ -169,33 +168,44 @@ class TiledProcessor:
     def split_image(self, image: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
         """Split image into overlapping tiles"""
         H, W = image.shape[1:3] if len(image.shape) == 4 else image.shape[:2]
-        
+
         tiles = []
         positions = []
-        
+        seen_positions = set()  # Track unique positions to avoid duplicates
+
         stride = self.tile_size - self.overlap
-        
-        for y in range(0, H, stride):
-            for x in range(0, W, stride):
+
+        for y_start in range(0, H, stride):
+            for x_start in range(0, W, stride):
+                # Calculate actual tile position (use local vars to avoid modifying loop vars)
+                y = y_start
+                x = x_start
+
                 # Calculate tile boundaries
                 y_end = min(y + self.tile_size, H)
                 x_end = min(x + self.tile_size, W)
-                
-                # Adjust start if we're at the edge
-                if y_end == H:
+
+                # Adjust start if we're at the edge to get full-sized tiles
+                if y_end == H and H >= self.tile_size:
                     y = max(0, H - self.tile_size)
-                if x_end == W:
+                if x_end == W and W >= self.tile_size:
                     x = max(0, W - self.tile_size)
-                
+
+                # Skip duplicate positions (can occur at edges)
+                pos_key = (y, x)
+                if pos_key in seen_positions:
+                    continue
+                seen_positions.add(pos_key)
+
                 # Extract tile
                 if len(image.shape) == 4:
                     tile = image[:, y:y+self.tile_size, x:x+self.tile_size, :]
                 else:
                     tile = image[y:y+self.tile_size, x:x+self.tile_size]
-                
+
                 tiles.append(tile)
                 positions.append((y, x))
-        
+
         metadata = {
             'original_shape': (H, W),
             'tile_size': self.tile_size,
@@ -203,46 +213,52 @@ class TiledProcessor:
             'positions': positions,
             'n_tiles': len(tiles)
         }
-        
+
         return tiles, metadata
     
     def merge_tiles(self, tiles: List[np.ndarray], metadata: Dict) -> np.ndarray:
         """Merge tiles back with overlap blending"""
         H, W = metadata['original_shape']
-        
+
+        # Always use float32 for accumulation to avoid precision issues
         if len(tiles[0].shape) == 4:
             B, _, _, C = tiles[0].shape
-            output = np.zeros((B, H, W, C), dtype=tiles[0].dtype)
+            output = np.zeros((B, H, W, C), dtype=np.float32)
             weights = np.zeros((B, H, W, 1), dtype=np.float32)
         else:
             C = tiles[0].shape[-1] if len(tiles[0].shape) == 3 else 1
-            output = np.zeros((H, W, C), dtype=tiles[0].dtype)
+            output = np.zeros((H, W, C), dtype=np.float32)
             weights = np.zeros((H, W, 1), dtype=np.float32)
-        
+
         # Create blending weights (cosine window)
         blend_weights = self._create_blend_weights(self.tile_size, self.overlap)
-        
+
         for tile, (y, x) in zip(tiles, metadata['positions']):
             y_end = min(y + self.tile_size, H)
             x_end = min(x + self.tile_size, W)
-            
+
             tile_h = y_end - y
             tile_w = x_end - x
-            
+
+            # Convert tile to float32 for safe accumulation
+            tile_f32 = tile.astype(np.float32)
+
             # Apply weighted blending
             if len(tile.shape) == 4:
-                output[:, y:y_end, x:x_end] += tile[:, :tile_h, :tile_w] * blend_weights[:tile_h, :tile_w, None]
+                output[:, y:y_end, x:x_end] += tile_f32[:, :tile_h, :tile_w] * blend_weights[:tile_h, :tile_w, None]
                 weights[:, y:y_end, x:x_end] += blend_weights[:tile_h, :tile_w, None]
             else:
                 if len(tile.shape) == 3:
-                    output[y:y_end, x:x_end] += tile[:tile_h, :tile_w] * blend_weights[:tile_h, :tile_w, None]
+                    output[y:y_end, x:x_end] += tile_f32[:tile_h, :tile_w] * blend_weights[:tile_h, :tile_w, None]
                 else:
-                    output[y:y_end, x:x_end] += tile[:tile_h, :tile_w] * blend_weights[:tile_h, :tile_w]
+                    output[y:y_end, x:x_end] += tile_f32[:tile_h, :tile_w, None] * blend_weights[:tile_h, :tile_w, None]
                 weights[y:y_end, x:x_end] += blend_weights[:tile_h, :tile_w, None]
-        
-        # Normalize by weights
-        output = output / np.maximum(weights, 1e-8)
-        
+
+        # Normalize by weights with a reasonable minimum to avoid spikes
+        # Use a minimum weight of 0.1 to prevent extreme values at corners
+        min_weight = 0.1
+        output = output / np.maximum(weights, min_weight)
+
         return output
     
     def _create_blend_weights(self, size: int, overlap: int) -> np.ndarray:
@@ -425,7 +441,7 @@ class MSWRInference:
             try:
                 model = torch.compile(model, mode='reduce-overhead')
                 logger.info("Model compiled with torch.compile")
-            except:
+            except Exception:
                 logger.warning("Failed to compile model, using eager mode")
         
         return model
@@ -813,7 +829,7 @@ class MSWRInference:
             
             if input_path.is_file():
                 # Process single image
-                result = self.process_image(str(input_path))
+                _result = self.process_image(str(input_path))
                 logger.info("Inference completed successfully")
                 
             elif input_path.is_dir():
