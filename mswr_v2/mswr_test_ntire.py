@@ -15,28 +15,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import argparse
-import os
-import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
-from dataclasses import dataclass, field, asdict
+from typing import Dict, Tuple, Optional, Any
+from dataclasses import dataclass, asdict
 import json
 import yaml
 from tqdm import tqdm
-import warnings
-import cv2
 import h5py
 import scipy.io as sio
 from scipy import stats
 from collections import defaultdict
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 
 # Import model and utilities
@@ -171,13 +164,20 @@ class MetricsCalculator:
             sigma1_sq = F.avg_pool2d(pred_band * pred_band, 11, 1, 5) - mu1_sq
             sigma2_sq = F.avg_pool2d(target_band * target_band, 11, 1, 5) - mu2_sq
             sigma12 = F.avg_pool2d(pred_band * target_band, 11, 1, 5) - mu1_mu2
-            
+
+            # Clamp variances to avoid negative values due to floating-point precision
+            eps = 1e-8
+            sigma1_sq = torch.clamp(sigma1_sq, min=eps)
+            sigma2_sq = torch.clamp(sigma2_sq, min=eps)
+
             C1 = (0.01 * data_range) ** 2
             C2 = (0.03 * data_range) ** 2
-            
-            ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
-                      ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-            
+
+            # SSIM formula with clamped denominator for stability
+            numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+            denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+            ssim_map = numerator / torch.clamp(denominator, min=eps)
+
             ssim_values.append(ssim_map.mean())
         
         return torch.stack(ssim_values).mean()
@@ -243,13 +243,17 @@ class MetricsCalculator:
         # Reshape to (n_pixels, n_bands)
         pred_flat = pred.permute(0, 2, 3, 1).reshape(-1, pred.shape[1])
         target_flat = target.permute(0, 2, 3, 1).reshape(-1, target.shape[1])
-        
-        # Calculate per-pixel errors
-        pixel_mrae = torch.abs(pred_flat - target_flat) / (target_flat + 1e-8)
-        pixel_mrae = pixel_mrae.mean(dim=1)
-        
+
+        # Calculate per-pixel relative error with proper handling of near-zero values
+        # Use max(target, epsilon) to avoid division by very small values
+        # A typical threshold is based on the data range
+        eps = 1e-3  # Use a more reasonable epsilon for relative error
+        abs_error = torch.abs(pred_flat - target_flat)
+        denominator = torch.maximum(torch.abs(target_flat), torch.tensor(eps, device=target.device))
+        pixel_mrae = (abs_error / denominator).mean(dim=1)
+
         pixel_rmse = torch.sqrt(((pred_flat - target_flat) ** 2).mean(dim=1))
-        
+
         self.per_pixel_metrics['mrae'].extend(pixel_mrae.cpu().numpy().tolist())
         self.per_pixel_metrics['rmse'].extend(pixel_rmse.cpu().numpy().tolist())
     
@@ -1158,8 +1162,8 @@ def main():
     
     # Run testing
     engine = NTIRETestEngine(config)
-    results = engine.run_test()
-    
+    _results = engine.run_test()
+
     logger.info("Testing completed successfully!")
 
 

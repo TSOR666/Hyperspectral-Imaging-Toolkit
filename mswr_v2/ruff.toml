@@ -1,0 +1,35 @@
+# Ruff configuration for mswr_v2
+# See https://docs.astral.sh/ruff/settings/
+
+[lint]
+# Focus on critical issues - errors and unused code
+select = ["E", "F", "W"]
+
+# Ignore specific rules
+ignore = [
+    # E402: Module level import not at top of file
+    # We intentionally have a local path patch that must run before imports
+    "E402",
+    # E501: Line too long - we'll handle these gradually
+    "E501",
+    # W293: Blank line contains whitespace
+    "W293",
+    # W291: Trailing whitespace
+    "W291",
+]
+
+# Files/patterns to exclude from linting
+exclude = [
+    "__pycache__",
+    ".git",
+    ".ruff_cache",
+    "*.egg-info",
+]
+
+[lint.per-file-ignores]
+# Training script has intentional import ordering for path setup
+"train_mswr_v212_logging.py" = ["E402", "F401"]
+# Inference script imports after style setup
+"mswr_inference.py" = ["E402"]
+# Robustness verification has intentional import ordering
+"verify_robustness.py" = ["E402"]

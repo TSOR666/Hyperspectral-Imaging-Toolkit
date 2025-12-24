@@ -157,10 +157,23 @@ class TrainDataset(Dataset):
                 self.config.logger.warning("Skipping %s due to load failure: %s", stem, exc)
                 continue
 
+            h, w = hsi.shape[1:]
+
+            # Handle undersized images by padding to at least crop_size
+            if h < self.crop_size or w < self.crop_size:
+                pad_h = max(0, self.crop_size - h)
+                pad_w = max(0, self.crop_size - w)
+                # Pad with reflect mode to maintain continuity
+                rgb = np.pad(rgb, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+                hsi = np.pad(hsi, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+                h, w = hsi.shape[1:]
+                self.config.logger.debug(
+                    "Padded image to (%d, %d) for crop_size=%d", h, w, self.crop_size
+                )
+
             self.rgb_images.append(rgb)
             self.hsi_cubes.append(hsi)
 
-            h, w = hsi.shape[1:]
             patches_h = max(1, (h - self.crop_size) // self.stride + 1)
             patches_w = max(1, (w - self.crop_size) // self.stride + 1)
             total_patches += patches_h * patches_w
@@ -212,11 +225,21 @@ class TrainDataset(Dataset):
         patches_w = max(1, (w - self.crop_size) // self.stride + 1)
         row = patch_local_idx // patches_w
         col = patch_local_idx % patches_w
-        y = min(row * self.stride, h - self.crop_size)
-        x = min(col * self.stride, w - self.crop_size)
+
+        # Calculate patch position with proper clamping to ensure valid coordinates
+        # max(0, ...) ensures non-negative; min(..., h/w - crop_size) ensures we don't exceed bounds
+        y = max(0, min(row * self.stride, h - self.crop_size))
+        x = max(0, min(col * self.stride, w - self.crop_size))
 
         rgb_patch = rgb[:, y : y + self.crop_size, x : x + self.crop_size]
         hsi_patch = hsi[:, y : y + self.crop_size, x : x + self.crop_size]
+
+        # Validate patch shape (defensive check)
+        if rgb_patch.shape[1:] != (self.crop_size, self.crop_size):
+            raise RuntimeError(
+                f"Unexpected patch shape {rgb_patch.shape} for crop_size={self.crop_size} "
+                f"(image size: {h}x{w}, position: y={y}, x={x})"
+            )
 
         if self.augment:
             rgb_patch, hsi_patch = self._apply_augmentations(rgb_patch, hsi_patch)

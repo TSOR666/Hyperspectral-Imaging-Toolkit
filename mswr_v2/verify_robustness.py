@@ -18,9 +18,7 @@ import sys
 import os
 import torch
 import torch.nn as nn
-import numpy as np
 import logging
-from pathlib import Path
 from typing import Dict, Any
 import json
 import tempfile
@@ -35,9 +33,7 @@ if _local_model_dir not in sys.path:
 # Import model
 from model.mswr_net_v212 import (
     MSWRDualConfig,
-    IntegratedMSWRNet,
-    create_mswr_tiny,
-    create_mswr_small
+    create_mswr_tiny
 )
 
 # Setup logging
@@ -97,21 +93,21 @@ class RobustnessVerifier:
 
             # Get model info
             model_info = model.get_model_info()
-            logger.info(f"✓ Model created successfully")
+            logger.info("✓ Model created successfully")
             logger.info(f"  - Total parameters: {model_info['total_parameters']:,}")
             logger.info(f"  - Trainable parameters: {model_info['trainable_parameters']:,}")
             logger.info(f"  - Model memory: {model_info['total_memory_mb']:.2f} MB")
             logger.info(f"  - Architecture: {model_info['architecture']}")
 
             # Test configuration validation
-            config = MSWRDualConfig(
+            _config = MSWRDualConfig(
                 base_channels=64,
                 num_heads=8,
                 num_stages=3,
                 use_wavelet=True,
                 wavelet_type='db2'
             )
-            logger.info(f"✓ Configuration validation passed")
+            logger.info("✓ Configuration validation passed")
 
             self.results['model_init'] = True
             return True
@@ -140,7 +136,7 @@ class RobustnessVerifier:
                 dummy_input = torch.randn(bs, 3, 128, 128).to(self.device)
 
                 with torch.no_grad():
-                    output = model(dummy_input)
+                    _output = model(dummy_input)
 
                 if torch.cuda.is_available():
                     current_memory = torch.cuda.memory_allocated() / 1024**2
@@ -199,7 +195,7 @@ class RobustnessVerifier:
             dummy_target = torch.randn(2, 31, 128, 128).to(self.device)
 
             output = model(dummy_input)
-            logger.info(f"✓ Forward pass successful")
+            logger.info("✓ Forward pass successful")
             logger.info(f"  - Input shape: {dummy_input.shape}")
             logger.info(f"  - Output shape: {output.shape}")
             logger.info(f"  - Expected shape: {dummy_target.shape}")
@@ -209,7 +205,7 @@ class RobustnessVerifier:
             # Backward pass
             loss = nn.functional.l1_loss(output, dummy_target)
             loss.backward()
-            logger.info(f"✓ Backward pass successful")
+            logger.info("✓ Backward pass successful")
             logger.info(f"  - Loss: {loss.item():.6f}")
 
             # Check gradients
@@ -268,7 +264,7 @@ class RobustnessVerifier:
                     total_norm_after += param.grad.norm().item() ** 2
             total_norm_after = total_norm_after ** 0.5
 
-            logger.info(f"✓ Gradient clipping test passed")
+            logger.info("✓ Gradient clipping test passed")
             logger.info(f"  - Norm before clipping: {total_norm_before:.6f}")
             logger.info(f"  - Norm after clipping: {total_norm_after:.6f}")
             logger.info(f"  - Clip value: {clip_value}")
@@ -307,7 +303,7 @@ class RobustnessVerifier:
                 output = model(dummy_input)
                 loss = nn.functional.l1_loss(output, dummy_target)
 
-            logger.info(f"✓ AMP forward pass successful")
+            logger.info("✓ AMP forward pass successful")
             logger.info(f"  - Loss dtype: {loss.dtype}")
 
             # Backward pass with scaler
@@ -315,7 +311,7 @@ class RobustnessVerifier:
             scaler.step(torch.optim.Adam(model.parameters(), lr=1e-4))
             scaler.update()
 
-            logger.info(f"✓ AMP backward pass successful")
+            logger.info("✓ AMP backward pass successful")
             logger.info(f"  - Scaler scale: {scaler.get_scale():.2f}")
 
             self.results['amp_support'] = True
@@ -364,7 +360,7 @@ class RobustnessVerifier:
             model_new.load_state_dict(loaded_checkpoint['state_dict'])
             optimizer_new.load_state_dict(loaded_checkpoint['optimizer'])
 
-            logger.info(f"✓ Checkpoint loaded successfully")
+            logger.info("✓ Checkpoint loaded successfully")
             logger.info(f"  - Loaded epoch: {loaded_checkpoint['epoch']}")
             logger.info(f"  - Loaded loss: {loaded_checkpoint['loss']:.6f}")
 
@@ -440,7 +436,7 @@ class RobustnessVerifier:
                     break
 
             assert should_stop, "Early stopping did not trigger as expected"
-            logger.info(f"✓ Early stopping test passed")
+            logger.info("✓ Early stopping test passed")
 
             self.results['early_stopping'] = True
             return True
@@ -458,7 +454,7 @@ class RobustnessVerifier:
         try:
             # Test invalid configuration
             try:
-                config = MSWRDualConfig(
+                _config = MSWRDualConfig(
                     base_channels=65,  # Not divisible by num_heads=8
                     num_heads=8
                 )

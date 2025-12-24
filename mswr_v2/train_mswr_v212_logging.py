@@ -1,6 +1,7 @@
 
 # --- BEGIN LOCAL PATCH: ensure local 'model' package is importable ---
-import sys, os
+import sys
+import os
 _here = os.path.dirname(os.path.abspath(__file__))
 _local_model_dir = os.path.join(_here, "model")
 if _local_model_dir not in sys.path:
@@ -36,7 +37,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import torch.optim as optim
-import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from packaging import version
 
@@ -51,7 +51,7 @@ import json
 from datetime import datetime
 import numpy as np
 import random
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, Tuple, Any
 import wandb
 from tqdm import tqdm
 import yaml
@@ -60,7 +60,6 @@ import sys
 import time
 import psutil
 from collections import defaultdict
-import warnings
 import traceback
 import copy
 
@@ -961,7 +960,7 @@ class EnhancedTrainer:
         
         with torch.no_grad():
             for _ in range(50):
-                output = self.model(dummy_input)
+                _output = self.model(dummy_input)
         
         if has_cuda:
             torch.cuda.synchronize()

@@ -47,20 +47,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import math
 import logging
-from typing import Optional, Tuple, List, Dict, Union, Literal, Any, Callable
-from dataclasses import dataclass, field, asdict
+from typing import Optional, Tuple, List, Dict, Literal, Any
+from dataclasses import dataclass, asdict
 import torch.utils.checkpoint as checkpoint
-from einops import rearrange, repeat
-import numpy as np
-from contextlib import nullcontext
+from einops import rearrange
 import time
-from functools import lru_cache, partial
 from collections import defaultdict
-import os
-import gc
 import warnings
 
 # Suppress specific warnings for production
@@ -1454,7 +1447,7 @@ class IntegratedMSWRNet(nn.Module):
                 self._compiled_forward = torch.compile(self.forward, mode='default')
                 self.forward = self._compiled_forward
                 if self.rank == 0:
-                    logger.info(f"Model compiled successfully")
+                    logger.info("Model compiled successfully")
             except Exception as e:
                 if self.rank == 0:
                     logger.warning(f"Model compilation failed: {e}")
@@ -1821,7 +1814,7 @@ if __name__ == "__main__":
         y_train = model_layer(x_train)  # (B, C_out, H, W)
         loss = y_train.mean()  # () scalar
         loss.backward()
-        print(f"✅ Training mode test passed with gradient flow")
+        print("✅ Training mode test passed with gradient flow")
         
         # Clean up GPU memory
         del model_layer, model_group, model_batch, model_test
@@ -1831,7 +1824,7 @@ if __name__ == "__main__":
         # Model info (create fresh model for stats)
         model_info = create_mswr_base()
         info = model_info.get_model_info()
-        print(f"\n📊 Model Statistics:")
+        print("\n📊 Model Statistics:")
         print(f"   Total parameters: {info['total_parameters']:,}")
         print(f"   Model memory: {info['total_memory_mb']:.1f} MB")
         
