@@ -1,13 +1,19 @@
 
 from __future__ import annotations
-import argparse, subprocess, sys
-from pathlib import Path
 
-def run_script(script: str, args):
-    cmd = [sys.executable, str(Path(__file__).parent/script)] + args
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+
+def run_script(script: str, args: List[str]) -> None:
+    cmd = [sys.executable, str(Path(__file__).parent / script)] + args
     print("Running:", " ".join(cmd)); subprocess.check_call(cmd)
 
-def main():
+
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True)
     ap.add_argument("--output", required=True)

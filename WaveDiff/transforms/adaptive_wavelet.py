@@ -1,13 +1,24 @@
+"""Adaptive wavelet thresholding and noise estimation."""
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
+
+# Numerical stability constant
+_EPS = 1e-8
 
 
 class AdaptiveWaveletThresholding(nn.Module):
     """Adaptive thresholding for wavelet coefficients."""
 
-    def __init__(self, channels, method='soft', trainable=True, init_threshold=0.1):
+    def __init__(
+        self,
+        channels: int,
+        method: str = 'soft',
+        trainable: bool = True,
+        init_threshold: float = 0.1,
+    ):
         super().__init__()
         self.channels = channels
         self.method = method
@@ -72,22 +83,47 @@ class AdaptiveWaveletThresholding(nn.Module):
     def _soft_threshold(self, x, threshold):
         return torch.sign(x) * torch.clamp(torch.abs(x) - threshold, min=0)
 
-    def _garrote_threshold(self, x, threshold):
-        mask = torch.abs(x) > threshold
-        result = torch.zeros_like(x)
+    def _garrote_threshold(self, x: torch.Tensor, threshold: torch.Tensor) -> torch.Tensor:
+        """
+        Non-negative garrote thresholding with numerical stability.
 
-        if not torch.any(mask):
-            return result
+        Garrote: x - threshold^2 / x for |x| > threshold, else 0
 
-        x_masked = x[mask]
-        eps = torch.finfo(x.dtype).eps
-        safe_denominator = torch.where(
-            x_masked >= 0,
-            torch.clamp(x_masked, min=eps),
-            torch.clamp(x_masked, max=-eps)
-        )
+        Args:
+            x: Input tensor [B, C, H, W]
+            threshold: Threshold value (scalar or broadcastable tensor)
 
-        result[mask] = x_masked - (threshold ** 2 / safe_denominator)
+        Returns:
+            Thresholded tensor [B, C, H, W]
+        """
+        abs_x = torch.abs(x)
+
+        # Ensure threshold broadcasts correctly
+        if threshold.dim() == 0:
+            thresh = threshold
+        else:
+            thresh = threshold  # Already [B, C, 1, 1] or broadcastable
+
+        # Create mask for values above threshold
+        mask = (abs_x > thresh).float()
+
+        # Safe computation: use clamped abs_x to avoid division by small values
+        safe_abs_x = torch.clamp(abs_x, min=_EPS)
+
+        # Compute garrote: sign(x) * (|x| - threshold^2 / |x|)
+        # For values below threshold, result is 0
+        thresh_sq = thresh ** 2
+        correction = thresh_sq / safe_abs_x
+
+        # Clamp correction to prevent sign flips (correction should be <= |x|)
+        correction = torch.clamp(correction, max=abs_x)
+
+        # Apply garrote formula
+        garrote_value = torch.sign(x) * (abs_x - correction)
+
+        # Apply mask: zero out values below threshold
+        result = garrote_value * mask
+
         return result
 
 

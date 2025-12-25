@@ -89,16 +89,37 @@ class SpectralNoiseSchedule(BaseNoiseSchedule):
         return torch.stack(band_energies, dim=2)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        base_beta = self.betas[t]
+        """
+        Compute spectral-adaptive beta values.
 
+        Args:
+            x: Input tensor [B, C, H, W]
+            t: Timestep indices [B]
+
+        Returns:
+            Adapted beta values [B, 1, 1, 1]
+        """
+        base_beta = self.betas[t]  # [B]
+
+        # Compute band energies: [B, C, num_freq_bands]
         band_energies = self.compute_band_energy(x)
+
+        # Normalize across frequency bands: [B, C, num_freq_bands]
         energy_sum = band_energies.sum(dim=2, keepdim=True).clamp(min=1e-8)
         normalized_energies = band_energies / energy_sum
 
-        weights = F.softmax(self.spectral_weights, dim=0)
-        weighted_beta = base_beta.view(-1, 1, 1) * (normalized_energies @ weights)
+        # Compute weighted average across bands: [B, C]
+        weights = F.softmax(self.spectral_weights, dim=0)  # [num_freq_bands]
+        weighted_energies = (normalized_energies * weights.view(1, 1, -1)).sum(dim=2)  # [B, C]
 
-        beta_adapted = weighted_beta.mean(dim=1).view(-1, 1, 1, 1)
+        # Average across channels: [B]
+        channel_avg = weighted_energies.mean(dim=1)  # [B]
+
+        # Apply to base beta: [B]
+        beta_adapted = base_beta * channel_avg
+
+        # Reshape and clamp: [B, 1, 1, 1]
+        beta_adapted = beta_adapted.view(-1, 1, 1, 1)
         beta_adapted = torch.clamp(beta_adapted, min=1e-5, max=5e-2)
         return beta_adapted
 

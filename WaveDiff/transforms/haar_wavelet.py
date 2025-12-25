@@ -1,45 +1,62 @@
+"""Haar wavelet transform implementation for PyTorch."""
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
 
 class HaarWaveletTransform(nn.Module):
     """
-    Haar wavelet transform implementation as a PyTorch module
-    
+    Haar wavelet transform implementation as a PyTorch module.
+
     Decomposes an input tensor into four subbands:
     - LL: Low-frequency approximation (average)
     - LH: Horizontal details
     - HL: Vertical details
     - HH: Diagonal details
     """
-    def __init__(self, in_channels):
+
+    def __init__(self, in_channels: int):
         super().__init__()
-        # Define Haar wavelet filter bank
+        self.in_channels = in_channels
+
+        # Define Haar wavelet filter bank: [4, 1, 2, 2]
+        # Each filter is applied to each input channel independently
         filters = torch.tensor([
-            [[0.5, 0.5], [0.5, 0.5]],  # LL - Average
-            [[0.5, 0.5], [-0.5, -0.5]],  # LH - Horizontal
-            [[0.5, -0.5], [0.5, -0.5]],  # HL - Vertical
-            [[0.5, -0.5], [-0.5, 0.5]]   # HH - Diagonal
-        ])
-        # Register filters as buffer (not trainable)
-        self.register_buffer("weight", filters.repeat(in_channels, 1, 1, 1))
+            [[[0.5, 0.5], [0.5, 0.5]]],    # LL - Average
+            [[[0.5, 0.5], [-0.5, -0.5]]],  # LH - Horizontal
+            [[[0.5, -0.5], [0.5, -0.5]]],  # HL - Vertical
+            [[[0.5, -0.5], [-0.5, 0.5]]]   # HH - Diagonal
+        ], dtype=torch.float32)  # Shape: [4, 1, 2, 2]
+
+        # For grouped convolution with groups=in_channels:
+        # Weight shape must be [out_channels, in_channels/groups, kH, kW]
+        # = [in_channels*4, 1, 2, 2]
+        # Repeat the 4 filters for each input channel
+        weight = filters.repeat(in_channels, 1, 1, 1)  # [in_channels*4, 1, 2, 2]
+        self.register_buffer("weight", weight)
         self.groups = in_channels
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply wavelet transform to input
-        
+        Apply wavelet transform to input.
+
         Args:
             x: Input tensor [B, C, H, W]
-            
+
         Returns:
             Wavelet coefficients [B, C, 4, H//2, W//2]
         """
         B, C, H, W = x.shape
-        # Apply convolution with stride 2 to perform filtering and downsampling
+
+        # Apply grouped convolution: each channel gets 4 output coefficients
+        # Input: [B, C, H, W]
+        # Weight: [C*4, 1, 2, 2], groups=C
+        # Output: [B, C*4, H//2, W//2]
         out = F.conv2d(x, weight=self.weight, stride=2, groups=self.groups)
-        # Reshape to separate the wavelet components
+
+        # Reshape to separate the wavelet components: [B, C, 4, H//2, W//2]
         return out.view(B, C, 4, H // 2, W // 2)
 
 
