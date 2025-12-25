@@ -1,13 +1,17 @@
 
 from __future__ import annotations
-import argparse, json
+
+import argparse
+import json
 from pathlib import Path
-import numpy as np
+from typing import Dict, List
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 class MetricsStatisticsPlotter:
-    def __init__(self, results_dirs, output_dir: str, dpi: int = 300):
+    def __init__(self, results_dirs: Dict[str, str], output_dir: str, dpi: int = 300) -> None:
         self.results_dirs = {name: Path(d) for name,d in results_dirs.items()}
         self.output_dir = Path(output_dir); self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dpi = dpi
@@ -25,7 +29,7 @@ class MetricsStatisticsPlotter:
                 data.append(row)
         return pd.DataFrame(data)
 
-    def violin(self, metrics = ['mrae','rmse','psnr','sam']):
+    def violin(self, metrics: List[str] = ['mrae', 'rmse', 'psnr', 'sam']) -> None:
         n = len(metrics); fig, axes = plt.subplots(1, n, figsize=(3*n,4))
         axes = axes if isinstance(axes, np.ndarray) else np.array([axes])
         for i, m in enumerate(metrics):
@@ -39,7 +43,7 @@ class MetricsStatisticsPlotter:
         out = self.output_dir / "metrics_violin_plots.pdf"
         plt.tight_layout(); plt.savefig(out); plt.savefig(out.with_suffix('.png')); plt.close()
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", nargs='+', required=True)
     ap.add_argument("--names", nargs='+', required=True)

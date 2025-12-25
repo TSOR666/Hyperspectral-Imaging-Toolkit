@@ -1,7 +1,12 @@
+"""Spectral and spatial attention modules for HSI processing."""
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+# Numerical stability constant used across attention modules
+_EPS = 1e-6
 
 class SpectralAttention(nn.Module):
     """
@@ -60,27 +65,39 @@ class CrossSpectralAttention(nn.Module):
         # Scale factor for attention
         self.scale = self.head_dim ** -0.5
         
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with multi-head cross-spectral attention.
+
+        Args:
+            x: Input tensor [B, C, H, W]
+
+        Returns:
+            Attended tensor [B, C, H, W]
+        """
         b, c, h, w = x.size()
-        
-        # Calculate query, key, value
+
+        # Calculate query, key, value: [B, num_heads, head_dim, H*W]
         q = self.query(x).view(b, self.num_heads, self.head_dim, h * w)
         k = self.key(x).view(b, self.num_heads, self.head_dim, h * w)
         v = self.value(x).view(b, self.num_heads, self.head_dim, h * w)
-        
-        # Transpose for attention
-        q = q.transpose(2, 3)  # b, num_heads, h*w, head_dim
-        k = k.transpose(2, 3)  # b, num_heads, h*w, head_dim
-        v = v.transpose(2, 3)  # b, num_heads, h*w, head_dim
-        
-        # Calculate attention scores
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # b, num_heads, h*w, h*w
+
+        # Transpose for attention: [B, num_heads, H*W, head_dim]
+        q = q.transpose(2, 3)
+        k = k.transpose(2, 3)
+        v = v.transpose(2, 3)
+
+        # Calculate attention scores: [B, num_heads, H*W, H*W]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # Stabilized softmax: subtract max for numerical stability (prevents overflow in float16)
+        attn = attn - attn.max(dim=-1, keepdim=True).values
         attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to values
-        out = (attn @ v)  # b, num_heads, h*w, head_dim
+
+        # Apply attention to values: [B, num_heads, H*W, head_dim]
+        out = attn @ v
         out = out.transpose(2, 3).contiguous().view(b, c, h, w)
-        
+
         return self.out_proj(out)
 
 
@@ -263,9 +280,15 @@ class MultiHeadSpectralAttention(nn.Module):
         k = k.reshape(B, self.num_heads, self.head_dim, H * W)
         v = v.reshape(B, self.num_heads, self.head_dim, H * W)
 
-        # Compute attention scores
-        attn = torch.matmul(q.transpose(-2, -1), k)  # B, num_heads, H*W, H*W
-        attn = attn * self.temperature
+        # Compute attention scores: [B, num_heads, H*W, H*W]
+        attn = torch.matmul(q.transpose(-2, -1), k)
+
+        # Clamp temperature to prevent extreme scaling (numerical stability)
+        clamped_temp = torch.clamp(self.temperature, min=1e-4, max=10.0)
+        attn = attn * clamped_temp
+
+        # Stabilized softmax: subtract max for float16 safety
+        attn = attn - attn.max(dim=-1, keepdim=True).values
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
 

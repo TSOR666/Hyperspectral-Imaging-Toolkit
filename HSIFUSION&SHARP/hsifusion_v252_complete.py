@@ -78,9 +78,9 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 # Warning throttle helper
-_warning_counts = {}
+_warning_counts: Dict[str, int] = {}
 
-def throttled_warning(message: str, key: str, interval: int = 100):
+def throttled_warning(message: str, key: str, interval: int = 100) -> None:
     """Issue warning only every `interval` occurrences."""
     count = _warning_counts.get(key, 0) + 1
     _warning_counts[key] = count
@@ -131,9 +131,13 @@ def _factor_pair(n: int) -> Tuple[int, int]:
 # Fixed merge_sliding_windows using F.fold
 # ============================================================================
 
-def merge_sliding_windows_fixed(windows: torch.Tensor, grid_size: Tuple[int, int], 
-                               window_size: int, stride: int, 
-                               original_size: Tuple[int, int]) -> torch.Tensor:
+def merge_sliding_windows_fixed(
+    windows: torch.Tensor,
+    grid_size: Tuple[int, int],
+    window_size: int,
+    stride: int,
+    original_size: Tuple[int, int],
+) -> torch.Tensor:
     """
     Merge sliding windows using F.fold for safe and efficient reconstruction.
     
@@ -165,11 +169,17 @@ def merge_sliding_windows_fixed(windows: torch.Tensor, grid_size: Tuple[int, int
     C = windows.shape[1]
     
     # Reshape windows to (B, C, grid_H, grid_W, window_size, window_size)
-    windows = windows.contiguous().view(B, grid_H, grid_W, C, window_size, window_size)
+    windows = windows.contiguous().view(
+        B, grid_H, grid_W, C, window_size, window_size
+    )  # (B*num_win, C, ws, ws) -> (B, grid_H, grid_W, C, ws, ws)
+    # (B, grid_H, grid_W, C, ws, ws) -> (B, C, grid_H, grid_W, ws, ws)
     windows = windows.permute(0, 3, 1, 2, 4, 5).contiguous()  # (B, C, grid_H, grid_W, ws, ws)
     
     # Reshape for fold: (B*C, window_size*window_size, grid_H*grid_W)
-    windows_for_fold = windows.contiguous().view(B * C, grid_H * grid_W, window_size * window_size)
+    windows_for_fold = windows.contiguous().view(
+        B * C, grid_H * grid_W, window_size * window_size
+    )  # (B, C, grid_H, grid_W, ws, ws) -> (B*C, grid_H*grid_W, ws*ws)
+    # (B*C, grid_H*grid_W, ws*ws) -> (B*C, ws*ws, grid_H*grid_W)
     windows_for_fold = windows_for_fold.transpose(1, 2)  # (B*C, ws*ws, grid_H*grid_W)
     
     # Optimize output size: only pad when necessary
@@ -182,28 +192,36 @@ def merge_sliding_windows_fixed(windows: torch.Tensor, grid_size: Tuple[int, int
         out_W = grid_W * stride + window_size - stride
     
     # Use fold to merge windows
-    output = F.fold(windows_for_fold,
-                    output_size=(out_H, out_W),
-                    kernel_size=(window_size, window_size),
-                    stride=stride)
+    output = F.fold(
+        windows_for_fold,
+        output_size=(out_H, out_W),
+        kernel_size=(window_size, window_size),
+        stride=stride,
+    )  # (B*C, ws*ws, grid_H*grid_W) -> (B*C, 1, out_H, out_W)
     
     # Create weight tensor for normalization - use float32 for precision
     # Simplified for torch.compile compatibility - removed hasattr check
-    ones = torch.ones(1, 1, 1, dtype=torch.float32, device=windows.device).expand_as(windows_for_fold)
-    weight = F.fold(ones,
-                    output_size=(out_H, out_W),
-                    kernel_size=(window_size, window_size),
-                    stride=stride)
+    ones = torch.ones(1, 1, 1, dtype=torch.float32, device=windows.device).expand_as(
+        windows_for_fold
+    )  # (1,1,1) -> (B*C, ws*ws, grid_H*grid_W) via broadcast
+    weight = F.fold(
+        ones,
+        output_size=(out_H, out_W),
+        kernel_size=(window_size, window_size),
+        stride=stride,
+    )  # (B*C, ws*ws, grid_H*grid_W) -> (B*C, 1, out_H, out_W)
     
     # Normalize by overlap count (avoid dtype promotion)
+    # (B*C, 1, out_H, out_W) / (B*C, 1, out_H, out_W) -> (B*C, 1, out_H, out_W)
     output = output / weight.to(output.dtype).clamp_(min=1)
     
     # Reshape back to (B, C, out_H, out_W)
-    output = output.view(B, C, out_H, out_W)
+    # (B*C, 1, out_H, out_W) -> (B, C, out_H, out_W)
+    output = output.view(B, C, out_H, out_W)  # (B*C, 1, out_H, out_W) -> (B, C, out_H, out_W)
     
     # Crop to original size only if necessary
     if out_H > H or out_W > W:
-        output = output[:, :, :H, :W]
+        output = output[:, :, :H, :W]  # (B, C, out_H, out_W) -> (B, C, H, W)
     
     return output
 
@@ -214,10 +232,17 @@ def merge_sliding_windows_fixed(windows: torch.Tensor, grid_size: Tuple[int, int
 class VectorizedSlidingWindowAttention(nn.Module):
     """Sliding window attention using optimized unfold operations with fixed merge."""
     
-    def __init__(self, dim: int, window_size: int = 8, overlap: int = 4, 
-                 num_heads: int = 8, qkv_bias: bool = True, 
-                 attn_drop: float = 0.0, proj_drop: float = 0.0,
-                 use_rope: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        window_size: int = 8,
+        overlap: int = 4,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        use_rope: bool = True,
+    ) -> None:
         super().__init__()
         # Use explicit ValueError instead of assert for critical checks
         if dim % num_heads != 0:
@@ -250,31 +275,36 @@ class VectorizedSlidingWindowAttention(nn.Module):
         else:
             self._init_relative_position_bias()
             
-    def _init_relative_position_bias(self):
+    def _init_relative_position_bias(self) -> None:
         """Initialize relative position bias."""
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * self.window_size - 1) * (2 * self.window_size - 1), self.num_heads)
-        )
+        )  # ((2*ws-1)^2, num_heads)
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         
         # Compute relative position index
-        coords_h = torch.arange(self.window_size)
-        coords_w = torch.arange(self.window_size)
+        coords_h = torch.arange(self.window_size)  # (ws,)
+        coords_w = torch.arange(self.window_size)  # (ws,)
         
         # Handle both old and new PyTorch versions
         try:
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))
+            coords = torch.stack(
+                torch.meshgrid([coords_h, coords_w], indexing="ij")
+            )  # (2, ws, ws)
         except TypeError:
             # Fallback for older PyTorch versions without indexing parameter
-            coords = torch.stack(torch.meshgrid(coords_h, coords_w))
+            coords = torch.stack(torch.meshgrid(coords_h, coords_w))  # (2, ws, ws)
+        # coords: (2, ws, ws)
         
-        coords_flatten = torch.flatten(coords, 1)
+        coords_flatten = torch.flatten(coords, 1)  # (2, ws*ws)
+        # (2, ws*ws, 1) - (2, 1, ws*ws) -> (2, ws*ws, ws*ws)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        # (2, ws*ws, ws*ws) -> (ws*ws, ws*ws, 2)
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # (ws*ws, ws*ws, 2)
         relative_coords[:, :, 0] += self.window_size - 1
         relative_coords[:, :, 1] += self.window_size - 1
         relative_coords[:, :, 0] *= 2 * self.window_size - 1
-        relative_position_index = relative_coords.sum(-1)
+        relative_position_index = relative_coords.sum(-1)  # (ws*ws, ws*ws)
         
         # Ensure indices are within bounds (using proper validation instead of assert)
         max_index = (2 * self.window_size - 1) * (2 * self.window_size - 1) - 1
@@ -298,33 +328,55 @@ class VectorizedSlidingWindowAttention(nn.Module):
         self.register_buffer("relative_position_index", relative_position_index)
     
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """Apply windowed attention.
+
+        Args:
+            x: (B, H*W, C) flattened spatial tokens
+            H: height
+            W: width
+
+        Returns:
+            (B, H*W, C) attended tokens
+        """
         B, L, C = x.shape
         if L != H * W:
             raise ValueError(f"Input length {L} doesn't match H*W={H*W}")
         
         # Reshape to 2D
-        x = x.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
+        x = x.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         
         # Extract sliding windows
-        windows, grid_size = sliding_window_unfold(x, self.window_size, self.stride)
+        windows, grid_size = sliding_window_unfold(
+            x, self.window_size, self.stride
+        )  # (B, C, H, W) -> (B*num_win, C, ws, ws), (grid_H, grid_W)
         num_windows = windows.shape[0] // B
         
         # Process windows in batch
-        windows = windows.permute(0, 2, 3, 1).reshape(-1, self.window_size * self.window_size, C)
+        # (B*num_win, C, ws, ws) -> (B*num_win, ws, ws, C) -> (B*num_win, ws*ws, C)
+        windows = windows.permute(0, 2, 3, 1).reshape(
+            -1, self.window_size * self.window_size, C
+        )
         
         # Compute QKV
-        qkv = self.qkv(windows).reshape(-1, self.window_size * self.window_size, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(windows).reshape(
+            -1, self.window_size * self.window_size, 3, self.num_heads, self.head_dim
+        )  # (B*num_win, ws*ws, 3*dim) -> (B*num_win, ws*ws, 3, H, D)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B*num_win, H, ws*ws, D)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
         # Apply position encoding and attention
         if self.use_rope:
-            q, k = self.rope(q, k)
-            attn = sdpa_unified(q, k, v, scale=self.scale, 
-                               dropout_p=self.attn_drop.p if self.training else 0.0)
+            q, k = self.rope(q, k)  # (B*num_win, H, ws*ws, D) -> same
+            attn = sdpa_unified(
+                q,
+                k,
+                v,
+                scale=self.scale,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )  # (B*num_win, H, ws*ws, D)
         else:
             # Get relative position bias with proper error detection
-            idx_flat = self.relative_position_index.view(-1)
+            idx_flat = self.relative_position_index.view(-1)  # (ws*ws, ws*ws) -> (ws^4,)
             max_valid_idx = self.relative_position_bias_table.size(0) - 1
 
             # Check if clamping would occur (indicates a bug)
@@ -340,22 +392,38 @@ class VectorizedSlidingWindowAttention(nn.Module):
                 )
                 idx_flat = idx_flat.clamp(0, max_valid_idx)
 
-            relative_position_bias_flat = self.relative_position_bias_table[idx_flat]
+            relative_position_bias_flat = self.relative_position_bias_table[
+                idx_flat
+            ]  # (ws*ws*ws*ws, num_heads)
             relative_position_bias = relative_position_bias_flat.view(
-                self.window_size * self.window_size, self.window_size * self.window_size, -1
-            )
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+                self.window_size * self.window_size,
+                self.window_size * self.window_size,
+                -1,
+            )  # (ws*ws, ws*ws, num_heads)
+            relative_position_bias = (
+                relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+            )  # (1, num_heads, ws*ws, ws*ws)
             
-            attn = sdpa_unified(q, k, v, attn_mask=relative_position_bias, scale=self.scale,
-                               dropout_p=self.attn_drop.p if self.training else 0.0)
+            attn = sdpa_unified(
+                q,
+                k,
+                v,
+                attn_mask=relative_position_bias,
+                scale=self.scale,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )  # attn_mask broadcasts over batch -> (B*num_win, H, ws*ws, D)
         
         # Reshape attention output
-        attn = attn.transpose(1, 2).reshape(-1, self.window_size * self.window_size, C)
-        attn = self.proj(attn)
+        attn = attn.transpose(1, 2).reshape(
+            -1, self.window_size * self.window_size, C
+        )  # (B*num_win, H, ws*ws, D) -> (B*num_win, ws*ws, C)
+        attn = self.proj(attn)  # (B*num_win, ws*ws, C) -> (B*num_win, ws*ws, C)
         attn = self.proj_drop(attn)
         
         # Reshape back to windows
-        attn_windows = attn.view(-1, self.window_size, self.window_size, C).permute(0, 3, 1, 2)
+        attn_windows = attn.view(
+            -1, self.window_size, self.window_size, C
+        ).permute(0, 3, 1, 2)  # (B*num_win, ws*ws, C) -> (B*num_win, C, ws, ws)
         
         # Verify expected window count
         expected_windows = grid_size[0] * grid_size[1] * B
@@ -363,10 +431,14 @@ class VectorizedSlidingWindowAttention(nn.Module):
             raise ValueError(f"Window count mismatch: got {attn_windows.shape[0]}, expected {expected_windows}")
         
         # Use fixed merge function
-        output = merge_sliding_windows_fixed(attn_windows, grid_size, self.window_size, self.stride, (H, W))
+        output = merge_sliding_windows_fixed(
+            attn_windows, grid_size, self.window_size, self.stride, (H, W)
+        )  # (B, C, H, W)
         
         # Reshape to original format
-        output = output.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        output = output.permute(0, 2, 3, 1).reshape(
+            B, H * W, C
+        )  # (B, C, H, W) -> (B, H*W, C)
         
         return output
 
@@ -374,8 +446,15 @@ class VectorizedSlidingWindowAttention(nn.Module):
 class OptimizedDynamicSparseAttention(nn.Module):
     """Memory-efficient sparse attention using optimized top-k from common_utils."""
     
-    def __init__(self, dim: int, num_heads: int = 8, sparsity_ratio: float = 0.5,
-                 qkv_bias: bool = True, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        sparsity_ratio: float = 0.5,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
@@ -392,27 +471,42 @@ class OptimizedDynamicSparseAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
         # Learnable temperature for sparsity control
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)  # (1,)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply sparse attention.
+
+        Args:
+            x: (B, N, C) tokens
+
+        Returns:
+            (B, N, C) attended tokens
+        """
         B, N, C = x.shape
         
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(
+            B, N, 3, self.num_heads, C // self.num_heads
+        ).permute(2, 0, 3, 1, 4)  # (B, N, 3*C) -> (3, B, H, N, D)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
         # Apply temperature-controlled sparse attention
-        temp = self.temperature.clamp(min=0.01)
-        q = q / temp
+        temp = self.temperature.clamp(min=0.01)  # (1,)
+        q = q / temp  # broadcast (1,) -> (B, H, N, D)
         
         # Use optimized sparse attention
-        attn = sparse_attention_topk(q, k, v, sparsity_ratio=self.sparsity_ratio, scale=self.scale)
+        q_float = q.float()  # (B, H, N, D) float32 for stability
+        k_float = k.float()  # (B, H, N, D) float32 for stability
+        v_float = v.float()  # (B, H, N, D) float32 for stability
+        attn = sparse_attention_topk(
+            q_float, k_float, v_float, sparsity_ratio=self.sparsity_ratio, scale=self.scale
+        ).to(q.dtype)  # (B, H, N, D)
         
         # Apply attention dropout if specified
         if self.training and self.attn_drop.p > 0:
             attn = self.attn_drop(attn)
         
-        x = attn.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        x = attn.transpose(1, 2).reshape(B, N, C)  # (B, H, N, D) -> (B, N, C)
+        x = self.proj(x)  # (B, N, C) -> (B, N, C)
         x = self.proj_drop(x)
         
         return x
@@ -421,8 +515,13 @@ class OptimizedDynamicSparseAttention(nn.Module):
 class RobustEnhancedSpectralAttention(nn.Module):
     """Enhanced spectral attention with fixed divisibility and better error handling."""
     
-    def __init__(self, dim: int, num_bands: int = 31, reduction: int = 4,
-                 pool_sizes: Optional[List[int]] = None):
+    def __init__(
+        self,
+        dim: int,
+        num_bands: int = 31,
+        reduction: int = 4,
+        pool_sizes: Optional[List[int]] = None,
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.num_bands = num_bands
@@ -454,17 +553,31 @@ class RobustEnhancedSpectralAttention(nn.Module):
         # Learnable spectral correlations
         self.spectral_weights = nn.ParameterList([
             nn.Parameter(torch.eye(num_bands) * 0.1) for _ in self.pool_sizes
-        ])
+        ])  # each: (num_bands, num_bands)
         
         # Fixed: ensure GroupNorm doesn't get 0 groups
         self.norm = nn.GroupNorm(max(1, min(32, dim // 8)), dim)
     
     def get_scale_failure_rate(self) -> torch.Tensor:
-        """Return the exact rate of scale processing failures as a tensor for loss fusion."""
+        """Return the exact rate of scale processing failures as a tensor for loss fusion.
+
+        Returns:
+            scalar tensor on module device
+        """
         device = next(self.parameters()).device
-        return torch.tensor(self.scale_failures / max(1, self.total_attempts), device=device)
+        return torch.tensor(
+            self.scale_failures / max(1, self.total_attempts), device=device
+        )  # ()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply multi-scale spectral attention.
+
+        Args:
+            x: (B, C, H, W) feature map
+
+        Returns:
+            (B, C, H, W) spectrally attended map
+        """
         B, C, H, W = x.shape
         identity = x
         
@@ -474,11 +587,11 @@ class RobustEnhancedSpectralAttention(nn.Module):
             self.total_attempts += 1  # Track every attempt
             try:
                 # Pool at this scale
-                x_pooled = pool(x)
+                x_pooled = pool(x)  # (B, C, H, W) -> (B, C, h_p, w_p)
                 
                 # Generate Q, K, V
-                qkv = conv(x_pooled)
-                q, k, v = qkv.chunk(3, dim=1)
+                qkv = conv(x_pooled)  # (B, C, h_p, w_p) -> (B, 3*rd, h_p, w_p)
+                q, k, v = qkv.chunk(3, dim=1)  # each: (B, rd, h_p, w_p)
                 
                 # Validate shapes
                 _, rd, h_p, w_p = q.shape
@@ -495,20 +608,39 @@ class RobustEnhancedSpectralAttention(nn.Module):
                     )
                     continue
                 
-                q = q.view(B, bands_per_group, self.num_bands, spatial_dim).permute(0, 3, 1, 2)
-                k = k.view(B, bands_per_group, self.num_bands, spatial_dim).permute(0, 3, 2, 1)
-                v = v.view(B, bands_per_group, self.num_bands, spatial_dim).permute(0, 3, 1, 2)
+                # (B, rd, h_p, w_p) -> (B, bands_per_group, num_bands, h_p*w_p)
+                q = q.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
+                    0, 3, 1, 2
+                )  # (B, h_p*w_p, bands_per_group, num_bands)
+                k = k.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
+                    0, 3, 2, 1
+                )  # (B, h_p*w_p, num_bands, bands_per_group)
+                v = v.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
+                    0, 3, 1, 2
+                )  # (B, h_p*w_p, bands_per_group, num_bands)
                 
                 # Compute spectral attention with correlation
-                scale = (bands_per_group) ** -0.5
-                attn = torch.matmul(torch.matmul(q, spectral_weight), k) * scale
-                attn = F.softmax(attn, dim=-1)
+                scale = (self.num_bands) ** -0.5
+                q_float = q.float()  # (B, h_p*w_p, bands_per_group, num_bands)
+                k_float = k.float()  # (B, h_p*w_p, num_bands, bands_per_group)
+                v_float = v.float()  # (B, h_p*w_p, bands_per_group, num_bands)
+                spectral_weight_float = spectral_weight.float()  # (num_bands, num_bands)
+                # (B, h_p*w_p, bands_per_group, num_bands) @ (num_bands, num_bands) -> same
+                # then @ (B, h_p*w_p, num_bands, bands_per_group) -> (B, h_p*w_p, bands_per_group, bands_per_group)
+                attn = torch.matmul(torch.matmul(q_float, spectral_weight_float), k_float) * scale  # (B, h_p*w_p, bands_per_group, bands_per_group)
+                attn = F.softmax(attn, dim=-1)  # (B, h_p*w_p, bands_per_group, bands_per_group)
                 
-                out = torch.matmul(attn, v)
-                out = out.permute(0, 2, 3, 1).contiguous().reshape(B, rd, h_p, w_p)
+                # (B, h_p*w_p, bands_per_group, bands_per_group) @ (B, h_p*w_p, bands_per_group, num_bands)
+                out = torch.matmul(attn, v_float)  # (B, h_p*w_p, bands_per_group, num_bands)
+                out = out.to(q.dtype)  # (B, h_p*w_p, bands_per_group, num_bands)
+                out = out.permute(0, 2, 3, 1).contiguous().reshape(
+                    B, rd, h_p, w_p
+                )  # (B, h_p*w_p, bands_per_group, num_bands) -> (B, rd, h_p, w_p)
                 
                 # Upsample back to original size
-                out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+                out = F.interpolate(
+                    out, size=(H, W), mode="bilinear", align_corners=False
+                )  # (B, rd, h_p, w_p) -> (B, rd, H, W)
                 scale_outputs.append(out)
                 
             except RuntimeError as e:
@@ -524,9 +656,9 @@ class RobustEnhancedSpectralAttention(nn.Module):
         
         if scale_outputs:
             # Fuse multi-scale features
-            fused = torch.cat(scale_outputs, dim=1)
-            output = self.scale_fusion(fused)
-            output = self.norm(output + identity)
+            fused = torch.cat(scale_outputs, dim=1)  # (B, rd*num_scales, H, W)
+            output = self.scale_fusion(fused)  # (B, rd*num_scales, H, W) -> (B, C, H, W)
+            output = self.norm(output + identity)  # (B, C, H, W)
         else:
             throttled_warning(
                 "All spectral attention scales failed - using identity",
@@ -544,11 +676,21 @@ class RobustEnhancedSpectralAttention(nn.Module):
 class LightningProBlock(nn.Module):
     """High-performance transformer block with all optimizations and torch.compile compatibility."""
     
-    def __init__(self, dim: int, num_heads: int = 8, window_size: int = 8,
-                 mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0,
-                 use_moe: bool = False, num_experts: int = 4,
-                 use_sliding_window: bool = True, use_sparse: bool = False,
-                 use_spectral: bool = True, use_rope: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        window_size: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        use_moe: bool = False,
+        num_experts: int = 4,
+        use_sliding_window: bool = True,
+        use_sparse: bool = False,
+        use_spectral: bool = True,
+        use_rope: bool = True,
+    ) -> None:
         super().__init__()
         
         self.use_sliding_window = use_sliding_window
@@ -598,15 +740,27 @@ class LightningProBlock(nn.Module):
             )
         
         # Layer scale
-        self.ls1 = nn.Parameter(torch.ones(dim) * 1e-5)
-        self.ls2 = nn.Parameter(torch.ones(dim) * 1e-5) if use_spectral else None
-        self.ls3 = nn.Parameter(torch.ones(dim) * 1e-5)
+        self.ls1 = nn.Parameter(torch.ones(dim) * 1e-5)  # (C,)
+        self.ls2 = nn.Parameter(torch.ones(dim) * 1e-5) if use_spectral else None  # (C,)
+        self.ls3 = nn.Parameter(torch.ones(dim) * 1e-5)  # (C,)
         
         # Drop path
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         
-    def forward(self, x: torch.Tensor, H: Optional[int] = None, W: Optional[int] = None) -> Tuple[torch.Tensor, Dict]:
-        """Forward pass with torch.compile compatibility (no nested autocast)."""
+    def forward(
+        self, x: torch.Tensor, H: Optional[int] = None, W: Optional[int] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Forward pass with torch.compile compatibility (no nested autocast).
+
+        Args:
+            x: (B, C, H, W) feature map or (B, L, C) flattened tokens
+            H: height (required if x is flattened and H/W not inferable)
+            W: width (required if x is flattened and H/W not inferable)
+
+        Returns:
+            x_out: (B, C, H, W)
+            aux_losses: dict of auxiliary loss tensors
+        """
         # Get spatial dimensions
         if x.ndim == 4:
             B, C, H_in, W_in = x.shape
@@ -626,32 +780,44 @@ class LightningProBlock(nn.Module):
         # Spatial attention - use attribute check instead of introspection
         if isinstance(self.attn, VectorizedSlidingWindowAttention):
             # Sliding window attention requires H, W
-            attn_out = self.attn(self.norm1(x_flat), H, W)
+            attn_out = self.attn(
+                self.norm1(x_flat), H, W
+            )  # norm1: (B, H*W, C) -> (B, H*W, C)
         else:
             # Other attention types don't need H, W
-            attn_out = self.attn(self.norm1(x_flat))
+            attn_out = self.attn(
+                self.norm1(x_flat)
+            )  # norm1: (B, H*W, C) -> (B, H*W, C)
+        # (B, H*W, C) + broadcast (C,) -> (B, H*W, C)
         x_flat = x_flat + self.drop_path(attn_out * self.ls1)
         
         # Spectral attention (if enabled)
         if self.use_spectral:
             # Reshape to 4D for spectral attention
-            x_2d = x_flat.transpose(1, 2).view(B, C, H, W)
-            spectral_out = self.spectral_attn(x_2d)  # It has its own normalization
+            x_2d = x_flat.transpose(1, 2).view(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
+            spectral_out = self.spectral_attn(x_2d)  # (B, C, H, W)
             # Use reshape for safety
-            x_2d = x_2d + self.drop_path(spectral_out * self.ls2.reshape(1, -1, 1, 1))
-            x_flat = x_2d.flatten(2).transpose(1, 2)
+            x_2d = x_2d + self.drop_path(
+                spectral_out * self.ls2.reshape(1, -1, 1, 1)
+            )  # broadcast (1, C, 1, 1)
+            x_flat = x_2d.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
         
         # MLP/MoE
         if self.use_moe:
-            mlp_out, moe_aux = self.mlp(self.norm3(x_flat))
+            mlp_out, moe_aux = self.mlp(
+                self.norm3(x_flat)
+            )  # norm3: (B, H*W, C) -> (B, H*W, C)
             aux_losses.update(moe_aux)
         else:
-            mlp_out = self.mlp(self.norm3(x_flat))
+            mlp_out = self.mlp(
+                self.norm3(x_flat)
+            )  # norm3: (B, H*W, C) -> (B, H*W, C)
         
+        # (B, H*W, C) + broadcast (C,) -> (B, H*W, C)
         x_flat = x_flat + self.drop_path(mlp_out * self.ls3)
         
         # Always return in 4D format (B, C, H, W)
-        x_out = x_flat.transpose(1, 2).view(B, C, H, W)
+        x_out = x_flat.transpose(1, 2).view(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
         
         return x_out, aux_losses
 
@@ -706,7 +872,7 @@ class LightningProConfig:
 class HSIFusionNetV25LightningPro(nn.Module):
     """HSIFusionNet v2.5 Lightning Pro - Performance optimized architecture with torch.compile support."""
     
-    def __init__(self, config: LightningProConfig):
+    def __init__(self, config: LightningProConfig) -> None:
         super().__init__()
         self.config = config
         self.dims = [config.base_channels * (2 ** i) for i in range(len(config.depths))]
@@ -728,7 +894,7 @@ class HSIFusionNetV25LightningPro(nn.Module):
         self.downsample_layers = nn.ModuleList()
         
         # Stochastic depth schedule
-        dpr = [x.item() for x in torch.linspace(0, config.drop_path, sum(config.depths))]
+        dpr = [x.item() for x in torch.linspace(0, config.drop_path, sum(config.depths))]  # (sum(depths),)
         cur = 0
         
         for i, depth in enumerate(config.depths):
@@ -825,7 +991,7 @@ class HSIFusionNetV25LightningPro(nn.Module):
         # Setup auxiliary loss tracking
         self.aux_losses = {}
         
-    def _init_weights(self, m):
+    def _init_weights(self, m: nn.Module) -> None:
         """Xavier/Kaiming initialization."""
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
@@ -842,27 +1008,35 @@ class HSIFusionNetV25LightningPro(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward_encoder(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Forward through encoder with feature collection."""
+        """Forward through encoder with feature collection.
+
+        Args:
+            x: (B, C_in, H, W)
+
+        Returns:
+            x: (B, C_out, H', W')
+            features: list of (B, C_i, H_i, W_i) for skip connections
+        """
         features = []
         aux_losses = {}
         
         # Stem
-        x = self.stem(x)
+        x = self.stem(x)  # (B, C_in, H, W) -> (B, base_channels, H, W)
         
         # Encoder stages
         for i, (downsample, stage) in enumerate(zip(self.downsample_layers, self.encoder_stages)):
-            x = downsample(x)
+            x = downsample(x)  # (B, C_i, H, W) -> (B, C_{i+1}, H/2, W/2) for i>0
             
             # Process blocks - x is always 4D (B, C, H, W)
             B, C, H, W = x.shape
             
             for block in stage:
-                x, block_aux = block(x, H, W)
+                x, block_aux = block(x, H, W)  # (B, C, H, W)
                 
                 # Accumulate auxiliary losses
                 for k, v in block_aux.items():
                     if k in aux_losses:
-                        aux_losses[k] = aux_losses[k] + v
+                        aux_losses[k] = aux_losses[k] + v  # (,) + (,) -> (,)
                     else:
                         aux_losses[k] = v
             
@@ -872,16 +1046,24 @@ class HSIFusionNetV25LightningPro(nn.Module):
         total_blocks = sum(len(stage) for stage in self.encoder_stages)
         if total_blocks > 0:
             for k in aux_losses:
-                aux_losses[k] = aux_losses[k] / total_blocks
+                aux_losses[k] = aux_losses[k] / total_blocks  # (,) / scalar -> (,)
         
         self.aux_losses = aux_losses
         return x, features
     
     def forward_decoder(self, x: torch.Tensor, encoder_features: List[torch.Tensor]) -> torch.Tensor:
-        """Forward through decoder with cross-attention fusion."""
+        """Forward through decoder with cross-attention fusion.
+
+        Args:
+            x: (B, C, H, W) deepest feature map
+            encoder_features: list of (B, C_i, H_i, W_i) skip maps
+
+        Returns:
+            x: (B, base_channels, H, W)
+        """
         for i, (upsample, decoder) in enumerate(zip(self.upsample_layers, self.decoder_stages)):
             # Upsample
-            x = upsample(x)
+            x = upsample(x)  # (B, C_i, H, W) -> (B, C_{i-1}, 2H, 2W)
             
             # Get skip connection
             skip = encoder_features[-(i+2)]
@@ -889,22 +1071,24 @@ class HSIFusionNetV25LightningPro(nn.Module):
             # Apply cross-attention if enabled
             if self.cross_attns is not None:
                 B, C, H, W = x.shape
-                x_flat = x.flatten(2).transpose(1, 2)
-                skip_flat = skip.flatten(2).transpose(1, 2)
-                x_flat = self.cross_attns[i](x_flat, skip_flat)
-                x = x_flat.transpose(1, 2).reshape(B, C, H, W)
+                x_flat = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
+                skip_flat = skip.flatten(2).transpose(1, 2)  # (B, C, Hs, Ws) -> (B, Hs*Ws, C)
+                x_flat = self.cross_attns[i](x_flat, skip_flat)  # (B, H*W, C)
+                x = x_flat.transpose(1, 2).reshape(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
             
             # Ensure spatial dimensions match
             if x.shape[2:] != skip.shape[2:]:
-                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+                x = F.interpolate(
+                    x, size=skip.shape[2:], mode="bilinear", align_corners=False
+                )  # (B, C, H, W) -> (B, C, Hs, Ws)
             
             # Concatenate and refine
-            x = torch.cat([x, skip], dim=1)
-            x = decoder(x)
+            x = torch.cat([x, skip], dim=1)  # (B, C, H, W) cat (B, C, H, W) -> (B, 2C, H, W)
+            x = decoder(x)  # (B, 2C, H, W) -> (B, C, H, W)
         
         return x
     
-    def _compile_forward(self):
+    def _compile_forward(self) -> None:
         """Helper to compile the forward method lazily."""
         if not hasattr(self, '_lazy_compile_config'):
             return
@@ -929,7 +1113,15 @@ class HSIFusionNetV25LightningPro(nn.Module):
             delattr(self, '_lazy_compile_config')
     
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward pass with automatic mixed precision applied at model level."""
+        """Forward pass with automatic mixed precision applied at model level.
+
+        Args:
+            x: (B, in_channels, H, W)
+
+        Returns:
+            output: (B, out_channels, H, W)
+            uncertainty: (B, out_channels, H, W) if estimate_uncertainty is enabled
+        """
         # Lazy compilation on first forward if configured
         if hasattr(self, '_lazy_compile_config') and not hasattr(self, '_compiled'):
             self._compile_forward()
@@ -947,47 +1139,54 @@ class HSIFusionNetV25LightningPro(nn.Module):
             x = x.to(memory_format=torch.channels_last)
         
         # Encoder
-        x, encoder_features = self.forward_encoder(x)
+        x, encoder_features = self.forward_encoder(x)  # (B, C_enc, H', W'), list of skips
         
         # Decoder
-        x = self.forward_decoder(x, encoder_features)
+        x = self.forward_decoder(x, encoder_features)  # (B, base_channels, H, W)
         
         # Output
-        output = self.output_head(x)
+        output = self.output_head(x)  # (B, base_channels, H, W) -> (B, out_channels, H, W)
         
         # Uncertainty estimation
         if self.config.estimate_uncertainty and hasattr(self, 'uncertainty_head'):
-            uncertainty = self.uncertainty_head(x)
+            uncertainty = self.uncertainty_head(x)  # (B, base_channels, H, W) -> (B, out_channels, H, W)
             return output, uncertainty
         
         return output
     
     def get_auxiliary_loss(self) -> torch.Tensor:
-        """Get combined auxiliary loss with correct device handling."""
+        """Get combined auxiliary loss with correct device handling.
+
+        Returns:
+            scalar tensor on model device
+        """
         device = next(self.parameters()).device
         
-        total_loss = torch.tensor(0.0, device=device)
+        total_loss = torch.tensor(0.0, device=device)  # ()
         
         # Add MoE auxiliary losses
         if self.aux_losses:
-            total_loss = total_loss + sum(self.aux_losses.values()) * self.config.auxiliary_loss_weight
+            total_loss = total_loss + sum(self.aux_losses.values()) * self.config.auxiliary_loss_weight  # () + () -> ()
         
         # Add spectral attention failure penalty if any
         if self.config.enable_spectral:
             for module in self.modules():
                 if isinstance(module, RobustEnhancedSpectralAttention):
-                    failure_rate = module.get_scale_failure_rate()  # Now returns tensor
+                    failure_rate = module.get_scale_failure_rate()  # (), scalar
                     if failure_rate > 0:
                         # Penalize high failure rates (configurable weight)
-                        failure_penalty = failure_rate * self.config.spectral_failure_weight
-                        total_loss = total_loss + failure_penalty
+                        failure_penalty = failure_rate * self.config.spectral_failure_weight  # () * scalar -> ()
+                        total_loss = total_loss + failure_penalty  # () + () -> ()
         
         return total_loss
     
     @classmethod
-    def from_pretrained(cls, checkpoint_path: Union[str, Path, Mapping[str, Any]], 
-                       config_override: Optional[Dict] = None,
-                       strict: bool = True) -> 'HSIFusionNetV25LightningPro':
+    def from_pretrained(
+        cls,
+        checkpoint_path: Union[str, Path, Mapping[str, Any]],
+        config_override: Optional[Dict[str, Any]] = None,
+        strict: bool = True,
+    ) -> 'HSIFusionNetV25LightningPro':
         """
         Load model from pretrained checkpoint.
         
@@ -1045,8 +1244,14 @@ class HSIFusionNetV25LightningPro(nn.Module):
 class CrossAttention(nn.Module):
     """Cross-attention for encoder-decoder fusion with optimized sdpa."""
     
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = True,
-                 attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
@@ -1062,17 +1267,35 @@ class CrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Apply cross-attention.
+
+        Args:
+            x: (B, N, C) query tokens
+            context: (B, M, C) context tokens
+
+        Returns:
+            (B, N, C) attended tokens
+        """
         B, N, C = x.shape
         
-        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        kv = self.kv(context).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q = self.q(x).reshape(
+            B, N, self.num_heads, C // self.num_heads
+        ).permute(0, 2, 1, 3)  # (B, N, C) -> (B, H, N, D)
+        kv = self.kv(context).reshape(
+            B, -1, 2, self.num_heads, C // self.num_heads
+        ).permute(2, 0, 3, 1, 4)  # (B, M, 2C) -> (2, B, H, M, D)
         k, v = kv[0], kv[1]
         
-        attn = sdpa_unified(q, k, v, scale=self.scale, 
-                           dropout_p=self.attn_drop.p if self.training else 0.0)
+        attn = sdpa_unified(
+            q,
+            k,
+            v,
+            scale=self.scale,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )  # (B, H, N, D)
         
-        x = attn.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        x = attn.transpose(1, 2).reshape(B, N, C)  # (B, H, N, D) -> (B, N, C)
+        x = self.proj(x)  # (B, N, C) -> (B, N, C)
         x = self.proj_drop(x)
         
         return x
@@ -1081,7 +1304,7 @@ class CrossAttention(nn.Module):
 class UncertaintyHead(nn.Module):
     """Estimate aleatoric uncertainty with smooth activation."""
     
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.aleatoric = nn.Sequential(
             nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
@@ -1093,7 +1316,15 @@ class UncertaintyHead(nn.Module):
         self.activation = nn.Softplus(beta=5)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.activation(self.aleatoric(x))
+        """Compute per-band uncertainty.
+
+        Args:
+            x: (B, C_in, H, W)
+
+        Returns:
+            (B, C_out, H, W) uncertainty map
+        """
+        return self.activation(self.aleatoric(x))  # (B, C_in, H, W) -> (B, C_out, H, W)
 
 
 # ============================================================================
@@ -1110,7 +1341,7 @@ def create_hsifusion_lightning_pro(
     expected_min_size: Optional[int] = None,
     lazy_compile: bool = False,
     force_compile: bool = False,
-    **kwargs
+    **kwargs: Any,
 ) -> HSIFusionNetV25LightningPro:
     """
     Create HSIFusionNet v2.5.3 Lightning Pro model
@@ -1280,7 +1511,7 @@ def create_hsifusion_lightning_pro(
 # Testing
 # ============================================================================
 
-def test_lightning_pro_model():
+def test_lightning_pro_model() -> None:
     """Test HSIFusion v2.5.3 Lightning Pro with all optimizations."""
     print(" Testing HSIFusionNet v2.5.3 Lightning Pro (Production Release)...")
     print(f"   Version: {__version__}")
@@ -1326,20 +1557,20 @@ def test_lightning_pro_model():
             model.eval()
             
             # Test forward pass
-            x = torch.randn(input_shape, device=device)
+            x = torch.randn(input_shape, device=device)  # (B, in_channels, H, W)
             
             with torch.no_grad():
                 if extra_config.get('estimate_uncertainty'):
-                    output, uncertainty = model(x)
+                    output, uncertainty = model(x)  # output/uncertainty: (B, 31, H, W)
                     assert uncertainty.shape == (input_shape[0], 31, input_shape[2], input_shape[3])
                 else:
-                    output = model(x)
+                    output = model(x)  # (B, 31, H, W)
                 
             expected_shape = (input_shape[0], 31, input_shape[2], input_shape[3])
             assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
             
             # Test auxiliary loss
-            aux_loss = model.get_auxiliary_loss()
+            aux_loss = model.get_auxiliary_loss()  # ()
             assert isinstance(aux_loss, torch.Tensor)
             assert aux_loss.device == device, "Auxiliary loss on wrong device"
             
@@ -1356,10 +1587,10 @@ def test_lightning_pro_model():
             model = create_hsifusion_lightning_pro('tiny', compile_mode='default')
             model = model.to(device).eval()
             
-            x = torch.randn(1, 3, 64, 64, device=device)
+            x = torch.randn(1, 3, 64, 64, device=device)  # (1, 3, 64, 64)
             
             with torch.no_grad():
-                output = model(x)
+                output = model(x)  # (1, 31, 64, 64)
             
             assert output.shape == (1, 31, 64, 64), f"Wrong output shape: {output.shape}"
             print("  OK torch.compile compatibility verified")
@@ -1376,12 +1607,12 @@ def test_lightning_pro_model():
         model = create_hsifusion_lightning_pro('small', compile_mode=None)
         model = model.to(device).eval()
         
-        x = torch.randn(2, 3, 128, 128, device=device)
+        x = torch.randn(2, 3, 128, 128, device=device)  # (2, 3, 128, 128)
         
         try:
             with torch.cuda.amp.autocast():
                 with torch.no_grad():
-                    output = model(x)
+                    output = model(x)  # (2, 31, 128, 128)
             assert output.shape == (2, 31, 128, 128), f"Wrong output shape in AMP: {output.shape}"
             assert not torch.isnan(output).any(), "NaN in AMP output"
             assert not torch.isinf(output).any(), "Inf in AMP output"
@@ -1482,7 +1713,3 @@ if __name__ == "__main__":
 - Removed unused imports for faster load time
 - Comprehensive edge case handling and warnings
 """
-
-
-
-

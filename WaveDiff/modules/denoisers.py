@@ -180,66 +180,77 @@ class WaveletUNetDenoiser(nn.Module):
         
         # Inverse wavelet transform
         self.inverse_wavelet = InverseHaarWaveletTransform()
-        
-        # Upsampling with spectral attention
+
+        # SHAPE FIX: After middle processing, features have shape [B, channels*2, H, W]
+        # After inverse_wavelet(features.view(B, channels*2//4, 4, H, W)), output has
+        # shape [B, channels//2, H*2, W*2]
+        # So self.up must accept channels//2 channels, not channels*2
         self.up = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
-            SpectralAttention(channels * 2),
-            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1),
+            ResidualBlock(channels // 2, use_batchnorm=use_batchnorm),
+            SpectralAttention(channels // 2),
+            nn.Conv2d(channels // 2, channels, kernel_size=3, padding=1),
             nn.SiLU()
         )
-        
-        # Final blocks
-        self.final_attn = SpectralSpatialAttention(channels * 2)  # Considers both input and processed features
+
+        # Final blocks: expects concatenation of [up output (channels) + original input (channels)]
+        self.final_attn = SpectralSpatialAttention(channels * 2)
         self.final_res = ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
-        
+
     def forward(self, x, t):
+        """
+        Forward pass through WaveletUNetDenoiser.
+
+        Args:
+            x: Noisy input [B, C, H, W]
+            t: Timestep indices [B]
+
+        Returns:
+            Predicted noise [B, C, H, W]
+        """
         # Original input for residual connection
         original_x = x
-        
+
         # Embed timestep
         t_emb = get_timestep_embedding(t, self.time_dim, dtype=x.dtype)
         t_emb = self.time_mlp(t_emb).view(-1, self.time_dim, 1, 1)
-        
-        # Apply wavelet transform
+
+        # Apply wavelet transform: [B, C, H, W] -> [B, C, 4, H//2, W//2]
         wavelet_coeffs = self.wavelet(x)
-        B, C, _, H, W = wavelet_coeffs.shape
-        
-        # Process each component
+        B, C, _, H, W = wavelet_coeffs.shape  # H, W are already halved
+
+        # Process each component: [B, C, H//2, W//2] each
         components = [wavelet_coeffs[:, :, i] for i in range(4)]  # LL, LH, HL, HH
-        
+
         # Process approximation (LL) coefficient
         components[0] = self.process_ll(components[0])
-        
+
         # Process detail coefficients
         for i in range(3):
             components[i+1] = self.process_detail[i](components[i+1])
-            
+
         # Apply time embedding to each component
-        # OPTIMIZATION: More efficient reshaping and broadcasting
         time_context = self.time_proj(t_emb)  # [B, C*4, 1, 1]
         t_emb_reshaped = time_context.view(B, C, 4, 1, 1)
-        # Broadcast efficiently during addition instead of pre-expanding
         for i in range(4):
             components[i] = components[i] + t_emb_reshaped[:, :, i]
-            
-        # Reshape and combine
-        components = torch.cat([c.unsqueeze(2) for c in components], dim=2)  # B, C, 4, H, W
+
+        # Reshape and combine: [B, C*4, H//2, W//2]
+        components = torch.cat([c.unsqueeze(2) for c in components], dim=2)  # [B, C, 4, H//2, W//2]
         combined = components.view(B, C * 4, H, W)
-        features = F.silu(self.combine_wavelet(combined))
-        
+        features = F.silu(self.combine_wavelet(combined))  # [B, C*2, H//2, W//2]
+
         # Middle processing
         features = self.middle_attn(features)
-        features = self.middle(features)
-        
-        # Prepare for inverse wavelet transform
+        features = self.middle(features)  # [B, C*2, H//2, W//2]
+
+        # Prepare for inverse wavelet transform: [B, C//2, 4, H//2, W//2]
         features_for_iwt = features.view(B, features.shape[1] // 4, 4, H, W)
-        
-        # Apply inverse wavelet transform
+
+        # Apply inverse wavelet transform: [B, C//2, H, W]
         features_upsampled = self.inverse_wavelet(features_for_iwt)
-        
-        # Final processing
+
+        # Final processing: [B, C//2, H, W] -> [B, C, H, W]
         features_upsampled = self.up(features_upsampled)
         
         # Concatenate with original input
@@ -280,8 +291,9 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
             channels, method=threshold_method, trainable=trainable_threshold, init_threshold=init_threshold
         )
         
+        # NOTE: After middle, features.shape[1]//4 = channels*2//4 = channels//2
         self.output_thresholding = AdaptiveWaveletThresholding(
-            channels * 2, method=threshold_method, trainable=trainable_threshold, init_threshold=init_threshold * 0.5
+            channels // 2, method=threshold_method, trainable=trainable_threshold, init_threshold=init_threshold * 0.5
         )
         
         # Process different wavelet components separately
@@ -313,78 +325,78 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
         
         # Inverse wavelet transform
         self.inverse_wavelet = InverseHaarWaveletTransform()
-        
-        # Upsampling with spectral attention
+
+        # SHAPE FIX: After middle, features has channels*2, then reshaped to (channels//2, 4, H, W)
+        # IWT output: [B, channels//2, H*2, W*2]. So self.up must accept channels//2.
         self.up = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
-            SpectralAttention(channels * 2),
-            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1),
+            ResidualBlock(channels // 2, use_batchnorm=use_batchnorm),
+            SpectralAttention(channels // 2),
+            nn.Conv2d(channels // 2, channels, kernel_size=3, padding=1),
             nn.SiLU()
         )
-        
-        # Final blocks
-        self.final_attn = SpectralSpatialAttention(channels * 2)  # Considers both input and processed features
+
+        # Final blocks: expects [up output (channels) + original input (channels)]
+        self.final_attn = SpectralSpatialAttention(channels * 2)
         self.final_res = ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
-        
+
     def forward(self, x, t):
+        """Forward pass through ThresholdingWaveletUNetDenoiser."""
         # Original input for residual connection
         original_x = x
-        
+
         # Embed timestep
         t_emb = get_timestep_embedding(t, self.time_dim, dtype=x.dtype)
         t_emb = self.time_mlp(t_emb).view(-1, self.time_dim, 1, 1)
-        
-        # Apply wavelet transform
+
+        # Apply wavelet transform: [B, C, H, W] -> [B, C, 4, H//2, W//2]
         wavelet_coeffs = self.wavelet(x)
         B, C, _, H, W = wavelet_coeffs.shape
-        
+
         # Estimate noise level
         noise_level = self.noise_estimator(wavelet_coeffs)
-        
+
         # Apply thresholding to input coefficients
         wavelet_coeffs = self.input_thresholding(wavelet_coeffs, noise_level)
-        
-        # Process each component
+
+        # Process each component: [B, C, H//2, W//2] each
         components = [wavelet_coeffs[:, :, i] for i in range(4)]  # LL, LH, HL, HH
-        
+
         # Process approximation (LL) coefficient
         components[0] = self.process_ll(components[0])
-        
+
         # Process detail coefficients
         for i in range(3):
             components[i+1] = self.process_detail[i](components[i+1])
-            
+
         # Apply time embedding to each component
-        # OPTIMIZATION: More efficient reshaping and broadcasting
         time_context = self.time_proj(t_emb)  # [B, C*4, 1, 1]
         t_emb_reshaped = time_context.view(B, C, 4, 1, 1)
-        # Broadcast efficiently during addition instead of pre-expanding
         for i in range(4):
             components[i] = components[i] + t_emb_reshaped[:, :, i]
-            
-        # Reshape and combine
-        components = torch.cat([c.unsqueeze(2) for c in components], dim=2)  # B, C, 4, H, W
+
+        # Reshape and combine: [B, C*4, H//2, W//2]
+        components = torch.cat([c.unsqueeze(2) for c in components], dim=2)  # [B, C, 4, H//2, W//2]
         combined = components.view(B, C * 4, H, W)
-        features = F.silu(self.combine_wavelet(combined))
-        
+        features = F.silu(self.combine_wavelet(combined))  # [B, C*2, H//2, W//2]
+
         # Middle processing
         features = self.middle_attn(features)
-        features = self.middle(features)
-        
-        # Generate wavelet coefficients for the output
+        features = self.middle(features)  # [B, C*2, H//2, W//2]
+
+        # Generate wavelet coefficients for the output: [B, C//2, 4, H//2, W//2]
         out_coeffs = features.view(B, features.shape[1] // 4, 4, H, W)
-        
+
         # Apply output thresholding
         out_coeffs = self.output_thresholding(out_coeffs, noise_level)
-        
-        # Apply inverse wavelet transform
+
+        # Apply inverse wavelet transform: [B, C//2, H, W]
         features_upsampled = self.inverse_wavelet(out_coeffs)
-        
-        # Final processing
+
+        # Final processing: [B, C//2, H, W] -> [B, C, H, W]
         features_upsampled = self.up(features_upsampled)
-        
-        # Concatenate with original input
+
+        # Concatenate with original input: [B, C*2, H, W]
         output = torch.cat([features_upsampled, original_x], dim=1)
         
         # Final attention and convolution

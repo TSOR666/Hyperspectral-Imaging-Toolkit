@@ -1,9 +1,15 @@
+"""DPM-OT: Diffusion Probabilistic Models with Optimal Transport sampling."""
+from typing import Optional, Tuple, List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from diffusion.noise_schedule import BaseNoiseSchedule
+
+# Numerical stability constant
+_EPS = 1e-8
 
 
 class DPMOT(nn.Module):
@@ -222,8 +228,21 @@ class DPMOT(nn.Module):
         noisy_latent, _ = self.q_sample(conditioning, timesteps)
         return noisy_latent
 
-    def _dpm_solver_update(self, x, noise_pred, t, next_t):
-        """First-order DPM-Solver update."""
+    def _dpm_solver_update(
+        self, x: torch.Tensor, noise_pred: torch.Tensor, t: torch.Tensor, next_t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        First-order DPM-Solver update.
+
+        Args:
+            x: Current sample [B, C, H, W]
+            noise_pred: Predicted noise [B, C, H, W]
+            t: Current timestep [B]
+            next_t: Next timestep [B]
+
+        Returns:
+            Updated sample [B, C, H, W]
+        """
         # Get alpha values using proper indexing
         idx_t = self._time_to_index(t)
         idx_next = self._time_to_index(next_t)
@@ -231,49 +250,89 @@ class DPMOT(nn.Module):
         alpha_t = self._gather_alphas(idx_t)
         alpha_next_t = self._gather_alphas(idx_next)
 
-        # Reshape for broadcasting
+        # Reshape for broadcasting: [B] -> [B, 1, 1, 1]
         alpha_t = alpha_t.view(-1, 1, 1, 1)
         alpha_next_t = alpha_next_t.view(-1, 1, 1, 1)
 
-        # First-order DPM-Solver update (correct formula)
-        # x_{t+1} = (alpha_{t+1} / alpha_t) * x_t - alpha_{t+1} * (exp(h) - 1) * noise_pred
-        # where h = lambda_{t+1} - lambda_t and lambda = log(alpha / sqrt(1-alpha))
-        ratio = alpha_next_t / torch.clamp(alpha_t, min=1e-8)
+        # First-order DPM-Solver update
+        ratio = alpha_next_t / torch.clamp(alpha_t, min=_EPS)
 
         # Simplified update for linear schedule
-        x_next = torch.sqrt(ratio) * x - (torch.sqrt(alpha_next_t) - torch.sqrt(alpha_t)) * noise_pred
+        sqrt_ratio = torch.sqrt(torch.clamp(ratio, min=_EPS))
+        sqrt_alpha_t = torch.sqrt(torch.clamp(alpha_t, min=_EPS))
+        sqrt_alpha_next = torch.sqrt(torch.clamp(alpha_next_t, min=_EPS))
+
+        x_next = sqrt_ratio * x - (sqrt_alpha_next - sqrt_alpha_t) * noise_pred
 
         return x_next
 
-    def _dpm_solver_second_order_update(self, x, x_mid, noise_t, noise_mid, t, mid_t, next_t):
-        """Second-order DPM-Solver update using midpoint method."""
+    def _dpm_solver_second_order_update(
+        self,
+        x: torch.Tensor,
+        x_mid: torch.Tensor,
+        noise_t: torch.Tensor,
+        noise_mid: torch.Tensor,
+        t: torch.Tensor,
+        mid_t: torch.Tensor,
+        next_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Second-order DPM-Solver update using midpoint method.
+
+        Args:
+            x: Current sample [B, C, H, W]
+            x_mid: Intermediate sample (unused, kept for API compatibility)
+            noise_t: Noise prediction at t (unused)
+            noise_mid: Noise prediction at midpoint [B, C, H, W]
+            t, mid_t, next_t: Timestep tensors
+
+        Returns:
+            Updated sample [B, C, H, W]
+        """
         # Get alpha values using proper indexing
         idx_t = self._time_to_index(t)
-        idx_mid = self._time_to_index(mid_t)
         idx_next = self._time_to_index(next_t)
 
         alpha_t = self._gather_alphas(idx_t)
-        alpha_mid_t = self._gather_alphas(idx_mid)
         alpha_next_t = self._gather_alphas(idx_next)
 
-        # Reshape for broadcasting
+        # Reshape for broadcasting: [B] -> [B, 1, 1, 1]
         alpha_t = alpha_t.view(-1, 1, 1, 1)
-        alpha_mid_t = alpha_mid_t.view(-1, 1, 1, 1)
         alpha_next_t = alpha_next_t.view(-1, 1, 1, 1)
 
-        # Second-order update (correct formula using linear combination)
-        ratio = alpha_next_t / torch.clamp(alpha_t, min=1e-8)
-
-        # Use midpoint rule for second-order accuracy
-        coef1 = torch.sqrt(ratio)
-        coef2 = torch.sqrt(alpha_next_t) - torch.sqrt(alpha_t)
+        # Second-order update using midpoint rule
+        ratio = alpha_next_t / torch.clamp(alpha_t, min=_EPS)
+        coef1 = torch.sqrt(torch.clamp(ratio, min=_EPS))
+        coef2 = torch.sqrt(torch.clamp(alpha_next_t, min=_EPS)) - torch.sqrt(torch.clamp(alpha_t, min=_EPS))
 
         x_next = coef1 * x - coef2 * noise_mid
 
         return x_next
 
-    def _dpm_solver_third_order_update(self, x, x_mid, x_end, noise_t, noise_mid, noise_end, t, mid_t, next_t):
-        """Third-order DPM-Solver update."""
+    def _dpm_solver_third_order_update(
+        self,
+        x: torch.Tensor,
+        x_mid: torch.Tensor,
+        x_end: torch.Tensor,
+        noise_t: torch.Tensor,
+        noise_mid: torch.Tensor,
+        noise_end: torch.Tensor,
+        t: torch.Tensor,
+        mid_t: torch.Tensor,
+        next_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Third-order DPM-Solver update with improved numerical stability.
+
+        Args:
+            x: Current sample [B, C, H, W]
+            x_mid, x_end: Intermediate samples (unused, kept for API compatibility)
+            noise_t, noise_mid, noise_end: Noise predictions at t, mid_t, next_t
+            t, mid_t, next_t: Timestep tensors
+
+        Returns:
+            Updated sample [B, C, H, W]
+        """
         # Get alpha values using proper indexing
         idx_t = self._time_to_index(t)
         idx_mid = self._time_to_index(mid_t)
@@ -283,37 +342,53 @@ class DPMOT(nn.Module):
         alpha_mid_t = self._gather_alphas(idx_mid)
         alpha_next_t = self._gather_alphas(idx_next)
 
-        # Reshape for broadcasting
+        # Reshape for broadcasting: [B] -> [B, 1, 1, 1]
         alpha_t = alpha_t.view(-1, 1, 1, 1)
         alpha_mid_t = alpha_mid_t.view(-1, 1, 1, 1)
         alpha_next_t = alpha_next_t.view(-1, 1, 1, 1)
 
-        # Third-order update (correct formula using Taylor expansion)
-        ratio = alpha_next_t / torch.clamp(alpha_t, min=1e-8)
+        # Third-order update with improved stability
+        ratio = alpha_next_t / torch.clamp(alpha_t, min=_EPS)
 
         # Compute coefficients for third-order Taylor expansion
-        sqrt_alpha_t = torch.sqrt(alpha_t)
-        sqrt_alpha_mid = torch.sqrt(alpha_mid_t)
-        sqrt_alpha_next = torch.sqrt(alpha_next_t)
+        sqrt_alpha_t = torch.sqrt(torch.clamp(alpha_t, min=_EPS))
+        sqrt_alpha_mid = torch.sqrt(torch.clamp(alpha_mid_t, min=_EPS))
+        sqrt_alpha_next = torch.sqrt(torch.clamp(alpha_next_t, min=_EPS))
 
         # Use weighted combination of noise predictions for higher accuracy
-        h = (sqrt_alpha_next - sqrt_alpha_t)
-        h_mid = (sqrt_alpha_mid - sqrt_alpha_t)
+        h = sqrt_alpha_next - sqrt_alpha_t
+        h_mid = sqrt_alpha_mid - sqrt_alpha_t
 
-        # Third-order coefficients
-        coef_t = h * (h_mid / torch.clamp(h, min=1e-8) - 0.5)
+        # STABILITY FIX: When h is very small (near final steps), fall back to simpler update
+        h_abs = torch.abs(h)
+        use_simplified = h_abs < 1e-6
+
+        # Third-order coefficients with safe division
+        h_safe = torch.where(use_simplified, torch.ones_like(h), h)
+        ratio_mid = h_mid / torch.clamp(h_safe, min=_EPS)
+
+        coef_t = h * (ratio_mid - 0.5)
         coef_mid = h
-        coef_end = h * (1.0 - h_mid / torch.clamp(h, min=1e-8))
+        coef_end = h * (1.0 - ratio_mid)
 
-        x_next = torch.sqrt(ratio) * x - (coef_t * noise_t + coef_mid * noise_mid + coef_end * noise_end) / 3.0
+        # Apply third-order update
+        x_next_full = torch.sqrt(torch.clamp(ratio, min=_EPS)) * x - (
+            coef_t * noise_t + coef_mid * noise_mid + coef_end * noise_end
+        ) / 3.0
+
+        # Simplified first-order fallback for very small steps
+        x_next_simple = torch.sqrt(torch.clamp(ratio, min=_EPS)) * x - h * noise_end
+
+        # Select based on step size
+        x_next = torch.where(use_simplified, x_next_simple, x_next_full)
 
         return x_next
 
-    def _integral_beta(self, t):
-        """Compute integral of beta schedule from 0 to t."""
+    def _integral_beta(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute integral of beta schedule from 0 to t (negative log-alpha)."""
         idx = self._time_to_index(t)
         alphas_cumprod = self._gather_alphas(idx)
-        return -torch.log(torch.clamp(alphas_cumprod, min=1e-8))
+        return -torch.log(torch.clamp(alphas_cumprod, min=_EPS))
 
     def _gather_alphas(self, idx):
         """Safely gather alpha values from schedule using batched indices."""

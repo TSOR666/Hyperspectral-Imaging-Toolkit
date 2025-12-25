@@ -136,39 +136,53 @@ class WaveletRGBEncoder(nn.Module):
         return nn.ModuleList([SpectralAttention(channels) for _ in range(4)])
         
     def forward(self, x):
-        # Apply Haar wavelet transform
+        """
+        Forward pass through WaveletRGBEncoder.
+
+        Args:
+            x: Input RGB tensor [B, 3, H_in, W_in]
+
+        Returns:
+            Latent representation [B, latent_dim, H_in//4, W_in//4]
+        """
+        B = x.shape[0]
+
+        # Apply Haar wavelet transform: [B, 3, H, W] -> [B, 3, 4, H/2, W/2]
         wavelet_coeffs = self.wavelet(x)
-        B, C, _, H, W = wavelet_coeffs.shape
-        
-        # Flatten wavelet coefficients along the channel dimension
-        wavelet_features = wavelet_coeffs.reshape(B, C * 4, H, W)
-        wavelet_features = F.silu(self.wavelet_conv(wavelet_features))
-        
-        # Process original input
+        _, C_wav, _, H_wav, W_wav = wavelet_coeffs.shape  # H_wav = H_in/2, W_wav = W_in/2
+
+        # Flatten wavelet coefficients: [B, 3, 4, H/2, W/2] -> [B, 12, H/2, W/2]
+        wavelet_features = wavelet_coeffs.reshape(B, C_wav * 4, H_wav, W_wav)
+        wavelet_features = F.silu(self.wavelet_conv(wavelet_features))  # -> [B, 32, H/2, W/2]
+
+        # Process original input: [B, 3, H, W] -> [B, 32, H, W]
         spatial_features = F.silu(self.init_conv(x))
-        
+
         # Downsample spatial features to match wavelet resolution
         if spatial_features.shape[2] != wavelet_features.shape[2]:
-            spatial_features = F.avg_pool2d(spatial_features, 2)
-        
-        # Merge features
+            spatial_features = F.avg_pool2d(spatial_features, 2)  # -> [B, 32, H/2, W/2]
+
+        # Merge features: [B, 64, H/2, W/2]
         merged = torch.cat([spatial_features, wavelet_features], dim=1)
-        merged = F.silu(self.merge_conv(merged))
-        
+        merged = F.silu(self.merge_conv(merged))  # -> [B, 64, H/2, W/2]
+
         # First downsampling with wavelet attention
+        # [B, 64, H/2, W/2] -> [B, 64, 4, H/4, W/4]
         wavelet_coeffs1 = self.down1_wavelet(merged)
-        
+        _, C_merged, _, H_wav1, W_wav1 = wavelet_coeffs1.shape  # H_wav1 = H_in/4
+
         # Apply attention to each wavelet component
-        components = [wavelet_coeffs1[:, :, i] for i in range(4)]
+        components = [wavelet_coeffs1[:, :, i] for i in range(4)]  # Each: [B, 64, H/4, W/4]
         for i in range(4):
             components[i] = self.down1_attn[i](components[i])
-        
-        # Recombine wavelet components
+
+        # Recombine wavelet components: [B, 64, 4, H/4, W/4]
         wavelet_coeffs1 = torch.stack(components, dim=2)
-        
+
         # Flatten and proceed with downsampling
-        wavelet_features1 = wavelet_coeffs1.reshape(B, merged.shape[1] * 4, H // 2, W // 2)
-        features = F.silu(self.down1_conv(wavelet_features1))
+        # FIX: Use actual dimensions from wavelet_coeffs1, not halved H/W from initial transform
+        wavelet_features1 = wavelet_coeffs1.reshape(B, C_merged * 4, H_wav1, W_wav1)  # [B, 256, H/4, W/4]
+        features = F.silu(self.down1_conv(wavelet_features1))  # [B, 128, H/4, W/4]
         
         # Second downsampling (conventional)
         features = self.down2(features)

@@ -1,17 +1,21 @@
 
 from __future__ import annotations
-import os, argparse, json
+
+import argparse
+import json
 from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
+from typing import Any, Dict, List
+
 import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
-from typing import Dict, List, Tuple, Any
-from hsi_model.utils import get_cached_cmf, hsi_to_rgb, crop_center_arad1k
+
+from hsi_model.utils import crop_center_arad1k, get_cached_cmf, hsi_to_rgb
 from visualization_utils import compute_mrae_map
 
 class ResultsVisualizer:
-    def __init__(self, results_dir: str, output_dir: str, style: str = "paper", dpi: int = 300):
+    def __init__(self, results_dir: str, output_dir: str, style: str = "paper", dpi: int = 300) -> None:
         self.results_dir = Path(results_dir)
         self.output_dir = Path(output_dir); self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dpi = dpi
@@ -19,7 +23,7 @@ class ResultsVisualizer:
         self.cmf = get_cached_cmf(31, torch.device('cpu'))
         self._cache: Dict[str, Any] = {}
 
-    def _setup_style(self, style: str):
+    def _setup_style(self, style: str) -> None:
         plt.style.use('seaborn-v0_8-paper' if style == "paper" else 'seaborn-v0_8-talk')
         plt.rcParams.update({'font.size': 10 if style == "paper" else 14, 'savefig.dpi': self.dpi, 'savefig.bbox': 'tight'})
 
@@ -36,7 +40,13 @@ class ResultsVisualizer:
         self._cache[sample_name] = data
         return data
 
-    def create_comparison_figure(self, sample_names: List[str], save_name: str = "comparison_figure", show_metrics: bool = True, crop_arad1k_flag: bool = False):
+    def create_comparison_figure(
+        self,
+        sample_names: List[str],
+        save_name: str = "comparison_figure",
+        show_metrics: bool = True,
+        crop_arad1k_flag: bool = False,
+    ) -> None:
         n = min(len(sample_names), 4)
         fig = plt.figure(figsize=(12, 3*n))
         gs = gridspec.GridSpec(n, 4, hspace=0.3, wspace=0.1)
@@ -44,15 +54,19 @@ class ResultsVisualizer:
         for i, name in enumerate(sample_names[:n]):
             d = self.load_sample_data(name)
             if not all(k in d for k in ['pred_hsi','target_hsi']): continue
-            pred = torch.from_numpy(d['pred_hsi']).float().unsqueeze(0) if d['pred_hsi'].ndim==3 else torch.from_numpy(d['pred_hsi']).float()
-            targ = torch.from_numpy(d['target_hsi']).float().unsqueeze(0) if d['target_hsi'].ndim==3 else torch.from_numpy(d['target_hsi']).float()
+            pred = torch.from_numpy(d['pred_hsi']).float()
+            if d['pred_hsi'].ndim == 3:
+                pred = pred.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
+            targ = torch.from_numpy(d['target_hsi']).float()
+            if d['target_hsi'].ndim == 3:
+                targ = targ.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
             if crop_arad1k_flag:
                 pred = crop_center_arad1k(pred); targ = crop_center_arad1k(targ)
-            pred_rgb = hsi_to_rgb(pred, self.cmf).squeeze(0).permute(1,2,0).numpy()
-            targ_rgb = hsi_to_rgb(targ, self.cmf).squeeze(0).permute(1,2,0).numpy()
+            pred_rgb = hsi_to_rgb(pred, self.cmf).squeeze(0).permute(1, 2, 0).numpy()  # (1,3,H,W)->(H,W,3)
+            targ_rgb = hsi_to_rgb(targ, self.cmf).squeeze(0).permute(1, 2, 0).numpy()  # (1,3,H,W)->(H,W,3)
             ax1 = fig.add_subplot(gs[i,0]); ax1.imshow(targ_rgb); ax1.set_title('Ground Truth' if i==0 else ''); ax1.axis('off')
             ax2 = fig.add_subplot(gs[i,1]); ax2.imshow(pred_rgb); ax2.set_title('Prediction' if i==0 else ''); ax2.axis('off')
-            err = compute_mrae_map(pred, targ)
+            err = compute_mrae_map(pred, targ)  # (H,W)
             ax3 = fig.add_subplot(gs[i,2])
             im = ax3.imshow(err, cmap='hot', vmin=0, vmax=0.1)
             ax3.set_title('MRAE' if i==0 else '')
@@ -67,7 +81,7 @@ class ResultsVisualizer:
         out_path = self.output_dir / f"{save_name}.pdf"
         plt.savefig(out_path); plt.savefig(out_path.with_suffix('.png')); plt.close()
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True)
     ap.add_argument("--output", required=True)
