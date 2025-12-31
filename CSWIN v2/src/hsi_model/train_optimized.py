@@ -215,8 +215,13 @@ def setup_seed(seed: int, rank: int = 0) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    # Ensure deterministic behavior
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = False  # Must be False for determinism
+
+    logger.info("Deterministic mode enabled: cudnn.deterministic=True, benchmark=False")
+    logger.warning("Performance may be reduced. To disable: set cudnn.benchmark=True (loses determinism)")
 
 
 def memory_cleanup():
@@ -261,18 +266,19 @@ def validate_mst_style(
         persistent_workers=False  # KEY: Don't keep validation workers alive
     )
     
-    total_losses = {}
+    # Accumulate on GPU to avoid CPU↔GPU thrashing
+    total_gen_loss = torch.tensor(0.0, device=device)
     total_metrics = {}
     num_batches = 0
     use_amp = config.get("mixed_precision", True) and device.type == 'cuda'
-    
+
     with torch.no_grad():  # v2.0: Ensure no gradients during validation
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
             try:
                 rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
-                
+
                 with autocast(enabled=use_amp):
                     if hasattr(model, 'module'):
                         pred_hsi = model.module.generator(rgb_tensor)
@@ -284,29 +290,33 @@ def validate_mst_style(
                         # v2.0: Discriminator calls already under no_grad context
                         disc_real = model.discriminator(rgb_tensor, hsi_tensor)
                         disc_fake = model.discriminator(rgb_tensor, pred_hsi)
-                    
+
                     gen_loss, loss_components = criterion(pred_hsi, hsi_tensor, disc_real, disc_fake)
-                
-                total_losses['gen_loss'] = total_losses.get('gen_loss', 0.0) + gen_loss.item()
-                
+
+                # Accumulate on GPU (no .item() calls inside loop!)
+                total_gen_loss += gen_loss
+
                 metrics = compute_mst_center_crop_metrics(pred_hsi, hsi_tensor)
                 for key, value in metrics.items():
                     if key not in total_metrics:
-                        total_metrics[key] = 0.0
+                        total_metrics[key] = torch.tensor(0.0, device=device)
+                    # Ensure value is a tensor on GPU
+                    if not isinstance(value, torch.Tensor):
+                        value = torch.tensor(value, device=device)
                     total_metrics[key] += value
-                
+
                 num_batches += 1
-                
+
             except Exception as e:
                 logger.warning(f"Validation error: {str(e)}")
                 continue
     
     # DataLoader automatically cleans up workers when it goes out of scope
     del val_loader  # Explicit cleanup
-    
-    # Calculate averages
-    avg_losses = {k: v / max(num_batches, 1) for k, v in total_losses.items()}
-    avg_metrics = {k: v / max(num_batches, 1) for k, v in total_metrics.items()}
+
+    # Single sync at end: transfer accumulated metrics from GPU to CPU
+    avg_losses = {'gen_loss': total_gen_loss.item() / max(num_batches, 1)}
+    avg_metrics = {k: v.item() / max(num_batches, 1) for k, v in total_metrics.items()}
     all_metrics = {**avg_losses, **avg_metrics}
     
     logger.info(
@@ -372,10 +382,12 @@ def train_mst_gan_optimized(
     report_memory("Before creating DataLoader")
     
     # Create single training DataLoader
+    # Use consistent seed across sampler and workers for determinism
+    seed_base = seed + rank * 1000  # Unique per rank
     train_sampler = None
     if distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
-    
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed_base)
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -384,7 +396,7 @@ def train_mst_gan_optimized(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=lambda w: worker_init_fn_mst(w, seed_base, rank),
         persistent_workers=(num_workers > 0)
     )
     
@@ -445,8 +457,16 @@ def train_mst_gan_optimized(
                     )
                 
                 scaler_g.scale(gen_loss).backward()
+                # Detect gradient overflow in generator
+                old_scale_g = scaler_g.get_scale()
                 scaler_g.step(optimizer_g)
                 scaler_g.update()
+                new_scale_g = scaler_g.get_scale()
+                if new_scale_g < old_scale_g:
+                    logger.warning(
+                        f"Generator scaler reduced scale {old_scale_g:.1f} → {new_scale_g:.1f} "
+                        f"(overflow detected at iter {iteration})"
+                    )
             
             # ========== Train Discriminator (v3.0 OPTIMIZED) ==========
             optimizer_d.zero_grad()
@@ -474,8 +494,16 @@ def train_mst_gan_optimized(
                     disc_loss = (real_loss + fake_loss) * 0.5
                 
                 scaler_d.scale(disc_loss).backward()
+                # Detect gradient overflow in discriminator
+                old_scale_d = scaler_d.get_scale()
                 scaler_d.step(optimizer_d)
                 scaler_d.update()
+                new_scale_d = scaler_d.get_scale()
+                if new_scale_d < old_scale_d:
+                    logger.warning(
+                        f"Discriminator scaler reduced scale {old_scale_d:.1f} → {new_scale_d:.1f} "
+                        f"(overflow detected at iter {iteration})"
+                    )
             
             scheduler_g.step()
             scheduler_d.step()

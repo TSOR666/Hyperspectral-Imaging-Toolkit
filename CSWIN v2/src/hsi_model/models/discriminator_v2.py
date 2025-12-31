@@ -335,7 +335,15 @@ class SNTransformerDiscriminator(nn.Module):
         
         # Output projection
         output = self.output_proj(x)  # (B, 1, H', W')
-        
+
+        # Validate output spatial dimensions
+        if output.shape[2] < 1 or output.shape[3] < 1:
+            raise ValueError(
+                f"Discriminator output too small: {output.shape}. "
+                f"Increase input size or reduce downsampling. "
+                f"Input shape was: rgb={rgb.shape}, hsi={hsi.shape}"
+            )
+
         # Final clamp to prevent extreme values
         output = torch.clamp(output, -10, 10)
         

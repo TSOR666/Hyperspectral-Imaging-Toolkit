@@ -258,12 +258,14 @@ class CSWinAttentionBlock(nn.Module):
             # (B*hw*s, H, seq, d) @ (B*hw*s, H, d, seq) -> (B*hw*s, H, seq, seq)
             attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
             attn_h = attn_h + bias.unsqueeze(0).to(attn_h.dtype)
-            # Cast to fp32 and stabilize softmax to prevent overflow
-            attn_h = attn_h.float()
-            attn_h = attn_h - attn_h.amax(dim=-1, keepdim=True)
-            attn_h = F.softmax(attn_h, dim=-1)
-            attn_h = attn_h.to(q_h.dtype)  # Cast back to compute dtype
-            out_h = attn_h @ v_h
+            # KEEP in fp32 for softmax and matmul to prevent overflow with fp16
+            attn_h_fp32 = attn_h.float()
+            attn_h_fp32 = attn_h_fp32 - attn_h_fp32.amax(dim=-1, keepdim=True)
+            attn_h_fp32 = F.softmax(attn_h_fp32, dim=-1)
+            # Keep matmul in fp32 for numerical stability
+            out_h_fp32 = attn_h_fp32 @ v_h.float()
+            # Only cast final output back to original dtype
+            out_h = out_h_fp32.to(q_h.dtype)
         
         # Reshape back to original format
         out_h = rearrange(
@@ -350,12 +352,14 @@ class CSWinAttentionBlock(nn.Module):
             # (B*ww*s, H, seq, d) @ (B*ww*s, H, d, seq) -> (B*ww*s, H, seq, seq)
             attn_v = (q_v @ k_v.transpose(-2, -1)) * self.scale
             attn_v = attn_v + bias.unsqueeze(0).to(attn_v.dtype)
-            # Cast to fp32 and stabilize softmax to prevent overflow
-            attn_v = attn_v.float()
-            attn_v = attn_v - attn_v.amax(dim=-1, keepdim=True)
-            attn_v = F.softmax(attn_v, dim=-1)
-            attn_v = attn_v.to(q_v.dtype)  # Cast back to compute dtype
-            out_v = attn_v @ v_v
+            # KEEP in fp32 for softmax and matmul to prevent overflow with fp16
+            attn_v_fp32 = attn_v.float()
+            attn_v_fp32 = attn_v_fp32 - attn_v_fp32.amax(dim=-1, keepdim=True)
+            attn_v_fp32 = F.softmax(attn_v_fp32, dim=-1)
+            # Keep matmul in fp32 for numerical stability
+            out_v_fp32 = attn_v_fp32 @ v_v.float()
+            # Only cast final output back to original dtype
+            out_v = out_v_fp32.to(q_v.dtype)
         
         # Reshape back to original format
         out_v = rearrange(
@@ -376,14 +380,21 @@ class CSWinAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Perform cross-shaped window attention.
-        
+
         Args:
             x: Input tensor of shape (B, C, H, W)
-            
+
         Returns:
             Attention-processed tensor of shape (B, C, H, W)
         """
+        # Runtime assertions for input validation
+        if x.ndim != 4:
+            raise ValueError(f"Expected 4D input (B,C,H,W), got {x.ndim}D: {x.shape}")
+
         B, C, H, W = x.shape
+
+        if C != self.dim:
+            raise ValueError(f"Channel mismatch: expected {self.dim}, got {C}")
         
         # Pad input if needed to make it divisible by split_size
         pad_h = (self.split_size - H % self.split_size) % self.split_size

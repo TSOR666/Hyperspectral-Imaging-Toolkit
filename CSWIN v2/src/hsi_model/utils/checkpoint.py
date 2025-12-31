@@ -148,7 +148,9 @@ def load_checkpoint(
         return model, {}
     
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # SECURITY: Use weights_only=True to prevent arbitrary code execution from malicious checkpoints
+        # This prevents pickle exploits when loading untrusted checkpoint files
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         
         # Handle DDP module prefix mismatch
         is_model_ddp = isinstance(model, DDP)
