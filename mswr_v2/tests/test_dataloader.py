@@ -303,7 +303,7 @@ class TestRGBNormalizationEdgeCases:
         # Create image with tiny variance
         base_value = 200
         image = np.full((100, 100, 3), base_value, dtype=np.float32)
-        image += np.random.uniform(-0.0001, 0.0001, image.shape).astype(np.float32)
+        image += np.random.uniform(-1e-8, 1e-8, image.shape).astype(np.float32)
 
         denom = image.max() - image.min()
         assert denom < 1e-6, "Test setup: image should have near-zero variance"
