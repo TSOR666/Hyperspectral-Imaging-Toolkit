@@ -636,7 +636,11 @@ class OptimizedWindowAttention2D(nn.Module):
             H_pad, W_pad = H + pad_h, W + pad_w
         else:
             H_pad, W_pad = H, W
-        
+
+        # SHAPE VALIDATION: Ensure padding produced divisible dimensions
+        assert (H_pad % self.window_size == 0) and (W_pad % self.window_size == 0), \
+            f"Padding failed: {H_pad}x{W_pad} not divisible by window_size={self.window_size}"
+
         # Optimized QKV generation
         if use_linear:
             x_flat = x.permute(0, 2, 3, 1).reshape(B * H_pad * W_pad, C)  # (B, C, H_pad, W_pad) -> (B*H_pad*W_pad, C)
@@ -669,18 +673,27 @@ class OptimizedWindowAttention2D(nn.Module):
             )  # (B*nh*nw, Heads, N, D)
         else:
             # Manual attention with relative position bias
-            attn = (q.float() @ k.float().transpose(-2, -1)) * self.scale  # (B*nh*nw, Heads, N, D) @ (B*nh*nw, Heads, D, N) -> (B*nh*nw, Heads, N, N)
-            
+            # NUMERICAL STABILITY FIX: Always compute attention in float32 to avoid NaN in fp16/bf16
+            q_fp32 = q.float()
+            k_fp32 = k.float()
+            v_fp32 = v.float()
+
+            attn = (q_fp32 @ k_fp32.transpose(-2, -1)) * self.scale  # (B*nh*nw, Heads, N, D) @ (B*nh*nw, Heads, D, N) -> (B*nh*nw, Heads, N, N)
+
             # Add relative position bias
             relative_position_bias = self.relative_position_bias_table[
                 self.relative_position_index.view(-1)
             ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)  # (N, N, Heads)
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # (Heads, N, N)
-            attn = attn + relative_position_bias.unsqueeze(0)  # (1, Heads, N, N) broadcast across batch
-            
+            attn = attn + relative_position_bias.unsqueeze(0).float()  # (1, Heads, N, N) broadcast across batch
+
+            # NUMERICAL STABILITY FIX: Clamp attention scores to prevent overflow before softmax
+            # This prevents NaN when attention scores become extremely large in low-precision modes
+            attn = torch.clamp(attn, min=-65504.0, max=65504.0)  # fp16 max value
+
             attn = F.softmax(attn, dim=-1)  # (B*nh*nw, Heads, N, N), softmax over last dim
             attn = self.dropout(attn)
-            attn_out = attn @ v.float()  # (B*nh*nw, Heads, N, N) @ (B*nh*nw, Heads, N, D) -> (B*nh*nw, Heads, N, D)
+            attn_out = attn @ v_fp32  # (B*nh*nw, Heads, N, N) @ (B*nh*nw, Heads, N, D) -> (B*nh*nw, Heads, N, D)
             attn_out = attn_out.to(dtype=v.dtype)
         
         # Efficient reverse window partitioning

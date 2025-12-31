@@ -90,8 +90,13 @@ def _load_rgb_image(path: Path, *, bgr2rgb: bool) -> np.ndarray:
     image = image.astype(np.float32)
     denom = image.max() - image.min()
     if denom < 1e-6:
-        # Extremely rare but guard against flat images to avoid NaNs.
-        image.fill(0.0)
+        # EDGE CASE FIX: Preserve mean intensity for flat/constant-value images
+        # instead of zeroing, which loses all information and breaks reconstruction
+        # for calibration targets or uniform regions
+        mean_val = image.mean()
+        # Normalize mean to [0, 1] range (assuming 0-255 input range)
+        normalized_mean = np.clip(mean_val / 255.0, 0.0, 1.0)
+        image = np.full_like(image, normalized_mean)
     else:
         image = (image - image.min()) / denom
     image = np.transpose(image, (2, 0, 1))  # -> (channels, height, width)

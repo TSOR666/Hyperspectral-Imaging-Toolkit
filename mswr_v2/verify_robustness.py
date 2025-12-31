@@ -356,7 +356,8 @@ class RobustnessVerifier:
             model_new = create_mswr_tiny().to(self.device)
             optimizer_new = torch.optim.Adam(model_new.parameters(), lr=1e-4)
 
-            loaded_checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
+            loaded_checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
             model_new.load_state_dict(loaded_checkpoint['state_dict'])
             optimizer_new.load_state_dict(loaded_checkpoint['optimizer'])
 

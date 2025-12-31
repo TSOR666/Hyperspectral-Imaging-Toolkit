@@ -345,7 +345,8 @@ class TrainingConfig:
         self.num_workers = args.num_workers
         self.pin_memory = args.pin_memory
         self.seed = args.seed
-        
+        self.deterministic = getattr(args, 'deterministic', False)
+
         # Optimization parameters
         self.optimizer = args.optimizer
         self.scheduler = args.scheduler
@@ -445,7 +446,9 @@ def parse_arguments():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", action='store_true', default=True)
     parser.add_argument("--seed", type=int, default=42)
-    
+    parser.add_argument("--deterministic", action='store_true', default=False,
+                       help="Enable deterministic mode for reproducibility (slower but fully reproducible)")
+
     # Enhanced features
     parser.add_argument("--early_stopping_patience", type=int, default=50)
     parser.add_argument("--early_stopping_mode", type=str, default='off',
@@ -539,12 +542,22 @@ def setup_environment(config: TrainingConfig):
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
     
-    # Enhanced CUDA settings
+    # Enhanced CUDA settings with optional deterministic mode
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        if config.deterministic:
+            # REPRODUCIBILITY: Enable deterministic mode (slower but fully reproducible)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            # Note: TF32 is non-deterministic, so disable it in deterministic mode
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        else:
+            # PERFORMANCE: Enable optimizations for speed (non-deterministic)
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
     
     # Create directories
     log_dir = os.path.join(config.log_base, config.run_timestamp)
@@ -1020,6 +1033,15 @@ class EnhancedTrainer:
                 return {"prefetch_factor": max(2, getattr(self.config, "prefetch_factor", 2))}
             return {}
 
+        # REPRODUCIBILITY FIX: Worker init function to ensure reproducible augmentations
+        # Each worker gets a deterministic seed based on the main seed + worker_id
+        def worker_init_fn(worker_id: int):
+            worker_seed = self.config.seed + worker_id
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+            # Also set torch seed for any torch random operations in workers
+            torch.manual_seed(worker_seed)
+
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.batch_size,
@@ -1028,10 +1050,11 @@ class EnhancedTrainer:
             pin_memory=self.config.pin_memory,
             drop_last=True,
             persistent_workers=True if self.config.num_workers > 0 else False,
+            worker_init_fn=worker_init_fn,
             **_prefetch_kwargs(self.config.num_workers),
             **pin_memory_kwargs,
         )
-        
+
         # Validation loader with fixed persistent_workers handling
         val_num_workers = min(self.config.num_workers, 2)
         self.val_loader = DataLoader(
@@ -1041,6 +1064,7 @@ class EnhancedTrainer:
             num_workers=val_num_workers,
             pin_memory=self.config.pin_memory,
             persistent_workers=True if val_num_workers > 0 else False,
+            worker_init_fn=worker_init_fn,
             **_prefetch_kwargs(val_num_workers),
             **pin_memory_kwargs,
         )
@@ -1114,7 +1138,8 @@ class EnhancedTrainer:
         
         try:
             self.logger.info(f"Loading checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
             
             # Load model state
             if isinstance(self.model, nn.DataParallel):

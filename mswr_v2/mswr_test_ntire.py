@@ -165,8 +165,9 @@ class MetricsCalculator:
             sigma2_sq = F.avg_pool2d(target_band * target_band, 11, 1, 5) - mu2_sq
             sigma12 = F.avg_pool2d(pred_band * target_band, 11, 1, 5) - mu1_mu2
 
-            # Clamp variances to avoid negative values due to floating-point precision
-            eps = 1e-8
+            # NUMERICAL STABILITY FIX: Use dtype-aware epsilon to handle fp16 underflow
+            # In fp16 mode, eps=1e-8 is too small and can cause underflow
+            eps = torch.finfo(pred.dtype).eps * 10  # Safety margin for the dtype
             sigma1_sq = torch.clamp(sigma1_sq, min=eps)
             sigma2_sq = torch.clamp(sigma2_sq, min=eps)
 
@@ -770,7 +771,8 @@ class NTIRETestEngine:
         logger.info(f"Loading model from: {self.config.model_path}")
         
         # Load checkpoint
-        checkpoint = torch.load(self.config.model_path, map_location='cpu')
+        # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
+        checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
         
         # Create model
         if 'model_config' in checkpoint:
