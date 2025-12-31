@@ -243,18 +243,18 @@ class TestWaveletGradients:
     def test_wavelet_forward_gradient(self):
         """Test that forward wavelet transform has proper gradients."""
         # Use double precision for numerical gradient checking
-        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2', in_channels=3).double()
+        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2').double()
         dwt.eval()  # Disable dropout etc.
 
         # Small input for gradient check
         x = torch.randn(1, 3, 16, 16, dtype=torch.double, requires_grad=True)
 
         # Test forward pass produces gradients
-        outputs = dwt(x)
-        ll, lh, hl, hh = outputs
+        # Returns (yl, yh) where yh is a list of high-freq tensors with shape (B, C, 3, H, W)
+        yl, yh = dwt(x)
 
         # Test that all outputs can backprop
-        loss = ll.sum() + lh.sum() + hl.sum() + hh.sum()
+        loss = yl.sum() + sum(h.sum() for h in yh)
         loss.backward()
 
         assert x.grad is not None, "No gradient computed for input"
@@ -264,39 +264,37 @@ class TestWaveletGradients:
     def test_inverse_wavelet_gradient(self):
         """Test that inverse wavelet transform has proper gradients."""
         # Use double precision for numerical gradient checking
-        idwt = OptimizedCNNInverseWaveletTransform(wave='db2', in_channels=3).double()
+        idwt = OptimizedCNNInverseWaveletTransform(wave='db2').double()
         idwt.eval()
 
         # Create wavelet coefficients as input
-        # For J=1, we have LL (low-low) and 3 high-freq subbands (LH, HL, HH)
-        ll = torch.randn(1, 3, 8, 8, dtype=torch.double, requires_grad=True)
-        lh = torch.randn(1, 3, 8, 8, dtype=torch.double, requires_grad=True)
-        hl = torch.randn(1, 3, 8, 8, dtype=torch.double, requires_grad=True)
-        hh = torch.randn(1, 3, 8, 8, dtype=torch.double, requires_grad=True)
+        # For J=1, we have yl (low-freq) and yh list with one tensor of shape (B, C, 3, H, W)
+        yl = torch.randn(1, 3, 8, 8, dtype=torch.double, requires_grad=True)
+        # yh is a list of tensors with shape (B, C, 3, H/2^j, W/2^j) for each level
+        yh = [torch.randn(1, 3, 3, 8, 8, dtype=torch.double, requires_grad=True)]
 
-        # Forward pass through inverse wavelet
-        output = idwt(ll, lh, hl, hh)
+        # Forward pass through inverse wavelet - takes a tuple (yl, yh)
+        output = idwt((yl, yh))
 
         # Backprop
         loss = output.sum()
         loss.backward()
 
         # Check all inputs received gradients
-        assert ll.grad is not None, "No gradient for LL coefficient"
-        assert lh.grad is not None, "No gradient for LH coefficient"
-        assert hl.grad is not None, "No gradient for HL coefficient"
-        assert hh.grad is not None, "No gradient for HH coefficient"
+        assert yl.grad is not None, "No gradient for yl coefficient"
+        assert yh[0].grad is not None, "No gradient for yh coefficient"
 
         # Check no NaN/Inf
-        for name, tensor in [('LL', ll), ('LH', lh), ('HL', hl), ('HH', hh)]:
-            assert not torch.isnan(tensor.grad).any(), f"NaN in {name} gradient"
-            assert not torch.isinf(tensor.grad).any(), f"Inf in {name} gradient"
+        assert not torch.isnan(yl.grad).any(), "NaN in yl gradient"
+        assert not torch.isinf(yl.grad).any(), "Inf in yl gradient"
+        assert not torch.isnan(yh[0].grad).any(), "NaN in yh gradient"
+        assert not torch.isinf(yh[0].grad).any(), "Inf in yh gradient"
 
     def test_wavelet_roundtrip_gradient(self):
         """Test gradient flow through forward-inverse wavelet roundtrip."""
         # Create both transforms
-        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2', in_channels=3).double()
-        idwt = OptimizedCNNInverseWaveletTransform(wave='db2', in_channels=3).double()
+        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2').double()
+        idwt = OptimizedCNNInverseWaveletTransform(wave='db2').double()
 
         dwt.eval()
         idwt.eval()
@@ -304,11 +302,11 @@ class TestWaveletGradients:
         # Input
         x = torch.randn(1, 3, 16, 16, dtype=torch.double, requires_grad=True)
 
-        # Forward through DWT
-        ll, lh, hl, hh = dwt(x)
+        # Forward through DWT - returns (yl, yh)
+        coeffs = dwt(x)
 
-        # Inverse back to spatial
-        reconstructed = idwt(ll, lh, hl, hh)
+        # Inverse back to spatial - takes tuple (yl, yh)
+        reconstructed = idwt(coeffs)
 
         # Reconstruction loss
         loss = torch.nn.functional.mse_loss(reconstructed, x)
@@ -323,7 +321,7 @@ class TestWaveletGradients:
         This is a more rigorous test using torch.autograd.gradcheck.
         """
         # Create wavelet transform with small channels for faster testing
-        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2', in_channels=2).double()
+        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2').double()
         dwt.eval()
 
         # Very small input for numerical gradient check (gradcheck is slow)
@@ -331,8 +329,8 @@ class TestWaveletGradients:
 
         # Define a simple function that returns a scalar (sum of all outputs)
         def wavelet_scalar_output(inp):
-            ll, lh, hl, hh = dwt(inp)
-            return ll.sum() + lh.sum() + hl.sum() + hh.sum()
+            yl, yh = dwt(inp)
+            return yl.sum() + sum(h.sum() for h in yh)
 
         # Run numerical gradient check
         # Note: Using smaller eps and atol for robustness
@@ -345,22 +343,22 @@ class TestWaveletGradients:
 
     def test_wavelet_different_sizes(self):
         """Test wavelet transforms work with various input sizes."""
-        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2', in_channels=3)
-        idwt = OptimizedCNNInverseWaveletTransform(wave='db2', in_channels=3)
+        dwt = OptimizedCNNWaveletTransform(J=1, wave='db2')
+        idwt = OptimizedCNNInverseWaveletTransform(wave='db2')
 
         # Test various sizes (must be even for DWT)
         sizes = [(16, 16), (32, 32), (64, 64), (32, 48)]
 
         for h, w in sizes:
             x = torch.randn(1, 3, h, w, requires_grad=True)
-            ll, lh, hl, hh = dwt(x)
+            yl, yh = dwt(x)
 
             # Check output shapes (should be half size)
             expected_h, expected_w = h // 2, w // 2
-            assert ll.shape == (1, 3, expected_h, expected_w), f"Wrong LL shape for {h}x{w}"
+            assert yl.shape == (1, 3, expected_h, expected_w), f"Wrong yl shape for {h}x{w}"
 
             # Test backward
-            loss = ll.sum()
+            loss = yl.sum()
             loss.backward()
             assert x.grad is not None, f"No gradient for size {h}x{w}"
 
