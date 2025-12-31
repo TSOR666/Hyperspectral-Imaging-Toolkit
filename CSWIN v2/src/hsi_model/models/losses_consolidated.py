@@ -183,19 +183,29 @@ class SinkhornDivergence(nn.Module):
             C = C.float()
         K = torch.exp(-C / self.epsilon)  # (n, m)
 
+        # Validate point cloud sizes
+        if n <= 0 or m <= 0:
+            raise ValueError(f"Empty point clouds: X has {n} points, Y has {m} points")
+
+        # Create uniform distributions
         a = torch.full((n,), 1.0 / n, device=device, dtype=C.dtype)
         b = torch.full((m,), 1.0 / m, device=device, dtype=C.dtype)
+
+        # Validate probability distributions sum to 1
+        assert abs(a.sum().item() - 1.0) < 1e-6, f"Invalid distribution a: sum={a.sum().item()}"
+        assert abs(b.sum().item() - 1.0) < 1e-6, f"Invalid distribution b: sum={b.sum().item()}"
 
         u = torch.ones_like(a)
         v = torch.ones_like(b)
 
-        # Sinkhorn iterations
+        # Sinkhorn iterations with stabilization to prevent division by zero
         eps_stab = max(self.eps_stab, 1e-6)
         for _ in range(self.n_iters):
             Kv = K @ v + eps_stab
-            u = a / Kv
+            # Use torch.where and clamp to prevent division by zero/near-zero values
+            u = torch.where(Kv.abs() < eps_stab, a, a / torch.clamp(Kv, min=eps_stab))
             Ktu = K.transpose(0, 1) @ u + eps_stab
-            v = b / Ktu
+            v = torch.where(Ktu.abs() < eps_stab, b, b / torch.clamp(Ktu, min=eps_stab))
 
         # Transport plan π = diag(u) K diag(v)
         pi = (u[:, None] * K) * v[None, :]
@@ -531,19 +541,25 @@ class NoiseRobustLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute combined loss.
-        
+
         Args:
             pred: Predicted HSI (B, C, H, W)
             target: Ground truth HSI (B, C, H, W)
             disc_real: Discriminator output for real data (optional)
             disc_fake: Discriminator output for fake data (optional)
             current_iteration: Current training iteration for adaptive weighting
-            
+
         Returns:
             Tuple of (total_loss, loss_components_dict)
         """
+        # Validate dtype and device consistency
+        if pred.dtype != target.dtype:
+            raise TypeError(f"Dtype mismatch: pred={pred.dtype}, target={target.dtype}")
+        if pred.device != target.device:
+            raise RuntimeError(f"Device mismatch: pred={pred.device}, target={target.device}")
+
         loss_components = {}
-        
+
         # Check inputs for NaN
         if torch.isnan(pred).any() or torch.isnan(target).any():
             logger.error("NaN detected in loss inputs!")
@@ -628,8 +644,9 @@ class ComputeSinkhornDiscriminatorLoss(nn.Module):
         try:
             sinkhorn_terms = []
             for b in range(real_pred.shape[0]):
-                R = real_pred[b].view(-1, 1).detach()
-                Fk = fake_pred[b].view(-1, 1).detach()
+                # Use reshape() instead of view() to handle non-contiguous tensors safely
+                R = real_pred[b].reshape(-1, 1).detach()
+                Fk = fake_pred[b].reshape(-1, 1).detach()
 
                 # Normalize for stability
                 R = torch.nan_to_num(F.normalize(R, dim=0), nan=0.0, posinf=0.0, neginf=0.0)

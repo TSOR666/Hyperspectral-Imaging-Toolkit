@@ -52,15 +52,24 @@ class NaNSafeAttention(nn.Module):
 
         # Check for NaN/Inf
         if torch.isnan(out).any() or torch.isinf(out).any():
-            # Log this event (rate-limited)
             self.nan_count += 1
+
+            # In training mode, fail fast to prevent gradient deadzone
+            if self.training:
+                raise RuntimeError(
+                    f"NaN/Inf in attention (occurrence {self.nan_count}). "
+                    f"This indicates numerical instability. "
+                    f"Consider reducing learning rate or checking inputs. "
+                    f"Input range: [{x.min():.4f}, {x.max():.4f}]"
+                )
+
+            # In inference mode, fallback to input and warn
             if self.nan_count % 100 == 1:  # Log every 100 occurrences
                 import warnings
                 warnings.warn(
-                    f"NaN/Inf detected in attention output (occurrence {self.nan_count}). "
+                    f"NaN/Inf detected in attention output during inference (occurrence {self.nan_count}). "
                     f"Falling back to skip connection."
                 )
-            # Fallback to input (no clone needed - x hasn't been modified)
             return x
 
         return out
@@ -396,8 +405,11 @@ class NoiseRobustCSWinGenerator(nn.Module):
         # Decoder with skip connections
         x = self.up1(x)
         if x.shape[2:] != e2.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
             if e2.shape[2] < 1 or e2.shape[3] < 1:
-                raise ValueError("Invalid spatial size for encoder stage e2")
+                raise ValueError(f"Invalid spatial size for encoder stage e2: {e2.shape}")
             x = F.interpolate(x, size=e2.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, e2], dim=1)
         x = self.decoder1(x)
@@ -405,8 +417,11 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
         x = self.up2(x)
         if x.shape[2:] != e1.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
             if e1.shape[2] < 1 or e1.shape[3] < 1:
-                raise ValueError("Invalid spatial size for encoder stage e1")
+                raise ValueError(f"Invalid spatial size for encoder stage e1: {e1.shape}")
             x = F.interpolate(x, size=e1.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, e1], dim=1)
         x = self.compressor2(x)  # Apply before decoder2
@@ -414,8 +429,11 @@ class NoiseRobustCSWinGenerator(nn.Module):
         
         # Handle dynamic spatial dimensions for residual connection
         if x.shape[2:] != emb.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
             if emb.shape[2] < 1 or emb.shape[3] < 1:
-                raise ValueError("Invalid spatial size for embedding residual")
+                raise ValueError(f"Invalid spatial size for embedding residual: {emb.shape}")
             x = F.interpolate(x, size=emb.shape[2:], mode='bilinear', align_corners=False)
         
         # Output with residual connection
