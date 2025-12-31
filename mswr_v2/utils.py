@@ -60,7 +60,8 @@ class Loss_MRAE(nn.Module):
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
         assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        assert outputs.dtype == label.dtype, f"Dtype mismatch: {outputs.dtype} != {label.dtype}"
+        if outputs.dtype != label.dtype:
+            label = label.to(outputs.dtype)
 
         # Use torch.maximum to ensure minimum denominator (handles all-zero or near-zero labels)
         # This avoids division by zero when label values are exactly -1e-8 or very small
@@ -81,7 +82,8 @@ class Loss_RMSE(nn.Module):
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
         assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        assert outputs.dtype == label.dtype, f"Dtype mismatch: {outputs.dtype} != {label.dtype}"
+        if outputs.dtype != label.dtype:
+            label = label.to(outputs.dtype)
 
         error = outputs - label
         sqrt_error = torch.pow(error, 2)
@@ -131,7 +133,8 @@ class Loss_SAM(nn.Module):
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
         assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        assert outputs.dtype == label.dtype, f"Dtype mismatch: {outputs.dtype} != {label.dtype}"
+        if outputs.dtype != label.dtype:
+            label = label.to(outputs.dtype)
 
         # Reshape to (batch*height*width, channels)
         B, C, H, W = outputs.shape
