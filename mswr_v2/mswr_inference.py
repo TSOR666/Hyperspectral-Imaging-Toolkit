@@ -218,6 +218,13 @@ class TiledProcessor:
     
     def merge_tiles(self, tiles: List[np.ndarray], metadata: Dict) -> np.ndarray:
         """Merge tiles back with overlap blending"""
+        # VALIDATION: Ensure tiles list matches expected count from metadata
+        expected_tiles = len(metadata['positions'])
+        actual_tiles = len(tiles)
+        assert actual_tiles == expected_tiles, \
+            f"Tile count mismatch: got {actual_tiles} tiles but expected {expected_tiles} positions. " \
+            f"This may indicate tile processing failed mid-stream."
+
         H, W = metadata['original_shape']
 
         # Always use float32 for accumulation to avoid precision issues
@@ -254,10 +261,11 @@ class TiledProcessor:
                     output[y:y_end, x:x_end] += tile_f32[:tile_h, :tile_w, None] * blend_weights[:tile_h, :tile_w, None]
                 weights[y:y_end, x:x_end] += blend_weights[:tile_h, :tile_w, None]
 
-        # Normalize by weights with a reasonable minimum to avoid spikes
-        # Use a minimum weight of 0.1 to prevent extreme values at corners
-        min_weight = 0.1
-        output = output / np.maximum(weights, min_weight)
+        # NUMERICAL STABILITY FIX: Use proper normalization with small epsilon
+        # instead of arbitrary min_weight of 0.1 which is not mathematically justified
+        # This ensures proper weighted averaging without introducing artifacts
+        weights_safe = np.maximum(weights, 1e-8)
+        output = output / weights_safe
 
         return output
     
@@ -406,7 +414,8 @@ class MSWRInference:
         logger.info(f"Loading model from: {self.config.model_path}")
         
         # Load checkpoint
-        checkpoint = torch.load(self.config.model_path, map_location='cpu')
+        # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
+        checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
         
         # Extract model configuration if available
         if 'model_config' in checkpoint:
