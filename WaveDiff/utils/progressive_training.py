@@ -2,9 +2,8 @@
 Progressive training strategies for improved generalization
 Implements curriculum learning and progressive difficulty scheduling
 """
-import torch
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 
 class ProgressiveTrainingScheduler:

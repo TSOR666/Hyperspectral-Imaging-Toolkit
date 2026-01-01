@@ -1,12 +1,9 @@
 import os
 import torch
-import torch.nn.functional as F
 import numpy as np
 import argparse
-import json
 from tqdm import tqdm
 from PIL import Image
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Import model implementations
@@ -19,8 +16,7 @@ from utils.spectral_utils import (
     spectral_angular_mapper,
     root_mean_square_error,
     peak_signal_to_noise_ratio,
-    mean_relative_absolute_error,
-    calculate_metrics
+    mean_relative_absolute_error
 )
 
 # Import visualization utilities
@@ -117,27 +113,29 @@ def load_model(checkpoint_path, device, model_type=None):
 def preprocess_image(image_path, image_size=256):
     """
     Preprocess an image for inference
-    
+
     Args:
         image_path: Path to image file
         image_size: Size to resize image to
-        
+
     Returns:
         Preprocessed image tensor
     """
     from torchvision import transforms
-    
+
     # Define transforms
     transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    
+
     # Load and transform image
     image = Image.open(image_path).convert('RGB')
-    image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
-    
+    # transform() returns a Tensor after ToTensor() is applied
+    image_tensor: torch.Tensor = transform(image)  # type: ignore[assignment]
+    image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
+
     return image_tensor
 
 
@@ -385,9 +383,6 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
         apply_adaptive_threshold: Whether to apply adaptive thresholding (for adaptive models)
         batch_size: Batch size for processing (currently only supports batch_size=1)
     """
-    from torchvision import transforms
-    from PIL import Image
-    
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
@@ -404,14 +399,7 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
         return
     
     print(f"Found {len(image_files)} images to process")
-    
-    # Define transforms
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    
+
     # Create results file for metrics
     results_file = os.path.join(output_dir, "metrics.txt")
     results_summary = {}

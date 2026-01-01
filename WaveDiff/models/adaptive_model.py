@@ -1,7 +1,6 @@
+from __future__ import annotations
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
 from models.wavelet_model import WaveletHSILatentDiffusionModel
 from modules.denoisers import ThresholdingWaveletUNetDenoiser
@@ -101,17 +100,25 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         
         return losses
     
-    def rgb_to_hsi(self, rgb, sampling_steps=None, apply_adaptive_threshold=True, return_stages=False):
+    def rgb_to_hsi(
+        self,
+        rgb,
+        sampling_steps=None,
+        return_stages=False,
+        *,
+        apply_adaptive_threshold: bool = True,
+    ):
         """
         Convert RGB to HSI with enhanced adaptive thresholding
 
         Args:
             rgb: RGB image tensor [B, 3, H, W]
             sampling_steps: Optional reduced number of sampling steps
-            apply_adaptive_threshold: Whether to apply adaptive thresholding to the output
+            return_stages: Whether to return intermediate stages
+            apply_adaptive_threshold: Whether to apply adaptive thresholding to the output (keyword-only)
 
         Returns:
-            HSI image tensor [B, C, H, W]
+            HSI image tensor [B, C, H, W] or tuple of (HSI, stages dict)
         """
         # Encode RGB to latent space
         latent = self.encode(rgb)

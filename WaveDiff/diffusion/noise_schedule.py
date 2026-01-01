@@ -11,6 +11,18 @@ from transforms.haar_wavelet import HaarWaveletTransform
 class BaseNoiseSchedule(nn.Module):
     """Base class for diffusion noise schedules with useful cached statistics."""
 
+    # Explicit buffer type annotations for pyright
+    betas: torch.Tensor
+    alphas: torch.Tensor
+    alphas_cumprod: torch.Tensor
+    alphas_cumprod_prev: torch.Tensor
+    sqrt_alphas_cumprod: torch.Tensor
+    sqrt_one_minus_alphas_cumprod: torch.Tensor
+    sqrt_recip_alphas: torch.Tensor
+    sqrt_recipm1_alphas: torch.Tensor
+    posterior_variance: torch.Tensor
+    posterior_log_variance: torch.Tensor
+
     def __init__(self, timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
         super().__init__()
         self.timesteps = timesteps

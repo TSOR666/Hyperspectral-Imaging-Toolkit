@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 import os
 
 def visualize_rgb_hsi(rgb, hsi, save_path=None, title=None, figsize=(12, 8)):

@@ -3,13 +3,17 @@ Cross-dataset evaluation utilities
 Tests model generalization to unseen datasets beyond ARAD-1K
 """
 import torch
-import torch.nn as nn
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import json
 from tqdm import tqdm
-from .spectral_utils import calculate_rmse, calculate_psnr, calculate_sam, calculate_mrae
+from .spectral_utils import (
+    root_mean_square_error as calculate_rmse,
+    peak_signal_to_noise_ratio as calculate_psnr,
+    spectral_angular_mapper as calculate_sam,
+    mean_relative_absolute_error as calculate_mrae,
+)
 
 
 class CrossDatasetEvaluator:

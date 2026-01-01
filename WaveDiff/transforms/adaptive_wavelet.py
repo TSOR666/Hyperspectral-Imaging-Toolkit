@@ -1,6 +1,5 @@
 """Adaptive wavelet thresholding and noise estimation."""
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -43,15 +42,18 @@ class AdaptiveWaveletThresholding(nn.Module):
         ll_thresh = self.ll_threshold.to(device=device, dtype=dtype)
         detail_threshs = self.detail_thresholds.to(device=device, dtype=dtype)
 
+        # Initialize scale to None; will be set if noise_level is provided
+        scale: torch.Tensor | None = None
+
         if noise_level is not None:
             # Compute universal threshold scale
             n_elements = max(H * W, 2)
-            universal_scale = math.sqrt(2.0 * math.log(n_elements))
-            universal_scale = torch.as_tensor(universal_scale, device=device, dtype=dtype)
+            universal_scale_val = math.sqrt(2.0 * math.log(n_elements))
+            universal_scale_t = torch.as_tensor(universal_scale_val, device=device, dtype=dtype)
 
             # noise_level shape: [B, C, 1, 1]
             # Scale thresholds per batch and channel
-            scale = noise_level.to(device=device, dtype=dtype) * universal_scale  # [B, C, 1, 1]
+            scale = noise_level.to(device=device, dtype=dtype) * universal_scale_t  # [B, C, 1, 1]
 
             # ll_thresh: [1] -> broadcast to [B, C, 1, 1]
             ll_thresh = ll_thresh.view(1, 1, 1, 1) * scale
@@ -62,7 +64,7 @@ class AdaptiveWaveletThresholding(nn.Module):
         # Apply thresholding to each detail component
         for i in range(3):
             # Get threshold for this component
-            if noise_level is not None:
+            if noise_level is not None and scale is not None:
                 # detail_threshs[i]: scalar -> expand to [B, C, 1, 1]
                 thresh = detail_threshs[i].view(1, 1, 1, 1) * scale
             else:

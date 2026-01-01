@@ -5,7 +5,6 @@ Helps ensure model generates physically plausible and generalizable results
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class SpectralConsistencyLoss(nn.Module):

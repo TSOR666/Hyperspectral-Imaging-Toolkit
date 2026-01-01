@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-from modules.attention import SpectralAttention, CrossSpectralAttention, SpectralSpatialAttention
-from transforms.haar_wavelet import HaarWaveletTransform, InverseHaarWaveletTransform
+from modules.attention import SpectralAttention, CrossSpectralAttention
+from transforms.haar_wavelet import InverseHaarWaveletTransform
 from modules.encoders import ResidualBlock
 
 class HSIDecoder(nn.Module):

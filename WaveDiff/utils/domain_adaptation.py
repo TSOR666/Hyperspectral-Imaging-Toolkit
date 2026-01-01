@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class DomainAdversarialLoss(nn.Module):
@@ -64,12 +64,12 @@ class GradientReversalFunction(torch.autograd.Function):
     Backward: negates gradient
     """
     @staticmethod
-    def forward(ctx, x, alpha):
+    def forward(ctx, x, alpha):  # type: ignore[override]
         ctx.alpha = alpha
         return x.view_as(x)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # type: ignore[override]
         return -ctx.alpha * grad_output, None
 
 
@@ -264,7 +264,12 @@ class StatisticsAlignment:
     Simple statistics-based domain alignment
     Normalizes features to have similar statistics across domains
     """
-    def __init__(self, momentum=0.1, eps=1e-5):
+    source_mean: Optional[torch.Tensor]
+    source_std: Optional[torch.Tensor]
+    target_mean: Optional[torch.Tensor]
+    target_std: Optional[torch.Tensor]
+
+    def __init__(self, momentum: float = 0.1, eps: float = 1e-5):
         self.momentum = momentum
         self.eps = eps
         self.source_mean = None
@@ -272,12 +277,12 @@ class StatisticsAlignment:
         self.target_mean = None
         self.target_std = None
 
-    def update_source_stats(self, features):
+    def update_source_stats(self, features: torch.Tensor) -> None:
         """Update running statistics for source domain"""
         batch_mean = features.mean(dim=[0, 2, 3], keepdim=True)
         batch_std = features.std(dim=[0, 2, 3], keepdim=True)
 
-        if self.source_mean is None:
+        if self.source_mean is None or self.source_std is None:
             self.source_mean = batch_mean.detach()
             self.source_std = batch_std.detach()
         else:
@@ -290,12 +295,12 @@ class StatisticsAlignment:
                 self.momentum * batch_std.detach()
             )
 
-    def update_target_stats(self, features):
+    def update_target_stats(self, features: torch.Tensor) -> None:
         """Update running statistics for target domain"""
         batch_mean = features.mean(dim=[0, 2, 3], keepdim=True)
         batch_std = features.std(dim=[0, 2, 3], keepdim=True)
 
-        if self.target_mean is None:
+        if self.target_mean is None or self.target_std is None:
             self.target_mean = batch_mean.detach()
             self.target_std = batch_std.detach()
         else:
@@ -308,7 +313,7 @@ class StatisticsAlignment:
                 self.momentum * batch_std.detach()
             )
 
-    def align_to_target(self, source_features):
+    def align_to_target(self, source_features: torch.Tensor) -> torch.Tensor:
         """
         Align source features to target statistics
 
@@ -318,7 +323,8 @@ class StatisticsAlignment:
         Returns:
             Aligned features
         """
-        if self.source_mean is None or self.target_mean is None:
+        if (self.source_mean is None or self.source_std is None or
+                self.target_mean is None or self.target_std is None):
             return source_features
 
         # Normalize to source statistics

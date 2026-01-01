@@ -1,7 +1,7 @@
 from utils.masking import MaskingManager
 from utils.timestep import get_timestep_embedding
-import utils.visualization
-import utils.spectral_utils
+from utils import visualization as visualization
+from utils import spectral_utils as spectral_utils
 
 __all__ = [
     'MaskingManager',
