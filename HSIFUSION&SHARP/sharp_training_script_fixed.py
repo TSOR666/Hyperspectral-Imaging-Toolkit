@@ -158,6 +158,14 @@ class SHARPLoss(nn.Module):
         # Spectral angle mapper (SAM) loss
         pred_norm = F.normalize(pred, p=2, dim=1)
         target_norm = F.normalize(target, p=2, dim=1)
+
+        # Invariant check: Normalized vectors should have unit norm (within numerical tolerance)
+        # This check is only active in debug mode to avoid overhead in production
+        if __debug__:
+            pred_norms = pred_norm.norm(p=2, dim=1)
+            if not torch.allclose(pred_norms, torch.ones_like(pred_norms), atol=1e-5):
+                warnings.warn("Normalization invariant violation: pred_norm does not have unit norm")
+
         sam_loss = 1 - (pred_norm * target_norm).sum(dim=1).mean()
         
         # Combined loss
@@ -617,7 +625,8 @@ class DedicatedSHARPTrainer:
                     hsi = hsi[..., start_h:start_h+crop_h, start_w:start_w+crop_w]
             
             # Compute metrics
-            mrae = torch.mean(torch.abs(pred - hsi) / (hsi + 1e-8)).item()
+            # Use clamp_min for numerical stability, especially under AMP/float16
+            mrae = torch.mean(torch.abs(pred - hsi) / torch.clamp_min(hsi, 1e-6)).item()
             rmse = torch.sqrt(torch.mean((pred - hsi) ** 2)).item()
             mse = torch.mean((pred - hsi) ** 2)
             psnr = 20 * torch.log10(torch.tensor(2.0) / torch.sqrt(mse.clamp(min=1e-8))).item()

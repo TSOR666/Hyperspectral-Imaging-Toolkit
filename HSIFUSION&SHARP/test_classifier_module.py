@@ -55,28 +55,28 @@ def test_inheritance():
     # Check inheritance
     assert isinstance(classifier, HSIFusionNetV25LightningPro), \
         "Classifier must inherit from HSIFusionNetV25LightningPro"
-    print("✓ Correct inheritance from HSIFusionNetV25LightningPro")
+    print("[PASS] Correct inheritance from HSIFusionNetV25LightningPro")
 
     # Check that reconstruction branches are removed
     assert classifier.decoder_stages is None, "decoder_stages should be None"
     assert classifier.upsample_layers is None, "upsample_layers should be None"
     assert classifier.cross_attns is None, "cross_attns should be None"
     assert classifier.output_head is None, "output_head should be None"
-    print("✓ Reconstruction branches properly removed")
+    print("[PASS] Reconstruction branches properly removed")
 
     # Check classifier components exist
     assert hasattr(classifier, 'head'), "Classifier should have 'head' attribute"
     assert hasattr(classifier, 'normalizer'), "Classifier should have 'normalizer'"
     assert hasattr(classifier, 'num_classes'), "Classifier should have 'num_classes'"
     assert hasattr(classifier, 'embedding_dim'), "Classifier should have 'embedding_dim'"
-    print("✓ Classification components properly initialized")
+    print("[PASS] Classification components properly initialized")
 
     # Check encoder is preserved
     assert hasattr(classifier, 'encoder_stages'), "Encoder stages should be preserved"
     assert hasattr(classifier, 'stem'), "Stem should be preserved"
-    print("✓ Encoder architecture preserved")
+    print("[PASS] Encoder architecture preserved")
 
-    print("\n✅ TEST 1 PASSED: Inheritance and architecture verified")
+    print("\n[OK] TEST 1 PASSED: Inheritance and architecture verified")
     return True
 
 
@@ -110,14 +110,14 @@ def test_forward_pass():
     expected_shape = (batch_size, num_classes)
     assert logits.shape == expected_shape, \
         f"Expected output shape {expected_shape}, got {logits.shape}"
-    print(f"✓ Output shape correct: {logits.shape}")
+    print(f"[PASS] Output shape correct: {logits.shape}")
 
     # Check output is valid (no NaN or Inf)
     assert not torch.isnan(logits).any(), "Output contains NaN values"
     assert not torch.isinf(logits).any(), "Output contains Inf values"
-    print("✓ Output values are valid (no NaN/Inf)")
+    print("[PASS] Output values are valid (no NaN/Inf)")
 
-    print("\n✅ TEST 2 PASSED: Forward pass produces correct output")
+    print("\n[OK] TEST 2 PASSED: Forward pass produces correct output")
     return True
 
 
@@ -144,9 +144,9 @@ def test_decoder_error():
     except RuntimeError as e:
         assert "removes the reconstruction decoder" in str(e), \
             f"Unexpected error message: {e}"
-        print(f"✓ forward_decoder correctly raises error: {e}")
+        print(f"[PASS] forward_decoder correctly raises error: {e}")
 
-    print("\n✅ TEST 3 PASSED: Decoder properly disabled")
+    print("\n[OK] TEST 3 PASSED: Decoder properly disabled")
     return True
 
 
@@ -183,9 +183,9 @@ def test_pooling_modes():
 
         assert logits.shape == (batch_size, num_classes), \
             f"Pooling '{pooling}' failed: expected shape {(batch_size, num_classes)}, got {logits.shape}"
-        print(f"✓ Pooling mode '{pooling}' works correctly")
+        print(f"[PASS] Pooling mode '{pooling}' works correctly")
 
-    print("\n✅ TEST 4 PASSED: All pooling modes functional")
+    print("\n[OK] TEST 4 PASSED: All pooling modes functional")
     return True
 
 
@@ -238,17 +238,17 @@ def test_multi_scale_features():
     multi_scales = len(classifier_multi.selected_scales)
     single_scales = len(classifier_single.selected_scales)
 
-    print(f"✓ Multi-scale uses {multi_scales} scales")
-    print(f"✓ Single-scale uses {single_scales} scale(s)")
+    print(f"[PASS] Multi-scale uses {multi_scales} scales")
+    print(f"[PASS] Single-scale uses {single_scales} scale(s)")
     assert multi_scales > single_scales, "Multi-scale should use more scales"
 
     # Embedding dimension should be different
     assert classifier_multi.embedding_dim > classifier_single.embedding_dim, \
         "Multi-scale should have larger embedding dimension"
-    print(f"✓ Multi-scale embedding dim: {classifier_multi.embedding_dim}")
-    print(f"✓ Single-scale embedding dim: {classifier_single.embedding_dim}")
+    print(f"[PASS] Multi-scale embedding dim: {classifier_multi.embedding_dim}")
+    print(f"[PASS] Single-scale embedding dim: {classifier_single.embedding_dim}")
 
-    print("\n✅ TEST 5 PASSED: Multi-scale aggregation working")
+    print("\n[OK] TEST 5 PASSED: Multi-scale aggregation working")
     return True
 
 
@@ -274,7 +274,7 @@ def test_embedding_extraction():
 
     assert embeddings.shape == (batch_size, classifier.embedding_dim), \
         f"Expected embedding shape {(batch_size, classifier.embedding_dim)}, got {embeddings.shape}"
-    print(f"✓ Embedding extraction works: shape {embeddings.shape}")
+    print(f"[PASS] Embedding extraction works: shape {embeddings.shape}")
 
     # Test forward with return_embeddings=True
     with torch.no_grad():
@@ -282,12 +282,12 @@ def test_embedding_extraction():
 
     assert logits.shape == (batch_size, num_classes)
     assert embeddings2.shape == (batch_size, classifier.embedding_dim)
-    print(f"✓ Forward with return_embeddings=True works")
+    print(f"[PASS] Forward with return_embeddings=True works")
 
     # Embeddings should be the same
     assert torch.allclose(embeddings, embeddings2, atol=1e-5), \
         "Embeddings from different methods should match"
-    print(f"✓ Embeddings consistent across methods")
+    print(f"[PASS] Embeddings consistent across methods")
 
     # Test return_selected_features
     with torch.no_grad():
@@ -300,9 +300,9 @@ def test_embedding_extraction():
     assert isinstance(features, list), "Features should be a list"
     assert len(features) == len(classifier.selected_scales), \
         f"Should return {len(classifier.selected_scales)} feature maps"
-    print(f"✓ Feature extraction returns {len(features)} feature maps")
+    print(f"[PASS] Feature extraction returns {len(features)} feature maps")
 
-    print("\n✅ TEST 6 PASSED: Embedding extraction functional")
+    print("\n[OK] TEST 6 PASSED: Embedding extraction functional")
     return True
 
 
@@ -359,10 +359,10 @@ def test_hidden_layer():
     assert isinstance(classifier_no_hidden.head, nn.Linear), \
         "Classifier without hidden layer should use Linear"
 
-    print(f"✓ Classifier with hidden layer ({hidden_dim}) works")
-    print(f"✓ Classifier without hidden layer works")
+    print(f"[PASS] Classifier with hidden layer ({hidden_dim}) works")
+    print(f"[PASS] Classifier without hidden layer works")
 
-    print("\n✅ TEST 7 PASSED: Hidden layer configuration working")
+    print("\n[OK] TEST 7 PASSED: Hidden layer configuration working")
     return True
 
 
@@ -391,13 +391,13 @@ def test_model_sizes():
 
             # Count parameters
             params = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
-            print(f"✓ Model size '{size}' works: {params/1e6:.2f}M parameters")
+            print(f"[PASS] Model size '{size}' works: {params/1e6:.2f}M parameters")
 
         except Exception as e:
-            print(f"✗ Model size '{size}' failed: {e}")
+            print(f"[FAIL] Model size '{size}' failed: {e}")
             return False
 
-    print("\n✅ TEST 8 PASSED: All model sizes functional")
+    print("\n[OK] TEST 8 PASSED: All model sizes functional")
     return True
 
 
@@ -434,9 +434,9 @@ def test_selected_scales():
     assert classifier.selected_scales == (1, 3), \
         f"Expected selected_scales (1, 3), got {classifier.selected_scales}"
 
-    print(f"✓ Custom scale selection works: {classifier.selected_scales}")
+    print(f"[PASS] Custom scale selection works: {classifier.selected_scales}")
 
-    print("\n✅ TEST 9 PASSED: Custom scale selection working")
+    print("\n[OK] TEST 9 PASSED: Custom scale selection working")
     return True
 
 
@@ -463,13 +463,13 @@ def test_classification_workflow():
         }
     )
 
-    print(f"✓ Created classifier with {num_classes} classes")
+    print(f"[PASS] Created classifier with {num_classes} classes")
 
     # Create fake data
     images = [torch.randn(3, 64, 64) for _ in range(num_samples)]
     labels = torch.randint(0, num_classes, (num_samples,))
 
-    print(f"✓ Created {num_samples} samples")
+    print(f"[PASS] Created {num_samples} samples")
 
     # Test training mode
     classifier.train()
@@ -481,13 +481,13 @@ def test_classification_workflow():
     # Forward pass
     logits = classifier(batch_images)
     assert logits.shape == (batch_size, num_classes)
-    print(f"✓ Forward pass in training mode: {logits.shape}")
+    print(f"[PASS] Forward pass in training mode: {logits.shape}")
 
     # Compute loss
     criterion = nn.CrossEntropyLoss()
     loss = criterion(logits, batch_labels)
     assert loss.item() > 0
-    print(f"✓ Loss computation works: {loss.item():.4f}")
+    print(f"[PASS] Loss computation works: {loss.item():.4f}")
 
     # Test eval mode
     classifier.eval()
@@ -496,7 +496,7 @@ def test_classification_workflow():
         predictions = logits_eval.argmax(dim=1)
 
     assert predictions.shape == (batch_size,)
-    print(f"✓ Predictions in eval mode: {predictions}")
+    print(f"[PASS] Predictions in eval mode: {predictions}")
 
     # Test embeddings for similarity
     with torch.no_grad():
@@ -505,9 +505,9 @@ def test_classification_workflow():
 
     # Same inputs should give same embeddings
     assert torch.allclose(emb1, emb2, atol=1e-5)
-    print(f"✓ Embedding extraction deterministic")
+    print(f"[PASS] Embedding extraction deterministic")
 
-    print("\n✅ TEST 10 PASSED: Complete workflow functional")
+    print("\n[OK] TEST 10 PASSED: Complete workflow functional")
     return True
 
 
@@ -536,7 +536,7 @@ def run_all_tests():
             result = test_func()
             results.append((name, result))
         except Exception as e:
-            print(f"\n❌ TEST FAILED: {name}")
+            print(f"\n[FAIL] TEST FAILED: {name}")
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
@@ -551,7 +551,7 @@ def run_all_tests():
     total = len(results)
 
     for name, result in results:
-        status = "✅ PASS" if result else "❌ FAIL"
+        status = "[OK] PASS" if result else "[FAIL] FAIL"
         print(f"{status}: {name}")
 
     print("\n" + "-"*80)
@@ -559,20 +559,20 @@ def run_all_tests():
     print("="*80)
 
     if passed == total:
-        print("\n🎉 ALL TESTS PASSED - Classifier implementation is VERIFIED!")
+        print("\n*** ALL TESTS PASSED - Classifier implementation is VERIFIED! ***")
         print("\nThe HSIFusion Lightning Pro Classifier:")
-        print("  ✓ Correctly inherits from the base model")
-        print("  ✓ Properly removes reconstruction branches")
-        print("  ✓ Provides classification functionality")
-        print("  ✓ Supports multi-scale feature aggregation")
-        print("  ✓ Supports different pooling modes (avg, max, avgmax)")
-        print("  ✓ Can extract embeddings for downstream tasks")
-        print("  ✓ Works with all model sizes (tiny to xlarge)")
-        print("  ✓ Supports custom configurations")
-        print("\n✅ CONCLUSION: The module is correctly implemented and production-ready!")
+        print("  [OK] Correctly inherits from the base model")
+        print("  [OK] Properly removes reconstruction branches")
+        print("  [OK] Provides classification functionality")
+        print("  [OK] Supports multi-scale feature aggregation")
+        print("  [OK] Supports different pooling modes (avg, max, avgmax)")
+        print("  [OK] Can extract embeddings for downstream tasks")
+        print("  [OK] Works with all model sizes (tiny to xlarge)")
+        print("  [OK] Supports custom configurations")
+        print("\n[OK] CONCLUSION: The module is correctly implemented and production-ready!")
         return 0
     else:
-        print(f"\n⚠️  {total - passed} test(s) failed - please review errors above")
+        print(f"\n[WARNING] {total - passed} test(s) failed - please review errors above")
         return 1
 
 

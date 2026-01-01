@@ -916,7 +916,17 @@ class VectorizedMoELayer(nn.Module):
         
     @torch.jit.ignore
     def _forward_single_expert(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
-        """Helper to process single expert (for torch.compile compatibility)"""
+        """Helper to process single expert (for torch.compile compatibility).
+
+        Args:
+            x: Input tensor of shape (num_tokens, dim)
+            expert_idx: Index of the expert to use (must be in range [0, num_experts))
+
+        Returns:
+            Output tensor of same shape as x
+        """
+        if not (0 <= expert_idx < self.num_experts):
+            raise IndexError(f"expert_idx {expert_idx} out of range [0, {self.num_experts})")
         return self.experts[expert_idx](x)
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -944,9 +954,11 @@ class VectorizedMoELayer(nn.Module):
         # Handle invalid indices from capacity overflow
         valid_mask = expert_indices >= 0  # (T, K)
         idx_flat = torch.where(valid_mask, expert_indices, torch.zeros_like(expert_indices))  # (T, K)
-        
+
         # Accumulate weights for each expert
-        dispatch.scatter_add_(1, idx_flat, expert_weights * valid_mask.float())  # (T, E)
+        # Fix: Ensure expert_weights matches dispatch dtype to avoid dtype mismatch under AMP
+        weights_to_add = (expert_weights * valid_mask.float()).to(dispatch.dtype)
+        dispatch.scatter_add_(1, idx_flat, weights_to_add)  # (T, E)
         
         # Process all experts in parallel
         if self.training:
@@ -1023,7 +1035,9 @@ class AMPVectorizedMoELayer(VectorizedMoELayer):
                 
                 valid_mask = expert_indices >= 0  # (T, K)
                 idx_flat = torch.where(valid_mask, expert_indices, torch.zeros_like(expert_indices))  # (T, K)
-                dispatch.scatter_add_(1, idx_flat, expert_weights * valid_mask.float())  # (T, E)
+                # Fix: Ensure expert_weights matches dispatch dtype to avoid AMP dtype mismatch
+                weights_to_add = (expert_weights * valid_mask.float()).to(dispatch.dtype)
+                dispatch.scatter_add_(1, idx_flat, weights_to_add)  # (T, E)
                 
                 # Expert processing in reduced precision
                 if self.training:

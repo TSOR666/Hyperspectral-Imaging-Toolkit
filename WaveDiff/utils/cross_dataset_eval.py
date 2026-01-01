@@ -5,7 +5,7 @@ Tests model generalization to unseen datasets beyond ARAD-1K
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 import json
 from tqdm import tqdm
 from .spectral_utils import (
@@ -23,20 +23,20 @@ class CrossDatasetEvaluator:
     """
     def __init__(
         self,
-        model,
-        device='cuda',
-        metrics=('rmse', 'psnr', 'sam', 'mrae')
-    ):
+        model: torch.nn.Module,
+        device: str = 'cuda',
+        metrics: tuple = ('rmse', 'psnr', 'sam', 'mrae')
+    ) -> None:
         """
         Args:
-            model: HSI reconstruction model
+            model: HSI reconstruction model (torch.nn.Module)
             device: Device for computation
             metrics: Metrics to compute
         """
         self.model = model
         self.device = device
         self.metrics = metrics
-        self.results = {}
+        self.results: Dict[str, Dict[str, float]] = {}
 
     def evaluate_dataset(
         self,
@@ -296,7 +296,7 @@ class DomainShiftAnalyzer:
         dataset1: str,
         dataset2: str,
         modality: str = 'rgb'
-    ) -> float:
+    ) -> Optional[float]:
         """
         Compute domain distance between two datasets
 
@@ -306,7 +306,7 @@ class DomainShiftAnalyzer:
             modality: 'rgb' or 'hsi'
 
         Returns:
-            Domain distance (L2 distance between mean statistics)
+            Domain distance (L2 distance between mean statistics), or None if dataset not found
         """
         if dataset1 not in self.dataset_stats or dataset2 not in self.dataset_stats:
             return None
@@ -383,12 +383,16 @@ class GeneralizationMetrics:
             source_val = source_metrics[metric]
             target_val = target_metrics[metric]
 
-            # For PSNR (higher is better)
-            if metric == 'psnr':
-                deg = (source_val - target_val) / source_val * 100
-            # For RMSE, SAM, MRAE (lower is better)
+            # Guard against division by zero
+            if abs(source_val) < 1e-10:
+                deg = 0.0 if abs(target_val - source_val) < 1e-10 else float('inf')
             else:
-                deg = (target_val - source_val) / source_val * 100
+                # For PSNR (higher is better)
+                if metric == 'psnr':
+                    deg = (source_val - target_val) / source_val * 100
+                # For RMSE, SAM, MRAE (lower is better)
+                else:
+                    deg = (target_val - source_val) / source_val * 100
 
             degradation[f'{metric}_degradation_%'] = deg
 
