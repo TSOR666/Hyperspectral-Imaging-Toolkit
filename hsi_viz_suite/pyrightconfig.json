@@ -1,0 +1,16 @@
+{
+    "include": [
+        "scripts",
+        "hsi_model",
+        "tests",
+        "examples"
+    ],
+    "extraPaths": [
+        "scripts",
+        "."
+    ],
+    "reportMissingImports": "warning",
+    "reportMissingTypeStubs": "none",
+    "pythonVersion": "3.11",
+    "typeCheckingMode": "basic"
+}
