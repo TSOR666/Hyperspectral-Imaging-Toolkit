@@ -19,15 +19,17 @@ from visualization_utils import (
 class ErrorMapGenerator:
     def __init__(self, results_dir: str, output_dir: str, dpi: int = 300) -> None:
         self.results_dir = Path(results_dir)
-        self.output_dir = Path(output_dir); self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dpi = dpi
         self.cmf = get_cached_cmf(31, torch.device('cpu'))
 
     def _load_pair(self, sample: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Load prediction/target pair as (B,C,H,W) tensors."""
         pred_path = self.results_dir / "hsi" / f"{sample}.npy"
-        tgt_path  = self.results_dir / "hsi" / f"{sample}_target.npy"
-        if not pred_path.exists() or not tgt_path.exists(): return None, None
+        tgt_path = self.results_dir / "hsi" / f"{sample}_target.npy"
+        if not pred_path.exists() or not tgt_path.exists():
+            return None, None
         pred = torch.from_numpy(np.load(pred_path)).float()
         tgt = torch.from_numpy(np.load(tgt_path)).float()
         if pred.dim() == 3:
@@ -39,13 +41,24 @@ class ErrorMapGenerator:
     def create_mrae_heatmap(self, sample: str, save_name: Optional[str] = None) -> None:
         """Create and save a smoothed MRAE heatmap for a given sample."""
         pred, tgt = self._load_pair(sample)
-        if pred is None: return
+        if pred is None or tgt is None:
+            print(f"Skipping {sample}: files not found")
+            return
         mrae = compute_mrae_map(pred, tgt)  # (H,W)
-        fig, ax = plt.subplots(figsize=(8,6))
-        im = ax.imshow(apply_gaussian_smoothing(mrae, 0.6), cmap=create_error_colormap(), vmin=0, vmax=0.1)
-        ax.axis('off'); plt.colorbar(im).set_label('MRAE')
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(
+            apply_gaussian_smoothing(mrae, 0.6),
+            cmap=create_error_colormap(),
+            vmin=0,
+            vmax=0.1,
+        )
+        ax.axis('off')
+        plt.colorbar(im).set_label('MRAE')
         save_name = save_name or f"mrae_heatmap_{sample}"
-        out = self.output_dir / f"{save_name}.pdf"; plt.savefig(out); plt.savefig(out.with_suffix('.png')); plt.close()
+        out = self.output_dir / f"{save_name}.pdf"
+        plt.savefig(out)
+        plt.savefig(out.with_suffix('.png'))
+        plt.close()
 
 def main() -> None:
     ap = argparse.ArgumentParser()
