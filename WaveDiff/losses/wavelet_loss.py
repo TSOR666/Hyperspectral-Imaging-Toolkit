@@ -1,22 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from transforms.haar_wavelet import HaarWaveletTransform
+
 
 class WaveletLoss(nn.Module):
     """
     Loss function operating directly on wavelet coefficients
-    
+
     Allows different weights for approximation and detail coefficients
     to emphasize different frequency components.
     """
+
+    # Explicit buffer type annotations for pyright
+    ll_weight: torch.Tensor
+    lh_weight: torch.Tensor
+    hl_weight: torch.Tensor
+    hh_weight: torch.Tensor
+
     def __init__(self, in_channels=31, ll_weight=1.0, lh_weight=0.5, hl_weight=0.5, hh_weight=0.25):
         super().__init__()
         self.in_channels = in_channels
         self.wavelet = HaarWaveletTransform(in_channels)
-        
+
         # Weights for different coefficient types (can be learned or fixed)
         self.register_buffer('ll_weight', torch.tensor(ll_weight))  # Approximation (low frequency)
         self.register_buffer('lh_weight', torch.tensor(lh_weight))  # Horizontal detail
@@ -60,21 +67,25 @@ class MultiscaleWaveletLoss(nn.Module):
     Multi-scale wavelet loss that applies wavelet transform at multiple levels
     and calculates loss at each level.
     """
+
+    # Explicit buffer type annotation for pyright
+    level_weights: torch.Tensor
+
     def __init__(self, in_channels=31, num_levels=3, level_weights=None):
         super().__init__()
         self.in_channels = in_channels
         self.num_levels = num_levels
-        
+
         # Create wavelet transform for each input channel
         self.wavelet = HaarWaveletTransform(in_channels)
-        
+
         # Weights for each decomposition level
         if level_weights is None:
             # Default: higher weight for lower levels (larger structures)
             level_weights = [2**(-i) for i in range(num_levels)]
             # Normalize weights
             level_weights = [w / sum(level_weights) for w in level_weights]
-            
+
         self.register_buffer('level_weights', torch.tensor(level_weights))
         
     def forward(self, pred, target):

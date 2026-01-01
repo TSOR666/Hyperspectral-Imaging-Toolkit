@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from modules.attention import SpectralAttention, SpectralSpatialAttention, CrossSpectralAttention
 from transforms.haar_wavelet import HaarWaveletTransform

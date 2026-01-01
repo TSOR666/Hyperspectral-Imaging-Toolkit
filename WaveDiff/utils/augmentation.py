@@ -5,7 +5,7 @@ Implements augmentations that preserve spectral-spatial consistency
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class RGBHSIAugmentation:

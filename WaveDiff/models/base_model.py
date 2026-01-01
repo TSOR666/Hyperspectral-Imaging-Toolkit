@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from modules.encoders import RGBEncoder
 from modules.decoders import HSIDecoder, HSI2RGBConverter
@@ -9,7 +8,7 @@ from modules.denoisers import UNetDenoiser
 from modules.refinement import SpectralRefinementHead, PixelRefinementHead
 from modules.attention import MultiHeadSpectralAttention, DomainAdaptiveAttention
 from diffusion.dpm_ot import DPMOT
-from diffusion.noise_schedule import BaseNoiseSchedule, SpectralNoiseSchedule
+from diffusion.noise_schedule import SpectralNoiseSchedule
 from utils.masking import MaskingManager
 
 class HSILatentDiffusionModel(nn.Module):

@@ -1,8 +1,4 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import math
 
 class MaskingManager:
     """
@@ -223,12 +219,9 @@ class MaskingManager:
         
         # Process each sample in batch
         for b in range(batch_size):
-            # Get sample
-            x = inputs[b:b+1]
-            
-            # Compute FFT
-            x_fft = torch.fft.rfft2(x)
-            
+            # Get sample (used for device reference)
+            _ = inputs[b:b+1]
+
             # Create frequency grid
             freq_h = torch.fft.fftfreq(height, device=device)[:, None]
             freq_w = torch.fft.rfftfreq(width, device=device)[None, :]

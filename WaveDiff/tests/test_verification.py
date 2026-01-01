@@ -34,7 +34,6 @@ sys.modules['matplotlib.colors'] = MockMatplotlib()
 sys.modules['matplotlib.cm'] = MockMatplotlib()
 
 import torch
-import torch.nn as nn
 
 
 def test_haar_wavelet_transform():
@@ -103,7 +102,6 @@ def test_attention_modules():
     from modules.attention import (
         SpectralAttention,
         CrossSpectralAttention,
-        SpectralSpatialAttention,
         MultiHeadSpectralAttention,
     )
 
@@ -354,6 +352,136 @@ def test_gradient_flow():
     print("  [PASS] Gradient flow")
 
 
+def test_wavelet_loss():
+    """Test wavelet loss functions."""
+    from losses.wavelet_loss import WaveletLoss, MultiscaleWaveletLoss
+
+    B, C, H, W = 2, 31, 64, 64
+    pred = torch.randn(B, C, H, W)
+    target = torch.randn(B, C, H, W)
+
+    # Test WaveletLoss
+    wavelet_loss = WaveletLoss(in_channels=C)
+    loss = wavelet_loss(pred, target)
+    assert loss.shape == (), f"WaveletLoss output shape mismatch: {loss.shape}"
+    assert loss.item() >= 0, "WaveletLoss should be non-negative"
+    assert torch.isfinite(loss), "WaveletLoss contains NaN/Inf"
+
+    # Test MultiscaleWaveletLoss
+    ms_loss = MultiscaleWaveletLoss(in_channels=C, num_levels=2)
+    loss = ms_loss(pred, target)
+    assert loss.shape == () or loss.numel() == 1, f"MultiscaleWaveletLoss shape mismatch"
+    assert torch.isfinite(loss), "MultiscaleWaveletLoss contains NaN/Inf"
+
+    print("  [PASS] Wavelet loss functions")
+
+
+def test_masking_manager():
+    """Test masking manager strategies."""
+    from utils.masking import MaskingManager
+
+    B, C, H, W = 2, 31, 64, 64
+    x = torch.randn(B, C, H, W)
+    device = x.device
+
+    # Test random masking
+    config_random = {'mask_strategy': 'random', 'mask_ratio': 0.5}
+    manager = MaskingManager(config_random)
+    mask = manager.generate_mask(x, B, C, H, W, device)
+    assert mask.shape == (B, 1, H, W), f"Mask shape mismatch: {mask.shape}"
+    assert ((mask == 0) | (mask == 1)).all(), "Mask should be binary"
+
+    # Test block masking
+    config_block = {'mask_strategy': 'block', 'mask_ratio': 0.5}
+    manager_block = MaskingManager(config_block)
+    mask_block = manager_block.generate_mask(x, B, C, H, W, device)
+    assert mask_block.shape == (B, 1, H, W), f"Block mask shape mismatch"
+
+    # Test spectral masking - note: spectral masks may have different shape depending on implementation
+    config_spectral = {'mask_strategy': 'spectral', 'band_mask_ratio': 0.5}
+    manager_spectral = MaskingManager(config_spectral)
+    mask_spectral = manager_spectral.generate_mask(x, B, C, H, W, device)
+    # Spectral masks can be (B, C, 1, 1) or (B, C, H, W) depending on whether they're band-wise or spatial
+    assert mask_spectral.shape[0] == B and mask_spectral.shape[1] == C, f"Spectral mask batch/channel mismatch"
+
+    print("  [PASS] Masking manager")
+
+
+def test_wavelet_model():
+    """Test wavelet HSI latent diffusion model."""
+    from models.wavelet_model import WaveletHSILatentDiffusionModel
+
+    B, H, W = 2, 64, 64
+    rgb = torch.randn(B, 3, H, W)
+
+    model = WaveletHSILatentDiffusionModel(
+        latent_dim=32,
+        out_channels=31,
+        timesteps=100,
+        use_batchnorm=True
+    )
+
+    # Test forward pass
+    outputs = model(rgb)
+    assert 'hsi_output' in outputs, "Model should output 'hsi_output'"
+    assert outputs['hsi_output'].shape == (B, 31, H, W), f"HSI output shape mismatch: {outputs['hsi_output'].shape}"
+
+    # Test encode/decode
+    latent = model.encode(rgb)
+    assert latent.shape[0] == B, "Latent batch size mismatch"
+    assert latent.shape[1] == 32, "Latent dim mismatch"
+
+    hsi = model.decode(latent)
+    assert hsi.shape == (B, 31, H, W), "Decoded HSI shape mismatch"
+
+    print("  [PASS] Wavelet model")
+
+
+def test_adaptive_model():
+    """Test adaptive wavelet HSI latent diffusion model initialization and basic methods."""
+    from models.adaptive_model import AdaptiveWaveletHSILatentDiffusionModel
+
+    B, H, W = 2, 64, 64
+    rgb = torch.randn(B, 3, H, W)
+
+    # Use latent_dim=64 (divisible by num_heads=8)
+    model = AdaptiveWaveletHSILatentDiffusionModel(
+        latent_dim=64,
+        out_channels=31,
+        timesteps=100,
+        use_batchnorm=True,
+        threshold_method='soft',
+        init_threshold=0.1,
+        trainable_threshold=True
+    )
+
+    # Test encode/decode (simpler path that doesn't involve diffusion)
+    latent = model.encode(rgb)
+    assert latent.shape[0] == B, "Latent batch size mismatch"
+    assert latent.shape[1] == 64, "Latent dim mismatch"
+
+    hsi = model.decode(latent)
+    assert hsi.shape == (B, 31, H, W), "Decoded HSI shape mismatch"
+
+    # Test threshold stats
+    stats = model.get_adaptive_threshold_stats()
+    assert isinstance(stats, dict), "Threshold stats should be a dict"
+
+    # Test adaptive thresholding module directly
+    from transforms.haar_wavelet import HaarWaveletTransform, InverseHaarWaveletTransform
+    wavelet = HaarWaveletTransform(31)
+    inv_wavelet = InverseHaarWaveletTransform()
+
+    test_hsi = torch.randn(B, 31, H, W)
+    coeffs = wavelet(test_hsi)
+    thresholded = model.adaptive_thresholding(coeffs)
+    assert thresholded.shape == coeffs.shape, "Thresholded coeffs shape mismatch"
+    reconstructed = inv_wavelet(thresholded)
+    assert reconstructed.shape == test_hsi.shape, "Reconstructed shape mismatch"
+
+    print("  [PASS] Adaptive model")
+
+
 def run_all_tests():
     """Run all verification tests."""
     print("\n" + "=" * 60)
@@ -371,6 +499,10 @@ def run_all_tests():
         ("Noise Schedules", test_noise_schedules),
         ("Base Model Forward", test_base_model_forward),
         ("Gradient Flow", test_gradient_flow),
+        ("Wavelet Loss", test_wavelet_loss),
+        ("Masking Manager", test_masking_manager),
+        ("Wavelet Model", test_wavelet_model),
+        ("Adaptive Model", test_adaptive_model),
     ]
 
     passed = 0

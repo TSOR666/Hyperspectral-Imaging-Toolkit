@@ -1,5 +1,7 @@
 """DPM-OT: Diffusion Probabilistic Models with Optimal Transport sampling."""
-from typing import Optional, Tuple, List
+from __future__ import annotations
+
+from typing import Optional, List, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -7,6 +9,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from diffusion.noise_schedule import BaseNoiseSchedule
+
+if TYPE_CHECKING:
+    pass
 
 # Numerical stability constant
 _EPS = 1e-8
@@ -77,13 +82,13 @@ class DPMOT(nn.Module):
 
     def sample(
         self,
-        shape,
-        device,
-        conditioning: torch.Tensor = None,
+        shape: Tuple[int, ...],
+        device: torch.device | str,
+        conditioning: Optional[torch.Tensor] = None,
         return_intermediates: bool = False,
         use_dpm_solver: bool = True,
-        steps: int = None,
-    ):
+        steps: Optional[int] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Sample from the model
 
@@ -101,22 +106,28 @@ class DPMOT(nn.Module):
             return self.sample_dpm_solver(shape, device, conditioning=conditioning, steps=steps or 20)
         return self.sample_ddpm(shape, device, conditioning=conditioning, return_intermediates=return_intermediates)
 
-    def sample_ddpm(self, shape, device, conditioning=None, return_intermediates=False):
+    def sample_ddpm(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device | str,
+        conditioning: Optional[torch.Tensor] = None,
+        return_intermediates: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, List[torch.Tensor]]:
         """Standard DDPM sampling."""
         b = shape[0]
 
         # Start from pure noise
         x = self._prepare_starting_point(shape, device, conditioning)
 
-        intermediates = [x] if return_intermediates else None
+        intermediates: List[torch.Tensor] = [x] if return_intermediates else []
 
         # Iteratively denoise
         for i in tqdm(reversed(range(0, self.timesteps)), desc='Sampling time step', total=self.timesteps):
             t = torch.full((b,), i, device=device, dtype=torch.long)
 
             beta_t = self.spectral_schedule(x, t)
-            alpha_bar_t = self.spectral_schedule.extract('alphas_cumprod', t, x.shape)
-            alpha_bar_prev = self.spectral_schedule.extract('alphas_cumprod_prev', t, x.shape)
+            _ = self.spectral_schedule.extract('alphas_cumprod', t, x.shape)  # alpha_bar_t unused
+            _ = self.spectral_schedule.extract('alphas_cumprod_prev', t, x.shape)  # alpha_bar_prev unused
 
             sqrt_one_minus_alpha_bar_t = self.spectral_schedule.extract(
                 'sqrt_one_minus_alphas_cumprod', t, x.shape
@@ -145,7 +156,13 @@ class DPMOT(nn.Module):
             return x, intermediates
         return x
 
-    def sample_dpm_solver(self, shape, device, conditioning=None, steps=20):
+    def sample_dpm_solver(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device | str,
+        conditioning: Optional[torch.Tensor] = None,
+        steps: int = 20,
+    ) -> torch.Tensor:
         """
         DPM Solver v3 sampling for faster inference.
 
@@ -167,12 +184,14 @@ class DPMOT(nn.Module):
 
         with torch.no_grad():
             for i, t in enumerate(tqdm(t_steps, desc="DPM-Solver sampling")):
-                # Create batch timestep
-                t_tensor = torch.full((shape[0],), t, device=device)
+                # Create batch timestep - convert tensor element to Python float
+                t_val: float = t.item() if isinstance(t, torch.Tensor) else float(t)
+                t_tensor = torch.full((shape[0],), t_val, device=device)
 
                 # Previous timestep (or 0 if final step)
-                prev_t = t_steps[i + 1] if i < len(t_steps) - 1 else 0.0
-                prev_t_tensor = torch.full((shape[0],), prev_t, device=device)
+                prev_t_elem = t_steps[i + 1] if i < len(t_steps) - 1 else None
+                prev_t_val: float = prev_t_elem.item() if prev_t_elem is not None else 0.0
+                prev_t_tensor = torch.full((shape[0],), prev_t_val, device=device)
 
                 # For DPM-Solver v3, we need to approximate the ODE more accurately
 
@@ -185,8 +204,8 @@ class DPMOT(nn.Module):
                 # For higher-order updates (used in later steps)
                 if i > 0:  # Use first-order for first step
                     # Second prediction at midpoint
-                    mid_t = (t + prev_t) / 2.0
-                    mid_t_tensor = torch.full((shape[0],), mid_t, device=device)
+                    mid_t_val: float = (t_val + prev_t_val) / 2.0
+                    mid_t_tensor = torch.full((shape[0],), mid_t_val, device=device)
 
                     pred_noise_mid = self.denoiser(x_1, self._time_to_index(mid_t_tensor))
 
@@ -213,7 +232,12 @@ class DPMOT(nn.Module):
 
         return x
 
-    def _prepare_starting_point(self, shape, device, conditioning):
+    def _prepare_starting_point(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device | str,
+        conditioning: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """Return initial noisy state, optionally conditioned on an encoder latent."""
         if conditioning is None:
             return torch.randn(shape, device=device)

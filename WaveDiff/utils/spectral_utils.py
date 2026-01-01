@@ -3,7 +3,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch.fft
-import numpy as np
 from scipy.stats import wasserstein_distance
 
 

@@ -1,5 +1,4 @@
 """Haar wavelet transform implementation for PyTorch."""
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -16,6 +15,9 @@ class HaarWaveletTransform(nn.Module):
     - HL: Vertical details
     - HH: Diagonal details
     """
+
+    # Explicit buffer type annotation for pyright
+    weight: torch.Tensor
 
     def __init__(self, in_channels: int):
         super().__init__()

@@ -19,12 +19,6 @@ from models.wavelet_model import WaveletHSILatentDiffusionModel
 from models.adaptive_model import AdaptiveWaveletHSILatentDiffusionModel
 
 # Import utilities
-from utils.visualization import (
-    visualize_rgb_hsi,
-    visualize_reconstruction_comparison,
-    visualize_spectral_signature,
-    create_false_color_image
-)
 
 
 def load_sample_image(image_path, size=256):
@@ -35,11 +29,13 @@ def load_sample_image(image_path, size=256):
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    
+
     # Load and transform image
     image = Image.open(image_path).convert('RGB')
-    image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
-    
+    # transform() returns a Tensor after ToTensor() is applied
+    image_tensor: torch.Tensor = transform(image)  # type: ignore[assignment]
+    image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
+
     return image_tensor
 
 

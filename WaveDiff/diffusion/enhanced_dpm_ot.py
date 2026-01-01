@@ -62,7 +62,7 @@ class DPMOT_Solver:
     def _setup_karras_sigmas(self):
         """Setup Karras sigmas for improved sampling"""
         # Implementation of Karras et al. schedule which is more optimal
-        rho = 7.0  # default value from the paper
+        # Note: rho = 7.0 is the default value from the paper, but not used in simplified version
         sigma_min, sigma_max = 0.02, 80.0  # From Imagen paper
         
         ramp = torch.linspace(0, 1, self.timesteps)
