@@ -10,7 +10,7 @@ import h5py
 import cv2
 import random
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List, Any
 from functools import lru_cache
 import logging
 from packaging import version
@@ -55,7 +55,7 @@ class OptimizedTrainDataset(Dataset):
             # Preload all data for standard/float16 modes
             self._preload_data()
     
-    def _load_file_lists(self):
+    def _load_file_lists(self) -> None:
         """Load train file lists"""
         train_list_path = os.path.join(self.data_root, 'split_txt', 'train_list.txt')
         
@@ -74,8 +74,28 @@ class OptimizedTrainDataset(Dataset):
                 self.hsi_files.append(hsi_path)
         
         logger.info(f"Found {len(self.rgb_files)} training images")
-    
-    def _compute_patch_indices(self):
+
+    def _infer_image_shape(self, idx: int) -> Tuple[int, int]:
+        """Return (height, width) for the idx-th sample without assuming ARAD defaults."""
+        if self.memory_mode != 'lazy' and hasattr(self, 'hsi_data'):
+            data = self.hsi_data[idx]
+            return int(data.shape[1]), int(data.shape[2])
+
+        # Lazy mode: inspect metadata without materialising full array
+        try:
+            with h5py.File(self.hsi_files[idx], 'r') as f:
+                cube = f['cube']
+                bands, dim1, dim2 = cube.shape
+                # After transpose([0,2,1]) we end up with (bands, dim2, dim1)
+                return int(dim2), int(dim1)
+        except Exception:
+            # Fallback to RGB dimensions
+            rgb = cv2.imread(self.rgb_files[idx], cv2.IMREAD_COLOR)
+            if rgb is None:
+                raise RuntimeError(f"Failed to load RGB image at index {idx}")
+            return int(rgb.shape[0]), int(rgb.shape[1])
+
+    def _compute_patch_indices(self) -> None:
         """Precompute patch counts for each image"""
         for i in range(len(self.rgb_files)):
             h, w = self._infer_image_shape(i)
@@ -205,11 +225,7 @@ class OptimizedTrainDataset(Dataset):
         rgb_patch = rgb[y:y+size, x:x+size].copy()
         hsi_patch = hsi[:, y:y+size, x:x+size].copy()
         
-        # Verify shapes before augmentation
-        assert rgb_patch.shape == (size, size, 3), f"RGB shape error: {rgb_patch.shape}"
-        assert hsi_patch.shape == (31, size, size), f"HSI shape error: {hsi_patch.shape}"
-        
-        # Verify patch sizes
+        # Verify patch sizes and pad if necessary (use ValueError instead of assert for production safety)
         if rgb_patch.shape != (size, size, 3):
             logger.warning(f"RGB patch shape mismatch: expected ({size}, {size}, 3), got {rgb_patch.shape}")
             # Pad if necessary
@@ -244,20 +260,26 @@ class OptimizedTrainDataset(Dataset):
         rgb_patch = np.ascontiguousarray(rgb_patch.transpose(2, 0, 1))
         hsi_patch = np.ascontiguousarray(hsi_patch)
 
+        # Note: While float16 saves memory during storage, PyTorch operations generally
+        # expect float32. We store as float16 for memory efficiency but convert to float32
+        # for tensor operations to ensure numerical stability and compatibility.
         if self.memory_mode == 'float16':
+            # Store as float16 for memory efficiency, will be cast to float32 in training loop
             rgb_patch = rgb_patch.astype(np.float16, copy=False)
             hsi_patch = hsi_patch.astype(np.float16, copy=False)
         else:
             rgb_patch = rgb_patch.astype(np.float32, copy=False)
             hsi_patch = hsi_patch.astype(np.float32, copy=False)
+
+        # Convert to tensors - float16 tensors will be upcast to float32 during model forward
+        rgb_tensor = torch.from_numpy(rgb_patch).float()  # Always return float32 for compatibility
+        hsi_tensor = torch.from_numpy(hsi_patch).float()  # Always return float32 for compatibility
         
-        # Convert to tensors
-        rgb_tensor = torch.from_numpy(rgb_patch)
-        hsi_tensor = torch.from_numpy(hsi_patch)
-        
-        # Final shape validation
-        assert rgb_tensor.shape == (3, size, size), f"Final RGB tensor shape error: {rgb_tensor.shape}"
-        assert hsi_tensor.shape == (31, size, size), f"Final HSI tensor shape error: {hsi_tensor.shape}"
+        # Final shape validation (use ValueError instead of assert for production safety)
+        if rgb_tensor.shape != (3, size, size):
+            raise ValueError(f"Final RGB tensor shape error: expected (3, {size}, {size}), got {rgb_tensor.shape}")
+        if hsi_tensor.shape != (31, size, size):
+            raise ValueError(f"Final HSI tensor shape error: expected (31, {size}, {size}), got {hsi_tensor.shape}")
         
         return rgb_tensor, hsi_tensor
     
@@ -280,7 +302,7 @@ class OptimizedValDataset(Dataset):
         # Preload validation data (it's small)
         self._preload_data()
     
-    def _load_file_lists(self):
+    def _load_file_lists(self) -> None:
         """Load validation file lists"""
         val_list_path = os.path.join(self.data_root, 'split_txt', 'valid_list.txt')
         
@@ -479,25 +501,3 @@ def test_dataloader():
 
 if __name__ == '__main__':
     test_dataloader()
-
-
-
-    def _infer_image_shape(self, idx: int) -> Tuple[int, int]:
-        """Return (height, width) for the idx-th sample without assuming ARAD defaults."""
-        if self.memory_mode != 'lazy' and hasattr(self, 'hsi_data'):
-            data = self.hsi_data[idx]
-            return int(data.shape[1]), int(data.shape[2])
-
-        # Lazy mode: inspect metadata without materialising full array
-        try:
-            with h5py.File(self.hsi_files[idx], 'r') as f:
-                cube = f['cube']
-                bands, dim1, dim2 = cube.shape
-                # After transpose([0,2,1]) we end up with (bands, dim2, dim1)
-                return int(dim2), int(dim1)
-        except Exception:
-            # Fallback to RGB dimensions
-            rgb = cv2.imread(self.rgb_files[idx], cv2.IMREAD_COLOR)
-            if rgb is None:
-                raise
-            return int(rgb.shape[0]), int(rgb.shape[1])

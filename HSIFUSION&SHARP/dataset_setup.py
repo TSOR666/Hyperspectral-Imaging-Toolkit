@@ -15,7 +15,14 @@ import cv2
 
 
 def verify_dataset_structure(data_root: Path) -> bool:
-    """Verify dataset has correct structure"""
+    """Verify dataset has correct structure.
+
+    Args:
+        data_root: Path to the dataset root directory
+
+    Returns:
+        True if dataset structure is valid with at least one matched pair, False otherwise
+    """
     required_dirs = ['Train_RGB', 'Train_Spec']
     
     print(f"Checking dataset structure in: {data_root}")

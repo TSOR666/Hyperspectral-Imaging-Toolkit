@@ -7,7 +7,7 @@ Loads configuration from INI file and creates a `SHARPTrainingConfig`.
 import argparse
 import configparser
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 try:
     from sharp_training_script_fixed import SHARPTrainingConfig, DedicatedSHARPTrainer
@@ -18,8 +18,16 @@ except ImportError:  # pragma: no cover - legacy fallback
     )
 
 
-def parse_config_value(value: str) -> Any:
-    """Parse configuration value to appropriate type"""
+# Type alias for configuration values - more specific than Any
+ConfigValue = Union[bool, int, float, str, None]
+
+
+def parse_config_value(value: str) -> ConfigValue:
+    """Parse configuration value to appropriate type.
+
+    Returns:
+        Parsed value as bool, int, float, str, or None
+    """
     # Boolean values
     if value.lower() in ['true', 'yes', 'on']:
         return True
