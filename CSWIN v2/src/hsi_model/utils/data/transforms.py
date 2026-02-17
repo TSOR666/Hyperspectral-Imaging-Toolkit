@@ -17,6 +17,7 @@ from ...constants import (
 )
 
 logger = logging.getLogger(__name__)
+_STD_EPS = 1e-12
 
 
 def mst_to_gan_batch(
@@ -118,7 +119,9 @@ def normalize_batch(
     if std.dim() == 1:
         std = std.view(1, -1, 1, 1)
 
-    return (batch - mean) / std
+    safe_std = torch.where(std.abs() < _STD_EPS, torch.full_like(std, _STD_EPS), std)
+    safe_std = torch.nan_to_num(safe_std, nan=_STD_EPS, posinf=1.0, neginf=-1.0)
+    return torch.nan_to_num((batch - mean) / safe_std, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def denormalize_batch(
@@ -139,7 +142,9 @@ def denormalize_batch(
     if std.dim() == 1:
         std = std.view(1, -1, 1, 1)
 
-    return batch * std + mean
+    safe_std = torch.where(std.abs() < _STD_EPS, torch.full_like(std, _STD_EPS), std)
+    safe_std = torch.nan_to_num(safe_std, nan=_STD_EPS, posinf=1.0, neginf=-1.0)
+    return torch.nan_to_num(batch * safe_std + mean, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def resize_batch(

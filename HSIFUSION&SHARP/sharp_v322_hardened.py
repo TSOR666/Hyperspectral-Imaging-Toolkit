@@ -17,12 +17,23 @@ All v3.2.2 features maintained:
 
 import logging
 import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils import checkpoint
+
+from common_utils_v32 import (
+    DropPath,
+    RBFKernel,
+    get_optimal_groups,
+    linear_sparsemax,
+    sdpa_unified,
+    validate_model_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -926,7 +937,11 @@ class SHARPv32(nn.Module):
                                                   self.fusion, 
                                                   reversed(features[:-1]))):
             if HAS_DYNAMO:
-                with torch._dynamo.disable():
+                # torch._dynamo.disable is a decorator in newer PyTorch versions;
+                # calling it as a context manager raises at runtime.
+                try:
+                    x = torch._dynamo.disable(up)(x)
+                except Exception:
                     x = up(x)
             else:
                 x = up(x)
@@ -1246,6 +1261,16 @@ class SHARPv32Trainer:
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             outputs = self.model(inputs)
             loss = self.model.compute_loss(outputs, targets)
+
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad(set_to_none=True)
+            return {
+                'loss': float('nan'),
+                'grad_norm': 0.0,
+                'lr': self.scheduler.get_last_lr()[0],
+                'step': self._step,
+                'skipped': True,
+            }
         
         self.scaler.scale(loss).backward()
         
@@ -1257,6 +1282,22 @@ class SHARPv32Trainer:
             )
         else:
             grad_norm = 0.0
+
+        has_finite_grads = True
+        for param in self.model.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                has_finite_grads = False
+                break
+
+        if not has_finite_grads:
+            self.optimizer.zero_grad(set_to_none=True)
+            return {
+                'loss': float('nan'),
+                'grad_norm': 0.0,
+                'lr': self.scheduler.get_last_lr()[0],
+                'step': self._step,
+                'skipped': True,
+            }
         
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -1269,17 +1310,21 @@ class SHARPv32Trainer:
             'loss': loss.item(),
             'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
             'lr': self.scheduler.get_last_lr()[0],
-            'step': self._step
+            'step': self._step,
+            'skipped': False,
         }
         
     @torch.no_grad()
     def evaluate(self, dataloader, psnr_max: float = 2.0) -> Dict[str, float]:
         """Evaluate model."""
-        assert psnr_max > 0, "psnr_max must be positive"
+        if psnr_max <= 0:
+            raise ValueError("psnr_max must be positive")
         
         self.model.eval()
         
         total_loss = 0.0
+        total_mrae = 0.0
+        total_rmse = 0.0
         total_psnr = 0.0
         num_batches = 0
         
@@ -1291,19 +1336,25 @@ class SHARPv32Trainer:
                 outputs = self.model(inputs)
                 loss = self.model.compute_loss(outputs, targets)
             
-            # PSNR calculation with configurable max value
+            abs_err = torch.abs(outputs - targets)
+            mrae = torch.mean(abs_err / torch.clamp_min(torch.abs(targets), 1e-6))
             mse = F.mse_loss(outputs, targets)
+            rmse = torch.sqrt(mse)
             psnr = 10 * torch.log10((psnr_max ** 2) / mse.clamp(min=1e-8))
             
             total_loss += loss.item()
+            total_mrae += mrae.item()
+            total_rmse += rmse.item()
             total_psnr += psnr.item()
             num_batches += 1
         
         if num_batches == 0:
-            return {'loss': 0.0, 'psnr': 0.0}
+            return {'loss': 0.0, 'mrae': 0.0, 'rmse': 0.0, 'psnr': 0.0}
         
         return {
             'loss': total_loss / num_batches,
+            'mrae': total_mrae / num_batches,
+            'rmse': total_rmse / num_batches,
             'psnr': total_psnr / num_batches
         }
     

@@ -5,10 +5,10 @@ MST++ Training Script with Critical Memory Optimizations
 CRITICAL MEMORY OPTIMIZATIONS (v3.0):
 ==========================================
 1. Training Loop Optimization (SAVES ~18GB):
-   - Don't compute disc_real during generator training
-   - Use torch.set_grad_enabled() instead of toggling requires_grad
+   - Compute disc_real under no_grad during generator updates
+   - Freeze discriminator params during generator updates
    - Cache disc_fake to avoid duplicate computation
-   - Memory reduction: ~41GB â†’ ~23GB for discriminator phase
+   - Memory reduction: ~41GB -> ~23GB for discriminator phase
 
 2. Validation Optimization:
    - Use torch.no_grad() for all discriminator calls in validation
@@ -29,7 +29,7 @@ CRITICAL MEMORY OPTIMIZATIONS (v3.0):
 Memory Impact:
 - Before: Peak memory ~76GB causing OOM on 80GB A100
 - After: Peak memory <30GB with comfortable headroom
-- Can now train with batch_size=20 on 128Â² patches
+- Can now train with batch_size=20 on 128x128 patches
 
 Environment Setup:
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
@@ -86,6 +86,8 @@ from hsi_model.utils.dataloader import (
     show_dataloader_diagnostics,
     worker_init_fn_mst,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def report_memory(tag: str):
@@ -231,6 +233,12 @@ def memory_cleanup():
         torch.cuda.empty_cache()
 
 
+def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+    """Toggle gradient computation for all parameters in a module."""
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
+
+
 def validate_mst_style(
     model: nn.Module,
     val_dataset: Any,
@@ -266,7 +274,7 @@ def validate_mst_style(
         persistent_workers=False  # KEY: Don't keep validation workers alive
     )
     
-    # Accumulate on GPU to avoid CPU↔GPU thrashing
+    # Accumulate on GPU to avoid CPU-GPU thrashing
     total_gen_loss = torch.tensor(0.0, device=device)
     total_metrics = {}
     num_batches = 0
@@ -411,6 +419,8 @@ def train_mst_gan_optimized(
     use_amp = config.get("mixed_precision", True) and device.type == 'cuda'
     epoch_losses = []
     current_epoch = 0
+    generator = model.module.generator if hasattr(model, "module") else model.generator
+    discriminator = model.module.discriminator if hasattr(model, "module") else model.discriminator
     
     # Main training loop
     while iteration < total_iteration:
@@ -430,81 +440,98 @@ def train_mst_gan_optimized(
             rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
             rgb_tensor = rgb_tensor.to(device, non_blocking=True)
             hsi_tensor = hsi_tensor.to(device, non_blocking=True)
+            if not torch.isfinite(rgb_tensor).all() or not torch.isfinite(hsi_tensor).all():
+                logger.warning("Skipping non-finite batch at iteration %s", iteration)
+                continue
             
             lr_g = optimizer_g.param_groups[0]['lr']
             lr_d = optimizer_d.param_groups[0]['lr']
             
             # ========== Train Generator (v3.0 OPTIMIZED) ==========
-            optimizer_g.zero_grad()
+            optimizer_g.zero_grad(set_to_none=True)
             
-            # v3.0: Use context manager for gradient control
-            with torch.set_grad_enabled(True):  # Ensure gradients are enabled for G
+            with autocast(enabled=use_amp):
+                fake_hsi = generator(rgb_tensor)
+
+            if not torch.isfinite(fake_hsi).all():
+                logger.warning("Non-finite generator output at iteration %s; skipping batch", iteration)
+                optimizer_g.zero_grad(set_to_none=True)
+                continue
+
+            set_requires_grad(discriminator, False)
+            try:
                 with autocast(enabled=use_amp):
-                    if hasattr(model, 'module'):
-                        fake_hsi = model.module.generator(rgb_tensor)
-                        # Compute disc_fake ONCE and cache it
-                        disc_fake_for_g = model.module.discriminator(rgb_tensor, fake_hsi)
-                    else:
-                        fake_hsi = model.generator(rgb_tensor)
-                        # Compute disc_fake ONCE and cache it
-                        disc_fake_for_g = model.discriminator(rgb_tensor, fake_hsi)
-                    
-                    # v3.0: Pass None for disc_real during G training
-                    gen_loss, loss_components = criterion(
-                        fake_hsi, hsi_tensor, 
-                        None,  # Don't compute disc_real during G training
-                        disc_fake_for_g
-                    )
-                
-                scaler_g.scale(gen_loss).backward()
-                # Detect gradient overflow in generator
-                old_scale_g = scaler_g.get_scale()
-                scaler_g.step(optimizer_g)
-                scaler_g.update()
-                new_scale_g = scaler_g.get_scale()
-                if new_scale_g < old_scale_g:
-                    logger.warning(
-                        f"Generator scaler reduced scale {old_scale_g:.1f} → {new_scale_g:.1f} "
-                        f"(overflow detected at iter {iteration})"
-                    )
-            
+                    disc_fake_for_g = discriminator(rgb_tensor, fake_hsi)
+                with torch.no_grad():
+                    with autocast(enabled=use_amp):
+                        disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
+            finally:
+                set_requires_grad(discriminator, True)
+
+            with autocast(enabled=use_amp):
+                gen_loss, loss_components = criterion(
+                    fake_hsi,
+                    hsi_tensor,
+                    disc_real_for_g,
+                    disc_fake_for_g
+                )
+
+            if not torch.isfinite(gen_loss):
+                logger.warning("Non-finite generator loss at iteration %s; skipping batch", iteration)
+                optimizer_g.zero_grad(set_to_none=True)
+                continue
+
+            scaler_g.scale(gen_loss).backward()
+            old_scale_g = scaler_g.get_scale()
+            scaler_g.step(optimizer_g)
+            scaler_g.update()
+            new_scale_g = scaler_g.get_scale()
+            if new_scale_g < old_scale_g:
+                logger.warning(
+                    f"Generator scaler reduced scale {old_scale_g:.1f} -> {new_scale_g:.1f} "
+                    f"(overflow detected at iter {iteration})"
+                )
+
             # ========== Train Discriminator (v3.0 OPTIMIZED) ==========
-            optimizer_d.zero_grad()
-            
+            optimizer_d.zero_grad(set_to_none=True)
+
             # v3.0: Detach fake_hsi to prevent gradients flowing to generator
             fake_hsi_detached = fake_hsi.detach()
-            
-            with torch.set_grad_enabled(True):  # Ensure gradients are enabled for D
-                with autocast(enabled=use_amp):
-                    if hasattr(model, 'module'):
-                        real_pred = model.module.discriminator(rgb_tensor, hsi_tensor)
-                        # v3.0: Reuse computation but with detached fake_hsi
-                        fake_pred = model.module.discriminator(rgb_tensor, fake_hsi_detached)
-                    else:
-                        real_pred = model.discriminator(rgb_tensor, hsi_tensor)
-                        # v3.0: Reuse computation but with detached fake_hsi
-                        fake_pred = model.discriminator(rgb_tensor, fake_hsi_detached)
-                    
-                    real_loss = nn.functional.binary_cross_entropy_with_logits(
-                        real_pred, torch.ones_like(real_pred)
-                    )
-                    fake_loss = nn.functional.binary_cross_entropy_with_logits(
-                        fake_pred, torch.zeros_like(fake_pred)
-                    )
-                    disc_loss = (real_loss + fake_loss) * 0.5
-                
-                scaler_d.scale(disc_loss).backward()
-                # Detect gradient overflow in discriminator
-                old_scale_d = scaler_d.get_scale()
-                scaler_d.step(optimizer_d)
-                scaler_d.update()
-                new_scale_d = scaler_d.get_scale()
-                if new_scale_d < old_scale_d:
-                    logger.warning(
-                        f"Discriminator scaler reduced scale {old_scale_d:.1f} → {new_scale_d:.1f} "
-                        f"(overflow detected at iter {iteration})"
-                    )
-            
+
+            with autocast(enabled=use_amp):
+                real_pred = discriminator(rgb_tensor, hsi_tensor)
+                fake_pred = discriminator(rgb_tensor, fake_hsi_detached)
+                if not torch.isfinite(real_pred).all() or not torch.isfinite(fake_pred).all():
+                    logger.warning("Non-finite discriminator logits at iteration %s; skipping D step", iteration)
+                    optimizer_d.zero_grad(set_to_none=True)
+                    continue
+
+                real_logits = real_pred.float()
+                fake_logits = fake_pred.float()
+                real_loss = nn.functional.binary_cross_entropy_with_logits(
+                    real_logits, torch.ones_like(real_logits)
+                )
+                fake_loss = nn.functional.binary_cross_entropy_with_logits(
+                    fake_logits, torch.zeros_like(fake_logits)
+                )
+                disc_loss = (real_loss + fake_loss) * 0.5
+
+            if not torch.isfinite(disc_loss):
+                logger.warning("Non-finite discriminator loss at iteration %s; skipping D step", iteration)
+                optimizer_d.zero_grad(set_to_none=True)
+                continue
+
+            scaler_d.scale(disc_loss).backward()
+            old_scale_d = scaler_d.get_scale()
+            scaler_d.step(optimizer_d)
+            scaler_d.update()
+            new_scale_d = scaler_d.get_scale()
+            if new_scale_d < old_scale_d:
+                logger.warning(
+                    f"Discriminator scaler reduced scale {old_scale_d:.1f} -> {new_scale_d:.1f} "
+                    f"(overflow detected at iter {iteration})"
+                )
+
             scheduler_g.step()
             scheduler_d.step()
             
@@ -513,7 +540,10 @@ def train_mst_gan_optimized(
             
             # Logging
             if iteration % 20 == 0:
-                avg_loss = np.mean(epoch_losses[-20:]) if len(epoch_losses) >= 20 else np.mean(epoch_losses)
+                if epoch_losses:
+                    avg_loss = np.mean(epoch_losses[-20:]) if len(epoch_losses) >= 20 else np.mean(epoch_losses)
+                else:
+                    avg_loss = 0.0
                 logger.info(
                     f'[iter:{iteration}/{total_iteration}], lr_g={lr_g:.9f}, '
                     f'train_loss={avg_loss:.9f}'
@@ -582,6 +612,23 @@ def train_mst_gan_optimized(
             if iteration >= total_iteration:
                 break
                 
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error("OOM at iteration %s; clearing gradients and cache", iteration)
+                optimizer_g.zero_grad(set_to_none=True)
+                optimizer_d.zero_grad(set_to_none=True)
+                if "fake_hsi" in locals():
+                    del fake_hsi
+                if "fake_hsi_detached" in locals():
+                    del fake_hsi_detached
+                if "rgb_tensor" in locals():
+                    del rgb_tensor
+                if "hsi_tensor" in locals():
+                    del hsi_tensor
+                memory_cleanup()
+                continue
+            logger.error(f"Training runtime error: {str(e)}", exc_info=True)
+            continue
         except Exception as e:
             logger.error(f"Training error: {str(e)}", exc_info=True)
             continue

@@ -59,6 +59,9 @@ DEFAULT_LAMBDA_SAM = 0.05
 DEFAULT_SINKHORN_EPSILON = 0.1
 DEFAULT_SINKHORN_ITERATIONS = 50
 SINKHORN_EPS_STABILITY = 1e-6
+DEFAULT_SINKHORN_MAX_POINTS = 1024  # Caps OT cost matrix size to mitigate OOM
+DEFAULT_SINKHORN_KERNEL_CLAMP = 60.0  # Clamp exponent argument for exp stability
+DEFAULT_SINKHORN_LOSS_CLIP = 5.0  # Clip adversarial Sinkhorn terms
 
 # ============================================
 # Regularization Constants

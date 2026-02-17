@@ -16,6 +16,14 @@ from PIL import Image
 from sharp_v322_hardened import create_sharp_v32, SHARPv32Config
 
 
+def _torch_load_compat(path: str, map_location: torch.device):
+    """Load checkpoints across PyTorch versions (2.6+ defaults to weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class SHARPInference:
     """SHARP v3.2.2 inference wrapper."""
     
@@ -24,7 +32,7 @@ class SHARPInference:
         
         # Load checkpoint
         print(f"Loading checkpoint from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _torch_load_compat(checkpoint_path, self.device)
         
         # Get configuration
         if 'config' in checkpoint:
@@ -126,7 +134,8 @@ class SHARPInference:
             hsi_pred = self.model(rgb_image)
         else:
             # Process in patches with overlap
-            hsi_pred = self._predict_patches(rgb_image, patch_size, overlap)
+            safe_overlap = min(max(overlap, 0), max(0, patch_size - 1))
+            hsi_pred = self._predict_patches(rgb_image, patch_size, safe_overlap)
         
         # Remove batch dimension if needed
         if single_image:
@@ -137,6 +146,13 @@ class SHARPInference:
     def _predict_patches(self, rgb_image: torch.Tensor, 
                         patch_size: int, overlap: int) -> torch.Tensor:
         """Process large image in overlapping patches"""
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
+        if overlap < 0 or overlap >= patch_size:
+            raise ValueError(
+                f"overlap must be in [0, patch_size), got overlap={overlap}, patch_size={patch_size}"
+            )
+
         B, C, H, W = rgb_image.shape
         
         # Initialize output
@@ -181,6 +197,8 @@ class SHARPInference:
         
         # Create 2D weight
         weight = h_grad.unsqueeze(1) * w_grad.unsqueeze(0)
+        # Keep a small positive floor so image borders are not forced to zero.
+        weight = weight.clamp_min(1e-3)
         return weight.unsqueeze(0).unsqueeze(0)
     
     def process_image_file(self, image_path: str, 
@@ -221,7 +239,6 @@ class SHARPInference:
                 scipy.io.savemat(output_path, {'hsi': hsi_np})
             else:
                 # Save as multi-channel TIFF
-                from PIL import Image
                 # Convert to uint16 for better precision
                 hsi_uint16 = (hsi_np * 65535).clip(0, 65535).astype(np.uint16)
                 # Save each channel

@@ -183,11 +183,12 @@ class OptimizedCNNWaveletTransform(nn.Module):
             # Optimized grouped convolution with proper padding
             coeffs = F.conv2d(current, filters, stride=2, padding=padding, groups=C)  # (B, C, H, W) -> (B, 4*C, H/2, W/2)
             
-            # Efficient tensor reshaping
-            coeffs = coeffs.view(B, 4, C, coeffs.shape[2], coeffs.shape[3])  # (B, 4*C, H2, W2) -> (B, 4, C, H2, W2)
-            
-            yl_new = coeffs[:, 0]  # (B, C, H2, W2)
-            yh_level = coeffs[:, 1:].permute(0, 2, 1, 3, 4)  # (B, 3, C, H2, W2) -> (B, C, 3, H2, W2)
+            # Grouped conv output order: [ch0_f0..ch0_f3, ch1_f0..ch1_f3, ...]
+            # Reshape as (B, C, 4, H2, W2) so dim=2 indexes subbands [LL, LH, HL, HH]
+            coeffs = coeffs.view(B, C, 4, coeffs.shape[2], coeffs.shape[3])  # (B, 4*C, H2, W2) -> (B, C, 4, H2, W2)
+
+            yl_new = coeffs[:, :, 0]  # (B, C, H2, W2) — LL subband
+            yh_level = coeffs[:, :, 1:]  # (B, C, 3, H2, W2) — [LH, HL, HH]
             yh.append(yh_level)
             
             current = yl_new
@@ -275,8 +276,9 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
 class PerformanceMonitor:
     """Enhanced performance monitoring with detailed profiling"""
     
-    def __init__(self, enabled: bool = True, rank: int = 0, profile_memory: bool = True) -> None:
+    def __init__(self, enabled: bool = True, rank: int = 0, profile_memory: bool = True, sync_cuda: bool = False) -> None:
         self.enabled = enabled and rank == 0
+        self.sync_cuda = sync_cuda  # Only synchronize when explicit profiling is requested
         self.profile_memory = profile_memory and torch.cuda.is_available()
         self.reset()
     
@@ -295,10 +297,10 @@ class PerformanceMonitor:
     def start_stage(self, stage_name: str) -> None:
         if not self.enabled:
             return
-        
-        if torch.cuda.is_available():
+
+        if self.sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
-        
+
         self._start_times[stage_name] = time.perf_counter()
         
         if self.profile_memory:
@@ -310,8 +312,8 @@ class PerformanceMonitor:
     def end_stage(self, stage_name: str) -> None:
         if not self.enabled or stage_name not in self._start_times:
             return
-        
-        if torch.cuda.is_available():
+
+        if self.sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
         
         elapsed = (time.perf_counter() - self._start_times[stage_name]) * 1000
@@ -663,11 +665,19 @@ class OptimizedWindowAttention2D(nn.Module):
         qkv = rearrange(qkv, 'bw n k (h d) -> k bw h n d', h=self.num_heads)  # (B*nh*nw, N, 3, C) -> (3, B*nh*nw, Heads, N, D)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B*nh*nw, Heads, N, D)
         
+        # Compute relative position bias (used by both paths)
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)  # (N, N, Heads)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # (Heads, N, N)
+
         # Enhanced attention computation
         if self.use_flash and self.training:
-            # Use flash attention for training
+            # Pass bias via attn_mask so SDPA can select the best kernel
+            bias = relative_position_bias.unsqueeze(0).expand(q.shape[0], -1, -1, -1)  # (B*nh*nw, Heads, N, N)
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
+                attn_mask=bias.to(dtype=q.dtype),
                 dropout_p=self.dropout.p if self.training else 0.0,
                 scale=self.scale
             )  # (B*nh*nw, Heads, N, D)
@@ -680,11 +690,7 @@ class OptimizedWindowAttention2D(nn.Module):
 
             attn = (q_fp32 @ k_fp32.transpose(-2, -1)) * self.scale  # (B*nh*nw, Heads, N, D) @ (B*nh*nw, Heads, D, N) -> (B*nh*nw, Heads, N, N)
 
-            # Add relative position bias
-            relative_position_bias = self.relative_position_bias_table[
-                self.relative_position_index.view(-1)
-            ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)  # (N, N, Heads)
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # (Heads, N, N)
+            # Add relative position bias (already computed above)
             attn = attn + relative_position_bias.unsqueeze(0).float()  # (1, Heads, N, N) broadcast across batch
 
             # NUMERICAL STABILITY FIX: Clamp attention scores to prevent overflow before softmax

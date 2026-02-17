@@ -87,6 +87,14 @@ def throttled_warning(message: str, key: str, interval: int = 100) -> None:
     if count % interval == 1:
         warnings.warn(f"{message} (occurrence {count})")
 
+
+def _torch_load_compat(path: Union[str, Path], map_location: str = "cpu"):
+    """Load checkpoints across PyTorch versions (2.6+ defaults to weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
 def _factor_pair(n: int) -> Tuple[int, int]:
     """Find factor pair (h, w) such that h*w = n, with h as close to sqrt(n) as possible.
     
@@ -1200,7 +1208,7 @@ class HSIFusionNetV25LightningPro(nn.Module):
         """
         # Handle different input types
         if isinstance(checkpoint_path, (str, Path)):
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            checkpoint = _torch_load_compat(checkpoint_path, map_location='cpu')
         elif isinstance(checkpoint_path, Mapping):
             checkpoint = checkpoint_path
         else:
