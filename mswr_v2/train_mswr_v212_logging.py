@@ -197,11 +197,16 @@ class EnhancedMSWRLoss(nn.Module):
         sigma1_sq = F.avg_pool2d(pred * pred, window_size, 1, window_size//2) - mu1_sq
         sigma2_sq = F.avg_pool2d(target * target, window_size, 1, window_size//2) - mu2_sq
         sigma12 = F.avg_pool2d(pred * target, window_size, 1, window_size//2) - mu1_mu2
-        
+
+        # Clamp variances to avoid negative values from floating-point imprecision
+        sigma1_sq = sigma1_sq.clamp(min=0.0)
+        sigma2_sq = sigma2_sq.clamp(min=0.0)
+
         C1 = 0.01**2
         C2 = 0.03**2
-        
-        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+
+        denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / (denominator + 1e-8)
         return 1 - ssim_map.mean()
     
     def _gradient_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -237,7 +242,7 @@ class EnhancedMSWRLoss(nn.Module):
             total_loss: Combined loss scalar
             loss_dict: Dictionary of individual loss components
         """
-        total_loss = torch.tensor(0.0, device=pred.device)
+        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         loss_dict = {}
         
         # L1 loss (base loss)
@@ -250,7 +255,7 @@ class EnhancedMSWRLoss(nn.Module):
         if self.mrae_weight > 0:
             mrae_weight = self.mrae_weight
             if self.current_epoch < self.warmup_epochs:
-                mrae_weight *= (self.current_epoch / self.warmup_epochs)
+                mrae_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
             
             mrae_loss = self.mrae_loss(pred, target)
             total_loss = total_loss + mrae_weight * mrae_loss
@@ -260,7 +265,7 @@ class EnhancedMSWRLoss(nn.Module):
         if self.ssim_weight > 0:
             ssim_weight = self.ssim_weight
             if self.current_epoch < self.warmup_epochs:
-                ssim_weight *= (self.current_epoch / self.warmup_epochs)
+                ssim_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
             
             ssim_loss = self._ssim_loss(pred, target)
             total_loss = total_loss + ssim_weight * ssim_loss
@@ -270,7 +275,7 @@ class EnhancedMSWRLoss(nn.Module):
         if self.sam_weight > 0 and pred.size(1) > 3:  # Only for hyperspectral (>3 channels)
             sam_weight = self.sam_weight
             if self.current_epoch < self.warmup_epochs:
-                sam_weight *= (self.current_epoch / self.warmup_epochs)
+                sam_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
             
             sam_loss = self.sam_loss(pred, target)
             # Convert from radians to degrees for better interpretability in logging
@@ -283,7 +288,7 @@ class EnhancedMSWRLoss(nn.Module):
         if self.gradient_weight > 0:
             grad_weight = self.gradient_weight
             if self.current_epoch < self.warmup_epochs:
-                grad_weight *= (self.current_epoch / self.warmup_epochs)
+                grad_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
             
             grad_loss = self._gradient_loss(pred, target)
             total_loss = total_loss + grad_weight * grad_loss
@@ -841,7 +846,8 @@ class EnhancedTrainer:
         self.early_stopping_warmup = max(0, config.early_stopping_warmup)
         self.early_stopping_metric_key = 'psnr' if config.early_stopping_mode == 'max' else 'mrae'
         self.ema = None
-        
+        self._consecutive_nan_count = 0  # Convergence safeguard: halt after N consecutive NaN losses
+
         # Setup components
         self._setup_model()
         self._setup_data()
@@ -1165,6 +1171,14 @@ class EnhancedTrainer:
             self.iteration = checkpoint.get('iter', 0)
             self.best_mrae = checkpoint.get('best_mrae', float('inf'))
 
+            # Restore GradScaler state for AMP continuity
+            if self.scaler is not None and 'scaler' in checkpoint:
+                try:
+                    self.scaler.load_state_dict(checkpoint['scaler'])
+                    self.logger.info("Loaded GradScaler state from checkpoint.")
+                except Exception as e:
+                    self.logger.warning(f"Failed to load GradScaler state: {e}")
+
             # Restore EMA state if available
             if self.ema is not None and checkpoint.get('ema'):
                 try:
@@ -1217,24 +1231,74 @@ class EnhancedTrainer:
             loss_dict = {}
             grad_norm = 0.0
             
-            # Forward pass
-            if self.scaler is not None:
-                with autocast('cuda'):
+            # Forward + backward with OOM recovery
+            try:
+                # Forward pass
+                if self.scaler is not None:
+                    with autocast('cuda'):
+                        output = self.model(images)
+                    # Compute loss in fp32 outside autocast for numerical stability
+                    output_fp32 = output.float().clamp(0.0, 1.0)
+                    labels_fp32 = labels.float()
+                    if not torch.isfinite(output_fp32).all():
+                        self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
+                        self.optimizer.zero_grad()
+                        self.iteration += 1
+                        continue
+                    if self.config.use_enhanced_loss:
+                        loss, loss_dict = self.criterion(output_fp32, labels_fp32)
+                        loss = loss / self.config.gradient_accumulation_steps
+                    else:
+                        loss = self.criterion(output_fp32, labels_fp32) / self.config.gradient_accumulation_steps
+                else:
                     output = self.model(images)
+                    output = output.clamp(0.0, 1.0)
+                    if not torch.isfinite(output).all():
+                        self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
+                        self.optimizer.zero_grad()
+                        self.iteration += 1
+                        continue
                     if self.config.use_enhanced_loss:
                         loss, loss_dict = self.criterion(output, labels)
                         loss = loss / self.config.gradient_accumulation_steps
                     else:
                         loss = self.criterion(output, labels) / self.config.gradient_accumulation_steps
-                self.scaler.scale(loss).backward()
-            else:
-                output = self.model(images)
-                if self.config.use_enhanced_loss:
-                    loss, loss_dict = self.criterion(output, labels)
-                    loss = loss / self.config.gradient_accumulation_steps
+
+                # NaN/Inf loss guard
+                if not torch.isfinite(loss):
+                    self._consecutive_nan_count += 1
+                    self.logger.warning(
+                        f"[Iter {self.iteration}] Non-finite loss "
+                        f"(consecutive: {self._consecutive_nan_count})"
+                    )
+                    if self._consecutive_nan_count >= 10:
+                        self.logger.error("10 consecutive NaN/Inf losses — halting training")
+                        return {'loss': float('nan'), 'early_stop': True}
+                    self.optimizer.zero_grad()
+                    self.iteration += 1
+                    continue
+                self._consecutive_nan_count = 0
+
+                # Backward pass
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
                 else:
-                    loss = self.criterion(output, labels) / self.config.gradient_accumulation_steps
-                loss.backward()
+                    loss.backward()
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    self.logger.warning(
+                        f"[Iter {self.iteration}] CUDA OOM, skipping batch. "
+                        f"Allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB"
+                    )
+                    for v in ('output', 'output_fp32', 'loss'):
+                        if v in locals():
+                            del locals()[v]
+                    torch.cuda.empty_cache()
+                    self.optimizer.zero_grad()
+                    self.iteration += 1
+                    continue
+                raise
             
             # Gradient accumulation and optimization step
             if (i + 1) % self.config.gradient_accumulation_steps == 0:
@@ -1254,12 +1318,27 @@ class EnhancedTrainer:
                 
                 self.optimizer.zero_grad()
                 self.scheduler.step()
-                
+
+                # Learning rate floor check
+                _lr_post = self.optimizer.param_groups[0]['lr']
+                if _lr_post < 1e-9:
+                    self.logger.warning(
+                        f"[Iter {self.iteration}] LR near zero: {_lr_post:.2e}. "
+                        "Training may be stalling."
+                    )
+
                 # Track gradient norm
                 if isinstance(grad_norm, torch.Tensor):
-                    grad_norms.update(grad_norm.item())
+                    _gn = grad_norm.item()
                 else:
-                    grad_norms.update(grad_norm)
+                    _gn = grad_norm
+                grad_norms.update(_gn)
+
+                # Vanishing gradient detection
+                if _gn == 0.0:
+                    self.logger.warning(
+                        f"[Iter {self.iteration}] Vanishing gradients (grad_norm=0.0)"
+                    )
             
             # Update metrics
             losses.update(loss.item() * self.config.gradient_accumulation_steps)
@@ -1665,7 +1744,31 @@ class EnhancedTrainer:
                 # Track metrics for analysis
                 self.train_losses.append(train_metrics['loss'])
                 self.val_losses.append(val_metrics['mrae'])
-                
+
+                # Loss plateau detection (last 20 epochs)
+                _stall_window = 20
+                if len(self.train_losses) >= _stall_window:
+                    _recent = self.train_losses[-_stall_window:]
+                    _improvement = abs(_recent[0] - _recent[-1]) / (abs(_recent[0]) + 1e-10)
+                    if _improvement < 1e-4:
+                        self.logger.warning(
+                            f"Training loss plateau: <0.01% change over last "
+                            f"{_stall_window} epochs ({_recent[0]:.6f} -> {_recent[-1]:.6f})"
+                        )
+
+                # Overfitting detection: train improves but val worsens
+                if len(self.train_losses) >= 5 and len(self.val_losses) >= 5:
+                    _rtrain = self.train_losses[-5:]
+                    _rval = self.val_losses[-5:]
+                    _train_trend = _rtrain[-1] - _rtrain[0]   # negative = improving
+                    _val_trend = _rval[-1] - _rval[0]         # positive = worsening
+                    if _train_trend < -1e-5 and _val_trend > 1e-5:
+                        self.logger.warning(
+                            f"Overfitting signal: train loss improving "
+                            f"({_rtrain[0]:.6f}->{_rtrain[-1]:.6f}) but val MRAE "
+                            f"worsening ({_rval[0]:.6f}->{_rval[-1]:.6f})"
+                        )
+
                 # Enhanced wandb logging
                 if self.config.use_wandb:
                     wandb.log({

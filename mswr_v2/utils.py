@@ -118,7 +118,7 @@ class Loss_PSNR(nn.Module):
         err = mse(Itrue, Ifake).sum(dim=1, keepdim=True).div(C * H * W)
 
         # Calculate PSNR
-        psnr = 10. * torch.log10((data_range ** 2) / (err + 1e-8))  # Add epsilon to avoid log(0)
+        psnr = 10. * torch.log10((data_range ** 2) / (err + 1e-6))  # Epsilon caps PSNR at ~60dB; 1e-6 survives fp16
         return torch.mean(psnr)
 
 # Additional loss functions for enhanced training

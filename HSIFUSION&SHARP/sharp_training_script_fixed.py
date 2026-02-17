@@ -54,6 +54,21 @@ except ImportError:
     DATALOADER_AVAILABLE = False
 
 
+def _torch_load_compat(path: str, map_location: torch.device):
+    """Load checkpoints across PyTorch versions (2.6+ defaults to weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def should_optimizer_step(batch_idx: int, total_batches: int, accumulate_steps: int) -> bool:
+    """Return whether an optimizer update should be executed for this batch index."""
+    if accumulate_steps <= 0:
+        raise ValueError("accumulate_steps must be > 0")
+    return ((batch_idx + 1) % accumulate_steps == 0) or ((batch_idx + 1) == total_batches)
+
+
 @dataclass
 class SHARPTrainingConfig:
     """Configuration for SHARP v3.2.2 training"""
@@ -101,6 +116,8 @@ class SHARPTrainingConfig:
     val_interval: int = 10
     val_crop: bool = True  # Center crop 226x256 for MST++ protocol
     val_crop_size: Tuple[int, int] = (226, 256)
+    early_stopping_patience: int = 35
+    early_stopping_min_delta: float = 1e-5
     
     # Checkpointing
     save_interval: int = 50
@@ -115,6 +132,9 @@ class SHARPTrainingConfig:
     # Hardware
     device: str = 'cuda'
     seed: int = 42
+    min_mrae_denom: float = 1e-6
+    max_consecutive_nonfinite: int = 8
+    skip_oom_batches: bool = True
     
     def __post_init__(self):
         """Post-initialization validation and setup"""
@@ -134,6 +154,9 @@ class SHARPTrainingConfig:
         # Create experiment name if not provided
         if self.experiment_name is None:
             self.experiment_name = f"sharp_v322_{self.model_size}_sp{self.sparse_sparsity_ratio:.1f}_rbf{self.rbf_centers_per_head}"
+
+        if self.accumulate_steps <= 0:
+            raise ValueError("accumulate_steps must be > 0")
 
 
 class SHARPLoss(nn.Module):
@@ -221,6 +244,10 @@ class DedicatedSHARPTrainer:
         self.best_mrae = float('inf')
         self.start_epoch = 0
         self.iteration = 0
+        self.bad_val_epochs = 0
+        self.consecutive_nonfinite = 0
+        self.skipped_oom_batches = 0
+        self.skipped_nonfinite_batches = 0
         
         # Resume if specified
         if config.resume_from:
@@ -228,6 +255,19 @@ class DedicatedSHARPTrainer:
         
         # Print model info
         self._print_model_info()
+    
+    def _is_oom_error(self, exc: BaseException) -> bool:
+        return "out of memory" in str(exc).lower()
+
+    def _has_finite_gradients(self) -> bool:
+        for param in self.model.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                return False
+        return True
+
+    def _safe_mrae(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
+        return torch.mean(torch.abs(pred - target) / denom)
     
     def _set_seeds(self, seed: int):
         """Set random seeds for reproducibility"""
@@ -479,10 +519,23 @@ class DedicatedSHARPTrainer:
                 val_metrics = self._validate(epoch)
                 
                 # Save best model
-                if val_metrics['mrae'] < self.best_mrae:
+                if val_metrics['mrae'] < (self.best_mrae - self.config.early_stopping_min_delta):
                     self.best_mrae = val_metrics['mrae']
+                    self.bad_val_epochs = 0
                     self._save_checkpoint(epoch, is_best=True)
                     print(f"New best model! MRAE: {self.best_mrae:.6f}")
+                else:
+                    self.bad_val_epochs += 1
+
+                if (
+                    self.config.early_stopping_patience > 0
+                    and self.bad_val_epochs >= self.config.early_stopping_patience
+                ):
+                    print(
+                        f"Early stopping triggered after {self.bad_val_epochs} validation checks "
+                        f"without improvement > {self.config.early_stopping_min_delta}."
+                    )
+                    break
             
             # Periodic checkpoint
             if (epoch + 1) % self.config.save_interval == 0:
@@ -492,6 +545,7 @@ class DedicatedSHARPTrainer:
         total_time = time.time() - start_time
         print(f"\nTraining completed in {total_time/3600:.1f} hours")
         print(f"Best MRAE: {self.best_mrae:.6f}")
+        print(f"Skipped batches - OOM: {self.skipped_oom_batches}, non-finite: {self.skipped_nonfinite_batches}")
         print(f"Results saved to: {self.exp_dir}")
         self.writer.close()
     
@@ -500,14 +554,38 @@ class DedicatedSHARPTrainer:
         self.model.train()
         epoch_losses = []
         epoch_start = time.time()
+        total_batches = len(self.train_loader)
         
         for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
-            if self.use_sharp_trainer:
-                # Use built-in trainer
-                metrics = self.sharp_trainer.train_step(rgb, hsi)
-            else:
-                # Manual training step
-                metrics = self._train_step(batch_idx, rgb, hsi)
+            try:
+                if self.use_sharp_trainer:
+                    # Use built-in trainer
+                    metrics = self.sharp_trainer.train_step(rgb, hsi)
+                else:
+                    # Manual training step
+                    metrics = self._train_step(
+                        batch_idx=batch_idx,
+                        rgb=rgb,
+                        hsi=hsi,
+                        is_last_batch=(batch_idx + 1) == total_batches,
+                    )
+            except RuntimeError as exc:
+                if self.config.skip_oom_batches and self._is_oom_error(exc):
+                    self.skipped_oom_batches += 1
+                    if not self.use_sharp_trainer:
+                        self.optimizer.zero_grad(set_to_none=True)
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    warnings.warn(
+                        f"Skipped OOM batch at epoch={epoch+1}, batch={batch_idx+1}. "
+                        f"Total skipped OOM batches: {self.skipped_oom_batches}"
+                    )
+                    continue
+                raise
+
+            if metrics.get('skipped', False):
+                self.skipped_nonfinite_batches += 1
+                continue
             
             epoch_losses.append(metrics['loss'])
             self.iteration += 1
@@ -518,7 +596,7 @@ class DedicatedSHARPTrainer:
         
         # Epoch statistics
         epoch_time = time.time() - epoch_start
-        avg_loss = np.mean(epoch_losses)
+        avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float('nan')
         
         print(f"\nEpoch {epoch+1}/{self.config.epochs} completed in {epoch_time:.1f}s")
         print(f"Average loss: {avg_loss:.4f}")
@@ -531,7 +609,7 @@ class DedicatedSHARPTrainer:
         
         return {'avg_loss': avg_loss, 'epoch_time': epoch_time}
     
-    def _train_step(self, batch_idx: int, rgb: torch.Tensor, hsi: torch.Tensor) -> Dict:
+    def _train_step(self, batch_idx: int, rgb: torch.Tensor, hsi: torch.Tensor, is_last_batch: bool = False) -> Dict:
         """Single training step (manual implementation)"""
         # Move to device
         if self.config.use_channels_last:
@@ -544,19 +622,51 @@ class DedicatedSHARPTrainer:
         # Forward pass
         with autocast(enabled=self.config.use_amp):
             pred = self.model(rgb)
+            if isinstance(pred, tuple):
+                pred = pred[0]
             loss = self.criterion(pred, hsi)
-            loss = loss / self.config.accumulate_steps
+
+        if not torch.isfinite(loss):
+            self.consecutive_nonfinite += 1
+            warnings.warn(
+                f"Non-finite loss at batch={batch_idx+1}; skipping update "
+                f"({self.consecutive_nonfinite} consecutive)."
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                raise RuntimeError("Exceeded maximum consecutive non-finite losses; aborting to avoid divergence.")
+            return {
+                'loss': float('nan'),
+                'grad_norm': 0.0,
+                'lr': self.optimizer.param_groups[0]['lr'],
+                'skipped': True,
+            }
+
+        self.consecutive_nonfinite = 0
+        loss = loss / self.config.accumulate_steps
         
         # Backward pass
         self.scaler.scale(loss).backward()
         
         # Gradient accumulation
-        if (batch_idx + 1) % self.config.accumulate_steps == 0:
+        if should_optimizer_step(batch_idx, len(self.train_loader), self.config.accumulate_steps) or is_last_batch:
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), 
                 self.config.gradient_clip
             )
+            if not self._has_finite_gradients():
+                self.consecutive_nonfinite += 1
+                warnings.warn(f"Non-finite gradients at batch={batch_idx+1}; skipping optimizer step.")
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                    raise RuntimeError("Exceeded maximum consecutive non-finite gradients; aborting to avoid divergence.")
+                return {
+                    'loss': float('nan'),
+                    'grad_norm': 0.0,
+                    'lr': self.optimizer.param_groups[0]['lr'],
+                    'skipped': True,
+                }
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -572,7 +682,8 @@ class DedicatedSHARPTrainer:
         return {
             'loss': loss.item() * self.config.accumulate_steps,
             'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-            'lr': self.optimizer.param_groups[0]['lr']
+            'lr': self.optimizer.param_groups[0]['lr'],
+            'skipped': False,
         }
     
     @torch.no_grad()
@@ -626,7 +737,7 @@ class DedicatedSHARPTrainer:
             
             # Compute metrics
             # Use clamp_min for numerical stability, especially under AMP/float16
-            mrae = torch.mean(torch.abs(pred - hsi) / torch.clamp_min(hsi, 1e-6)).item()
+            mrae = self._safe_mrae(pred, hsi).item()
             rmse = torch.sqrt(torch.mean((pred - hsi) ** 2)).item()
             mse = torch.mean((pred - hsi) ** 2)
             psnr = 20 * torch.log10(torch.tensor(2.0) / torch.sqrt(mse.clamp(min=1e-8))).item()
@@ -636,6 +747,9 @@ class DedicatedSHARPTrainer:
             total_psnr += psnr
             num_samples += 1
         
+        if num_samples == 0:
+            return {'mrae': 0.0, 'rmse': 0.0, 'psnr': 0.0}
+
         return {
             'mrae': total_mrae / num_samples,
             'rmse': total_rmse / num_samples,
@@ -691,7 +805,7 @@ class DedicatedSHARPTrainer:
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint for resuming training"""
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _torch_load_compat(checkpoint_path, self.device)
         
         # Load model state
         model_ref = getattr(self.model, '_orig_mod', self.model)
@@ -765,6 +879,16 @@ def main():
                         help='Disable automatic mixed precision')
     parser.add_argument('--checkpoint', action='store_true',
                         help='Enable gradient checkpointing')
+    parser.add_argument('--early_stopping_patience', type=int, default=35,
+                        help='Stop training after this many validations without improvement')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=1e-5,
+                        help='Minimum MRAE improvement to reset early stopping counter')
+    parser.add_argument('--min_mrae_denom', type=float, default=1e-6,
+                        help='Clamp floor for MRAE denominator to avoid division by zero')
+    parser.add_argument('--max_consecutive_nonfinite', type=int, default=8,
+                        help='Abort after this many consecutive non-finite batches')
+    parser.add_argument('--disable_oom_skip', action='store_true',
+                        help='Disable OOM batch skipping and fail immediately')
     
     # Output
     parser.add_argument('--output_dir', type=str, default='./experiments/sharp',
@@ -801,6 +925,11 @@ def main():
         compile_model=args.compile,
         use_amp=not args.no_amp,
         use_checkpoint=args.checkpoint,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        min_mrae_denom=args.min_mrae_denom,
+        max_consecutive_nonfinite=args.max_consecutive_nonfinite,
+        skip_oom_batches=not args.disable_oom_skip,
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,
         resume_from=args.resume,
@@ -814,8 +943,5 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-
 
 

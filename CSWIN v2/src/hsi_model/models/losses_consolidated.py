@@ -23,8 +23,12 @@ from ..constants import (
     CHARBONNIER_EPSILON,
     DEFAULT_SINKHORN_EPSILON,
     DEFAULT_SINKHORN_ITERATIONS,
+    DEFAULT_SINKHORN_MAX_POINTS,
+    DEFAULT_SINKHORN_KERNEL_CLAMP,
+    DEFAULT_SINKHORN_LOSS_CLIP,
     SINKHORN_EPS_STABILITY,
     EPSILON_LARGE,
+    EPSILON_SMALL,
     SAM_COSINE_CLAMP,
     DEFAULT_LAMBDA_REC,
     DEFAULT_LAMBDA_PERCEPTUAL,
@@ -36,6 +40,27 @@ from ..constants import (
 logger = logging.getLogger(__name__)
 
 ConfigDict = Mapping[str, object]
+
+
+def _cap_points(points: torch.Tensor, max_points: int) -> torch.Tensor:
+    """Deterministically subsample points to cap Sinkhorn memory usage."""
+    if max_points <= 0 or points.shape[0] <= max_points:
+        return points
+
+    idx = torch.linspace(
+        0,
+        points.shape[0] - 1,
+        steps=max_points,
+        device=points.device,
+        dtype=torch.float32,
+    ).round().long()
+    return points.index_select(0, idx)
+
+
+def _safe_normalize(points: torch.Tensor, eps: float = EPSILON_SMALL) -> torch.Tensor:
+    """Normalize and sanitize a point cloud tensor."""
+    normalized = F.normalize(points, dim=0, eps=max(float(eps), 1e-12))
+    return torch.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class FeatureExtractor(Protocol):
@@ -141,12 +166,25 @@ class SinkhornDivergence(nn.Module):
         self,
         epsilon: float = DEFAULT_SINKHORN_EPSILON,
         n_iters: int = DEFAULT_SINKHORN_ITERATIONS,
-        eps_stab: float = SINKHORN_EPS_STABILITY
+        eps_stab: float = SINKHORN_EPS_STABILITY,
+        max_points: int = DEFAULT_SINKHORN_MAX_POINTS,
+        kernel_clamp: float = DEFAULT_SINKHORN_KERNEL_CLAMP,
+        force_fp32: bool = True,
     ):
         super().__init__()
-        self.epsilon = epsilon
-        self.n_iters = n_iters
-        self.eps_stab = eps_stab
+        self.epsilon = max(float(epsilon), 1e-4)
+        self.n_iters = max(int(n_iters), 1)
+        self.eps_stab = max(float(eps_stab), 1e-8)
+        self.max_points = max(int(max_points), 0)
+        self.kernel_clamp = max(float(kernel_clamp), 1.0)
+        self.force_fp32 = bool(force_fp32)
+
+        if epsilon <= 0:
+            logger.warning(
+                "Non-positive Sinkhorn epsilon=%s detected; clamped to %.6f",
+                epsilon,
+                self.epsilon,
+            )
 
     @staticmethod
     def _cost_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -162,7 +200,21 @@ class SinkhornDivergence(nn.Module):
         """
         if x.dim() != 2 or y.dim() != 2:
             raise ValueError("Cost matrix expects 2D tensors of shape (n, d) and (m, d)")
-        return torch.cdist(x, y, p=2) ** 2
+        cost = torch.cdist(x, y, p=2) ** 2
+        return torch.nan_to_num(cost, nan=0.0, posinf=1e6, neginf=0.0)
+
+    def _prepare_points(self, points: torch.Tensor) -> torch.Tensor:
+        """Sanitize and optionally subsample point cloud for stable Sinkhorn."""
+        if points.dim() != 2:
+            raise ValueError(f"Point cloud must be 2D, got shape {tuple(points.shape)}")
+
+        points = torch.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0)
+        points = _cap_points(points, self.max_points)
+
+        if self.force_fp32 and points.dtype in (torch.float16, torch.bfloat16):
+            points = points.float()
+
+        return points
 
     def _sinkhorn_cost(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
@@ -175,42 +227,48 @@ class SinkhornDivergence(nn.Module):
         Returns:
             OT cost (scalar)
         """
+        X = self._prepare_points(X)
+        Y = self._prepare_points(Y)
         n, m = X.size(0), Y.size(0)
         device = X.device
-
-        C = self._cost_matrix(X, Y)  # (n, m)
-        if C.dtype in (torch.float16, torch.bfloat16):
-            C = C.float()
-        K = torch.exp(-C / self.epsilon)  # (n, m)
+        differentiable_zero = (X.sum() + Y.sum()) * 0.0
 
         # Validate point cloud sizes
         if n <= 0 or m <= 0:
-            raise ValueError(f"Empty point clouds: X has {n} points, Y has {m} points")
+            return differentiable_zero
+
+        C = self._cost_matrix(X, Y)  # (n, m)
+        if self.force_fp32 and C.dtype in (torch.float16, torch.bfloat16):
+            C = C.float()
+        scaled_cost = torch.clamp(-C / self.epsilon, min=-self.kernel_clamp, max=0.0)
+        K = torch.exp(scaled_cost)
+        K = torch.nan_to_num(K, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(self.eps_stab)
 
         # Create uniform distributions
         a = torch.full((n,), 1.0 / n, device=device, dtype=C.dtype)
         b = torch.full((m,), 1.0 / m, device=device, dtype=C.dtype)
 
-        # Validate probability distributions sum to 1
-        assert abs(a.sum().item() - 1.0) < 1e-6, f"Invalid distribution a: sum={a.sum().item()}"
-        assert abs(b.sum().item() - 1.0) < 1e-6, f"Invalid distribution b: sum={b.sum().item()}"
-
         u = torch.ones_like(a)
         v = torch.ones_like(b)
 
         # Sinkhorn iterations with stabilization to prevent division by zero
-        eps_stab = max(self.eps_stab, 1e-6)
         for _ in range(self.n_iters):
-            Kv = K @ v + eps_stab
-            # Use torch.where and clamp to prevent division by zero/near-zero values
-            u = torch.where(Kv.abs() < eps_stab, a, a / torch.clamp(Kv, min=eps_stab))
-            Ktu = K.transpose(0, 1) @ u + eps_stab
-            v = torch.where(Ktu.abs() < eps_stab, b, b / torch.clamp(Ktu, min=eps_stab))
+            Kv = (K @ v).clamp_min(self.eps_stab)
+            u = a / Kv
+            Ktu = (K.transpose(0, 1) @ u).clamp_min(self.eps_stab)
+            v = b / Ktu
 
-        # Transport plan π = diag(u) K diag(v)
+            if not torch.isfinite(u).all() or not torch.isfinite(v).all():
+                logger.warning("Non-finite Sinkhorn iterates detected; returning zero OT cost")
+                return differentiable_zero.to(dtype=C.dtype, device=device)
+
+        # Transport plan pi = diag(u) K diag(v)
         pi = (u[:, None] * K) * v[None, :]
         cost = torch.sum(pi * C)
-        return cost
+        if not torch.isfinite(cost):
+            logger.warning("Non-finite Sinkhorn cost detected; returning zero OT cost")
+            return differentiable_zero.to(dtype=C.dtype, device=device)
+        return torch.clamp(cost, min=0.0)
 
     def forward(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
@@ -228,12 +286,12 @@ class SinkhornDivergence(nn.Module):
         ot_yy = self._sinkhorn_cost(Y, Y.detach())
         divergence = ot_xy - 0.5 * (ot_xx + ot_yy)
 
-        if torch.isnan(divergence) or torch.isinf(divergence):
+        if not torch.isfinite(divergence):
             logger.warning("Invalid Sinkhorn divergence detected; returning zero")
-            return torch.zeros_like(divergence)
+            return divergence * 0.0
         if (divergence < -1e-6).any():
             logger.warning("Sinkhorn divergence negative (min=%.6f); clamping to zero", divergence.min().item())
-        return torch.clamp(divergence, min=0.0)
+        return torch.clamp(divergence, min=0.0, max=1e4)
 
 
 class SinkhornLoss(nn.Module):
@@ -407,8 +465,12 @@ class NoiseRobustLoss(nn.Module):
         self.use_sinkhorn_adv = config.get("use_sinkhorn_adversarial", True)
         self.sinkhorn = SinkhornDivergence(
             epsilon=config.get("sinkhorn_epsilon", DEFAULT_SINKHORN_EPSILON),
-            n_iters=config.get("sinkhorn_iters", DEFAULT_SINKHORN_ITERATIONS)
+            n_iters=config.get("sinkhorn_iters", DEFAULT_SINKHORN_ITERATIONS),
+            max_points=config.get("sinkhorn_max_points", DEFAULT_SINKHORN_MAX_POINTS),
+            kernel_clamp=config.get("sinkhorn_kernel_clamp", DEFAULT_SINKHORN_KERNEL_CLAMP),
+            force_fp32=config.get("sinkhorn_force_fp32", True),
         )
+        self.sinkhorn_loss_clip = config.get("sinkhorn_loss_clip", DEFAULT_SINKHORN_LOSS_CLIP)
         
         # Adaptive weighting
         self.use_adaptive_weights = config.get("use_adaptive_weights", True)
@@ -438,49 +500,67 @@ class NoiseRobustLoss(nn.Module):
         Returns:
             Adversarial loss (scalar)
         """
-        if disc_fake is None or disc_real is None:
+        differentiable_zero: torch.Tensor
+        if disc_fake is not None:
+            differentiable_zero = torch.nan_to_num(
+                disc_fake, nan=0.0, posinf=0.0, neginf=0.0
+            ).sum() * 0.0
+        elif disc_real is not None:
+            differentiable_zero = torch.nan_to_num(
+                disc_real, nan=0.0, posinf=0.0, neginf=0.0
+            ).sum() * 0.0
+        else:
             if device is None:
-                device = 'cpu'
-            return torch.tensor(0.0, device=device)
+                device = torch.device("cpu")
+            differentiable_zero = torch.zeros((), device=device)
+
+        if disc_fake is None or disc_real is None:
+            return differentiable_zero
 
         # Check for NaN/Inf in inputs
-        if torch.isnan(disc_fake).any() or torch.isnan(disc_real).any():
-            logger.warning("NaN detected in discriminator outputs for Sinkhorn loss")
-            return torch.tensor(0.0, device=device)
+        if not torch.isfinite(disc_fake).all() or not torch.isfinite(disc_real).all():
+            logger.warning("Non-finite discriminator outputs for Sinkhorn loss; using zero fallback")
+            return differentiable_zero
 
         B = disc_fake.shape[0]
         loss_batch = []
         
         try:
+            max_points = getattr(self.sinkhorn, "max_points", 0)
             for b in range(B):
                 # Flatten spatial dimensions to point clouds
-                f = disc_fake[b].reshape(1, -1).squeeze(0)  # (S,)
-                r = disc_real[b].reshape(1, -1).squeeze(0)  # (S,)
+                f = disc_fake[b].reshape(-1, 1)  # (S, 1)
+                r = disc_real[b].reshape(-1, 1)  # (S, 1)
+                f = _cap_points(f, max_points)
+                r = _cap_points(r, max_points)
 
                 # Build point clouds in R^1: (S, 1)
                 # Keep gradients on fake, detach real
-                X = f.view(-1, 1).detach() * 1.0 + (f.view(-1, 1) - f.view(-1, 1).detach())
-                Y = r.view(-1, 1).detach()
+                X = f.detach() * 1.0 + (f - f.detach())
+                Y = r.detach()
 
                 # Normalize for stability
-                X = torch.nan_to_num(F.normalize(X, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
-                Y = torch.nan_to_num(F.normalize(Y, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+                X = _safe_normalize(X)
+                Y = _safe_normalize(Y)
 
                 # Skip if all zeros after normalization
                 if X.abs().sum() < 1e-12 or Y.abs().sum() < 1e-12:
-                    loss_b = torch.tensor(0.0, device=device)
+                    loss_b = differentiable_zero
                 else:
                     loss_b = self.sinkhorn(X, Y)
                     
                 loss_batch.append(loss_b)
 
             adv_loss = torch.stack(loss_batch).mean()
-            adv_loss = torch.clamp(adv_loss, 0, 5.0)
+            adv_loss = torch.clamp(adv_loss, 0, self.sinkhorn_loss_clip)
+            if not torch.isfinite(adv_loss):
+                logger.warning("Non-finite adversarial loss computed; using zero fallback")
+                return differentiable_zero
             return adv_loss
             
         except Exception as e:
             logger.warning(f"Error in Sinkhorn computation: {e}, returning zero loss")
-            return torch.tensor(0.0, device=device)
+            return differentiable_zero
     
     def get_adaptive_weights(self, iteration: int) -> Dict[str, float]:
         """
@@ -560,31 +640,35 @@ class NoiseRobustLoss(nn.Module):
 
         loss_components = {}
 
-        # Check inputs for NaN
-        if torch.isnan(pred).any() or torch.isnan(target).any():
-            logger.error("NaN detected in loss inputs!")
+        # Check inputs for NaN/Inf
+        if not torch.isfinite(pred).all() or not torch.isfinite(target).all():
+            logger.error("Non-finite values detected in loss inputs!")
             return torch.tensor(1.0, device=pred.device, requires_grad=True), {
-                'reconstruction': torch.tensor(1.0),
-                'perceptual': torch.tensor(0.0),
-                'adversarial': torch.tensor(0.0),
-                'sam': torch.tensor(0.0)
+                'reconstruction': torch.tensor(1.0, device=pred.device),
+                'perceptual': torch.tensor(0.0, device=pred.device),
+                'adversarial': torch.tensor(0.0, device=pred.device),
+                'sam': torch.tensor(0.0, device=pred.device)
             }
+
+        # Compute losses in fp32 for mixed-precision stability.
+        pred_loss = pred.float()
+        target_loss = target.float()
         
         # Get adaptive weights
         iteration = current_iteration if current_iteration is not None else 0
         weights = self.get_adaptive_weights(iteration)
         
         # Compute individual losses
-        rec_loss = self.charbonnier(pred, target)
+        rec_loss = self.charbonnier(pred_loss, target_loss)
         loss_components['reconstruction'] = rec_loss
         
-        perc_loss = self.perceptual_loss(pred, target)
+        perc_loss = self.perceptual_loss(pred_loss, target_loss)
         loss_components['perceptual'] = perc_loss
         
         adv_loss = self.compute_adversarial_loss(disc_real, disc_fake, device=pred.device)
         loss_components['adversarial'] = adv_loss
         
-        sam_loss = self.sam_loss(pred, target)
+        sam_loss = self.sam_loss(pred_loss, target_loss)
         loss_components['sam'] = sam_loss
         
         # Combine with adaptive weights
@@ -602,7 +686,7 @@ class NoiseRobustLoss(nn.Module):
         loss_components['weighted_sam'] = weights['sam'] * sam_loss
         
         # Final safety check
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
+        if not torch.isfinite(total_loss):
             logger.error("NaN/Inf in total loss! Using fallback.")
             total_loss = torch.tensor(1.0, device=pred.device, requires_grad=True)
         else:
@@ -641,32 +725,52 @@ class ComputeSinkhornDiscriminatorLoss(nn.Module):
         Returns:
             Discriminator loss (scalar)
         """
+        # Keep a differentiable zero fallback anchored to discriminator outputs.
+        differentiable_zero = (
+            torch.nan_to_num(real_pred, nan=0.0, posinf=0.0, neginf=0.0).sum()
+            + torch.nan_to_num(fake_pred, nan=0.0, posinf=0.0, neginf=0.0).sum()
+        ) * 0.0
+        if not torch.isfinite(real_pred).all() or not torch.isfinite(fake_pred).all():
+            logger.warning("Non-finite discriminator logits detected; using zero fallback")
+            return differentiable_zero
+
         try:
             sinkhorn_terms = []
+            max_points = getattr(self.criterion.sinkhorn, "max_points", 0)
             for b in range(real_pred.shape[0]):
-                # Use reshape() instead of view() to handle non-contiguous tensors safely
-                R = real_pred[b].reshape(-1, 1).detach()
-                Fk = fake_pred[b].reshape(-1, 1).detach()
+                # Use reshape() instead of view() to handle non-contiguous tensors safely.
+                # IMPORTANT: do NOT detach here; discriminator loss must backpropagate to
+                # discriminator parameters through both real and fake logits.
+                R = real_pred[b].reshape(-1, 1)
+                Fk = fake_pred[b].reshape(-1, 1)
+                R = _cap_points(R, max_points)
+                Fk = _cap_points(Fk, max_points)
 
                 # Normalize for stability
-                R = torch.nan_to_num(F.normalize(R, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
-                Fk = torch.nan_to_num(F.normalize(Fk, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+                R = _safe_normalize(R)
+                Fk = _safe_normalize(Fk)
 
                 # Skip if all zeros after normalization
                 if R.abs().sum() < 1e-12 or Fk.abs().sum() < 1e-12:
-                    sinkhorn_terms.append(torch.tensor(0.0, device=real_pred.device))
+                    sinkhorn_terms.append(differentiable_zero)
                 else:
                     sinkhorn_terms.append(self.criterion.sinkhorn(R, Fk))
+
+            if not sinkhorn_terms:
+                return differentiable_zero
 
             sinkhorn_val = torch.stack(sinkhorn_terms).mean()
             # Discriminator maximizes divergence -> minimize negative
             disc_loss = -sinkhorn_val
+            if not torch.isfinite(disc_loss):
+                logger.warning("Non-finite discriminator Sinkhorn loss detected; using zero fallback")
+                return differentiable_zero
 
             return disc_loss
 
         except Exception as e:
             logger.warning(f"Error in discriminator Sinkhorn computation: {e}, returning fallback")
-            return torch.tensor(0.1, device=real_pred.device, requires_grad=True)
+            return differentiable_zero
 
 
 # ============================================
@@ -682,3 +786,4 @@ __all__ = [
     'NoiseRobustLoss',
     'ComputeSinkhornDiscriminatorLoss',
 ]
+

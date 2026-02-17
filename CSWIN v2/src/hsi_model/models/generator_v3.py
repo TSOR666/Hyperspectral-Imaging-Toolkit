@@ -301,7 +301,14 @@ class NoiseRobustCSWinGenerator(nn.Module):
         in_channels = config.get("in_channels", 3)
         out_channels = config.get("out_channels", 31)
         base_channels = config.get("base_channels", 64)
-        split_sizes = config.get("split_sizes", [7, 7, 7])
+        split_sizes = list(config.get("split_sizes", [7, 7, 7]))
+        if len(split_sizes) == 0:
+            raise ValueError("split_sizes must contain at least one value")
+        # Keep backward compatibility with older 1-2 stage configs used in tests/scripts.
+        if len(split_sizes) < 3:
+            split_sizes.extend([split_sizes[-1]] * (3 - len(split_sizes)))
+        elif len(split_sizes) > 3:
+            split_sizes = split_sizes[:3]
         base_groups = config.get("norm_groups", 8)
         num_heads = config.get("num_heads", 4)
         

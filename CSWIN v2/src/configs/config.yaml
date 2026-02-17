@@ -26,6 +26,10 @@ discriminator_lr: 0.00005
 sinkhorn_epsilon: 0.1
 sinkhorn_iters: 50
 sinkhorn_flatten_spatial: true
+sinkhorn_max_points: 1024
+sinkhorn_kernel_clamp: 60.0
+sinkhorn_force_fp32: true
+sinkhorn_loss_clip: 5.0
 use_r1_regularization: true
 r1_gamma: 10.0
 

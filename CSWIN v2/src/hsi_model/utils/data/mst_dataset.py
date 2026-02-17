@@ -20,7 +20,7 @@ import h5py
 import cv2
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple
+from typing import Any, Tuple
 
 from ...constants import (
     ARAD1K_FULL_HEIGHT,
@@ -137,7 +137,20 @@ class MST_TrainDataset(Dataset):
 
             # MST++ RGB normalization: per-image min-max
             bgr = np.float32(bgr)
-            bgr = (bgr - bgr.min()) / (bgr.max() - bgr.min())
+            bgr_min = float(np.min(bgr))
+            bgr_max = float(np.max(bgr))
+            bgr_range = bgr_max - bgr_min
+            if not np.isfinite(bgr_range) or bgr_range < 1e-12:
+                logger.warning(
+                    "Degenerate RGB dynamic range (min=%.6f, max=%.6f) for %s; using zeros",
+                    bgr_min,
+                    bgr_max,
+                    bgr_path,
+                )
+                bgr = np.zeros_like(bgr, dtype=np.float32)
+            else:
+                bgr = (bgr - bgr_min) / bgr_range
+            bgr = np.nan_to_num(bgr, nan=0.0, posinf=1.0, neginf=0.0)
             bgr = np.transpose(bgr, [2, 0, 1])  # [H, W, 3] -> [3, H, W]
 
             # Store in memory
@@ -288,7 +301,20 @@ class MST_ValidDataset(Dataset):
 
             # MST++ RGB normalization
             bgr = np.float32(bgr)
-            bgr = (bgr - bgr.min()) / (bgr.max() - bgr.min())
+            bgr_min = float(np.min(bgr))
+            bgr_max = float(np.max(bgr))
+            bgr_range = bgr_max - bgr_min
+            if not np.isfinite(bgr_range) or bgr_range < 1e-12:
+                logger.warning(
+                    "Degenerate RGB dynamic range (min=%.6f, max=%.6f) for %s; using zeros",
+                    bgr_min,
+                    bgr_max,
+                    bgr_path,
+                )
+                bgr = np.zeros_like(bgr, dtype=np.float32)
+            else:
+                bgr = (bgr - bgr_min) / bgr_range
+            bgr = np.nan_to_num(bgr, nan=0.0, posinf=1.0, neginf=0.0)
             bgr = np.transpose(bgr, [2, 0, 1])
 
             self.hypers.append(hyper)

@@ -58,7 +58,10 @@ from hsi_model.constants import (
     SAVE_CHECKPOINT_EVERY_N_ITERATIONS,
     PYTORCH_CUDA_ALLOC_CONF,
     DEFAULT_SINKHORN_EPSILON,
-    DEFAULT_SINKHORN_ITERATIONS
+    DEFAULT_SINKHORN_ITERATIONS,
+    DEFAULT_SINKHORN_MAX_POINTS,
+    DEFAULT_SINKHORN_KERNEL_CLAMP,
+    DEFAULT_SINKHORN_LOSS_CLIP,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,12 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+    """Toggle gradient computation for all parameters in a module."""
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
 
 
 # ============================================
@@ -199,6 +208,9 @@ def validate_gan_safe(
                 
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
+                if not torch.isfinite(rgb_tensor).all() or not torch.isfinite(hsi_tensor).all():
+                    logger_val.warning(f"Non-finite validation batch at index {batch_idx}; skipping")
+                    continue
                 
                 with autocast(enabled=use_amp):
                     if hasattr(model, 'module'):
@@ -210,9 +222,9 @@ def validate_gan_safe(
                         disc_real = model.discriminator(rgb_tensor, hsi_tensor)
                         disc_fake = model.discriminator(rgb_tensor, pred_hsi)
                     
-                    # Check for NaN
-                    if torch.isnan(pred_hsi).any():
-                        logger_val.warning(f"NaN in predictions at validation batch {batch_idx}")
+                    # Check for NaN/Inf
+                    if not torch.isfinite(pred_hsi).all():
+                        logger_val.warning(f"Non-finite predictions at validation batch {batch_idx}")
                         continue
                     
                     # Compute generator loss
@@ -223,9 +235,11 @@ def validate_gan_safe(
                         current_iteration=iteration
                     )
                 
-                if not torch.isnan(gen_loss):
+                if torch.isfinite(gen_loss):
                     total_losses['gen_loss'] = total_losses.get('gen_loss', 0.0) + gen_loss.item()
                     num_valid_batches += 1
+                else:
+                    logger_val.warning(f"Non-finite generator loss at validation batch {batch_idx}")
                 
                 # Compute metrics
                 metrics = compute_mst_center_crop_metrics(pred_hsi, hsi_tensor)
@@ -424,13 +438,15 @@ def train_sinkhorn_gan(
     n_critic = config.get("n_critic", 1)
     use_r1_reg = config.get("use_r1_regularization", True)
     r1_gamma = config.get("r1_gamma", DEFAULT_R1_GAMMA)
+    generator = model.module.generator if hasattr(model, "module") else model.generator
+    discriminator = model.module.discriminator if hasattr(model, "module") else model.discriminator
     
     # Main training loop
     data_iter = iter(train_loader)
     
     # Zero gradients at start
-    optimizer_g.zero_grad()
-    optimizer_d.zero_grad()
+    optimizer_g.zero_grad(set_to_none=True)
+    optimizer_d.zero_grad(set_to_none=True)
     
     while iteration < total_iteration:
         model.train()
@@ -454,6 +470,9 @@ def train_sinkhorn_gan(
             
             rgb_tensor = rgb_tensor.to(device, non_blocking=True)
             hsi_tensor = hsi_tensor.to(device, non_blocking=True)
+            if not torch.isfinite(rgb_tensor).all() or not torch.isfinite(hsi_tensor).all():
+                logger.warning("Skipping non-finite input batch at iteration %s", iteration)
+                continue
             
             # Get learning rates
             lr_g = optimizer_g.param_groups[0]['lr']
@@ -461,78 +480,84 @@ def train_sinkhorn_gan(
             
             # ========== Train Generator ==========
             is_step_boundary = ((iteration + 1) % accumulation_steps == 0)
-            
             with autocast(enabled=use_amp):
-                if hasattr(model, 'module'):
-                    fake_hsi = model.module.generator(rgb_tensor)
-                    disc_fake_for_g = model.module.discriminator(rgb_tensor, fake_hsi)
-                    disc_real_for_g = model.module.discriminator(rgb_tensor, hsi_tensor).detach()
-                else:
-                    fake_hsi = model.generator(rgb_tensor)
-                    disc_fake_for_g = model.discriminator(rgb_tensor, fake_hsi)
-                    disc_real_for_g = model.discriminator(rgb_tensor, hsi_tensor).detach()
-                
-                # Check for NaN with aggressive handling
-                if torch.isnan(fake_hsi).any() or torch.isinf(fake_hsi).any():
-                    nan_count += 1
-                    logger.warning(f"NaN/Inf in generator output! Count: {nan_count}")
-                    
-                    if nan_count >= consecutive_nan_tolerance:
-                        # Emergency recovery
-                        logger.warning("Too many NaNs - emergency recovery!")
-                        optimizer_g.zero_grad()
+                fake_hsi = generator(rgb_tensor)
 
-                        # Reduce learning rate without mutating optimizer state.
-                        for param_group in optimizer_g.param_groups:
-                            param_group['lr'] *= 0.5
-                        logger.warning(
-                            f"Reduced generator LR to {optimizer_g.param_groups[0]['lr']:.6f}"
-                        )
-                        
-                        nan_count = 0
-                        scaler_g.update(new_scale=1.0)
-                        clear_memory()
-                    
-                    continue
-                else:
+            if not torch.isfinite(fake_hsi).all():
+                nan_count += 1
+                logger.warning(f"Non-finite generator output detected. Consecutive count={nan_count}")
+
+                if nan_count >= consecutive_nan_tolerance:
+                    logger.warning("Too many non-finite generator outputs; running recovery")
+                    optimizer_g.zero_grad(set_to_none=True)
+                    for param_group in optimizer_g.param_groups:
+                        param_group['lr'] *= 0.5
+                    logger.warning(
+                        f"Reduced generator LR to {optimizer_g.param_groups[0]['lr']:.6f}"
+                    )
                     nan_count = 0
-                
-                # Compute generator loss
+                    scaler_g.update(new_scale=1.0)
+                    clear_memory()
+
+                continue
+
+            nan_count = 0
+
+            set_requires_grad(discriminator, False)
+            try:
+                with autocast(enabled=use_amp):
+                    disc_fake_for_g = discriminator(rgb_tensor, fake_hsi)
+                with torch.no_grad():
+                    with autocast(enabled=use_amp):
+                        disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
+            finally:
+                set_requires_grad(discriminator, True)
+
+            with autocast(enabled=use_amp):
                 gen_loss, loss_components = criterion(
-                    fake_hsi, hsi_tensor,
+                    fake_hsi,
+                    hsi_tensor,
                     disc_real=disc_real_for_g,
                     disc_fake=disc_fake_for_g,
                     current_iteration=iteration
                 )
-            
-            if not torch.isnan(gen_loss):
-                gen_loss = gen_loss / accumulation_steps
-                scaler_g.scale(gen_loss).backward()
-                
-                if is_step_boundary:
-                    # Gradient clipping
-                    scaler_g.unscale_(optimizer_g)
-                    g_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.module.generator.parameters() if hasattr(model, 'module') else model.generator.parameters(),
-                        max_norm=DEFAULT_GRADIENT_CLIP_NORM
-                    )
-                    
-                    scaler_g.step(optimizer_g)
-                    scaler_g.update()
-                    optimizer_g.zero_grad()
-                    scheduler_g.step()
+
+            if not torch.isfinite(gen_loss):
+                logger.warning("Non-finite generator loss at iteration %s; skipping batch", iteration)
+                optimizer_g.zero_grad(set_to_none=True)
+                continue
+
+            gen_loss = gen_loss / accumulation_steps
+            scaler_g.scale(gen_loss).backward()
+
+            if is_step_boundary:
+                # Gradient clipping
+                scaler_g.unscale_(optimizer_g)
+                g_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    generator.parameters(),
+                    max_norm=DEFAULT_GRADIENT_CLIP_NORM
+                )
+                if not torch.isfinite(g_grad_norm):
+                    logger.warning("Non-finite generator grad norm; skipping optimizer step")
+                    optimizer_g.zero_grad(set_to_none=True)
+                    continue
+
+                scaler_g.step(optimizer_g)
+                scaler_g.update()
+                optimizer_g.zero_grad(set_to_none=True)
+                scheduler_g.step()
             
             # ========== Train Discriminator ==========
             if is_step_boundary and (iteration % n_critic == 0):
                 fake_hsi_detached = fake_hsi.detach()
                 
                 with autocast(enabled=use_amp):
-                    if hasattr(model, 'module'):
-                        real_pred = model.module.discriminator(rgb_tensor, hsi_tensor)
-                        fake_pred = model.module.discriminator(rgb_tensor, fake_hsi_detached)
-                    else:
-                        real_pred = model.discriminator(rgb_tensor, hsi_tensor)
-                        fake_pred = model.discriminator(rgb_tensor, fake_hsi_detached)
+                    real_pred = discriminator(rgb_tensor, hsi_tensor)
+                    fake_pred = discriminator(rgb_tensor, fake_hsi_detached)
+                    if not torch.isfinite(real_pred).all() or not torch.isfinite(fake_pred).all():
+                        logger.warning("Non-finite discriminator logits at iteration %s; skipping D step", iteration)
+                        optimizer_d.zero_grad(set_to_none=True)
+                        continue
                     
                     # Sinkhorn discriminator loss
                     disc_loss = disc_criterion(real_pred, fake_pred)
@@ -540,32 +565,37 @@ def train_sinkhorn_gan(
                     # R1 regularization
                     if use_r1_reg and iteration % R1_APPLY_FREQUENCY == 0:
                         hsi_tensor.requires_grad_(True)
-                        if hasattr(model, 'module'):
-                            real_pred_for_r1 = model.module.discriminator(rgb_tensor, hsi_tensor)
-                        else:
-                            real_pred_for_r1 = model.discriminator(rgb_tensor, hsi_tensor)
+                        real_pred_for_r1 = discriminator(rgb_tensor, hsi_tensor)
                         r1_loss = apply_r1_regularization(real_pred_for_r1, hsi_tensor, gamma=r1_gamma)
                         disc_loss = disc_loss + r1_loss
                 
-                if not torch.isnan(disc_loss):
-                    scaler_d.scale(disc_loss).backward()
-                    
-                    # Update moving average
-                    disc_loss_ma = disc_loss_ma_beta * disc_loss_ma + (1 - disc_loss_ma_beta) * disc_loss.item()
-                    
-                    # Gradient clipping
-                    scaler_d.unscale_(optimizer_d)
-                    d_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.module.discriminator.parameters() if hasattr(model, 'module') else model.discriminator.parameters(),
-                        max_norm=DEFAULT_GRADIENT_CLIP_NORM
-                    )
-                    
-                    scaler_d.step(optimizer_d)
-                    scaler_d.update()
-                    optimizer_d.zero_grad()
-                    scheduler_d.step()
+                if not torch.isfinite(disc_loss):
+                    logger.warning("Non-finite discriminator loss at iteration %s; skipping D step", iteration)
+                    optimizer_d.zero_grad(set_to_none=True)
+                    continue
+
+                scaler_d.scale(disc_loss).backward()
+                
+                # Update moving average
+                disc_loss_ma = disc_loss_ma_beta * disc_loss_ma + (1 - disc_loss_ma_beta) * disc_loss.item()
+                
+                # Gradient clipping
+                scaler_d.unscale_(optimizer_d)
+                d_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    max_norm=DEFAULT_GRADIENT_CLIP_NORM
+                )
+                if not torch.isfinite(d_grad_norm):
+                    logger.warning("Non-finite discriminator grad norm; skipping optimizer step")
+                    optimizer_d.zero_grad(set_to_none=True)
+                    continue
+                
+                scaler_d.step(optimizer_d)
+                scaler_d.update()
+                optimizer_d.zero_grad(set_to_none=True)
+                scheduler_d.step()
             
-            if not torch.isnan(gen_loss):
+            if torch.isfinite(gen_loss):
                 epoch_losses.append(gen_loss.item() * accumulation_steps)
             
             iteration += 1
@@ -583,7 +613,10 @@ def train_sinkhorn_gan(
             
             # Logging
             if iteration % LOG_EVERY_N_ITERATIONS == 0:
-                avg_loss = np.mean(epoch_losses[-20:]) if len(epoch_losses) >= 20 else np.mean(epoch_losses)
+                if epoch_losses:
+                    avg_loss = np.mean(epoch_losses[-20:]) if len(epoch_losses) >= 20 else np.mean(epoch_losses)
+                else:
+                    avg_loss = 0.0
                 disc_loss_value = disc_loss_ma / (1 - disc_loss_ma_beta ** max(iteration, 1)) if disc_loss_ma != 0 else 0.0
                 logger.info(
                     f'[iter:{iteration}/{total_iteration}], lr_g={lr_g:.9f}, lr_d={lr_d:.9f}, '
@@ -641,7 +674,7 @@ def train_sinkhorn_gan(
                             record_mrae_loss = current_mrae
                             best_path = os.path.join(config["checkpoint_dir"], 'best_model.pth')
                             torch.save(checkpoint_dict, best_path)
-                            logger.info(f"ðŸ† New best MRAE: {current_mrae:.4f}")
+                            logger.info(f"New best MRAE: {current_mrae:.4f}")
                         
                         if iteration % SAVE_CHECKPOINT_EVERY_N_ITERATIONS == 0:
                             checkpoint_path = os.path.join(config["checkpoint_dir"], f'net_{epoch_num}epoch.pth')
@@ -669,10 +702,18 @@ def train_sinkhorn_gan(
                 break
                 
         except RuntimeError as e:
-            if "out of memory" in str(e):
+            if "out of memory" in str(e).lower():
                 logger.error(f"OOM at iteration {iteration}! Clearing cache")
-                optimizer_g.zero_grad()
-                optimizer_d.zero_grad()
+                optimizer_g.zero_grad(set_to_none=True)
+                optimizer_d.zero_grad(set_to_none=True)
+                if "fake_hsi" in locals():
+                    del fake_hsi
+                if "fake_hsi_detached" in locals():
+                    del fake_hsi_detached
+                if "rgb_tensor" in locals():
+                    del rgb_tensor
+                if "hsi_tensor" in locals():
+                    del hsi_tensor
                 clear_memory()
                 continue
             else:
@@ -731,6 +772,10 @@ def main(config: DictConfig) -> None:
     cfg.setdefault("sinkhorn_epsilon", DEFAULT_SINKHORN_EPSILON)
     cfg.setdefault("sinkhorn_iters", DEFAULT_SINKHORN_ITERATIONS)
     cfg.setdefault("sinkhorn_flatten_spatial", True)
+    cfg.setdefault("sinkhorn_max_points", DEFAULT_SINKHORN_MAX_POINTS)
+    cfg.setdefault("sinkhorn_kernel_clamp", DEFAULT_SINKHORN_KERNEL_CLAMP)
+    cfg.setdefault("sinkhorn_force_fp32", True)
+    cfg.setdefault("sinkhorn_loss_clip", DEFAULT_SINKHORN_LOSS_CLIP)
     cfg.setdefault("generator_lr", DEFAULT_GENERATOR_LR)
     cfg.setdefault("discriminator_lr", DEFAULT_DISCRIMINATOR_LR)
     

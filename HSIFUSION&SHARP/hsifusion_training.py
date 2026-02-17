@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -27,6 +28,14 @@ from hsifusion_v252_complete import create_hsifusion_lightning_pro
 from optimized_dataloader import MSTPlusPlusLoss, create_optimized_dataloaders
 
 
+def _torch_load_compat(path: str, map_location: torch.device):
+    """Load checkpoints across PyTorch versions (2.6+ defaults to weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def set_random_seed(seed: int) -> None:
     """Set random seeds for reproducibility."""
     random.seed(seed)
@@ -35,6 +44,13 @@ def set_random_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
+
+
+def should_optimizer_step(batch_idx: int, total_batches: int, accumulate_steps: int) -> bool:
+    """Return whether an optimizer update should be executed for this batch index."""
+    if accumulate_steps <= 0:
+        raise ValueError("accumulate_steps must be > 0")
+    return ((batch_idx + 1) % accumulate_steps == 0) or ((batch_idx + 1) == total_batches)
 
 
 @dataclass
@@ -72,6 +88,8 @@ class HSIFusionTrainingConfig:
     val_interval: int = 10
     log_interval: int = 50
     save_interval: int = 50
+    early_stopping_patience: int = 40
+    early_stopping_min_delta: float = 1e-5
 
     # Output
     output_dir: str = "./experiments/hsifusion"
@@ -81,6 +99,9 @@ class HSIFusionTrainingConfig:
     # Misc
     device: str = "cuda"
     seed: int = 42
+    min_mrae_denom: float = 1e-6
+    max_consecutive_nonfinite: int = 8
+    skip_oom_batches: bool = True
 
     def experiment_path(self) -> Path:
         root = Path(self.output_dir)
@@ -111,9 +132,26 @@ class HSIFusionTrainer:
         self.start_epoch = 0
         self.iteration = 0
         self.best_mrae = math.inf
+        self.bad_val_epochs = 0
+        self.consecutive_nonfinite = 0
+        self.skipped_oom_batches = 0
+        self.skipped_nonfinite_batches = 0
 
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
+    
+    def _is_oom_error(self, exc: BaseException) -> bool:
+        return "out of memory" in str(exc).lower()
+
+    def _has_finite_gradients(self) -> bool:
+        for param in self.model.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                return False
+        return True
+
+    def _safe_mrae(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
+        return torch.mean(torch.abs(prediction - target) / denom)
 
     def _build_model(self) -> nn.Module:
         """Create HSIFusion model and move to device."""
@@ -169,6 +207,10 @@ class HSIFusionTrainer:
             "scaler_state_dict": self.scaler.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_mrae": self.best_mrae,
+            "bad_val_epochs": self.bad_val_epochs,
+            "consecutive_nonfinite": self.consecutive_nonfinite,
+            "skipped_oom_batches": self.skipped_oom_batches,
+            "skipped_nonfinite_batches": self.skipped_nonfinite_batches,
             "config": self.config,
         }
         suffix = "best.pth" if is_best else f"epoch_{epoch:04d}.pth"
@@ -176,7 +218,7 @@ class HSIFusionTrainer:
         torch.save(checkpoint, path)
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        ckpt = _torch_load_compat(checkpoint_path, self.device)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -184,6 +226,10 @@ class HSIFusionTrainer:
         self.start_epoch = ckpt.get("epoch", 0)
         self.iteration = ckpt.get("iteration", 0)
         self.best_mrae = ckpt.get("best_mrae", math.inf)
+        self.bad_val_epochs = ckpt.get("bad_val_epochs", 0)
+        self.consecutive_nonfinite = ckpt.get("consecutive_nonfinite", 0)
+        self.skipped_oom_batches = ckpt.get("skipped_oom_batches", 0)
+        self.skipped_nonfinite_batches = ckpt.get("skipped_nonfinite_batches", 0)
         print(f"Resumed training from epoch {self.start_epoch}")
 
     def _step_scheduler(self) -> None:
@@ -198,7 +244,7 @@ class HSIFusionTrainer:
         mse = F.mse_loss(pred, tgt).item()
         rmse = math.sqrt(mse)
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-8))
-        mrae = torch.mean(torch.abs(pred - tgt) / (tgt + 1e-8)).item()
+        mrae = self._safe_mrae(pred, tgt).item()
         return {"mrae": mrae, "rmse": rmse, "psnr": psnr}
 
     def train(self) -> None:
@@ -213,22 +259,64 @@ class HSIFusionTrainer:
                 rgb = rgb.to(self.device, non_blocking=True)
                 hsi = hsi.to(self.device, non_blocking=True)
 
-                with autocast(enabled=self.config.use_amp):
-                    outputs = self.model(rgb)
-                    if isinstance(outputs, tuple):
-                        outputs, _ = outputs
-                    loss = self.criterion(outputs, hsi)
-                    aux_loss = self.model.get_auxiliary_loss()
-                    if torch.is_tensor(aux_loss):
-                        loss = loss + aux_loss
-                loss = loss / self.config.accumulate_steps
+                try:
+                    with autocast(enabled=self.config.use_amp):
+                        outputs = self.model(rgb)
+                        if isinstance(outputs, tuple):
+                            outputs, _ = outputs
+                        loss = self.criterion(outputs, hsi)
+                        aux_loss = self.model.get_auxiliary_loss()
+                        if torch.is_tensor(aux_loss):
+                            loss = loss + aux_loss
+                except RuntimeError as exc:
+                    if self.config.skip_oom_batches and self._is_oom_error(exc):
+                        self.skipped_oom_batches += 1
+                        self.optimizer.zero_grad(set_to_none=True)
+                        if self.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        warnings.warn(
+                            f"Skipped OOM batch at epoch={epoch+1}, batch={batch_idx+1}. "
+                            f"Total skipped OOM batches: {self.skipped_oom_batches}"
+                        )
+                        continue
+                    raise
 
-                self.scaler.scale(loss).backward()
+                if not torch.isfinite(loss):
+                    self.consecutive_nonfinite += 1
+                    self.skipped_nonfinite_batches += 1
+                    self.optimizer.zero_grad(set_to_none=True)
+                    warnings.warn(
+                        f"Non-finite loss at epoch={epoch+1}, batch={batch_idx+1}; "
+                        f"skipping update ({self.consecutive_nonfinite} consecutive)."
+                    )
+                    if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                        raise RuntimeError(
+                            "Exceeded maximum consecutive non-finite losses; aborting to avoid divergence."
+                        )
+                    continue
 
-                if (batch_idx + 1) % self.config.accumulate_steps == 0:
+                self.consecutive_nonfinite = 0
+                loss_scaled = loss / self.config.accumulate_steps
+                self.scaler.scale(loss_scaled).backward()
+
+                if should_optimizer_step(batch_idx, total_steps, self.config.accumulate_steps):
                     if self.config.gradient_clip > 0:
                         self.scaler.unscale_(self.optimizer)
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+
+                    if not self._has_finite_gradients():
+                        self.consecutive_nonfinite += 1
+                        self.skipped_nonfinite_batches += 1
+                        self.optimizer.zero_grad(set_to_none=True)
+                        warnings.warn(
+                            f"Non-finite gradients at epoch={epoch+1}, batch={batch_idx+1}; skipping optimizer step."
+                        )
+                        if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                            raise RuntimeError(
+                                "Exceeded maximum consecutive non-finite gradients; aborting to avoid divergence."
+                            )
+                        continue
+
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -251,16 +339,28 @@ class HSIFusionTrainer:
                 self.writer.add_scalar("val/rmse", metrics["rmse"], epoch + 1)
                 self.writer.add_scalar("val/psnr", metrics["psnr"], epoch + 1)
 
-                is_best = metrics["mrae"] < self.best_mrae
+                is_best = metrics["mrae"] < (self.best_mrae - self.config.early_stopping_min_delta)
                 if is_best:
                     self.best_mrae = metrics["mrae"]
+                    self.bad_val_epochs = 0
                     print(f"New best MRAE: {self.best_mrae:.6f}")
+                else:
+                    self.bad_val_epochs += 1
                 self._save_checkpoint(epoch + 1, is_best=is_best)
+
+                if self.config.early_stopping_patience > 0 and self.bad_val_epochs >= self.config.early_stopping_patience:
+                    print(
+                        f"Early stopping triggered after {self.bad_val_epochs} validation checks "
+                        f"without improvement > {self.config.early_stopping_min_delta}."
+                    )
+                    break
             elif (epoch + 1) % self.config.save_interval == 0:
                 self._save_checkpoint(epoch + 1, is_best=False)
 
         print("Training complete.")
         print(f"Best validation MRAE: {self.best_mrae:.6f}")
+        print(f"Skipped batches - OOM: {self.skipped_oom_batches}, non-finite: {self.skipped_nonfinite_batches}")
+        self.writer.close()
 
     def validate(self) -> Dict[str, float]:
         """Run full-image validation."""
@@ -304,6 +404,11 @@ def parse_args() -> HSIFusionTrainingConfig:
     parser.add_argument("--patch_size", type=int, default=128)
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--min_mrae_denom", type=float, default=1e-6)
+    parser.add_argument("--max_consecutive_nonfinite", type=int, default=8)
+    parser.add_argument("--early_stopping_patience", type=int, default=40)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-5)
+    parser.add_argument("--disable_oom_skip", action="store_true")
     parser.add_argument("--output_dir", type=str, default="./experiments/hsifusion")
     parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
@@ -324,6 +429,11 @@ def parse_args() -> HSIFusionTrainingConfig:
         patch_size=args.patch_size,
         stride=args.stride,
         num_workers=args.num_workers,
+        min_mrae_denom=args.min_mrae_denom,
+        max_consecutive_nonfinite=args.max_consecutive_nonfinite,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        skip_oom_batches=not args.disable_oom_skip,
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,
         resume_from=args.resume,

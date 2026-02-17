@@ -137,7 +137,7 @@ class SpectralSelfAttention(nn.Module):
         attn = attn.softmax(dim=-1)
         
         # Check for NaN in attention
-        if torch.isnan(attn).any():
+        if not torch.isfinite(attn).all():
             logger.warning("NaN detected in attention weights, using identity mapping")
             return x
         
@@ -149,7 +149,7 @@ class SpectralSelfAttention(nn.Module):
         out = self.project_out(out)
         
         # Final NaN check
-        if torch.isnan(out).any():
+        if not torch.isfinite(out).all():
             logger.warning("NaN detected in attention output, using identity mapping")
             return x
         
@@ -219,7 +219,7 @@ class SNTransformerBlock(nn.Module):
         x = x + self.residual_scale * attn_out
         
         # Check for NaN after attention
-        if torch.isnan(x).any():
+        if not torch.isfinite(x).all():
             logger.warning("NaN after attention block, reverting to input")
             x = x_input
         
@@ -236,7 +236,7 @@ class SNTransformerBlock(nn.Module):
         x = x + self.residual_scale * mlp_out
         
         # Final NaN check
-        if torch.isnan(x).any():
+        if not torch.isfinite(x).all():
             logger.warning("NaN after transformer block, reverting to input")
             x = x_input
         
@@ -263,14 +263,16 @@ class SNTransformerDiscriminator(nn.Module):
         num_blocks = config.get('discriminator_num_blocks', [2, 2, 2])  # Per resolution
         mlp_ratio = config.get('discriminator_mlp_ratio', 2.0)
         dropout = config.get('discriminator_dropout', 0.0)
+        if not num_blocks:
+            raise ValueError("discriminator_num_blocks must contain at least one stage")
         
         # Initial projection with careful initialization
         self.input_proj = SNConvBlock(in_channels, base_dim, kernel_size=7, stride=1, padding=3)
         
         # Encoder stages
         self.encoder_stages = nn.ModuleList()
-        dims = [base_dim, base_dim * 2, base_dim * 4]
-        
+        dims = [base_dim * (2 ** i) for i in range(len(num_blocks))]
+
         for i, (in_dim, out_dim, n_blocks) in enumerate(zip([base_dim] + dims[:-1], dims, num_blocks)):
             stage = nn.ModuleDict({
                 'downsample': SNConvBlock(in_dim, out_dim, kernel_size=3, stride=2, padding=1) if i > 0 else nn.Identity(),
@@ -309,7 +311,7 @@ class SNTransformerDiscriminator(nn.Module):
         x = torch.cat([rgb, hsi], dim=1)  # (B, 34, H, W)
         
         # Check input validity
-        if torch.isnan(x).any():
+        if not torch.isfinite(x).all():
             logger.error("NaN in discriminator input!")
             # Return zeros to avoid propagating NaN
             B = x.shape[0]
@@ -329,7 +331,7 @@ class SNTransformerDiscriminator(nn.Module):
                 x = block(x)
                 
                 # Emergency NaN handling
-                if torch.isnan(x).any():
+                if not torch.isfinite(x).all():
                     logger.warning("NaN in discriminator encoder, using pre-block features")
                     x = x_before
         

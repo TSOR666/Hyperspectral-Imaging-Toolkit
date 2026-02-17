@@ -368,12 +368,14 @@ class OptimizedValDataset(Dataset):
 class MSTPlusPlusLoss(torch.nn.Module):
     """MST++ style MRAE loss"""
     
-    def __init__(self):
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute MRAE loss"""
-        return torch.mean(torch.abs(pred - target) / (target + 1e-8))
+        denom = torch.clamp_min(torch.abs(target), self.eps)
+        return torch.mean(torch.abs(pred - target) / denom)
 
 
 def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None) -> Tuple[DataLoader, DataLoader]:
