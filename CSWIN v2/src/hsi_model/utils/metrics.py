@@ -104,7 +104,7 @@ def create_cmf_tensor(
 
 # Global CMF cache to avoid recomputation
 _CMF_CACHE: Dict[Tuple[int, str, Tuple[float, float]], torch.Tensor] = {}
-_WINDOW_CACHE: Dict[Tuple[int, int, float], torch.Tensor] = {}
+_WINDOW_CACHE: Dict[Tuple[int, int, float, str], torch.Tensor] = {}
 
 
 def get_cached_cmf(
@@ -448,14 +448,24 @@ def compute_ssim(
 
 
 def _get_cached_window(window_size: int, channel: int, sigma: float, device: torch.device) -> torch.Tensor:
-    """Get cached Gaussian window for SSIM computation."""
-    cache_key = (window_size, channel, sigma)
-    
+    """Get cached Gaussian window for SSIM computation.
+
+    The cache key includes device so repeated calls on the same device return
+    the exact same tensor without a per-call host->device copy.
+    """
+    if device is None:
+        device_key = "cpu"
+    else:
+        device_key = str(device.type)
+        if getattr(device, "index", None) is not None:
+            device_key += f":{device.index}"
+    cache_key = (window_size, channel, sigma, device_key)
+
     if cache_key not in _WINDOW_CACHE:
-        window = _create_window(window_size, channel, sigma)
+        window = _create_window(window_size, channel, sigma).to(device)
         _WINDOW_CACHE[cache_key] = window
-    
-    return _WINDOW_CACHE[cache_key].to(device)
+
+    return _WINDOW_CACHE[cache_key]
 
 
 def _create_window(window_size: int, channel: int, sigma: float) -> torch.Tensor:

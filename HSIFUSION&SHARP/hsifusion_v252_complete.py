@@ -67,6 +67,19 @@ from packaging import version
 _TV = version.parse(torch.__version__)
 _T20 = _TV >= version.parse("2.0.0")
 _T21 = _TV >= version.parse("2.1.0")
+_AUTO_COMPILE = object()
+
+
+def _resolve_compile_mode(
+    compile_mode: Union[str, None, object],
+    compile_model_default: bool,
+) -> Optional[str]:
+    """Differentiate omitted compile_mode from an explicit request to disable compile."""
+    if compile_mode is _AUTO_COMPILE:
+        return "default" if compile_model_default else None
+    if compile_mode is None:
+        return None
+    return str(compile_mode)
 
 # Configure environment
 if torch.cuda.is_available():
@@ -1343,7 +1356,7 @@ def create_hsifusion_lightning_pro(
     model_size: str = "base",
     in_channels: int = 3,
     out_channels: int = 31,
-    compile_mode: Optional[str] = None,
+    compile_mode: Union[str, None, object] = _AUTO_COMPILE,
     rank: int = 0,
     skip_compile_small_inputs: bool = True,
     expected_min_size: Optional[int] = None,
@@ -1359,6 +1372,7 @@ def create_hsifusion_lightning_pro(
         in_channels: Number of input channels
         out_channels: Number of output channels  
         compile_mode: Compilation mode. Options:
+            - omit argument: follow config.compile_model
             - None: No compilation
             - 'default': Standard compilation
             - 'reduce-overhead': Optimized for training
@@ -1450,6 +1464,8 @@ def create_hsifusion_lightning_pro(
     # Create model
     model = HSIFusionNetV25LightningPro(config)
     
+    compile_mode = _resolve_compile_mode(compile_mode, config.compile_model)
+
     # Skip compilation for small models if requested (unless forced)
     compile_threshold = expected_min_size or config.min_input_size
     if skip_compile_small_inputs and compile_threshold < 128 and not force_compile:
@@ -1458,11 +1474,7 @@ def create_hsifusion_lightning_pro(
         compile_mode = None
     elif force_compile and rank == 0:
         print("Force compilation enabled - will compile regardless of input size")
-    
-    # Compile if requested
-    if compile_mode is None:
-        compile_mode = 'default' if config.compile_model else None
-    
+
     if compile_mode and _T20 and not lazy_compile:
         try:
             # Check available backends

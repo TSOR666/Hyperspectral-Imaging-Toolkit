@@ -7,8 +7,8 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from .discriminator import SpatialSpectralDiscriminator
-from .generator import NoiseRobustCSWinGenerator
+from .discriminator_v2 import SpatialSpectralDiscriminator
+from .generator_v3 import NoiseRobustCSWinGenerator
 
 class NoiseRobustCSWinModel(nn.Module):
     """

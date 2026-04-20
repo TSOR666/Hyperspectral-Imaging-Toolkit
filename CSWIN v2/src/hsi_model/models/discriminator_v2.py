@@ -133,26 +133,33 @@ class SpectralSelfAttention(nn.Module):
         # Clamp attention scores to prevent overflow
         attn = torch.clamp(attn, -self.attention_clamp, self.attention_clamp)
         
-        # Apply softmax
-        attn = attn.softmax(dim=-1)
-        
-        # Check for NaN in attention
-        if not torch.isfinite(attn).all():
-            logger.warning("NaN detected in attention weights, using identity mapping")
-            return x
-        
+        # Apply softmax in fp32 for mixed-precision stability, cast back at the end.
+        attn_fp32 = attn.float()
+        attn_fp32 = attn_fp32 - attn_fp32.amax(dim=-1, keepdim=True)
+        attn_fp32 = F.softmax(attn_fp32, dim=-1)
+
+        # Check for NaN in attention (silent identity fallback would break grad flow).
+        if not torch.isfinite(attn_fp32).all():
+            if self.training:
+                raise RuntimeError("Non-finite attention weights in SpectralSelfAttention.")
+            logger.warning("NaN detected in attention weights (eval); zeroing and continuing.")
+            attn_fp32 = torch.nan_to_num(attn_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+
+        attn = attn_fp32.to(v.dtype)
         attn = self.attn_drop(attn)
-        
+
         out = (attn @ v)
-        
+
         out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
         out = self.project_out(out)
-        
-        # Final NaN check
+
+        # Final NaN check (same fail-fast policy).
         if not torch.isfinite(out).all():
-            logger.warning("NaN detected in attention output, using identity mapping")
-            return x
-        
+            if self.training:
+                raise RuntimeError("Non-finite attention output in SpectralSelfAttention.")
+            logger.warning("NaN detected in attention output (eval); zeroing and continuing.")
+            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
         return out
 
 
@@ -217,10 +224,13 @@ class SNTransformerBlock(nn.Module):
         # Self-attention with residual
         attn_out = self.attn(x_norm)
         x = x + self.residual_scale * attn_out
-        
-        # Check for NaN after attention
+
+        # Check for NaN after attention. Silent identity fallback hides bugs
+        # and breaks gradients, so fail-fast when training.
         if not torch.isfinite(x).all():
-            logger.warning("NaN after attention block, reverting to input")
+            if self.training:
+                raise RuntimeError("Non-finite values after attention in SNTransformerBlock.")
+            logger.warning("NaN after attention block (eval); reverting to input")
             x = x_input
         
         if self.use_spatial_norm:
@@ -234,12 +244,14 @@ class SNTransformerBlock(nn.Module):
         # MLP with residual
         mlp_out = self.mlp(x_norm)
         x = x + self.residual_scale * mlp_out
-        
-        # Final NaN check
+
+        # Final NaN check (fail-fast in training, permissive in eval).
         if not torch.isfinite(x).all():
-            logger.warning("NaN after transformer block, reverting to input")
+            if self.training:
+                raise RuntimeError("Non-finite values after MLP in SNTransformerBlock.")
+            logger.warning("NaN after transformer block (eval); reverting to input")
             x = x_input
-        
+
         return x
 
 
@@ -309,13 +321,27 @@ class SNTransformerDiscriminator(nn.Module):
         """
         # Concatenate inputs
         x = torch.cat([rgb, hsi], dim=1)  # (B, 34, H, W)
-        
+
         # Check input validity
         if not torch.isfinite(x).all():
+            if self.training:
+                raise RuntimeError(
+                    "Non-finite values in discriminator input during training; "
+                    "fix upstream generator/data instead of masking the signal."
+                )
+            # Eval fallback: compute the true output spatial size dynamically
+            # so downstream losses see the correct shape. Stage 0 keeps size
+            # (Identity); each subsequent stage halves H/W with stride-2 conv.
             logger.error("NaN in discriminator input!")
-            # Return zeros to avoid propagating NaN
-            B = x.shape[0]
-            return torch.zeros(B, 1, 8, 8, device=x.device, dtype=x.dtype)
+            B, _, H, W = x.shape
+            downsamples = max(0, len(self.encoder_stages) - 1)
+            h_out = max(1, H >> downsamples)
+            w_out = max(1, W >> downsamples)
+            zero = torch.zeros(B, 1, h_out, w_out, device=x.device, dtype=x.dtype)
+            # Keep gradient flow: anchor a differentiable zero to the input,
+            # but sanitize first so NaN inputs don't contaminate the output.
+            sanitized = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            return zero + (sanitized.sum() * 0.0)
         
         # Initial projection
         x = self.input_proj(x)  # (B, base_dim, H, W)

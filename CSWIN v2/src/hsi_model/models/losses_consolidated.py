@@ -378,53 +378,154 @@ class SinkhornLoss(nn.Module):
 # Perceptual Loss
 # ============================================
 
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+# Local CMF cache. Kept here (instead of importing from utils.metrics) so the
+# losses module has no transitive dependency on utils.__init__, which would
+# otherwise pull in optional deps (tensorboard, scipy, h5py, cv2) used by
+# the dataloaders.
+_PERCEPTUAL_CMF_CACHE: Dict[Tuple[int, str, Tuple[float, float]], torch.Tensor] = {}
+
+
+def _gaussian_cmf(
+    num_bands: int,
+    device: torch.device,
+    wavelength_range: Tuple[float, float] = (400.0, 700.0),
+) -> torch.Tensor:
+    """Return a Gaussian approximation of CIE-1931 color-matching functions.
+
+    Shape is (num_bands, 3). Matches utils.metrics.create_cmf_tensor so
+    training-time perceptual conversion is consistent with eval metrics.
+    """
+    device_key = "cpu" if device is None else str(device.type)
+    if getattr(device, "index", None) is not None:
+        device_key += f":{device.index}"
+    key = (num_bands, device_key, wavelength_range)
+    cached = _PERCEPTUAL_CMF_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import numpy as _np  # local to avoid a global numpy import at module load
+
+    wavelengths = _np.linspace(wavelength_range[0], wavelength_range[1], num_bands)
+    # CIE-1931-ish Gaussian peaks (nm, width, amplitude).
+    r_peak, r_width, r_amp = 599.8, 33.0, 0.264
+    g_peak, g_width, g_amp = 549.1, 57.0, 0.323
+    b_peak, b_width, b_amp = 445.8, 33.0, 0.272
+    r = r_amp * _np.exp(-((wavelengths - r_peak) / r_width) ** 2)
+    g = g_amp * _np.exp(-((wavelengths - g_peak) / g_width) ** 2)
+    b = b_amp * _np.exp(-((wavelengths - b_peak) / b_width) ** 2)
+    cmf = _np.stack([r, g, b], axis=1).astype(_np.float32)
+    tensor = torch.from_numpy(cmf).to(device)
+    _PERCEPTUAL_CMF_CACHE[key] = tensor
+    return tensor
+
+
 class ImprovedPerceptualLoss(nn.Module):
     """
     Perceptual loss using pre-trained feature extractor.
-    
-    Computes loss on intermediate features from a pre-trained network,
-    capturing semantic similarity beyond pixel-wise metrics.
+
+    Computes loss on intermediate features from a pre-trained (RGB) network.
+    For hyperspectral inputs, HSI is converted to RGB via a color-matching
+    function (CMF) BEFORE feeding the feature extractor. Using the first 3
+    HSI bands as pseudo-RGB — the previous behaviour — is not meaningful
+    because those bands are typically ~400-430 nm (near-blue).
+
+    Args:
+        feature_extractor: Pretrained RGB feature extractor (e.g. VGG).
+        num_bands: Number of spectral bands in the input HSI. If 3 the CMF
+            step is skipped (already RGB).
+        use_imagenet_norm: Apply ImageNet normalization (mean/std) before
+            feeding the extractor. Required for standard torchvision VGG.
+        wavelength_range: Band wavelength range in nm.
     """
-    def __init__(self, feature_extractor: Optional[FeatureExtractor] = None):
+
+    def __init__(
+        self,
+        feature_extractor: Optional[FeatureExtractor] = None,
+        num_bands: int = 31,
+        use_imagenet_norm: bool = True,
+        wavelength_range: Tuple[float, float] = (400.0, 700.0),
+    ):
         super().__init__()
         self.feature_extractor = feature_extractor
-        if feature_extractor:
+        self.num_bands = int(num_bands)
+        self.use_imagenet_norm = bool(use_imagenet_norm)
+        self.wavelength_range = wavelength_range
+        if feature_extractor is not None:
             # Freeze feature extractor
             for param in self.feature_extractor.parameters():
                 param.requires_grad = False
-        
+
         self.charbonnier = CharbonnierLoss()
-                
+        # Register constants as buffers so they follow .to(device) / .half()
+        self.register_buffer(
+            "_imagenet_mean",
+            torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_imagenet_std",
+            torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self._warned_disabled = False
+
+    def _hsi_to_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert HSI (B,C,H,W) to RGB (B,3,H,W) via cached CMF; passthrough if C==3."""
+        if x.shape[1] == 3:
+            return torch.clamp(x, 0.0, 1.0)
+        cmf = _gaussian_cmf(
+            num_bands=x.shape[1],
+            device=x.device,
+            wavelength_range=self.wavelength_range,
+        ).to(dtype=x.dtype)
+        rgb = torch.einsum("bchw,cd->bdhw", x, cmf)
+        return torch.clamp(rgb, 0.0, 1.0)
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred: Predicted tensor
-            target: Target tensor
-            
+            pred: Predicted HSI tensor (B, C, H, W)
+            target: Target HSI tensor (B, C, H, W)
+
         Returns:
-            Perceptual loss value
+            Perceptual loss value (scalar, differentiable zero if no extractor).
         """
         if self.feature_extractor is None:
-            return torch.tensor(0.0, device=pred.device)
-        
-        # Extract RGB channels (assuming first 3 channels)
-        pred_rgb = pred[:, :3, :, :].contiguous()
-        target_rgb = target[:, :3, :, :].contiguous()
-        
-        # Ensure valid range [0, 1]
-        pred_rgb = torch.clamp(pred_rgb, 0, 1)
-        target_rgb = torch.clamp(target_rgb, 0, 1)
-        
+            if not self._warned_disabled:
+                logger.warning(
+                    "ImprovedPerceptualLoss: no feature_extractor provided; "
+                    "perceptual loss will always be zero. Pass a pretrained "
+                    "RGB network (e.g. VGG16 features) to actually use "
+                    "lambda_perceptual."
+                )
+                self._warned_disabled = True
+            # Keep it differentiable so the combined loss graph is stable.
+            return pred.sum() * 0.0
+
+        # Convert HSI -> RGB in a principled way (CMF), then normalize.
+        pred_rgb = self._hsi_to_rgb(pred)
+        target_rgb = self._hsi_to_rgb(target)
+
+        if self.use_imagenet_norm:
+            mean = self._imagenet_mean.to(dtype=pred_rgb.dtype, device=pred_rgb.device)
+            std = self._imagenet_std.to(dtype=pred_rgb.dtype, device=pred_rgb.device)
+            pred_rgb = (pred_rgb - mean) / std
+            target_rgb = (target_rgb - mean) / std
+
         # Extract features (gradients flow through!)
         pred_features = self.feature_extractor(pred_rgb)
         target_features = self.feature_extractor(target_rgb)
-        
+
         # Use Charbonnier loss on features
         loss = self.charbonnier(pred_features, target_features)
-        
+
         # Clamp to prevent extreme values
         loss = torch.clamp(loss, 0, 10.0)
-        
+
         return loss
 
 
@@ -455,10 +556,23 @@ class NoiseRobustLoss(nn.Module):
         self.lambda_perc = config.get("lambda_perceptual", DEFAULT_LAMBDA_PERCEPTUAL)
         self.lambda_adv = config.get("lambda_adversarial", DEFAULT_LAMBDA_ADVERSARIAL)
         self.lambda_sam = config.get("lambda_sam", DEFAULT_LAMBDA_SAM)
-        
+
         # Loss components
         self.charbonnier = CharbonnierLoss()
-        self.perceptual_loss = ImprovedPerceptualLoss()
+        perceptual_num_bands = int(config.get("perceptual_num_bands", 31))
+        perceptual_feature_extractor = config.get("perceptual_feature_extractor", None)
+        if perceptual_feature_extractor is None and self.lambda_perc > 0:
+            logger.warning(
+                "lambda_perceptual=%s > 0 but no perceptual_feature_extractor "
+                "was provided; perceptual loss will be a differentiable zero. "
+                "Pass a pretrained RGB model (e.g. torchvision.models.vgg16(...).features) "
+                "via config['perceptual_feature_extractor'] to enable it.",
+                self.lambda_perc,
+            )
+        self.perceptual_loss = ImprovedPerceptualLoss(
+            feature_extractor=perceptual_feature_extractor,
+            num_bands=perceptual_num_bands,
+        )
         self.sam_loss = SAMLoss()
         
         # Adversarial loss configuration

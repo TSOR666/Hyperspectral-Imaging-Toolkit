@@ -3,7 +3,7 @@
 import torch
 import torch.optim as optim
 
-from hsi_model.model import NoiseRobustCSWinModel
+from hsi_model.models.model import NoiseRobustCSWinModel
 from hsi_model.models.losses_consolidated import NoiseRobustLoss
 
 
@@ -121,9 +121,3 @@ def test_model_forward_backward():
     assert all(torch.isfinite(v) for v in components.values())
 
 
-def test_legacy_model_import_path():
-    """Legacy import path should remain compatible."""
-    from hsi_model.model import NoiseRobustCSWinModel as legacy_model
-    from hsi_model.models.model import NoiseRobustCSWinModel as canonical_model
-
-    assert legacy_model is canonical_model

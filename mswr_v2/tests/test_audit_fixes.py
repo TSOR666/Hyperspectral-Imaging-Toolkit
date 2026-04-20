@@ -238,7 +238,7 @@ class TestFlashAttentionBias:
 class TestScalerCheckpointRestore:
     """Verify _load_checkpoint restores GradScaler state."""
 
-    def test_load_checkpoint_restores_scaler(self, tmp_path):
+    def test_load_checkpoint_restores_scaler(self, workspace_tmp_dir):
         """Save and reload a checkpoint; scaler state should round-trip."""
         try:
             from torch.amp import GradScaler
@@ -260,7 +260,7 @@ class TestScalerCheckpointRestore:
             "best_mrae": 0.05,
             "scaler": scaler_state,
         }
-        ckpt_path = tmp_path / "test_ckpt.pth"
+        ckpt_path = workspace_tmp_dir / "test_ckpt.pth"
         torch.save(ckpt, ckpt_path)
 
         # Reload and verify scaler key is present

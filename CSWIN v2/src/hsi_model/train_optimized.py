@@ -46,7 +46,6 @@ Version History:
 import os
 import time
 import logging
-import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -56,7 +55,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-import atexit
 import hydra
 import gc
 from omegaconf import DictConfig, OmegaConf
@@ -65,7 +63,7 @@ from pathlib import Path
 
 # Local imports
 from hsi_model.models import NoiseRobustCSWinModel
-from hsi_model.models.losses import NoiseRobustLoss
+from hsi_model.models.losses_consolidated import NoiseRobustLoss
 from hsi_model.constants import (
     DEFAULT_DATA_DIR,
     DEFAULT_CHECKPOINT_DIR,
@@ -76,11 +74,19 @@ from hsi_model.constants import (
 from hsi_model.utils import (
     setup_logging, MetricsLogger, save_checkpoint, load_checkpoint
 )
+from hsi_model.utils.training_setup import (
+    cleanup,
+    setup_distributed_training,
+    setup_paths,
+    setup_seed,
+)
 from hsi_model.utils.metrics import (
     compute_metrics, compute_metrics_arad1k, profile_model, export_model,
     validate_model_architecture, save_metrics, create_error_report
 )
-from hsi_model.utils.dataloader import (
+from hsi_model.utils.data import (
+    MST_TrainDataset,
+    MST_ValidDataset,
     mst_to_gan_batch,
     compute_mst_center_crop_metrics,
     show_dataloader_diagnostics,
@@ -114,116 +120,26 @@ def create_datasets_only(config: Dict[str, Any]) -> Tuple[Any, Any]:
     memory_mode = config.get("memory_mode", "standard")
     logger = logging.getLogger(__name__)
     logger.info(f"Creating MST++ datasets with memory mode: {memory_mode}")
-    
-    # Check if optimized dataloader is available
-    try:
-        from hsi_model.utils.dataloader import create_optimized_datasets
-        train_dataset, val_dataset = create_optimized_datasets(config, memory_mode)
-    except ImportError:
-        # Fallback to standard dataloader
-        logger.warning("Optimized dataloader not found, using standard")
-        from hsi_model.utils.dataloader import MST_TrainDataset, MST_ValidDataset
-        
-        data_root = config.get("data_dir", DEFAULT_DATA_DIR)
-        crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
-        stride = config.get("stride", DEFAULT_STRIDE)
-        
-        train_dataset = MST_TrainDataset(
-            data_root=data_root,
-            crop_size=crop_size,
-            arg=True,
-            bgr2rgb=True,
-            stride=stride,
-            memory_mode=memory_mode
-        )
-        
-        val_dataset = MST_ValidDataset(
-            data_root=data_root,
-            bgr2rgb=True,
-            memory_mode=memory_mode
-        )
-    
-    return train_dataset, val_dataset
 
+    data_root = config.get("data_dir", DEFAULT_DATA_DIR)
+    crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
+    stride = config.get("stride", DEFAULT_STRIDE)
 
-def setup_paths(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Set up and validate all required paths."""
-    logger = logging.getLogger("hsi_model.setup")
-
-    data_dir = Path(config.get("data_dir", DEFAULT_DATA_DIR))
-    checkpoint_dir = Path(config.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR))
-    log_dir = Path(config.get("log_dir", DEFAULT_LOG_DIR))
-
-    if not data_dir.exists():
-        raise FileNotFoundError(
-            f"Dataset directory not found: {data_dir.resolve()} "
-            "(set `data_dir` in the Hydra config or environment)."
-        )
-
-    required_dirs = ["Train_RGB", "Train_Spec", "Test_RGB", "split_txt"]
-    for req_dir in required_dirs:
-        full_path = data_dir / req_dir
-        if not full_path.exists():
-            raise FileNotFoundError(f"Required MST++ directory not found: {full_path}")
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    config["data_dir"] = str(data_dir)
-    config["checkpoint_dir"] = str(checkpoint_dir)
-    config["log_dir"] = str(log_dir)
-
-    logger.info("Data directory: %s", data_dir)
-    logger.info("Checkpoint directory: %s", checkpoint_dir)
-    logger.info("Log directory: %s", log_dir)
-
-    return config
-
-
-def cleanup() -> None:
-    """Clean up distributed training resources"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def setup_distributed_training(config: Dict[str, Any]) -> Tuple[torch.device, int, int, bool]:
-    """Set up distributed training environment."""
-    if not config.get("distributed", False):
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu"), 0, 1, False
-    
-    local_rank = int(os.environ.get('LOCAL_RANK', config.get("local_rank", 0)))
-    rank = int(os.environ.get('RANK', local_rank))
-    world_size = int(os.environ.get('WORLD_SIZE', config.get("world_size", 1)))
-    
-    torch.cuda.set_device(local_rank)
-    
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
+    train_dataset = MST_TrainDataset(
+        data_root=data_root,
+        crop_size=crop_size,
+        arg=True,
+        bgr2rgb=True,
+        stride=stride,
+        memory_mode=memory_mode,
     )
-    
-    atexit.register(cleanup)
-    
-    return torch.device(f"cuda:{local_rank}"), rank, world_size, True
+    val_dataset = MST_ValidDataset(
+        data_root=data_root,
+        bgr2rgb=True,
+        memory_mode=memory_mode,
+    )
 
-
-def setup_seed(seed: int, rank: int = 0) -> None:
-    """Set random seeds for reproducibility."""
-    seed = seed + rank
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    # Ensure deterministic behavior
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # Must be False for determinism
-
-    logger.info("Deterministic mode enabled: cudnn.deterministic=True, benchmark=False")
-    logger.warning("Performance may be reduced. To disable: set cudnn.benchmark=True (loses determinism)")
+    return train_dataset, val_dataset
 
 
 def memory_cleanup():
@@ -594,7 +510,14 @@ def train_mst_gan_optimized(
                             'scaler_g': scaler_g.state_dict(),
                             'scaler_d': scaler_d.state_dict(),
                             'best_mrae': min(current_mrae, record_mrae_loss),
-                            'config': config
+                            'config': config,
+                            # RNG state for deterministic resume.
+                            'torch_rng_state': torch.get_rng_state(),
+                            'cuda_rng_state_all': (
+                                torch.cuda.get_rng_state_all()
+                                if torch.cuda.is_available() else None
+                            ),
+                            'numpy_rng_state': np.random.get_state(),
                         }
                         
                         checkpoint_path = os.path.join(config["checkpoint_dir"], f'net_{epoch_num}epoch.pth')

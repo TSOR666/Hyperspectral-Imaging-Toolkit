@@ -139,3 +139,49 @@ def test_generator_determinism():
 
     assert torch.equal(x1, x2), "Input mismatch"
     assert torch.equal(out1, out2), f"Output mismatch: max diff = {(out1 - out2).abs().max()}"
+
+
+# Audit fix: NaN-fallback shape must be dynamic, not hardcoded (B,1,8,8).
+@pytest.mark.parametrize("spatial", [16, 32, 64])
+def test_discriminator_nan_fallback_shape_matches_downsample(spatial):
+    """Eval-mode NaN fallback must produce a logit map matching the true downsample pattern."""
+    config = {
+        "discriminator_base_dim": 8,
+        "discriminator_num_heads": 2,
+        "discriminator_num_blocks": [1, 1, 1],
+    }
+    disc = SNTransformerDiscriminator(config)
+    disc.eval()
+
+    # Build a clean input to learn the true output spatial size...
+    clean_rgb = torch.randn(1, 3, spatial, spatial)
+    clean_hsi = torch.randn(1, 31, spatial, spatial)
+    with torch.no_grad():
+        expected = disc(clean_rgb, clean_hsi)
+
+    # ...then a NaN input so the fallback path triggers.
+    bad_rgb = torch.full((1, 3, spatial, spatial), float("nan"))
+    bad_hsi = torch.full((1, 31, spatial, spatial), float("nan"))
+    with torch.no_grad():
+        out = disc(bad_rgb, bad_hsi)
+
+    assert out.shape == expected.shape, (
+        f"NaN fallback shape {out.shape} != clean output shape {expected.shape}"
+    )
+    # Fallback should be all zeros.
+    assert torch.all(out == 0)
+
+
+def test_discriminator_nan_input_raises_in_training():
+    """Fail-fast behaviour: non-finite discriminator input during training is an error."""
+    config = {
+        "discriminator_base_dim": 8,
+        "discriminator_num_heads": 2,
+        "discriminator_num_blocks": [1, 1],
+    }
+    disc = SNTransformerDiscriminator(config)
+    disc.train()
+    rgb = torch.full((1, 3, 16, 16), float("nan"))
+    hsi = torch.randn(1, 31, 16, 16)
+    with pytest.raises(RuntimeError, match="Non-finite"):
+        disc(rgb, hsi)

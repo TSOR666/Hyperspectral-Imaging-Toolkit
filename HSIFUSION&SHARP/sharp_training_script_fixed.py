@@ -22,7 +22,25 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    class SummaryWriter:  # type: ignore[override]
+        """No-op fallback so training/imports still work without tensorboard installed."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            warnings.warn(
+                "tensorboard is not installed; SummaryWriter logging is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        def add_scalar(self, *args, **kwargs) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
 
 # Import SHARP v3.2.2
 try:
@@ -943,5 +961,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 

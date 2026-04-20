@@ -37,10 +37,13 @@ from pathlib import Path
 
 # Local imports
 from hsi_model.models import NoiseRobustCSWinModel
-from hsi_model.models.losses import NoiseRobustLoss, ComputeSinkhornDiscriminatorLoss
+from hsi_model.models.losses_consolidated import NoiseRobustLoss, ComputeSinkhornDiscriminatorLoss
 from hsi_model.utils import setup_logging, MetricsLogger
-from hsi_model.utils.dataloader import (
+from hsi_model.utils.data import (
     mst_to_gan_batch, compute_mst_center_crop_metrics, worker_init_fn_mst
+)
+from hsi_model.utils.training_setup import (
+    setup_paths, setup_distributed_training, setup_seed,
 )
 from hsi_model.constants import (
     DEFAULT_BATCH_SIZE,
@@ -123,7 +126,7 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 def create_datasets_only(config: Dict[str, Any]) -> Tuple[Any, Any]:
     """Create MST++ datasets without DataLoaders."""
-    from hsi_model.utils.dataloader import MST_TrainDataset, MST_ValidDataset
+    from hsi_model.utils.data import MST_TrainDataset, MST_ValidDataset
     
     memory_mode = config.get("memory_mode", "standard")
     data_root = config.get("data_dir", DEFAULT_DATA_DIR)
@@ -417,7 +420,7 @@ def train_sinkhorn_gan(
         pin_memory=True,
         drop_last=True,
         worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
-        persistent_workers=False
+        persistent_workers=(num_workers > 0),
     )
     
     # Training state
@@ -558,16 +561,21 @@ def train_sinkhorn_gan(
                         logger.warning("Non-finite discriminator logits at iteration %s; skipping D step", iteration)
                         optimizer_d.zero_grad(set_to_none=True)
                         continue
-                    
+
                     # Sinkhorn discriminator loss
                     disc_loss = disc_criterion(real_pred, fake_pred)
-                    
-                    # R1 regularization
-                    if use_r1_reg and iteration % R1_APPLY_FREQUENCY == 0:
-                        hsi_tensor.requires_grad_(True)
-                        real_pred_for_r1 = discriminator(rgb_tensor, hsi_tensor)
-                        r1_loss = apply_r1_regularization(real_pred_for_r1, hsi_tensor, gamma=r1_gamma)
-                        disc_loss = disc_loss + r1_loss
+
+                # R1 regularization. Run OUTSIDE autocast: torch.autograd.grad
+                # with fp16/bf16 activations produces low-resolution gradient
+                # norms and interacts badly with GradScaler (the penalty is not
+                # on the scaled-loss path). Computing in fp32 is negligible
+                # cost because R1 only fires every R1_APPLY_FREQUENCY steps.
+                if use_r1_reg and iteration % R1_APPLY_FREQUENCY == 0:
+                    hsi_tensor_r1 = hsi_tensor.detach().clone().requires_grad_(True)
+                    real_pred_for_r1 = discriminator(rgb_tensor, hsi_tensor_r1)
+                    real_pred_for_r1 = real_pred_for_r1.float()
+                    r1_loss = apply_r1_regularization(real_pred_for_r1, hsi_tensor_r1, gamma=r1_gamma)
+                    disc_loss = disc_loss.float() + r1_loss
                 
                 if not torch.isfinite(disc_loss):
                     logger.warning("Non-finite discriminator loss at iteration %s; skipping D step", iteration)
@@ -667,7 +675,14 @@ def train_sinkhorn_gan(
                             'scaler_g': scaler_g.state_dict(),
                             'scaler_d': scaler_d.state_dict(),
                             'best_mrae': min(current_mrae, record_mrae_loss),
-                            'config': config
+                            'config': config,
+                            # RNG state for deterministic resume.
+                            'torch_rng_state': torch.get_rng_state(),
+                            'cuda_rng_state_all': (
+                                torch.cuda.get_rng_state_all()
+                                if torch.cuda.is_available() else None
+                            ),
+                            'numpy_rng_state': np.random.get_state(),
                         }
                         
                         if is_best:
@@ -740,10 +755,7 @@ def train_sinkhorn_gan(
 def main(config: DictConfig) -> None:
     """Main function for Sinkhorn GAN training."""
     cfg = OmegaConf.to_container(config, resolve=True)
-    
-    # Setup paths
-    from train_optimized import setup_paths, setup_distributed_training, setup_seed
-    
+
     cfg = setup_paths(cfg)
     device, rank, world_size, is_distributed = setup_distributed_training(cfg)
     

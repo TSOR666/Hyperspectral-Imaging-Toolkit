@@ -4,7 +4,18 @@ import logging.handlers
 from typing import Dict, Any, Optional
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
+
+# tensorboard is an optional dependency. Importing it at module load time
+# prevents any utils.* import (including metrics) from working in environments
+# that don't have tensorboard installed (e.g. CI, smoke tests, CPU-only
+# evaluation). Defer the import to MetricsLogger.__init__ and skip writing
+# to tensorboard when the dependency is missing.
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore[attr-defined]
+    _HAS_TENSORBOARD = True
+except ModuleNotFoundError:  # pragma: no cover - environment-dependent
+    SummaryWriter = None  # type: ignore[assignment]
+    _HAS_TENSORBOARD = False
 
 from hsi_model.constants import DEFAULT_LOG_DIR
 
@@ -62,12 +73,16 @@ class MetricsLogger:
         self.local_rank = local_rank
         self.logger = logging.getLogger("hsi_model")
         
-        # Only create tensorboard writer on rank 0
+        # Only create tensorboard writer on rank 0 — and only if available.
         self.writer = None
-        if local_rank == 0:
+        if local_rank == 0 and _HAS_TENSORBOARD:
             tensorboard_dir = os.path.join(log_dir, "tensorboard")
             os.makedirs(tensorboard_dir, exist_ok=True)
             self.writer = SummaryWriter(tensorboard_dir)
+        elif local_rank == 0 and not _HAS_TENSORBOARD:
+            self.logger.warning(
+                "tensorboard is not installed; metrics will only be logged to text."
+            )
     
     def log_scalars(self, metrics: Dict[str, float], step: int, prefix: str = "") -> None:
         """
