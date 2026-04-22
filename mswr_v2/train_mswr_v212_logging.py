@@ -52,7 +52,6 @@ from datetime import datetime
 import numpy as np
 import random
 from typing import Dict, Tuple, Any
-import wandb
 from tqdm import tqdm
 import yaml
 import logging
@@ -62,6 +61,17 @@ import psutil
 from collections import defaultdict
 import traceback
 import copy
+
+wandb = None
+
+
+def get_wandb():
+    """Import wandb only when explicitly enabled to avoid test-time side effects."""
+    global wandb
+    if wandb is None:
+        import wandb as wandb_module
+        wandb = wandb_module
+    return wandb
 
 # Import the enhanced model - UPDATE THIS PATH TO YOUR FIXED MODEL FILE
 try:
@@ -889,15 +899,17 @@ class EnhancedTrainer:
             self.scaler = None
         
         # Wandb setup
+        self.wandb = None
         if config.use_wandb:
-            wandb.init(
+            self.wandb = get_wandb()
+            self.wandb.init(
                 project="mswr-v212-cnn-wavelets",
                 name=config.experiment_name,
                 config=config.to_dict(),
                 tags=['cnn-wavelets', 'production', 'v2.1.2', 'fixed', 'sam', 'fixed-logging']
             )
             # Reduced frequency for transformer models to avoid overhead
-            wandb.watch(self.model, log='gradients', log_freq=500)
+            self.wandb.watch(self.model, log='gradients', log_freq=500)
     
     def _setup_model(self):
         """Initialize model with CNN wavelets"""
@@ -1149,9 +1161,16 @@ class EnhancedTrainer:
             
             # Load model state
             if isinstance(self.model, nn.DataParallel):
-                self.model.module.load_state_dict(checkpoint['state_dict'], strict=False)
+                incompatible = self.model.module.load_state_dict(checkpoint['state_dict'], strict=False)
             else:
-                self.model.load_state_dict(checkpoint['state_dict'], strict=False)
+                incompatible = self.model.load_state_dict(checkpoint['state_dict'], strict=False)
+
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                self.logger.warning(
+                    "Checkpoint loaded with missing keys=%s unexpected keys=%s",
+                    incompatible.missing_keys,
+                    incompatible.unexpected_keys,
+                )
             
             # Load optimizer state
             try:
@@ -1378,7 +1397,7 @@ class EnhancedTrainer:
             pbar.set_postfix(postfix)
             
             # Logging
-            if self.config.use_wandb and self.iteration % 20 == 0:
+            if self.wandb is not None and self.iteration % 20 == 0:
                 log_dict = {
                     'train/loss': losses.val,
                     'train/lr': current_lr,
@@ -1403,7 +1422,7 @@ class EnhancedTrainer:
                 if torch.cuda.is_available():
                     log_dict['train/gpu_memory_gb'] = torch.cuda.memory_allocated() / 1024**3
                 
-                wandb.log(log_dict)
+                self.wandb.log(log_dict)
             
             # Validation and checkpointing
             if self.iteration % self.config.validate_frequency == 0:
@@ -1552,7 +1571,7 @@ class EnhancedTrainer:
             results = self._validation_pass(model_to_eval, desc=desc)
             results['evaluation_model'] = 'ema' if use_ema else 'model'
         
-        if self.config.use_wandb:
+        if self.wandb is not None:
             log_dict = {
                 'val/mrae': results['mrae'],
                 'val/rmse': results['rmse'],
@@ -1575,7 +1594,7 @@ class EnhancedTrainer:
                         log_dict[f'val_{prefix}/psnr'] = results[key_psnr]
                     if key_sam in results:
                         log_dict[f'val_{prefix}/sam_deg'] = results[key_sam]
-            wandb.log(log_dict)
+            self.wandb.log(log_dict)
         
         self.model.train()
         return results
@@ -1770,8 +1789,8 @@ class EnhancedTrainer:
                         )
 
                 # Enhanced wandb logging
-                if self.config.use_wandb:
-                    wandb.log({
+                if self.wandb is not None:
+                    self.wandb.log({
                         'epoch': epoch,
                         'epoch_time': epoch_time,
                         'best_mrae': self.best_mrae,
@@ -1805,14 +1824,14 @@ class EnhancedTrainer:
             self.logger.info(f"Checkpoints saved to: {self.checkpoint_dir}")
             self.logger.info("="*80)
             
-            if self.config.use_wandb:
-                wandb.log({
+            if self.wandb is not None:
+                self.wandb.log({
                     'training_completed': True,
                     'total_training_hours': total_time / 3600,
                     'final_best_mrae': self.best_mrae,
                     'best_epoch': best_epoch
                 })
-                wandb.finish()
+                self.wandb.finish()
 
 def main():
     """Main training entry point - FIXED VERSION with proper logging"""

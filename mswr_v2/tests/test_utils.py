@@ -148,6 +148,14 @@ class TestLossFunctions:
         loss = loss_fn(tensor, tensor)
         assert loss.item() < 1e-5
 
+    def test_sam_loss_zero_vectors(self):
+        """Test SAM treats matching zero spectra as zero angle instead of NaN."""
+        tensor = torch.zeros(1, 31, 16, 16)
+        loss_fn = Loss_SAM()
+        loss = loss_fn(tensor, tensor)
+        assert torch.isfinite(loss)
+        assert loss.item() < 1e-6
+
     def test_sam_loss_range(self, sample_tensors):
         """Test SAM loss is in valid range [0, pi]."""
         pred, target = sample_tensors

@@ -19,6 +19,19 @@ from hsifusion_v252_complete import HSIFusionNetV25LightningPro, LightningProCon
 _TV = version.parse(torch.__version__)
 _T20 = _TV >= version.parse("2.0.0")
 _T21 = _TV >= version.parse("2.1.0")
+_AUTO_COMPILE = object()
+
+
+def _resolve_compile_mode(
+    compile_mode: Union[str, None, object],
+    compile_model_default: bool,
+) -> Optional[str]:
+    """Differentiate omitted compile_mode from an explicit request to disable compile."""
+    if compile_mode is _AUTO_COMPILE:
+        return "default" if compile_model_default else None
+    if compile_mode is None:
+        return None
+    return str(compile_mode)
 
 
 @dataclass
@@ -211,7 +224,7 @@ def create_hsifusion_lightning_classifier(
     model_size: str = "base",
     in_channels: int = 3,
     num_classes: int = 10,
-    compile_mode: Optional[str] = None,
+    compile_mode: Union[str, None, object] = _AUTO_COMPILE,
     rank: int = 0,
     skip_compile_small_inputs: bool = True,
     expected_min_size: Optional[int] = None,
@@ -279,6 +292,7 @@ def create_hsifusion_lightning_classifier(
     head_config = LightningProClassifierHeadConfig(**head_kwargs)
 
     model = HSIFusionNetV25LightningProClassifier(backbone_config, head_config=head_config)
+    compile_mode = _resolve_compile_mode(compile_mode, backbone_config.compile_model)
 
     compile_threshold = expected_min_size or backbone_config.min_input_size
     if skip_compile_small_inputs and compile_threshold < 128 and not force_compile:
@@ -287,9 +301,6 @@ def create_hsifusion_lightning_classifier(
         compile_mode = None
     elif force_compile and rank == 0:
         print("Force compilation enabled - will compile regardless of input size")
-
-    if compile_mode is None:
-        compile_mode = "default" if backbone_config.compile_model else None
 
     if compile_mode and _T20 and not lazy_compile:
         try:

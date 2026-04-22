@@ -148,3 +148,56 @@ def test_adversarial_loss_nonfinite_logits_fallback_is_finite():
     adv_loss = criterion.compute_adversarial_loss(disc_real, disc_fake)
     assert torch.isfinite(adv_loss)
     assert adv_loss.item() == 0.0
+
+
+# Audit fix: perceptual loss must warn when effectively disabled, and stay differentiable.
+def test_noise_robust_loss_warns_when_perceptual_disabled(caplog):
+    """lambda_perceptual>0 without a feature_extractor should log a clear warning once."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        NoiseRobustLoss({"lambda_perceptual": 0.1})
+    assert any(
+        "perceptual_feature_extractor" in record.message for record in caplog.records
+    ), "Expected a warning pointing at perceptual_feature_extractor config."
+
+
+def test_perceptual_loss_returns_differentiable_zero_without_extractor():
+    from hsi_model.models.losses_consolidated import ImprovedPerceptualLoss
+
+    loss_fn = ImprovedPerceptualLoss(feature_extractor=None, num_bands=31)
+    pred = torch.randn(1, 31, 8, 8, requires_grad=True)
+    target = torch.randn(1, 31, 8, 8)
+    value = loss_fn(pred, target)
+    assert torch.isfinite(value)
+    assert value.item() == 0.0
+    # Must stay differentiable so combined-loss backward never breaks.
+    value.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+
+
+def test_perceptual_loss_uses_cmf_for_hsi_when_extractor_present():
+    """With a real extractor, 31-channel input must flow through the CMF->RGB path."""
+    from hsi_model.models.losses_consolidated import ImprovedPerceptualLoss
+
+    # Identity-like extractor that collapses to RGB (3 channels). Any 3-channel
+    # module is fine; what matters is that it accepts (B,3,H,W) without error.
+    class TinyExtractor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.c(x)
+
+    extractor = TinyExtractor().eval()
+    loss_fn = ImprovedPerceptualLoss(
+        feature_extractor=extractor, num_bands=31, use_imagenet_norm=True
+    )
+    pred = torch.rand(1, 31, 8, 8, requires_grad=True)
+    target = torch.rand(1, 31, 8, 8)
+    value = loss_fn(pred, target)
+    assert torch.isfinite(value)
+    assert value.item() >= 0.0
+    value.backward()
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()

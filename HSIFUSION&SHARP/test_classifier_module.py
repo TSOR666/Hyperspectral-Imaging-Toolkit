@@ -267,6 +267,7 @@ def test_embedding_extraction():
         num_classes=num_classes,
         compile_mode=None,
     )
+    classifier.eval()
 
     # Test extract_embeddings method
     with torch.no_grad():

@@ -38,6 +38,25 @@ from common_utils_v32 import (
 logger = logging.getLogger(__name__)
 
 
+def _make_grad_scaler(enabled: bool):
+    """Use the modern torch.amp API when available while keeping older PyTorch support."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast(enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.autocast(enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def robust_version_parse(version_str: str) -> Tuple[int, int, int]:
     """Robustly parse a version string into ``(major, minor, patch)``."""
 
@@ -1151,7 +1170,7 @@ class SHARPv32Trainer:
         self.scheduler = self._create_scheduler(warmup_steps, total_steps)
         
         self.use_amp = use_amp and torch.cuda.is_available()
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = _make_grad_scaler(enabled=self.use_amp)
         
         self.ema_decay = ema_decay
         self.ema_state = self._create_ema_state() if ema_decay > 0 else None
@@ -1258,7 +1277,7 @@ class SHARPv32Trainer:
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with _autocast(enabled=self.use_amp):
             outputs = self.model(inputs)
             loss = self.model.compute_loss(outputs, targets)
 
@@ -1332,7 +1351,7 @@ class SHARPv32Trainer:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with _autocast(enabled=self.use_amp):
                 outputs = self.model(inputs)
                 loss = self.model.compute_loss(outputs, targets)
             

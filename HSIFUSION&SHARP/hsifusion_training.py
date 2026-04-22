@@ -22,7 +22,25 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    class SummaryWriter:  # type: ignore[override]
+        """No-op fallback so training/imports still work without tensorboard installed."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            warnings.warn(
+                "tensorboard is not installed; SummaryWriter logging is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        def add_scalar(self, *args, **kwargs) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
 
 from hsifusion_v252_complete import create_hsifusion_lightning_pro
 from optimized_dataloader import MSTPlusPlusLoss, create_optimized_dataloaders

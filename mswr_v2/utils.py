@@ -109,16 +109,13 @@ class Loss_PSNR(nn.Module):
         H = im_true.size()[2]
         W = im_true.size()[3]
 
-        # FIXED: Use reshape instead of resize_ (which is deprecated and modifies in-place)
-        Itrue = im_true.clamp(0., 1.).mul(data_range).reshape(N, C * H * W)
-        Ifake = im_fake.clamp(0., 1.).mul(data_range).reshape(N, C * H * W)
+        # Metrics should run in float32 so tiny errors do not underflow in fp16/bf16.
+        Itrue = im_true.clamp(0.0, 1.0).mul(float(data_range)).reshape(N, C * H * W).to(torch.float32)
+        Ifake = im_fake.clamp(0.0, 1.0).mul(float(data_range)).reshape(N, C * H * W).to(torch.float32)
 
-        # Calculate MSE
-        mse = nn.MSELoss(reduction='none')
-        err = mse(Itrue, Ifake).sum(dim=1, keepdim=True).div(C * H * W)
-
-        # Calculate PSNR
-        psnr = 10. * torch.log10((data_range ** 2) / (err + 1e-6))  # Epsilon caps PSNR at ~60dB; 1e-6 survives fp16
+        err = (Itrue - Ifake).pow(2).sum(dim=1, keepdim=True).div(C * H * W)
+        data_range_sq = torch.tensor(float(data_range) ** 2, device=im_true.device, dtype=torch.float32)
+        psnr = 10.0 * torch.log10(data_range_sq / err.clamp_min(1e-6))
         return torch.mean(psnr)
 
 # Additional loss functions for enhanced training
@@ -141,16 +138,21 @@ class Loss_SAM(nn.Module):
         outputs_flat = outputs.permute(0, 2, 3, 1).reshape(-1, C)
         label_flat = label.permute(0, 2, 3, 1).reshape(-1, C)
 
-        # Normalize vectors
-        outputs_norm = torch.nn.functional.normalize(outputs_flat, p=2, dim=1)
-        label_norm = torch.nn.functional.normalize(label_flat, p=2, dim=1)
+        work_dtype = torch.float64 if outputs.device.type == 'cpu' else torch.float32
+        outputs_flat = outputs_flat.to(work_dtype)
+        label_flat = label_flat.to(work_dtype)
 
-        # Compute dot product and clamp to avoid numerical issues
-        dot_product = torch.sum(outputs_norm * label_norm, dim=1)
-        dot_product = torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7)
+        dot_product = torch.sum(outputs_flat * label_flat, dim=1)
+        output_norm = torch.linalg.vector_norm(outputs_flat, dim=1)
+        label_norm = torch.linalg.vector_norm(label_flat, dim=1)
+        denom = output_norm * label_norm
 
-        # Compute angle in radians
-        angles = torch.acos(dot_product)
+        cosine = dot_product / denom.clamp_min(1e-8)
+        both_zero = (output_norm <= 1e-8) & (label_norm <= 1e-8)
+        cosine = torch.where(both_zero, torch.ones_like(cosine), cosine)
+        cosine = torch.where(cosine > 1.0 - 1e-7, torch.ones_like(cosine), cosine)
+        cosine = torch.where(cosine < -1.0 + 1e-7, -torch.ones_like(cosine), cosine)
+        angles = torch.acos(cosine.clamp(-1.0, 1.0))
 
         # Return mean angle (you can convert to degrees if needed)
         sam = torch.mean(angles)

@@ -30,6 +30,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import seaborn as sns
+import math
 sns.set_style("whitegrid")
 
 # Import model and utilities
@@ -121,6 +122,8 @@ class MemoryManager:
                           target_channels: int = 31) -> int:
         """Estimate optimal tile size based on available memory"""
         available_gb = self.get_available_memory()
+        if not math.isfinite(available_gb):
+            return 1024
         
         # Estimate memory per pixel (rough approximation)
         # Forward pass typically needs 3-4x the model size
@@ -274,9 +277,9 @@ class TiledProcessor:
         weights = np.ones((size, size), dtype=np.float32)
         
         if overlap > 0:
-            # Create 1D cosine ramp
-            ramp = np.linspace(0, np.pi/2, overlap)
-            ramp_weights = np.sin(ramp) ** 2
+            overlap = min(overlap, max(1, size // 2))
+            ramp = np.arange(1, overlap + 1, dtype=np.float32) / (overlap + 1)
+            ramp_weights = np.sin(ramp * (np.pi / 2.0)) ** 2
             
             # Apply to edges
             weights[:overlap, :] *= ramp_weights[:, None]
@@ -430,9 +433,16 @@ class MSWRInference:
         
         # Load state dict
         if 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'], strict=False)
+            incompatible = model.load_state_dict(checkpoint['state_dict'], strict=False)
         else:
-            model.load_state_dict(checkpoint, strict=False)
+            incompatible = model.load_state_dict(checkpoint, strict=False)
+
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            logger.warning(
+                "Checkpoint loaded with missing keys=%s unexpected keys=%s",
+                incompatible.missing_keys,
+                incompatible.unexpected_keys,
+            )
         
         # Move to device and set to eval mode
         model = model.to(self.device)
@@ -667,13 +677,18 @@ class MSWRInference:
                     
         elif self.config.save_format == 'png':
             # Save as multi-channel PNG sequence
-            output_dir = self.output_dir / f"{input_name}_hsi_{timestamp}"
-            output_dir.mkdir(exist_ok=True)
+            output_path = self.output_dir / f"{input_name}_hsi_{timestamp}"
+            output_path.mkdir(exist_ok=True)
             
             for i in range(output.shape[2]):
-                channel_path = output_dir / f"channel_{i:03d}.png"
+                channel_path = output_path / f"channel_{i:03d}.png"
                 channel_img = (output[:, :, i] * 255).astype(np.uint8)
                 cv2.imwrite(str(channel_path), channel_img)
+            meta_path = output_path / "metadata.json"
+            with open(meta_path, 'w') as f:
+                json.dump(metadata, f, indent=4, default=str)
+        else:
+            raise ValueError(f"Unsupported save format: {self.config.save_format}")
         
         logger.info(f"Output saved: {output_path}")
         

@@ -10,6 +10,8 @@ from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
 from hsifusion_training import HSIFusionTrainer, should_optimizer_step as hsifusion_should_step
+from hsifusion_classifier_v253 import create_hsifusion_lightning_classifier
+from hsifusion_v252_complete import create_hsifusion_lightning_pro
 from optimized_dataloader import MSTPlusPlusLoss
 from sharp_training_script_fixed import should_optimizer_step as sharp_should_step
 from sharp_inference import SHARPInference, _torch_load_compat
@@ -162,3 +164,51 @@ def test_blend_weight_has_positive_floor() -> None:
     runner = SHARPInference.__new__(SHARPInference)
     weight = SHARPInference._create_blend_weight(runner, 16, 16)
     assert float(weight.min()) > 0.0
+
+
+def test_hsifusion_factory_explicit_none_disables_compile(monkeypatch) -> None:
+    compile_calls = []
+
+    def _compile_should_not_run(model, **kwargs):
+        compile_calls.append(kwargs)
+        raise AssertionError("torch.compile should not be called when compile_mode=None")
+
+    monkeypatch.setattr(torch, "compile", _compile_should_not_run)
+    model = create_hsifusion_lightning_pro(
+        model_size="tiny",
+        in_channels=3,
+        out_channels=31,
+        compile_mode=None,
+        expected_min_size=256,
+        skip_compile_small_inputs=False,
+    )
+    assert compile_calls == []
+    x = torch.rand(1, 3, 64, 64)
+    with torch.no_grad():
+        y = model(x)
+    if isinstance(y, tuple):
+        y = y[0]
+    assert y.shape == (1, 31, 64, 64)
+
+
+def test_hsifusion_classifier_explicit_none_disables_compile(monkeypatch) -> None:
+    compile_calls = []
+
+    def _compile_should_not_run(model, **kwargs):
+        compile_calls.append(kwargs)
+        raise AssertionError("torch.compile should not be called when compile_mode=None")
+
+    monkeypatch.setattr(torch, "compile", _compile_should_not_run)
+    model = create_hsifusion_lightning_classifier(
+        model_size="tiny",
+        in_channels=3,
+        num_classes=7,
+        compile_mode=None,
+        expected_min_size=256,
+        skip_compile_small_inputs=False,
+    )
+    assert compile_calls == []
+    x = torch.rand(2, 3, 64, 64)
+    with torch.no_grad():
+        logits = model(x)
+    assert logits.shape == (2, 7)

@@ -9,9 +9,9 @@ Exports:
 """
 
 from .model import NoiseRobustCSWinModel
-from .generator import NoiseRobustCSWinGenerator
-from .discriminator import SpatialSpectralDiscriminator
-from .losses import (
+from .generator_v3 import NoiseRobustCSWinGenerator
+from .discriminator_v2 import SpatialSpectralDiscriminator
+from .losses_consolidated import (
     CharbonnierLoss,
     SAMLoss,
     SinkhornDivergence,

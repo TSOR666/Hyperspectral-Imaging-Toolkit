@@ -6,13 +6,21 @@ import torch
 
 # Conditional import to handle missing dependencies
 try:
-    from mswr_inference import TiledProcessor, MemoryManager, EnsembleProcessor
+    from mswr_inference import (
+        TiledProcessor,
+        MemoryManager,
+        EnsembleProcessor,
+        InferenceConfig,
+        MSWRInference,
+    )
     INFERENCE_AVAILABLE = True
 except ImportError:
     INFERENCE_AVAILABLE = False
     TiledProcessor = None
     MemoryManager = None
     EnsembleProcessor = None
+    InferenceConfig = None
+    MSWRInference = None
 
 pytestmark = pytest.mark.skipif(not INFERENCE_AVAILABLE, reason="inference module dependencies not available")
 
@@ -112,6 +120,26 @@ class TestTiledProcessor:
         assert corner_value > 0, "Corner weight should be > 0"
         assert corner_value < center_value, "Corner weight should be less than center"
         assert center_value == 1.0, "Center weight should be 1.0"
+
+    def test_png_save_returns_directory(self, workspace_tmp_dir):
+        """PNG export should return the output directory and write metadata."""
+        engine = object.__new__(MSWRInference)
+        engine.config = InferenceConfig(
+            model_path="unused.pth",
+            output_dir=str(workspace_tmp_dir),
+            save_format="png",
+            save_visualization=False,
+        )
+        engine.output_dir = workspace_tmp_dir
+
+        output = np.random.rand(8, 8, 4).astype(np.float32)
+        metadata = {"shape": output.shape}
+
+        saved_path = engine.save_output(output, "sample.png", metadata)
+
+        assert saved_path.is_dir()
+        assert (saved_path / "channel_000.png").exists()
+        assert (saved_path / "metadata.json").exists()
 
 
 class TestMemoryManager:
