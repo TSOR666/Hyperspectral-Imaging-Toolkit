@@ -168,6 +168,7 @@ class DPMOT(nn.Module):
             return x, intermediates
         return x
 
+    @torch.no_grad()
     def sample_dpm_solver(
         self,
         shape: Tuple[int, ...],
@@ -194,53 +195,50 @@ class DPMOT(nn.Module):
         # DPM-Solver v3 uses lower-order solvers for the first few steps
         # and higher-order solvers for later steps
 
-        with torch.no_grad():
-            for i, t in enumerate(tqdm(t_steps, desc="DPM-Solver sampling")):
-                # Create batch timestep - convert tensor element to Python float
-                t_val: float = t.item() if isinstance(t, torch.Tensor) else float(t)
-                t_tensor = torch.full((shape[0],), t_val, device=device)
+        batch_size = shape[0]
+        zero_t = t_steps.new_zeros(batch_size)
 
-                # Previous timestep (or 0 if final step)
-                prev_t_elem = t_steps[i + 1] if i < len(t_steps) - 1 else None
-                prev_t_val: float = prev_t_elem.item() if prev_t_elem is not None else 0.0
-                prev_t_tensor = torch.full((shape[0],), prev_t_val, device=device)
+        for i in tqdm(range(steps), desc="DPM-Solver sampling"):
+            # Keep timestep values as tensors. Calling Tensor.item() here forces a
+            # GPU synchronization once per solver step and is unnecessary because
+            # all downstream helpers accept batched tensor timesteps.
+            t_tensor = t_steps[i].expand(batch_size)
+            prev_t_tensor = (
+                t_steps[i + 1].expand(batch_size)
+                if i < steps - 1
+                else zero_t
+            )
 
-                # For DPM-Solver v3, we need to approximate the ODE more accurately
+            # For DPM-Solver v3, we need to approximate the ODE more accurately.
+            pred_noise = self.denoiser(x, self._time_to_index(t_tensor))
 
-                # Get current prediction
-                pred_noise = self.denoiser(x, self._time_to_index(t_tensor))
+            # First-order update
+            x_1 = self._dpm_solver_update(x, pred_noise, t_tensor, prev_t_tensor)
 
-                # First-order update
-                x_1 = self._dpm_solver_update(x, pred_noise, t_tensor, prev_t_tensor)
+            # For higher-order updates (used in later steps)
+            if i > 0:  # Use first-order for first step
+                mid_t_tensor = 0.5 * (t_tensor + prev_t_tensor)
+                pred_noise_mid = self.denoiser(x_1, self._time_to_index(mid_t_tensor))
 
-                # For higher-order updates (used in later steps)
-                if i > 0:  # Use first-order for first step
-                    # Second prediction at midpoint
-                    mid_t_val: float = (t_val + prev_t_val) / 2.0
-                    mid_t_tensor = torch.full((shape[0],), mid_t_val, device=device)
+                # Second-order correction
+                x_2 = self._dpm_solver_second_order_update(
+                    x, x_1, pred_noise, pred_noise_mid,
+                    t_tensor, mid_t_tensor, prev_t_tensor
+                )
 
-                    pred_noise_mid = self.denoiser(x_1, self._time_to_index(mid_t_tensor))
+                # For even higher accuracy in final steps
+                if i > steps // 2:  # Use higher-order for later steps
+                    pred_noise_end = self.denoiser(x_2, self._time_to_index(prev_t_tensor))
 
-                    # Second-order correction
-                    x_2 = self._dpm_solver_second_order_update(
-                        x, x_1, pred_noise, pred_noise_mid,
+                    # Third-order correction
+                    x = self._dpm_solver_third_order_update(
+                        x, x_1, x_2, pred_noise, pred_noise_mid, pred_noise_end,
                         t_tensor, mid_t_tensor, prev_t_tensor
                     )
-
-                    # For even higher accuracy in final steps
-                    if i > len(t_steps) // 2:  # Use higher-order for later steps
-                        # Third prediction
-                        pred_noise_end = self.denoiser(x_2, self._time_to_index(prev_t_tensor))
-
-                        # Third-order correction
-                        x = self._dpm_solver_third_order_update(
-                            x, x_1, x_2, pred_noise, pred_noise_mid, pred_noise_end,
-                            t_tensor, mid_t_tensor, prev_t_tensor
-                        )
-                    else:
-                        x = x_2
                 else:
-                    x = x_1
+                    x = x_2
+            else:
+                x = x_1
 
         return x
 
