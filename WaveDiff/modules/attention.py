@@ -7,6 +7,10 @@ import torch.nn.functional as F
 # Numerical stability constant used across attention modules
 _EPS = 1e-6
 
+# Prefer torch SDPA (Flash / memory-efficient kernels) whenever available.
+# Falls back to the manual softmax path if running on a very old torch.
+_HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
+
 class SpectralAttention(nn.Module):
     """
     Spectral attention module that focuses on different frequency components
@@ -76,27 +80,23 @@ class CrossSpectralAttention(nn.Module):
         """
         b, c, h, w = x.size()
 
-        # Calculate query, key, value: [B, num_heads, head_dim, H*W]
-        q = self.query(x).view(b, self.num_heads, self.head_dim, h * w)
-        k = self.key(x).view(b, self.num_heads, self.head_dim, h * w)
-        v = self.value(x).view(b, self.num_heads, self.head_dim, h * w)
+        # Calculate query, key, value: [B, num_heads, H*W, head_dim]
+        q = self.query(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
+        k = self.key(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
+        v = self.value(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
 
-        # Transpose for attention: [B, num_heads, H*W, head_dim]
-        q = q.transpose(2, 3)
-        k = k.transpose(2, 3)
-        v = v.transpose(2, 3)
+        if _HAS_SDPA:
+            # Flash / memory-efficient kernel: avoids materialising the
+            # (H*W, H*W) attention matrix which dominated memory at full
+            # spatial resolution.
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn - attn.max(dim=-1, keepdim=True).values
+            attn = F.softmax(attn, dim=-1)
+            out = attn @ v
 
-        # Calculate attention scores: [B, num_heads, H*W, H*W]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
-        # Stabilized softmax: subtract max for numerical stability (prevents overflow in float16)
-        attn = attn - attn.max(dim=-1, keepdim=True).values
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values: [B, num_heads, H*W, head_dim]
-        out = attn @ v
         out = out.transpose(2, 3).contiguous().view(b, c, h, w)
-
         return self.out_proj(out)
 
 
@@ -227,16 +227,38 @@ class MultiscaleSpectralAttention(nn.Module):
 
 class MultiHeadSpectralAttention(nn.Module):
     """
-    Enhanced multi-head spectral attention for robust feature extraction
-    Helps model generalize by capturing diverse spectral patterns
+    Multi-head attention over latent features.
+
+    Despite the legacy "Spectral" name, the default ``mode="spatial"``
+    performs *spatial* attention: tokens are the H*W spatial positions
+    grouped across num_heads channel slices.  This costs O((H*W)^2) per
+    head, dominated by the spatial resolution.
+
+    ``mode="channel"`` selects a true cross-channel (Restormer-style)
+    attention: tokens are the channels within each head, features are the
+    H*W spatial positions.  Cost is O(head_dim^2) per head, independent
+    of spatial size — for 31-band HSI or latent_dim<=128 this is almost
+    free, and it complements SpectralAttention (cosine channel attention)
+    in the sibling modules.
+
+    Args:
+        channels: Input/output channel count
+        num_heads: Number of attention heads (must divide ``channels``)
+        reduction: Channel-MLP hidden-dim reduction factor
+        dropout: Attention / projection / MLP dropout probability
+        mode: ``"spatial"`` (default, over H*W tokens) or ``"channel"``
+            (over per-head channel tokens)
     """
-    def __init__(self, channels, num_heads=8, reduction=4, dropout=0.1):
+    def __init__(self, channels, num_heads=8, reduction=4, dropout=0.1, mode: str = "spatial"):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
 
         assert channels % num_heads == 0, "channels must be divisible by num_heads"
+        if mode not in ("spatial", "channel"):
+            raise ValueError(f"mode must be 'spatial' or 'channel', got {mode!r}")
+        self.mode = mode
 
         # Multi-head projections
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
@@ -246,7 +268,11 @@ class MultiHeadSpectralAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
 
-        # Learnable temperature parameter
+        # Learnable temperature. Initialised to the 1/sqrt(d) scale of the
+        # token-feature dimension for the selected mode: head_dim for
+        # spatial attention (D = head_dim), head_dim for channel attention
+        # (D = H*W is input-dependent, so head_dim is a reasonable anchor
+        # that the temperature parameter can learn to adjust).
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * (self.head_dim ** -0.5))
 
         # Channel mixing MLP for better representation
@@ -274,26 +300,43 @@ class MultiHeadSpectralAttention(nn.Module):
         qkv = self.qkv(x)
         q, k, v = torch.chunk(qkv, 3, dim=1)
 
-        # Reshape for multi-head attention
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
-        k = k.reshape(B, self.num_heads, self.head_dim, H * W)
-        v = v.reshape(B, self.num_heads, self.head_dim, H * W)
+        if self.mode == "spatial":
+            # Tokens = H*W spatial positions, features = per-head channel slice.
+            # Layout: [B, num_heads, tokens=H*W, head_dim] for SDPA.
+            q = q.reshape(B, self.num_heads, self.head_dim, H * W).transpose(-2, -1)
+            k = k.reshape(B, self.num_heads, self.head_dim, H * W).transpose(-2, -1)
+            v = v.reshape(B, self.num_heads, self.head_dim, H * W).transpose(-2, -1)
+        else:  # "channel": tokens = per-head channels, features = H*W
+            # Layout: [B, num_heads, tokens=head_dim, features=H*W] for SDPA.
+            q = q.reshape(B, self.num_heads, self.head_dim, H * W)
+            k = k.reshape(B, self.num_heads, self.head_dim, H * W)
+            v = v.reshape(B, self.num_heads, self.head_dim, H * W)
 
-        # Compute attention scores: [B, num_heads, H*W, H*W]
-        attn = torch.matmul(q.transpose(-2, -1), k)
-
-        # Clamp temperature to prevent extreme scaling (numerical stability)
+        # Per-head learnable temperature replaces the constant scale used by
+        # SDPA. Clamped to avoid exploding/vanishing scales under AMP.
         clamped_temp = torch.clamp(self.temperature, min=1e-4, max=10.0)
-        attn = attn * clamped_temp
+        # Bake the per-head temperature into Q so SDPA's internal scaling
+        # applies it consistently across all backends.
+        q = q * clamped_temp.to(q.dtype)
 
-        # Stabilized softmax: subtract max for float16 safety
-        attn = attn - attn.max(dim=-1, keepdim=True).values
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+        if _HAS_SDPA:
+            dropout_p = self.attn_dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, scale=1.0
+            )
+        else:
+            attn = torch.matmul(q, k.transpose(-2, -1))
+            attn = attn - attn.max(dim=-1, keepdim=True).values
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            out = torch.matmul(attn, v)
 
-        # Apply attention to values
-        out = torch.matmul(v, attn.transpose(-2, -1))  # B, num_heads, head_dim, H*W
-        out = out.reshape(B, C, H, W)
+        if self.mode == "spatial":
+            # (B, H, H*W, head_dim) -> (B, C, H, W)
+            out = out.transpose(-2, -1).reshape(B, C, H, W)
+        else:
+            # (B, H, head_dim, H*W) -> (B, C, H, W)
+            out = out.reshape(B, C, H, W)
 
         # Output projection
         out = self.out_proj(out)
@@ -308,6 +351,10 @@ class MultiHeadSpectralAttention(nn.Module):
         x = x + out
 
         return x
+
+
+# Backwards-compatible alias reflecting what the default mode actually does.
+MultiHeadSpatialAttention = MultiHeadSpectralAttention
 
 
 class DomainAdaptiveAttention(nn.Module):
