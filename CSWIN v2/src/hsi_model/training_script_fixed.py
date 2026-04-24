@@ -75,7 +75,14 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 def clear_memory():
-    """Aggressive memory clearing."""
+    """Aggressive memory clearing (sync + empty_cache + gc).
+
+    Use for explicit cleanup points (e.g. post-validation, pre-checkpoint).
+    Avoid calling this inside the hot training loop: torch.cuda.synchronize
+    serialises the queue and empty_cache returns blocks to the driver which
+    the caching allocator would otherwise reuse, both of which are
+    counter-productive for throughput.
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -161,36 +168,43 @@ def validate_gan_safe(
     iteration: int,
     config: Dict[str, Any],
     seed: int = 42,
-    rank: int = 0
+    rank: int = 0,
+    val_loader=None,
 ) -> Dict[str, float]:
     """
     Safe validation for GAN with memory management.
-    
+
     Args:
         model: Model to validate
-        val_dataset: Validation dataset
+        val_dataset: Validation dataset (used only if val_loader is None)
         criterion: Loss criterion
         device: Device to run on
         iteration: Current iteration
         config: Configuration dictionary
         seed: Random seed
         rank: Process rank
-        
+        val_loader: Optional pre-built DataLoader. Pass a persistent loader to
+            avoid rebuilding workers on every validation call. If None, a
+            single-worker loader is constructed from val_dataset (legacy path).
+
     Returns:
         Dictionary of validation metrics
     """
     model.eval()
     logger_val = logging.getLogger("hsi_model.validation")
-    
-    # Create validation loader with minimal memory usage
-    val_loader = DataLoader(
-        dataset=val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False
-    )
+
+    _owns_loader = val_loader is None
+    if _owns_loader:
+        # Legacy path: no persistent loader was provided. Build a minimal one.
+        # Prefer passing a pre-built val_loader to avoid per-call worker startup.
+        val_loader = DataLoader(
+            dataset=val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+        )
     
     total_losses = {}
     total_metrics = {}
@@ -265,7 +279,10 @@ def validate_gan_safe(
                 logger_val.warning(f"Validation error at batch {batch_idx}: {str(e)}")
                 continue
     
-    del val_loader
+    if _owns_loader:
+        # Only discard the loader if we created it here; a caller-owned
+        # persistent loader must not be deleted.
+        del val_loader
     clear_memory()
     
     # Calculate averages with fallback values
@@ -410,7 +427,7 @@ def train_sinkhorn_gan(
     train_sampler = None
     if distributed:
         train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
-    
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -421,6 +438,21 @@ def train_sinkhorn_gan(
         drop_last=True,
         worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
         persistent_workers=(num_workers > 0),
+    )
+
+    # Persistent validation loader — created once and reused across all
+    # validation calls. Previously validate_gan_safe() built a fresh
+    # num_workers=0 loader on every call, which incurred Python-process
+    # startup overhead and lost prefetching. Two workers with
+    # persistent_workers=True keeps the processes alive between epochs.
+    _val_num_workers = min(2, num_workers) if num_workers > 0 else 0
+    val_loader_persistent = DataLoader(
+        dataset=val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=_val_num_workers,
+        pin_memory=True,
+        persistent_workers=(_val_num_workers > 0),
     )
     
     # Training state
@@ -483,6 +515,13 @@ def train_sinkhorn_gan(
             
             # ========== Train Generator ==========
             is_step_boundary = ((iteration + 1) % accumulation_steps == 0)
+            # Determine whether the D-step will run this iteration.  When it
+            # does, we compute discriminator(rgb, hsi) ONCE with grad and
+            # reuse the same tensor both detached for the G-step Sinkhorn
+            # target and with-grad for the D-step loss — eliminating a full
+            # discriminator forward pass on D-step iterations.
+            run_disc_step = is_step_boundary and (iteration % n_critic == 0)
+
             with autocast(enabled=use_amp):
                 fake_hsi = generator(rgb_tensor)
 
@@ -506,13 +545,25 @@ def train_sinkhorn_gan(
 
             nan_count = 0
 
+            # Compute disc(real, rgb) once.  Keep the autograd graph alive
+            # when D will step this iteration so the same tensor can be
+            # re-used below — .detach() is passed to the G-step, the raw
+            # tensor is used in the D-step so disc_loss.backward() still
+            # flows gradients through it into D's parameters.
+            if run_disc_step:
+                with autocast(enabled=use_amp):
+                    disc_real_full = discriminator(rgb_tensor, hsi_tensor)
+                disc_real_for_g = disc_real_full.detach()
+            else:
+                disc_real_full = None
+                with torch.no_grad():
+                    with autocast(enabled=use_amp):
+                        disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
+
             set_requires_grad(discriminator, False)
             try:
                 with autocast(enabled=use_amp):
                     disc_fake_for_g = discriminator(rgb_tensor, fake_hsi)
-                with torch.no_grad():
-                    with autocast(enabled=use_amp):
-                        disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
             finally:
                 set_requires_grad(discriminator, True)
 
@@ -551,11 +602,15 @@ def train_sinkhorn_gan(
                 scheduler_g.step()
             
             # ========== Train Discriminator ==========
-            if is_step_boundary and (iteration % n_critic == 0):
+            if run_disc_step:
                 fake_hsi_detached = fake_hsi.detach()
-                
+
                 with autocast(enabled=use_amp):
-                    real_pred = discriminator(rgb_tensor, hsi_tensor)
+                    # Reuse the disc(real) tensor computed before the G-step.
+                    # Its autograd graph is still intact because the G-step
+                    # only consumed the .detach()'d view; the original tensor
+                    # still flows gradients into D here.
+                    real_pred = disc_real_full
                     fake_pred = discriminator(rgb_tensor, fake_hsi_detached)
                     if not torch.isfinite(real_pred).all() or not torch.isfinite(fake_pred).all():
                         logger.warning("Non-finite discriminator logits at iteration %s; skipping D step", iteration)
@@ -632,14 +687,17 @@ def train_sinkhorn_gan(
                     f'Mem={current_memory:.1f}GB'
                 )
             
-            # Periodic memory cleanup
-            if iteration % 100 == 0:
-                clear_memory()
+            # Previous versions called clear_memory() every 100 iters, which
+            # forced a CUDA sync + cache drop and hurt throughput without
+            # reducing peak memory in steady state. The caching allocator
+            # already reuses freed blocks; keep the explicit sweep only at
+            # validation / checkpoint boundaries and on OOM recovery.
             
             # Validation
             if iteration % per_epoch_iteration == 0:
                 val_metrics = validate_gan_safe(
-                    model, val_dataset, criterion, device, iteration, config, seed, rank
+                    model, val_dataset, criterion, device, iteration, config, seed, rank,
+                    val_loader=val_loader_persistent,
                 )
                 
                 current_mrae = val_metrics.get('mrae', float('inf'))
@@ -697,20 +755,13 @@ def train_sinkhorn_gan(
                 
                 epoch_losses = []
                 clear_memory()
-                
-                # Recreate data loader
-                del train_loader
-                train_loader = DataLoader(
-                    dataset=train_dataset,
-                    batch_size=batch_size,
-                    shuffle=(train_sampler is None),
-                    sampler=train_sampler,
-                    num_workers=num_workers,
-                    pin_memory=True,
-                    drop_last=True,
-                    worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
-                    persistent_workers=False
-                )
+
+                # Reset the training iterator for the next epoch.
+                # Previously the loader was deleted and recreated with
+                # persistent_workers=False here, which lost all worker
+                # processes and re-incurred startup overhead every epoch.
+                # The existing loader already has persistent_workers set
+                # correctly at construction time, so we only reset the iter.
                 data_iter = iter(train_loader)
             
             if iteration >= total_iteration:
@@ -742,8 +793,8 @@ def train_sinkhorn_gan(
     logger.info("Sinkhorn GAN training completed!")
     logger.info(f"Best MRAE: {record_mrae_loss:.4f}")
     logger.info(f"Peak memory usage: {max_memory_gb:.1f}GB")
-    
-    del train_loader
+
+    del train_loader, val_loader_persistent
     clear_memory()
 
 

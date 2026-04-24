@@ -40,6 +40,75 @@ EPS = 1e-6
 if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
     torch.set_float32_matmul_precision("high")
 
+
+# ===== Inference-Path Optimization Helper =====
+def prepare_for_inference(
+    model: nn.Module,
+    *,
+    channels_last: bool = True,
+    compile_mode: Optional[str] = "reduce-overhead",
+    eval_mode: bool = True,
+) -> nn.Module:
+    """Apply the standard set of inference-path optimizations to a model.
+
+    Combines three cheap wins that compound on modern GPUs (A100/H100):
+
+    1. ``model.eval()`` — disables Dropout/BatchNorm train stats.
+    2. ``memory_format=torch.channels_last`` — 10-25% speed-up for
+       Conv-heavy models on Ampere+ GPUs because cuDNN picks NHWC kernels.
+       Harmless on CPU / older GPUs (just a metadata flag).
+    3. ``torch.compile(mode="reduce-overhead")`` — fuses CUDA graphs and
+       reduces launch overhead, a large win when the model has many
+       small kernels (typical for attention-heavy generators).
+
+    Call this at the top of the inference entry-point, *after* loading
+    weights and *before* the first forward.  Safe to call on a model
+    that was trained in the standard (contiguous) format — PyTorch
+    handles the layout conversion automatically.
+
+    Args:
+        model: Model to optimize (mutated in-place for channels_last +
+            eval; the returned handle is the compiled wrapper when
+            compile_mode is not None).
+        channels_last: Convert conv weights / buffers to channels_last.
+            Set False only if the model has ops that don't support
+            NHWC (rare in modern Conv2d/Linear stacks).
+        compile_mode: ``torch.compile`` mode.  ``"reduce-overhead"`` is
+            the sweet spot for inference; set to None to skip compile
+            (e.g. for debugging, small batch, or PyTorch <2.0).
+        eval_mode: Call ``model.eval()``.  Leave True unless you have a
+            specific reason to keep training-mode statistics.
+
+    Returns:
+        The optimized model.  When ``compile_mode`` is set this is the
+        compiled wrapper; otherwise it is the original ``model`` with
+        layout converted in place.
+    """
+    if eval_mode:
+        model.eval()
+
+    if channels_last:
+        # channels_last is a tensor-memory-format hint; NCHW semantics
+        # are preserved but cuDNN picks NHWC kernels where available.
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except (RuntimeError, AttributeError):
+            # Some custom modules may not handle the conversion — fall
+            # back to default format rather than failing the eval pipeline.
+            pass
+
+    if compile_mode is not None and HAS_TORCH_2_0 and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=compile_mode)
+        except Exception:
+            # torch.compile can raise on unusual graphs (dynamic shapes,
+            # unsupported ops).  Fall back to the uncompiled model
+            # rather than breaking inference.
+            pass
+
+    return model
+
+
 # ===== Unified SDPA Wrapper (FIXED: no double scaling) =====
 def sdpa_unified(
     q: torch.Tensor,

@@ -139,6 +139,16 @@ class CSWinAttentionBlock(nn.Module):
 
         torch_version = version.parse(torch.__version__.split('+')[0]) if hasattr(torch, "__version__") else version.parse("0")
         self._supports_non_reentrant_ckpt = torch_version >= version.parse("2.1")
+
+        # Checkpointing threshold: only recompute activations when the
+        # spatial grid is large enough for the memory saving to outweigh the
+        # ~30% recompute cost. Below this token count the fused kernels are
+        # fast enough that always-on checkpointing was pure overhead.
+        # Default 64*64 = 4096 tokens; overridable via config.
+        if config is not None:
+            self._ckpt_min_tokens = int(config.get('ckpt_min_tokens', 4096))
+        else:
+            self._ckpt_min_tokens = 4096
         
         # Default to FP32 bias tables for numerical stability; allow FP16 opt-in.
         # Config overrides, otherwise fall back to environment variable for compatibility.
@@ -406,8 +416,13 @@ class CSWinAttentionBlock(nn.Module):
         else:
             padded_H, padded_W = H, W
         
-        # v3.0: Version-aware gradient checkpointing
-        if self.training:
+        # v3.0: Version-aware gradient checkpointing.
+        # v4.0: Conditional on spatial token count — checkpointing the
+        # smaller/deeper stages spent more time on recompute than it saved
+        # in activation memory.  Only checkpoint when tokens >= threshold.
+        num_tokens = padded_H * padded_W
+        should_ckpt = self.training and (num_tokens >= self._ckpt_min_tokens)
+        if should_ckpt:
             if self._supports_non_reentrant_ckpt:
                 out_h = checkpoint(self._compute_horizontal_attention, x, use_reentrant=False)
                 out_v = checkpoint(self._compute_vertical_attention, x, use_reentrant=False)

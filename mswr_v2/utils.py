@@ -25,6 +25,48 @@ def save_matv73(mat_name: str, var_name: str, var: np.ndarray) -> None:
     """
     hdf5storage.savemat(mat_name, {var_name: var}, format='7.3', store_python_metadata=True)
 
+
+def prepare_for_inference(
+    model: nn.Module,
+    *,
+    channels_last: bool = True,
+    compile_mode: Optional[str] = "reduce-overhead",
+    eval_mode: bool = True,
+) -> nn.Module:
+    """Apply the standard inference-path optimizations.
+
+    Composes eval-mode, ``memory_format=channels_last`` (10-25% speed-up
+    on Ampere+ via NHWC cuDNN kernels), and ``torch.compile(mode=...)``
+    for CUDA-graph fusion. Each step is wrapped so the pipeline degrades
+    gracefully on older PyTorch / unsupported ops.
+
+    Args:
+        model: Model to optimize (mutated in place for eval / layout).
+        channels_last: Convert to channels_last memory format.
+        compile_mode: ``torch.compile`` mode, or None to skip.
+        eval_mode: Call ``model.eval()``.
+
+    Returns:
+        Optimized model (compiled wrapper when compile_mode is set).
+    """
+    if eval_mode:
+        model.eval()
+
+    if channels_last:
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except (RuntimeError, AttributeError):
+            pass
+
+    torch_ok = hasattr(torch, "compile")
+    if compile_mode is not None and torch_ok:
+        try:
+            model = torch.compile(model, mode=compile_mode)
+        except Exception:
+            pass
+
+    return model
+
 class AverageMeter:
     """Computes and stores the average and current value."""
 

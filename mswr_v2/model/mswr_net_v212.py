@@ -379,7 +379,12 @@ class MSWRDualConfig:
     use_wavelet: bool = True
     wavelet_type: str = 'db1'
     wavelet_levels: Optional[List[int]] = None
-    wavelet_gate_reuse: bool = True
+    # NOTE: wavelet_gate_reuse caches a *content-dependent* gate keyed only by
+    # spatial dims + stage. Reusing a cached gate across samples is a
+    # correctness bug (wrong gate content, wrong batch size on reuse) and
+    # freezes the gate after the first batch because it is .detach()'d before
+    # caching. Default is now False; enable only with caution.
+    wavelet_gate_reuse: bool = False
     
     # Network Architecture
     mlp_ratio: float = 4.0
@@ -672,8 +677,11 @@ class OptimizedWindowAttention2D(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # (Heads, N, N)
 
         # Enhanced attention computation
-        if self.use_flash and self.training:
-            # Pass bias via attn_mask so SDPA can select the best kernel
+        if self.use_flash:
+            # Pass bias via attn_mask so SDPA can select the best kernel.
+            # SDPA is equally valid for inference; previously this path was
+            # gated on self.training which forced a slow fp32 manual softmax
+            # at eval time.
             bias = relative_position_bias.unsqueeze(0).expand(q.shape[0], -1, -1, -1)  # (B*nh*nw, Heads, N, N)
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
@@ -794,8 +802,11 @@ class OptimizedLandmarkAttention2D(nn.Module):
         k, v = kv[:, :, 0].permute(0, 2, 1, 3), kv[:, :, 1].permute(0, 2, 1, 3)  # each (B, Heads, L, D)
         
         # Efficient attention computation
-        if self.use_flash and self.training:
-            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)  # (B, Heads, H*W, D)
+        # SDPA is correct in both training and eval; gating on self.training
+        # previously forced an fp32 manual path at inference, doubling latency.
+        if self.use_flash:
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=self.scale)  # (B, Heads, H*W, D)
         else:
             attn = (q.float() @ k.float().transpose(-2, -1)) * self.scale  # (B, Heads, H*W, D) @ (B, Heads, D, L) -> (B, Heads, H*W, L)
             attn = F.softmax(attn, dim=-1)  # (B, Heads, H*W, L), softmax over landmarks
