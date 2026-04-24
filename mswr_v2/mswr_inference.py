@@ -161,6 +161,23 @@ class MemoryManager:
         
         logger.debug(f"Memory [{stage}]: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
 
+
+def normalize_rgb_like_training(image: np.ndarray) -> np.ndarray:
+    """Match the RGB normalization used by dataloader._load_rgb_image."""
+    image = image.astype(np.float32, copy=False)
+    denom = float(image.max() - image.min())
+
+    if not np.isfinite(denom) or denom < 1e-8:
+        mean_val = float(image.mean())
+        if float(image.max()) > 1.0:
+            mean_val /= 255.0
+        normalized_mean = np.clip(mean_val, 0.0, 1.0)
+        return np.full_like(image, normalized_mean, dtype=np.float32)
+
+    normalized = (image - image.min()) / denom
+    return np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32, copy=False)
+
+
 class TiledProcessor:
     """Efficient tiled processing for large images"""
     
@@ -338,7 +355,7 @@ class EnsembleProcessor:
             augmented = transform(input_tensor)
             
             # Get prediction
-            with torch.no_grad():
+            with torch.inference_mode():
                 pred = model(augmented)
             
             # Apply inverse transform
@@ -474,7 +491,7 @@ class MSWRInference:
             # Load RGB image
             image = cv2.imread(str(image_path))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = image.astype(np.float32) / 255.0
+            image = normalize_rgb_like_training(image)
             metadata['original_dtype'] = 'uint8'
             
         elif image_path.suffix == '.mat':
@@ -492,9 +509,7 @@ class MSWRInference:
                         image = value.astype(np.float32)
                         break
             
-            # Normalize if needed
-            if image.max() > 1.0:
-                image = image / 255.0
+            image = normalize_rgb_like_training(image)
             
             metadata['original_dtype'] = str(mat_data[key].dtype)
             
@@ -503,9 +518,7 @@ class MSWRInference:
             image = np.load(str(image_path)).astype(np.float32)
             metadata['original_dtype'] = str(image.dtype)
             
-            # Normalize if needed
-            if image.max() > 1.0:
-                image = image / 255.0
+            image = normalize_rgb_like_training(image)
                 
         elif image_path.suffix in ['.h5', '.hdf5']:
             # Load HDF5 file
@@ -520,9 +533,7 @@ class MSWRInference:
                     key = list(f.keys())[0]
                     image = f[key][:].astype(np.float32)
             
-            # Normalize if needed
-            if image.max() > 1.0:
-                image = image / 255.0
+            image = normalize_rgb_like_training(image)
             
             metadata['original_dtype'] = 'float32'
         
@@ -611,7 +622,7 @@ class MSWRInference:
         input_tensor = self.preprocess(image).to(self.device)
         
         # Inference
-        with torch.no_grad():
+        with torch.inference_mode():
             if self.config.use_amp and self.device.type == 'cuda':
                 with autocast():
                     if self.ensemble_processor:
@@ -637,7 +648,7 @@ class MSWRInference:
         for tile in tqdm(tiles, desc="Processing tiles", disable=not self.config.verbose):
             tile_tensor = self.preprocess(tile).to(self.device)
             
-            with torch.no_grad():
+            with torch.inference_mode():
                 if self.config.use_amp and self.device.type == 'cuda':
                     with autocast():
                         output = self.model(tile_tensor)

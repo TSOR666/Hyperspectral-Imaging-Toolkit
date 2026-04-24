@@ -1,0 +1,22 @@
+# MSWR-Net v2 core runtime dependencies
+#
+# Install PyTorch with the CUDA/CPU wheel appropriate for your machine first,
+# then install the remaining package set with:
+#   pip install -r requirements.txt
+
+torch>=1.13.0
+torchvision>=0.14.0
+numpy>=1.21.0
+h5py>=3.7.0
+hdf5storage>=0.1.19
+scipy>=1.7.0
+pillow>=8.2.0
+opencv-python>=4.5.0
+einops>=0.6.0
+psutil>=5.9.0
+pyyaml>=6.0
+tqdm>=4.64.0
+matplotlib>=3.4.0
+seaborn>=0.12.0
+fvcore>=0.1.5
+pytest>=7.2.0

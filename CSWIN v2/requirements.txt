@@ -21,6 +21,8 @@ h5py>=3.7.0            # HDF5 file format for datasets
 psutil>=5.9.0          # Process and system monitoring
 tqdm>=4.64.0           # Progress bars
 einops>=0.6.0          # Tensor operations (rearrange, etc.)
+packaging>=21.0        # Version checks in attention utilities
+opencv-python>=4.5.0   # MST/ARAD image loading utilities
 
 # ============================================================================
 # Optional - Logging and Visualization

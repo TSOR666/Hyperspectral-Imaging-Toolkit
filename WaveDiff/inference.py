@@ -199,6 +199,32 @@ def load_hsi_ground_truth(path):
     return None
 
 
+def postprocess_hsi_output(hsi_tensor, config=None, clamp=True):
+    """
+    Convert model-domain HSI predictions back to the saved/evaluation data domain.
+
+    Training defaults normalize HSI targets to [-1, 1] after scaling by
+    hsi_max_value. Inference must undo that transform before saving cubes,
+    visualizing bands, or computing metrics against raw ground truth.
+    """
+    if config is None:
+        return hsi_tensor
+
+    config = config or {}
+    output = hsi_tensor
+
+    if config.get('hsi_normalize_to_neg_one_to_one', True):
+        output = (output + 1.0) * 0.5
+
+    hsi_max_value = float(config.get('hsi_max_value', 1.0) or 1.0)
+    output = output * hsi_max_value
+
+    if clamp:
+        output = torch.clamp(output, min=0.0, max=hsi_max_value)
+
+    return output
+
+
 def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_threshold=True):
     """
     Run inference on an RGB image
@@ -218,7 +244,7 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
     
     # Run inference
     stage_outputs = {}
-    with torch.no_grad():
+    with torch.inference_mode():
         # Check if model has dedicated inference method
         if hasattr(model, 'rgb_to_hsi'):
             # For adaptive models, use the method that applies thresholding
@@ -263,7 +289,16 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
     return hsi_output, stage_outputs
 
 
-def save_results(rgb_tensor, hsi_output, hsi_gt, output_dir, filename, metrics=None, stage_outputs=None):
+def save_results(
+    rgb_tensor,
+    hsi_output,
+    hsi_gt,
+    output_dir,
+    filename,
+    metrics=None,
+    stage_outputs=None,
+    config=None,
+):
     """
     Save inference results
     
@@ -281,6 +316,7 @@ def save_results(rgb_tensor, hsi_output, hsi_gt, output_dir, filename, metrics=N
     
     # Convert tensors to numpy
     rgb_np = rgb_tensor.squeeze(0).cpu().numpy()
+    hsi_output = postprocess_hsi_output(hsi_output, config)
     hsi_np = hsi_output.squeeze(0).cpu().numpy()
     
     # Save HSI as numpy array
@@ -291,6 +327,7 @@ def save_results(rgb_tensor, hsi_output, hsi_gt, output_dir, filename, metrics=N
         for stage_name, stage_tensor in stage_outputs.items():
             if stage_name == 'final':
                 continue
+            stage_tensor = postprocess_hsi_output(stage_tensor, config)
             stage_np = stage_tensor.squeeze(0).cpu().numpy()
             np.save(os.path.join(output_dir, f"{filename}_{stage_name}_hsi.npy"), stage_np)
     
@@ -336,7 +373,7 @@ def save_results(rgb_tensor, hsi_output, hsi_gt, output_dir, filename, metrics=N
         )
 
 
-def evaluate_metrics(hsi_output, hsi_gt):
+def evaluate_metrics(hsi_output, hsi_gt, config=None):
     """
     Calculate evaluation metrics between predicted and ground truth HSI
     
@@ -349,6 +386,7 @@ def evaluate_metrics(hsi_output, hsi_gt):
     """
     # Ensure both tensors are on the same device
     device = hsi_output.device
+    hsi_output = postprocess_hsi_output(hsi_output, config)
     hsi_gt = hsi_gt.to(device)
     
     # Calculate metrics
@@ -370,7 +408,7 @@ def evaluate_metrics(hsi_output, hsi_gt):
 
 
 def process_directory(input_dir, model, device, output_dir, sampling_steps=20, 
-                      apply_adaptive_threshold=True, batch_size=1):
+                      apply_adaptive_threshold=True, batch_size=1, config=None):
     """
     Process all RGB images in a directory
     
@@ -434,12 +472,12 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
         metrics = None
         stage_metrics = None
         if hsi_gt is not None:
-            metrics = evaluate_metrics(hsi_output, hsi_gt)
+            metrics = evaluate_metrics(hsi_output, hsi_gt, config=config)
             stage_metrics = {}
             for stage_name, stage_tensor in stage_outputs.items():
                 if stage_name == 'final':
                     continue
-                stage_metrics[stage_name] = evaluate_metrics(stage_tensor, hsi_gt)
+                stage_metrics[stage_name] = evaluate_metrics(stage_tensor, hsi_gt, config=config)
 
             # Save metrics to results dictionary
             results_summary[filename] = {
@@ -460,7 +498,8 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
         save_results(
             rgb_tensor, hsi_output, hsi_gt,
             output_dir, filename, metrics,
-            stage_outputs=stage_outputs
+            stage_outputs=stage_outputs,
+            config=config,
         )
     
     # Calculate and save average metrics
@@ -570,12 +609,12 @@ def main():
         metrics = None
         stage_metrics = None
         if hsi_gt is not None:
-            metrics = evaluate_metrics(hsi_output, hsi_gt)
+            metrics = evaluate_metrics(hsi_output, hsi_gt, config=config)
             stage_metrics = {}
             for stage_name, stage_tensor in stage_outputs.items():
                 if stage_name == 'final':
                     continue
-                stage_metrics[stage_name] = evaluate_metrics(stage_tensor, hsi_gt)
+                stage_metrics[stage_name] = evaluate_metrics(stage_tensor, hsi_gt, config=config)
 
             # Print metrics
             print("Evaluation Metrics:")
@@ -589,7 +628,8 @@ def main():
         save_results(
             rgb_tensor, hsi_output, hsi_gt,
             args.output_dir, filename, metrics,
-            stage_outputs=stage_outputs
+            stage_outputs=stage_outputs,
+            config=config,
         )
         
         print(f"Results saved to {args.output_dir}")
@@ -603,7 +643,8 @@ def main():
             args.output_dir,
             sampling_steps=args.sampling_steps,
             apply_adaptive_threshold=args.adaptive_threshold,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            config=config,
         )
         
         print(f"Results saved to {args.output_dir}")

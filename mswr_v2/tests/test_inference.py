@@ -12,6 +12,7 @@ try:
         EnsembleProcessor,
         InferenceConfig,
         MSWRInference,
+        normalize_rgb_like_training,
     )
     INFERENCE_AVAILABLE = True
 except ImportError:
@@ -21,8 +22,35 @@ except ImportError:
     EnsembleProcessor = None
     InferenceConfig = None
     MSWRInference = None
+    normalize_rgb_like_training = None
 
 pytestmark = pytest.mark.skipif(not INFERENCE_AVAILABLE, reason="inference module dependencies not available")
+
+
+class TestInferencePreprocessing:
+    """Tests for train/inference preprocessing consistency."""
+
+    def test_rgb_normalization_matches_training_minmax(self):
+        image = np.array(
+            [
+                [[10, 20, 30], [40, 50, 60]],
+                [[70, 80, 90], [100, 110, 120]],
+            ],
+            dtype=np.uint8,
+        )
+
+        normalized = normalize_rgb_like_training(image)
+        expected = (image.astype(np.float32) - 10.0) / 110.0
+
+        assert normalized.dtype == np.float32
+        assert np.allclose(normalized, expected)
+
+    def test_rgb_constant_image_preserves_intensity(self):
+        image = np.full((4, 4, 3), 127, dtype=np.uint8)
+
+        normalized = normalize_rgb_like_training(image)
+
+        assert np.allclose(normalized, 127.0 / 255.0, atol=1e-6)
 
 
 class TestTiledProcessor:
