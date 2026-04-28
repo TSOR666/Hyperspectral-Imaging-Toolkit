@@ -53,6 +53,19 @@ def test_postprocess_hsi_output_skips_when_metadata_absent():
     assert torch.equal(restored, model_domain)
 
 
+def test_postprocess_hsi_output_preserves_legacy_partial_metadata_behavior():
+    from inference import postprocess_hsi_output
+
+    model_domain = torch.tensor([[[[-1.0, 0.0, 1.0]]]])
+
+    restored = postprocess_hsi_output(
+        model_domain,
+        config={"hsi_max_value": 2.0},
+    )
+
+    assert torch.allclose(restored, torch.tensor([[[[0.0, 1.0, 2.0]]]]))
+
+
 def test_evaluate_metrics_compares_prediction_in_data_domain():
     from inference import evaluate_metrics
 

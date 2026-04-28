@@ -219,7 +219,11 @@ def postprocess_hsi_output(hsi_tensor, config=None, clamp=True):
 
     output = hsi_tensor
 
-    if config.get('hsi_normalize_to_neg_one_to_one', False):
+    # Preserve legacy behavior for partial metadata: when hsi_max_value is
+    # present but the normalize flag is absent, predictions are still assumed
+    # to be in [-1, 1] and must be remapped before scaling/clamping.
+    normalize_to_neg_one_to_one = config.get('hsi_normalize_to_neg_one_to_one', True)
+    if normalize_to_neg_one_to_one:
         output = (output + 1.0) * 0.5
 
     hsi_max_value = float(config.get('hsi_max_value', 1.0) or 1.0)
