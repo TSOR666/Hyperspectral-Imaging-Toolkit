@@ -1,5 +1,7 @@
 """Tests for MSWR v2 utility functions."""
 
+import importlib.util
+
 import numpy as np
 import pytest
 import torch
@@ -15,6 +17,8 @@ try:
         calculate_metrics,
         count_parameters,
         get_model_size,
+        my_summary,
+        save_matv73,
     )
     UTILS_AVAILABLE = True
 except ImportError:
@@ -217,3 +221,23 @@ class TestModelUtilities:
         size = get_model_size(model)
         assert size > 0
         assert isinstance(size, float)
+
+
+class TestOptionalDependencies:
+    """Utilities should import without optional export/profiling packages."""
+
+    def test_save_matv73_missing_dependency_error_is_lazy(self):
+        """Missing hdf5storage should only affect MATLAB export."""
+        if importlib.util.find_spec("hdf5storage") is not None:
+            pytest.skip("hdf5storage is installed in this environment")
+
+        with pytest.raises(ImportError, match="hdf5storage"):
+            save_matv73("unused.mat", "cube", np.zeros((1, 1), dtype=np.float32))
+
+    def test_my_summary_missing_dependency_error_is_lazy(self):
+        """Missing fvcore should only affect FLOP summary."""
+        if importlib.util.find_spec("fvcore") is not None:
+            pytest.skip("fvcore is installed in this environment")
+
+        with pytest.raises(ImportError, match="fvcore"):
+            my_summary(torch.nn.Conv2d(3, 31, 1), H=8, W=8, C=3, N=1)

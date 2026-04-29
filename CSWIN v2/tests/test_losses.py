@@ -155,10 +155,33 @@ def test_noise_robust_loss_warns_when_perceptual_disabled(caplog):
     """lambda_perceptual>0 without a feature_extractor should log a clear warning once."""
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        NoiseRobustLoss({"lambda_perceptual": 0.1})
+        criterion = NoiseRobustLoss({"lambda_perceptual": 0.1})
     assert any(
         "perceptual_feature_extractor" in record.message for record in caplog.records
     ), "Expected a warning pointing at perceptual_feature_extractor config."
+    assert criterion.lambda_perc == 0.0
+    assert criterion.get_adaptive_weights(10)["perc"] == 0.0
+
+
+def test_noise_robust_loss_keeps_perceptual_weight_with_extractor():
+    class TinyExtractor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.c = torch.nn.Conv2d(3, 4, kernel_size=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.c(x)
+
+    criterion = NoiseRobustLoss(
+        {
+            "lambda_perceptual": 0.1,
+            "perceptual_feature_extractor": TinyExtractor(),
+            "use_adaptive_weights": False,
+        }
+    )
+
+    assert criterion.lambda_perc == 0.1
+    assert criterion.get_adaptive_weights(0)["perc"] == 0.1
 
 
 def test_perceptual_loss_returns_differentiable_zero_without_extractor():
