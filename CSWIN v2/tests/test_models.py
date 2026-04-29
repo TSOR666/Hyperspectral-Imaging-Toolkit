@@ -185,3 +185,71 @@ def test_discriminator_nan_input_raises_in_training():
     hsi = torch.randn(1, 31, 16, 16)
     with pytest.raises(RuntimeError, match="Non-finite"):
         disc(rgb, hsi)
+
+
+# AUDIT v2: trainer-driven iteration counter must take precedence over
+# forward auto-increment, so delayed_sigmoid / clamp_after_iters cut over
+# at the canonical optimizer-step count rather than per-forward.
+def test_generator_set_iteration_drives_delayed_sigmoid():
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 16,
+        "split_sizes": [2, 2, 2],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "output_activation": "delayed_sigmoid",
+        "activation_delay_iters": 100,
+    }
+    gen = NoiseRobustCSWinGenerator(config)
+    gen.train()
+    rgb = torch.randn(1, 3, 16, 16)
+
+    gen.set_iteration(50)  # below threshold — sigmoid OFF
+    out_pre = gen(rgb)
+    # Linear/clamped phase: clamp_range default is 10 but output may be in any range.
+    assert out_pre.dtype == torch.float32
+
+    gen.set_iteration(200)  # above threshold — sigmoid ON
+    out_post = gen(rgb)
+    assert out_post.min().item() >= 0.0 and out_post.max().item() <= 1.0
+
+
+def test_generator_pre_sigmoid_clamp_under_delayed_sigmoid():
+    """Audit v2 fix: clamp must apply during the pre-sigmoid linear phase."""
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 16,
+        "split_sizes": [2, 2, 2],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "output_activation": "delayed_sigmoid",
+        "activation_delay_iters": 1_000_000,  # never trigger sigmoid
+        "generator_clamp_range": 1.5,
+    }
+    gen = NoiseRobustCSWinGenerator(config)
+    # Inflate the output projection so clamp would actually fire.
+    with torch.no_grad():
+        for p in gen.to_spectral.parameters():
+            p.mul_(20.0)
+    gen.train()
+    rgb = torch.randn(1, 3, 16, 16)
+    out = gen(rgb)
+    assert out.abs().max().item() <= 1.5 + 1e-5, (
+        "Pre-sigmoid logits exceeded clamp_range — the regression where "
+        "clamp was gated on output_activation == 'none' has returned."
+    )
+
+
+def test_generator_set_iteration_persists_buffer():
+    """The DDP-shared buffer must reflect set_iteration value."""
+    config = {
+        "in_channels": 3, "out_channels": 31, "base_channels": 16,
+        "split_sizes": [2, 2, 2], "num_heads": 2, "norm_groups": 4,
+        "output_activation": "none",
+    }
+    gen = NoiseRobustCSWinGenerator(config)
+    gen.set_iteration(12345)
+    assert int(gen.iteration_count.item()) == 12345
+    assert gen._iteration_count == 12345

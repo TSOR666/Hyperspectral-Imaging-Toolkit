@@ -89,3 +89,41 @@ def test_efficient_spectral_attention_fp16():
     out = attn(x)
     assert out.dtype == torch.float16, "Output dtype mismatch"
     assert torch.isfinite(out).all(), "FP16 produced NaN/Inf"
+
+
+# AUDIT v2: relative position bias must tile the (s, s) block correctly across
+# the long axis. Pre-fix the reshape produced bias[i,j] = bias_ss[i//tiles, j//tiles]
+# instead of the intended bias[i,j] = bias_ss[i mod s, j mod s], which silently
+# applied positional bias to scrambled positions.
+def test_cswin_expand_bias_tiles_correctly():
+    s = 4
+    tiles = 3
+    block = CSWinAttentionBlock(dim=8, num_heads=2, split_size=s)
+    # Use the actual table slice the forward path uses for horizontal attention.
+    rel_cols = block._relative_position_index
+    bias_ss = block.relative_position_bias_table_h[
+        block._relative_center_index, rel_cols, :
+    ]  # (s, s, num_heads)
+    bias = block._expand_bias(bias_ss, tiles_long=tiles)  # (num_heads, s*tiles, s*tiles)
+    expected_size = s * tiles
+    assert bias.shape == (block.num_heads, expected_size, expected_size)
+
+    # The expanded bias should be (s, s)-periodic in BOTH axes.
+    # bias[h, i, j] == bias_ss[i mod s, j mod s, h] for all i, j.
+    bias_perm = bias_ss.permute(2, 0, 1)  # (num_heads, s, s)
+    for h in range(block.num_heads):
+        for i in range(expected_size):
+            for j in range(expected_size):
+                assert torch.allclose(
+                    bias[h, i, j], bias_perm[h, i % s, j % s]
+                ), f"bias not (s, s)-periodic at h={h}, i={i}, j={j}"
+
+
+def test_cswin_attention_window_size_one():
+    """Smoke check: split_size=1 reduces relative bias to a single value but
+    must still produce shape-preserving outputs."""
+    block = CSWinAttentionBlock(dim=8, num_heads=2, split_size=1)
+    x = torch.randn(1, 8, 6, 6)
+    out = block(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()

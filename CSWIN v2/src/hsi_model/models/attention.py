@@ -187,26 +187,33 @@ class CSWinAttentionBlock(nn.Module):
         
     def _expand_bias(self, bias_ss_head: torch.Tensor, tiles_long: int) -> torch.Tensor:
         """
-        Inflate a (s, s, H) bias that covers one split-size window into a full
+        Tile a (s, s, H) intra-window bias along the long axis to produce a full
         (H, s·tiles_long, s·tiles_long) bias.
-        
-        Args:
-            bias_ss_head: Small bias tensor of shape (s, s, H)
-            tiles_long: Number of windows/repetitions to use when expanding the bias
-                in both row and column dimensions
-                
-        Returns:
-            Expanded bias tensor of shape (H, s*tiles_long, s*tiles_long)
+
+        The expanded bias[h, i, j] equals bias_ss_head[i mod s, j mod s, h], i.e.
+        the small (s, s) bias matrix is repeated across both axes. This is the
+        layout intended for stripe attention where the long axis is partitioned
+        into ``tiles_long`` consecutive windows of size ``s``.
+
+        Bug fixed: the previous implementation reshaped from
+        (H, s, tiles_long, s, tiles_long) which produced
+        bias[h, i, j] = bias_ss[i // tiles_long, j // tiles_long, h] —
+        the relative-position bias was therefore applied to scrambled
+        positions, not to the intended tiled windows.
         """
         if tiles_long <= 0:
             raise ValueError("tiles_long must be a positive integer")
         H = bias_ss_head.shape[-1]
         s = self.split_size
+        # (H, s, s) -> insert tile axes BEFORE the intra-window axes so that
+        # collapsing (tiles_long, s) -> tiles_long*s puts the tile index in the
+        # slow position and the intra-window position in the fast position. This
+        # yields contiguous windows along the long axis.
         bias = bias_ss_head.permute(2, 0, 1)  # (H, s, s)
         bias = (bias
-                .unsqueeze(2).unsqueeze(4)  # (H, s, 1, s, 1)
-                .expand(-1, s, tiles_long, s, tiles_long)
-                .reshape(H, s * tiles_long, s * tiles_long))
+                .unsqueeze(1).unsqueeze(3)   # (H, 1, s, 1, s)
+                .expand(-1, tiles_long, s, tiles_long, s)
+                .reshape(H, tiles_long * s, tiles_long * s))
         return bias
         
     def _compute_horizontal_attention(self, x: torch.Tensor) -> torch.Tensor:

@@ -499,7 +499,17 @@ def train_sinkhorn_gan(
             # Get learning rates
             lr_g = optimizer_g.param_groups[0]['lr']
             lr_d = optimizer_d.param_groups[0]['lr']
-            
+
+            # Drive the generator's iteration counter from the canonical
+            # training-step counter. The auto-increment in
+            # NoiseRobustCSWinGenerator.forward counts forwards (not steps),
+            # which drifts under gradient accumulation / DDP and would make
+            # ``delayed_sigmoid`` and ``clamp_after_iters`` cut over at the
+            # wrong time. Setting it explicitly each step keeps behavior
+            # rank-consistent and reproducible across accumulation factors.
+            if hasattr(generator, "set_iteration"):
+                generator.set_iteration(iteration)
+
             # ========== Train Generator ==========
             is_step_boundary = ((iteration + 1) % accumulation_steps == 0)
             # Determine whether the D-step will run this iteration.  When it

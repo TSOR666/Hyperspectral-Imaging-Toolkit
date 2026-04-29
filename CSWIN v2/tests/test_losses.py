@@ -1,5 +1,6 @@
 import logging
 
+import pytest
 import torch
 
 from hsi_model.models.losses_consolidated import (
@@ -197,6 +198,64 @@ def test_perceptual_loss_returns_differentiable_zero_without_extractor():
     value.backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
+
+
+# AUDIT v2: Sinkhorn-GAN regression — _safe_normalize used to divide each
+# point cloud by its own L2 norm, collapsing every batch onto the unit
+# sphere and erasing the magnitude difference between real and fake disc
+# outputs. The replacement preserves relative scale via joint rescaling.
+def test_adversarial_loss_responds_to_disc_magnitude_gap():
+    """Two disc-output magnitudes should produce DIFFERENT adversarial losses."""
+    criterion = NoiseRobustLoss(
+        {"sinkhorn_epsilon": 0.1, "sinkhorn_iters": 20,
+         "sinkhorn_max_points": 64, "lambda_adversarial": 1.0,
+         "use_adaptive_weights": False}
+    )
+    torch.manual_seed(0)
+    base_real = torch.randn(2, 1, 4, 4)
+    base_fake = torch.randn(2, 1, 4, 4)
+
+    # Case A: real and fake have similar magnitude
+    loss_close = criterion.compute_adversarial_loss(base_real * 1.0, base_fake * 1.0)
+    # Case B: fake is much smaller — discriminator is signaling "fake is far"
+    loss_far = criterion.compute_adversarial_loss(base_real * 5.0, base_fake * 0.05)
+    # With per-cloud L2 normalize the two cases were near-identical; with
+    # joint rescale the magnitude gap propagates into the loss.
+    assert torch.isfinite(loss_close)
+    assert torch.isfinite(loss_far)
+    assert loss_far.item() != pytest.approx(loss_close.item(), abs=1e-4), (
+        "Adversarial loss is invariant to disc magnitude gap — the scale-erasing "
+        "_safe_normalize regression has returned."
+    )
+
+
+def test_disc_sinkhorn_loss_responds_to_disc_magnitude_gap():
+    """Same regression check but for the discriminator side of the loss."""
+    criterion = NoiseRobustLoss(
+        {"sinkhorn_epsilon": 0.1, "sinkhorn_iters": 20,
+         "sinkhorn_max_points": 64, "use_adaptive_weights": False}
+    )
+    disc_criterion = ComputeSinkhornDiscriminatorLoss(criterion)
+
+    torch.manual_seed(1)
+    base_real = torch.randn(2, 1, 4, 4, requires_grad=True)
+    base_fake = torch.randn(2, 1, 4, 4, requires_grad=True)
+    loss_close = disc_criterion(base_real * 1.0, base_fake * 1.0)
+    loss_far = disc_criterion(base_real * 5.0, base_fake * 0.05)
+    assert torch.isfinite(loss_close) and torch.isfinite(loss_far)
+    assert loss_far.item() != pytest.approx(loss_close.item(), abs=1e-4)
+
+
+def test_jointly_rescale_preserves_relative_magnitude():
+    from hsi_model.models.losses_consolidated import _jointly_rescale
+    a = torch.tensor([[10.0], [20.0]])
+    b = torch.tensor([[1.0], [2.0]])
+    a_s, b_s = _jointly_rescale(a, b)
+    # Relative magnitude (10:1) preserved: a_s.max() / b_s.max() should be 10.
+    assert torch.allclose(a_s.max() / b_s.max(), torch.tensor(10.0), rtol=1e-5)
+    # Both clouds bounded by max of original (no absolute |x| > 1 after rescale).
+    assert a_s.abs().max().item() <= 1.0 + 1e-6
+    assert b_s.abs().max().item() <= 1.0 + 1e-6
 
 
 def test_perceptual_loss_uses_cmf_for_hsi_when_extractor_present():
