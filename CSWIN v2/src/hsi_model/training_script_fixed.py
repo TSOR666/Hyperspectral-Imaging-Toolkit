@@ -19,6 +19,7 @@ Version: 6.0 - Cleaned and refactored
 """
 
 import os
+import sys
 import time
 import logging
 import numpy as np
@@ -30,10 +31,14 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import gc
+from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from typing import Tuple, Dict, Any, Optional
-from pathlib import Path
+
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 # Local imports
 from hsi_model.models import NoiseRobustCSWinModel
@@ -132,28 +137,10 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
 # ============================================
 
 def create_datasets_only(config: Dict[str, Any]) -> Tuple[Any, Any]:
-    """Create MST++ datasets without DataLoaders."""
-    from hsi_model.utils.data import MST_TrainDataset, MST_ValidDataset
-    
-    memory_mode = config.get("memory_mode", "standard")
-    data_root = config.get("data_dir", DEFAULT_DATA_DIR)
-    crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
-    stride = config.get("stride", DEFAULT_STRIDE)
-    
-    train_dataset = MST_TrainDataset(
-        data_root=data_root,
-        crop_size=crop_size,
-        arg=True,
-        bgr2rgb=True,
-        stride=stride
-    )
-    
-    val_dataset = MST_ValidDataset(
-        data_root=data_root,
-        bgr2rgb=True
-    )
-    
-    return train_dataset, val_dataset
+    """Create configured datasets without DataLoaders."""
+    from hsi_model.utils.data import create_training_datasets
+
+    return create_training_datasets(config, seed=int(config.get("seed", 42)))
 
 
 # ============================================

@@ -4,9 +4,25 @@
 
 seed: 42
 
+dataset_source: mst  # mst | huggingface
 data_dir: ${oc.env:HSI_DATA_DIR,./data/ARAD_1K}
 log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}
 checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}
+
+# Hugging Face ARAD HSDB imagefolder adapter.  The public dataset is exposed as
+# one train split with class labels such as NTIRE2020_Train_Clean and
+# NTIRE2020_Train_RealWorld.  Override hf_rgb_label/hf_hsi_label if your local
+# cache uses different names for RGB inputs and spectral targets.
+hf_dataset_name: mhmdjouni/arad_hsdb
+hf_split: train
+hf_train_label_filter: train
+hf_val_label_filter: validation,val
+hf_rgb_label: null
+hf_hsi_label: null
+hf_patches_per_image: 1
+hf_max_train_samples: null
+hf_max_val_samples: null
+hf_allow_pseudo_hsi: false
 
 batch_size: 20
 val_batch_size: 1
