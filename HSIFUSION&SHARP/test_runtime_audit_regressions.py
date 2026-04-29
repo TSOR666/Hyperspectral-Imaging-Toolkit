@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from hsifusion_training import HSIFusionTrainer, should_optimizer_step as hsifusion_should_step
 from hsifusion_classifier_v253 import create_hsifusion_lightning_classifier
-from hsifusion_v252_complete import create_hsifusion_lightning_pro
+from hsifusion_v252_complete import RobustEnhancedSpectralAttention, create_hsifusion_lightning_pro
 from optimized_dataloader import MSTPlusPlusLoss
 from sharp_training_script_fixed import should_optimizer_step as sharp_should_step
 from sharp_inference import SHARPInference, _torch_load_compat
@@ -94,6 +94,28 @@ def test_hsifusion_compute_metrics_div_zero_safe() -> None:
     metrics = HSIFusionTrainer._compute_metrics(trainer, pred, target)
     for key in ("mrae", "rmse", "psnr"):
         assert math.isfinite(float(metrics[key]))
+
+
+def test_hsifusion_low_rank_spectral_attention_forward() -> None:
+    dense = RobustEnhancedSpectralAttention(dim=64, num_bands=31, pool_sizes=[2])
+    low_rank = RobustEnhancedSpectralAttention(
+        dim=64,
+        num_bands=31,
+        pool_sizes=[2],
+        spectral_basis_rank=8,
+    )
+
+    assert dense.spectral_weights is not None
+    assert dense.spectral_weights[0].numel() == 31 * 31
+    assert low_rank.spectral_coeffs is not None
+    assert low_rank.spectral_coeffs[0].numel() == 8
+
+    x = torch.rand(1, 64, 16, 16)
+    with torch.no_grad():
+        y = low_rank(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
 
 
 def test_optimizer_step_remainder_batch() -> None:

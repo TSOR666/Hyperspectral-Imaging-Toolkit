@@ -6,11 +6,9 @@ CRITICAL FIX: Replace .view(-1) with .reshape(-1) to handle non-contiguous tenso
 while maintaining complete backward compatibility with existing code.
 """
 
-import hdf5storage
 import numpy as np
 import torch
 import torch.nn as nn
-from fvcore.nn import FlopCountAnalysis
 import logging
 import os
 from typing import Optional, Dict, Any, Tuple, Union
@@ -23,6 +21,14 @@ def save_matv73(mat_name: str, var_name: str, var: np.ndarray) -> None:
         var_name: Variable name in the MAT file
         var: NumPy array to save
     """
+    try:
+        import hdf5storage
+    except ImportError as exc:
+        raise ImportError(
+            "save_matv73 requires the optional dependency 'hdf5storage'. "
+            "Install mswr_v2 requirements before exporting MATLAB v7.3 files."
+        ) from exc
+
     hdf5storage.savemat(mat_name, {var_name: var}, format='7.3', store_python_metadata=True)
 
 
@@ -211,9 +217,18 @@ def my_summary(test_model: nn.Module, H: int = 256, W: int = 256,
         C: Number of input channels
         N: Batch size
     """
-    model = test_model.cuda()
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except ImportError as exc:
+        raise ImportError(
+            "my_summary requires the optional dependency 'fvcore'. "
+            "Install mswr_v2 requirements before running FLOP analysis."
+        ) from exc
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = test_model.to(device)
     print(model)
-    inputs = torch.randn((N, C, H, W)).cuda()
+    inputs = torch.randn((N, C, H, W), device=device)
     flops = FlopCountAnalysis(model, inputs)
     n_param = sum([p.nelement() for p in model.parameters()])
     print(f'GMac:{flops.total()/(1024*1024*1024)}')

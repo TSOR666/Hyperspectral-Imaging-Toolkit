@@ -564,11 +564,12 @@ class NoiseRobustLoss(nn.Module):
         if perceptual_feature_extractor is None and self.lambda_perc > 0:
             logger.warning(
                 "lambda_perceptual=%s > 0 but no perceptual_feature_extractor "
-                "was provided; perceptual loss will be a differentiable zero. "
+                "was provided; setting effective lambda_perceptual=0. "
                 "Pass a pretrained RGB model (e.g. torchvision.models.vgg16(...).features) "
                 "via config['perceptual_feature_extractor'] to enable it.",
                 self.lambda_perc,
             )
+            self.lambda_perc = 0.0
         self.perceptual_loss = ImprovedPerceptualLoss(
             feature_extractor=perceptual_feature_extractor,
             num_bands=perceptual_num_bands,

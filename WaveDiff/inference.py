@@ -27,6 +27,15 @@ from utils.visualization import (
     create_false_color_image
 )
 
+
+def _torch_load_checkpoint(path, map_location):
+    """Load WaveDiff checkpoints without enabling arbitrary pickle payloads."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def load_model(checkpoint_path, device, model_type=None):
     """
     Load a model from checkpoint
@@ -40,7 +49,7 @@ def load_model(checkpoint_path, device, model_type=None):
         Loaded model
     """
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = _torch_load_checkpoint(checkpoint_path, map_location=device)
     
     # Get config
     config = checkpoint.get('config', {})

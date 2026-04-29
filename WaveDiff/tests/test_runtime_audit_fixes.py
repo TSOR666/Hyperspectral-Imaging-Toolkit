@@ -2,7 +2,6 @@
 
 import os
 import sys
-
 import torch
 
 
@@ -113,3 +112,45 @@ def test_dpm_solver_sampling_avoids_tensor_item_sync(monkeypatch):
 
     assert sample.shape == (1, 4, 8, 8)
     assert torch.isfinite(sample).all()
+
+
+def test_training_checkpoint_round_trip_uses_safe_loader():
+    from train import load_checkpoint, save_checkpoint
+
+    model = torch.nn.Conv2d(3, 31, kernel_size=1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2)
+
+    checkpoint_path = os.path.abspath("checkpoint_runtime_test.pt")
+    try:
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=3,
+            train_loss=0.4,
+            val_loss=0.3,
+            config={"model_type": "base", "latent_dim": 8},
+            path=checkpoint_path,
+        )
+
+        new_model = torch.nn.Conv2d(3, 31, kernel_size=1)
+        new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=1e-3)
+        new_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(new_optimizer, T_max=2)
+
+        checkpoint, start_epoch, best_val_loss = load_checkpoint(
+            new_model,
+            new_optimizer,
+            new_scheduler,
+            checkpoint_path,
+            torch.device("cpu"),
+        )
+    finally:
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+
+    assert checkpoint["epoch"] == 3
+    assert start_epoch == 4
+    assert best_val_loss == 0.3
+    for original, loaded in zip(model.parameters(), new_model.parameters()):
+        assert torch.allclose(original, loaded)

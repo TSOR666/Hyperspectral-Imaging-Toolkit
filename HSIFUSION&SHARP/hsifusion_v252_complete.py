@@ -32,6 +32,7 @@ __version__ = "2.5.3"
 
 
 import os
+import math
 import time
 import warnings
 import tempfile
@@ -542,6 +543,7 @@ class RobustEnhancedSpectralAttention(nn.Module):
         num_bands: int = 31,
         reduction: int = 4,
         pool_sizes: Optional[List[int]] = None,
+        spectral_basis_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -549,6 +551,13 @@ class RobustEnhancedSpectralAttention(nn.Module):
         self.pool_sizes = pool_sizes or [4, 8, 16]  # Avoid mutable default
         self.scale_failures = 0
         self.total_attempts = 0  # Exact tracking
+        self.spectral_basis_rank = spectral_basis_rank
+        if spectral_basis_rank is not None:
+            if spectral_basis_rank <= 0 or spectral_basis_rank >= num_bands:
+                raise ValueError(
+                    "spectral_basis_rank must be in [1, num_bands) for low-rank spectral attention"
+                )
+            self.spectral_basis_rank = int(spectral_basis_rank)
         
         # Ensure reduced_dim is divisible by num_bands
         reduced_dim = max(dim // reduction, num_bands)
@@ -571,13 +580,52 @@ class RobustEnhancedSpectralAttention(nn.Module):
         # Scale fusion
         self.scale_fusion = nn.Conv2d(reduced_dim * len(self.pool_sizes), dim, 1)
         
-        # Learnable spectral correlations
-        self.spectral_weights = nn.ParameterList([
-            nn.Parameter(torch.eye(num_bands) * 0.1) for _ in self.pool_sizes
-        ])  # each: (num_bands, num_bands)
+        if self.spectral_basis_rank is None:
+            # Learnable dense spectral correlations, each: (num_bands, num_bands).
+            self.spectral_weights = nn.ParameterList([
+                nn.Parameter(torch.eye(num_bands) * 0.1) for _ in self.pool_sizes
+            ])
+            self.spectral_coeffs = None
+            self.register_buffer("spectral_basis", torch.empty(0), persistent=False)
+        else:
+            # Fixed smooth low-rank basis with learnable per-scale coefficients.
+            # This constrains the correlation matrix to B diag(c) B^T, which is
+            # cheaper and biases attention toward smooth spectral correlations.
+            self.spectral_weights = None
+            self.spectral_coeffs = nn.ParameterList([
+                nn.Parameter(torch.ones(self.spectral_basis_rank) * 0.1)
+                for _ in self.pool_sizes
+            ])
+            self.register_buffer(
+                "spectral_basis",
+                self._make_smooth_spectral_basis(num_bands, self.spectral_basis_rank),
+                persistent=False,
+            )
         
         # Fixed: ensure GroupNorm doesn't get 0 groups
         self.norm = nn.GroupNorm(max(1, min(32, dim // 8)), dim)
+
+    @staticmethod
+    def _make_smooth_spectral_basis(num_bands: int, rank: int) -> torch.Tensor:
+        """Build an orthonormal low-frequency cosine basis over spectral bands."""
+        bands = torch.linspace(0.0, 1.0, num_bands)
+        components = [torch.ones_like(bands)]
+        for freq in range(1, rank):
+            components.append(torch.cos(math.pi * freq * bands))
+        basis = torch.stack(components, dim=1)
+        basis, _ = torch.linalg.qr(basis, mode="reduced")
+        return basis[:, :rank].contiguous()
+
+    def _get_spectral_weight(self, idx: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return dense spectral correlation matrix for a scale."""
+        if self.spectral_basis_rank is None:
+            assert self.spectral_weights is not None
+            return self.spectral_weights[idx].to(device=device, dtype=dtype)
+
+        assert self.spectral_coeffs is not None
+        basis = self.spectral_basis.to(device=device, dtype=dtype)
+        coeff = self.spectral_coeffs[idx].to(device=device, dtype=dtype)
+        return (basis * coeff.unsqueeze(0)) @ basis.transpose(0, 1)
     
     def get_scale_failure_rate(self) -> torch.Tensor:
         """Return the exact rate of scale processing failures as a tensor for loss fusion.
@@ -604,7 +652,7 @@ class RobustEnhancedSpectralAttention(nn.Module):
         
         scale_outputs = []
         
-        for idx, (pool, conv, spectral_weight) in enumerate(zip(self.pools, self.scale_convs, self.spectral_weights)):
+        for idx, (pool, conv) in enumerate(zip(self.pools, self.scale_convs)):
             self.total_attempts += 1  # Track every attempt
             try:
                 # Pool at this scale
@@ -645,7 +693,9 @@ class RobustEnhancedSpectralAttention(nn.Module):
                 q_float = q.float()  # (B, h_p*w_p, bands_per_group, num_bands)
                 k_float = k.float()  # (B, h_p*w_p, num_bands, bands_per_group)
                 v_float = v.float()  # (B, h_p*w_p, bands_per_group, num_bands)
-                spectral_weight_float = spectral_weight.float()  # (num_bands, num_bands)
+                spectral_weight_float = self._get_spectral_weight(
+                    idx, q.device, torch.float32
+                )  # (num_bands, num_bands)
                 # (B, h_p*w_p, bands_per_group, num_bands) @ (num_bands, num_bands) -> same
                 # then @ (B, h_p*w_p, num_bands, bands_per_group) -> (B, h_p*w_p, bands_per_group, bands_per_group)
                 attn = torch.matmul(torch.matmul(q_float, spectral_weight_float), k_float) * scale  # (B, h_p*w_p, bands_per_group, bands_per_group)
@@ -711,6 +761,7 @@ class LightningProBlock(nn.Module):
         use_sparse: bool = False,
         use_spectral: bool = True,
         use_rope: bool = True,
+        spectral_basis_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         
@@ -744,7 +795,10 @@ class LightningProBlock(nn.Module):
         
         # Spectral attention
         if use_spectral:
-            self.spectral_attn = RobustEnhancedSpectralAttention(dim=dim)
+            self.spectral_attn = RobustEnhancedSpectralAttention(
+                dim=dim,
+                spectral_basis_rank=spectral_basis_rank,
+            )
         
         # MLP or MoE
         if use_moe:
@@ -867,6 +921,7 @@ class LightningProConfig:
     use_rope: bool = True
     use_cross_attention: bool = True
     enable_spectral: bool = True
+    spectral_basis_rank: Optional[int] = None
     
     # Training
     dropout: float = 0.0
@@ -950,7 +1005,8 @@ class HSIFusionNetV25LightningPro(nn.Module):
                     use_sliding_window=use_sliding,
                     use_sparse=use_sparse,
                     use_spectral=config.enable_spectral,
-                    use_rope=config.use_rope
+                    use_rope=config.use_rope,
+                    spectral_basis_rank=config.spectral_basis_rank,
                 )
                 blocks.append(block)
             

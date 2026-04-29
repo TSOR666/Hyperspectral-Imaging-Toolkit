@@ -34,7 +34,7 @@ use_r1_regularization: true
 r1_gamma: 10.0
 
 lambda_rec: 1.0
-lambda_perceptual: 0.1
+lambda_perceptual: 0.0
 lambda_adversarial: 0.1
 lambda_sam: 0.05
 

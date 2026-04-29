@@ -23,6 +23,15 @@ from utils.augmentation import RGBHSIAugmentation
 from utils.progressive_training import ProgressiveTrainingManager
 from losses.spectral_consistency import CombinedSpectralLoss
 
+
+def _torch_load_checkpoint(path, map_location):
+    """Load WaveDiff checkpoints without enabling arbitrary pickle payloads."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 # Dataset class for HSI data
 class HSIDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir, transform=None, hsi_transform=None, augmentation=None):
@@ -147,7 +156,7 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
         return None, 0, float('inf')
     
     print(f"Loading checkpoint from {path}")
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = _torch_load_checkpoint(path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if 'scheduler_state_dict' in checkpoint:
