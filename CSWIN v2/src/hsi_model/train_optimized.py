@@ -44,6 +44,7 @@ Version History:
 """
 
 import os
+import sys
 import time
 import logging
 import numpy as np
@@ -57,9 +58,13 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import hydra
 import gc
+from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 from typing import Tuple, Dict, Any, Optional
-from pathlib import Path
+
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 # Local imports
 from hsi_model.models import NoiseRobustCSWinModel
@@ -85,8 +90,7 @@ from hsi_model.utils.metrics import (
     validate_model_architecture, save_metrics, create_error_report
 )
 from hsi_model.utils.data import (
-    MST_TrainDataset,
-    MST_ValidDataset,
+    create_training_datasets,
     mst_to_gan_batch,
     compute_mst_center_crop_metrics,
     show_dataloader_diagnostics,
@@ -116,30 +120,16 @@ def report_memory(tag: str):
 
 
 def create_datasets_only(config: Dict[str, Any]) -> Tuple[Any, Any]:
-    """Create only datasets without DataLoaders to avoid extra workers."""
+    """Create configured datasets without DataLoaders to avoid extra workers."""
     memory_mode = config.get("memory_mode", "standard")
     logger = logging.getLogger(__name__)
-    logger.info(f"Creating MST++ datasets with memory mode: {memory_mode}")
-
-    data_root = config.get("data_dir", DEFAULT_DATA_DIR)
-    crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
-    stride = config.get("stride", DEFAULT_STRIDE)
-
-    train_dataset = MST_TrainDataset(
-        data_root=data_root,
-        crop_size=crop_size,
-        arg=True,
-        bgr2rgb=True,
-        stride=stride,
-        memory_mode=memory_mode,
-    )
-    val_dataset = MST_ValidDataset(
-        data_root=data_root,
-        bgr2rgb=True,
-        memory_mode=memory_mode,
+    logger.info(
+        "Creating %s datasets with memory mode: %s",
+        config.get("dataset_source", "mst"),
+        memory_mode,
     )
 
-    return train_dataset, val_dataset
+    return create_training_datasets(config, seed=int(config.get("seed", 42)))
 
 
 def memory_cleanup():

@@ -4,6 +4,7 @@ Data loading and processing package.
 
 Organized modules:
 - mst_dataset: MST++ training and validation datasets
+- hf_arad_dataset: Hugging Face ARAD HSDB adapter
 - arad_dataset: ARAD-1K validation dataset with caching
 - loaders: DataLoader creation utilities
 - transforms: Data transformation and conversion helpers
@@ -11,8 +12,10 @@ Organized modules:
 """
 
 from .mst_dataset import MST_TrainDataset, MST_ValidDataset
+from .hf_arad_dataset import HuggingFaceARADHSDBDataset, create_hf_arad_datasets
 from .arad_dataset import ARAD1KDataset, create_arad1k_dataloader, DatasetCache
 from .loaders import (
+    create_training_datasets,
     create_mst_dataloaders,
     create_dataloaders,
     worker_init_fn_mst,
@@ -27,9 +30,12 @@ __all__ = [
     # Datasets
     "MST_TrainDataset",
     "MST_ValidDataset",
+    "HuggingFaceARADHSDBDataset",
     "ARAD1KDataset",
     "DatasetCache",
     # Loaders
+    "create_training_datasets",
+    "create_hf_arad_datasets",
     "create_mst_dataloaders",
     "create_dataloaders",
     "create_arad1k_dataloader",

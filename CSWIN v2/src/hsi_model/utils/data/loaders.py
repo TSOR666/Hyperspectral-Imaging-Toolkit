@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from .mst_dataset import MST_TrainDataset, MST_ValidDataset
+from .hf_arad_dataset import create_hf_arad_datasets
 from ...constants import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_PATCH_SIZE,
@@ -26,6 +27,55 @@ from ...constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dataset_source(config: Dict[str, Any]) -> str:
+    return str(
+        config.get("dataset_source", config.get("data_source", "mst"))
+    ).strip().lower()
+
+
+def create_training_datasets(
+    config: Dict[str, Any],
+    seed: int = 42,
+) -> Tuple[Any, Any]:
+    """
+    Create training/validation datasets for the configured source.
+
+    ``dataset_source=mst`` preserves the original local MST++ directory layout.
+    ``dataset_source=huggingface`` wraps ``mhmdjouni/arad_hsdb`` through the
+    optional Hugging Face ``datasets`` dependency while keeping the same
+    ``(rgb, hsi)`` sample contract used by the training loops.
+    """
+    source = _dataset_source(config)
+    if source in {"huggingface", "hf", "hf_arad", "arad_hsdb"}:
+        return create_hf_arad_datasets(config, seed=seed)
+    if source not in {"mst", "mst++", "arad1k", "local"}:
+        raise ValueError(
+            f"Unsupported dataset_source={source!r}. Expected 'mst' or 'huggingface'."
+        )
+
+    memory_mode = config.get("memory_mode", "standard")
+    data_root = config.get("data_dir", DEFAULT_DATA_DIR)
+    crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
+    stride = config.get("stride", DEFAULT_STRIDE)
+
+    train_dataset = MST_TrainDataset(
+        data_root=data_root,
+        crop_size=crop_size,
+        arg=True,
+        bgr2rgb=True,
+        stride=stride,
+        memory_mode=memory_mode,
+    )
+
+    val_dataset = MST_ValidDataset(
+        data_root=data_root,
+        bgr2rgb=True,
+        memory_mode=memory_mode,
+    )
+
+    return train_dataset, val_dataset
 
 
 def worker_init_fn_mst(worker_id: int, base_seed: int = 42, rank: int = 0) -> None:
@@ -73,18 +123,18 @@ def create_mst_dataloaders(
     """
     Create MST++ exact DataLoaders for GAN training.
     """
-    data_root = config.get("data_dir", DEFAULT_DATA_DIR)
     batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
     val_batch_size = config.get("val_batch_size", 1)
     num_workers = config.get("num_workers", DEFAULT_NUM_WORKERS)
 
     crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
     stride = config.get("stride", DEFAULT_STRIDE)
+    source = _dataset_source(config)
 
     logger.info("=" * 60)
-    logger.info("Creating MST++ DataLoaders")
+    logger.info("Creating %s DataLoaders", source)
     logger.info("=" * 60)
-    logger.info("  - Data root: %s", data_root)
+    logger.info("  - Data root: %s", config.get("data_dir", DEFAULT_DATA_DIR))
     logger.info("  - Crop size: %s", crop_size)
     logger.info("  - Stride: %s", stride)
     logger.info("  - Batch size: %s", batch_size)
@@ -93,18 +143,7 @@ def create_mst_dataloaders(
     logger.info("  - h5py cache: %sMB per worker (fixed from 64MB)", H5PY_CACHE_SIZE_MB)
     logger.info("  - Distributed: %s", distributed)
 
-    train_dataset = MST_TrainDataset(
-        data_root=data_root,
-        crop_size=crop_size,
-        arg=True,
-        bgr2rgb=True,
-        stride=stride,
-    )
-
-    val_dataset = MST_ValidDataset(
-        data_root=data_root,
-        bgr2rgb=True,
-    )
+    train_dataset, val_dataset = create_training_datasets(config, seed=seed)
 
     train_sampler = None
     val_sampler = None
