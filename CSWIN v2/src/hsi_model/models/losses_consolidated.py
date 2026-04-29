@@ -58,9 +58,35 @@ def _cap_points(points: torch.Tensor, max_points: int) -> torch.Tensor:
 
 
 def _safe_normalize(points: torch.Tensor, eps: float = EPSILON_SMALL) -> torch.Tensor:
-    """Normalize and sanitize a point cloud tensor."""
-    normalized = F.normalize(points, dim=0, eps=max(float(eps), 1e-12))
-    return torch.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+    """Sanitize a point cloud tensor.
+
+    NOTE (audit): the prior implementation called ``F.normalize(points, dim=0)``
+    which divided every point in the cloud by the cloud's overall L2 norm.
+    For 1D discriminator features this collapsed two clouds with vastly
+    different magnitudes onto the unit sphere and erased the scale signal that
+    the discriminator is supposed to convey to the Sinkhorn loss. Replaced by
+    a NaN/Inf sanitize that keeps relative scale; joint scaling between
+    real/fake clouds is now done by ``_jointly_rescale``.
+    """
+    return torch.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _jointly_rescale(
+    a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Divide both point clouds by the same scalar so the OT cost stays finite.
+
+    The shared scale is the maximum absolute value across both clouds. Using a
+    *shared* scale (instead of per-cloud normalization) preserves the relative
+    magnitude difference that distinguishes real from fake disc outputs, while
+    still bounding values to [-1, 1] so Sinkhorn's kernel exponent ``-C/eps``
+    does not under/overflow.
+    """
+    a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    b = torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+    scale = torch.maximum(a.abs().amax(), b.abs().amax())
+    scale = torch.clamp(scale, min=eps)
+    return a / scale, b / scale
 
 
 class FeatureExtractor(Protocol):
@@ -649,21 +675,22 @@ class NoiseRobustLoss(nn.Module):
                 f = _cap_points(f, max_points)
                 r = _cap_points(r, max_points)
 
-                # Build point clouds in R^1: (S, 1)
-                # Keep gradients on fake, detach real
-                X = f.detach() * 1.0 + (f - f.detach())
+                # Generator path: gradients flow only through `f` (fake);
+                # `r` (real) is detached so it does not couple back into D.
+                X = f
                 Y = r.detach()
 
-                # Normalize for stability
-                X = _safe_normalize(X)
-                Y = _safe_normalize(Y)
+                # Joint rescale by max-abs across BOTH clouds preserves the
+                # relative magnitude difference that the discriminator uses to
+                # signal real vs fake. The previous _safe_normalize divided
+                # each cloud by its own L2 norm and erased that signal.
+                X, Y = _jointly_rescale(X, Y)
 
-                # Skip if all zeros after normalization
-                if X.abs().sum() < 1e-12 or Y.abs().sum() < 1e-12:
+                if X.abs().sum() < 1e-12 and Y.abs().sum() < 1e-12:
                     loss_b = differentiable_zero
                 else:
                     loss_b = self.sinkhorn(X, Y)
-                    
+
                 loss_batch.append(loss_b)
 
             adv_loss = torch.stack(loss_batch).mean()
@@ -861,12 +888,12 @@ class ComputeSinkhornDiscriminatorLoss(nn.Module):
                 R = _cap_points(R, max_points)
                 Fk = _cap_points(Fk, max_points)
 
-                # Normalize for stability
-                R = _safe_normalize(R)
-                Fk = _safe_normalize(Fk)
+                # Joint rescale (shared scale across real+fake) — preserves
+                # the magnitude gap the discriminator should be exploiting,
+                # while keeping inputs O(1) so Sinkhorn's kernel stays stable.
+                R, Fk = _jointly_rescale(R, Fk)
 
-                # Skip if all zeros after normalization
-                if R.abs().sum() < 1e-12 or Fk.abs().sum() < 1e-12:
+                if R.abs().sum() < 1e-12 and Fk.abs().sum() < 1e-12:
                     sinkhorn_terms.append(differentiable_zero)
                 else:
                     sinkhorn_terms.append(self.criterion.sinkhorn(R, Fk))
