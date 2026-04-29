@@ -1059,7 +1059,7 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
     
     def _wavelet_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Enhanced wavelet processing with error handling.
+        Wavelet processing branch.
 
         Args:
             x: Input tensor in NCHW format (B, C, H, W).
@@ -1067,58 +1067,51 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         Returns:
             Output tensor in NCHW format (B, C, H, W).
         """
-        try:
-            B, C, H, W = x.shape  # (B, C, H, W)
-            cache_key = f"{H}x{W}_stage{self.stage_idx}"
-            
-            # Apply wavelet transform
-            yl, yh = self.dwt(x)  # yl: (B, C, H/2^J, W/2^J), yh: list of (B, C, 3, H/2^j, W/2^j)
-            
-            # Generate or retrieve wavelet gate
-            if self.config.wavelet_gate_reuse and cache_key in self.wavelet_gate_cache:
-                gate = self.wavelet_gate_cache[cache_key]  # (B, C, H_low, W_low)
+        # No try/except here on purpose: a silent fallback to the standard path
+        # masks real bugs (the prior B-1 reshape error trained for months under
+        # such a fallback). If wavelets fail, training should fail loudly so the
+        # cause is investigated, not bypassed.
+        B, C, H, W = x.shape  # (B, C, H, W)
+        cache_key = f"{H}x{W}_stage{self.stage_idx}"
+
+        # Apply wavelet transform
+        yl, yh = self.dwt(x)  # yl: (B, C, H/2^J, W/2^J), yh: list of (B, C, 3, H/2^j, W/2^j)
+
+        # Generate or retrieve wavelet gate
+        if self.config.wavelet_gate_reuse and cache_key in self.wavelet_gate_cache:
+            gate = self.wavelet_gate_cache[cache_key]  # (B, C, H_low, W_low)
+        else:
+            gate = self.wavelet_gate(yl)  # (B, C, H_low, W_low)
+            if self.config.wavelet_gate_reuse:
+                self.wavelet_gate_cache[cache_key] = gate.detach()
+
+        # Apply gating to high-frequency components
+        yh_gated = []
+        for h_coeffs in yh:
+            B_h, C_h, n_bands, H_level, W_level = h_coeffs.shape
+
+            # Ensure gate matches spatial dimensions
+            if gate.shape[-2:] != (H_level, W_level):
+                gate_resized = F.interpolate(
+                    gate, size=(H_level, W_level),
+                    mode='bilinear', align_corners=False
+                )  # (B, C, H_low, W_low) -> (B, C, H_level, W_level)
             else:
-                gate = self.wavelet_gate(yl)  # (B, C, H_low, W_low)
-                if self.config.wavelet_gate_reuse:
-                    self.wavelet_gate_cache[cache_key] = gate.detach()
-            
-            # Apply gating to high-frequency components
-            yh_gated = []
-            for h_coeffs in yh:
-                B_h, C_h, n_bands, H_level, W_level = h_coeffs.shape
-                
-                # Ensure gate matches spatial dimensions
-                if gate.shape[-2:] != (H_level, W_level):
-                    gate_resized = F.interpolate(
-                        gate, size=(H_level, W_level),
-                        mode='bilinear', align_corners=False
-                    )  # (B, C, H_low, W_low) -> (B, C, H_level, W_level)
-                else:
-                    gate_resized = gate  # (B, C, H_level, W_level)
-                
-                # Apply gate with proper broadcasting
-                gate_expanded = gate_resized.unsqueeze(2)  # (B, C, H_level, W_level) -> (B, C, 1, H_level, W_level)
-                h_gated = h_coeffs * gate_expanded  # (B, C, 3, H_level, W_level), broadcast along band dim
-                yh_gated.append(h_gated)
-            
-            # Process low-frequency component with attention
-            yl_processed = self.attn(yl)  # (B, C, H_low, W_low)
-            yl_processed = yl_processed + self.drop_path(self.gamma2 * self._ffn_forward(yl_processed))  # gamma2 broadcast
-            
-            # Reconstruct signal
-            x_reconstructed = self.idwt((yl_processed, yh_gated))  # (B, C, H, W)
-            
-            return x_reconstructed
-            
-        except Exception as e:
-            if 'Wrong shape' in str(e) or 'rearrange' in str(e):
-                logger.warning(f"Wavelet stage {self.stage_idx}: Attention shape mismatch - {e}")
-            else:
-                logger.warning(f"Wavelet processing failed in stage {self.stage_idx}: {e}")
-            # Fallback to standard processing
-            x = self.attn(x)  # (B, C, H, W)
-            x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))  # gamma2 broadcast
-            return x
+                gate_resized = gate  # (B, C, H_level, W_level)
+
+            # Apply gate with proper broadcasting
+            gate_expanded = gate_resized.unsqueeze(2)  # (B, C, H_level, W_level) -> (B, C, 1, H_level, W_level)
+            h_gated = h_coeffs * gate_expanded  # (B, C, 3, H_level, W_level), broadcast along band dim
+            yh_gated.append(h_gated)
+
+        # Process low-frequency component with attention
+        yl_processed = self.attn(yl)  # (B, C, H_low, W_low)
+        yl_processed = yl_processed + self.drop_path(self.gamma2 * self._ffn_forward(yl_processed))  # gamma2 broadcast
+
+        # Reconstruct signal
+        x_reconstructed = self.idwt((yl_processed, yh_gated))  # (B, C, H, W)
+
+        return x_reconstructed
     
     def _ffn_forward(self, x: torch.Tensor) -> torch.Tensor:
         """

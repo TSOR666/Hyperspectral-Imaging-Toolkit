@@ -380,10 +380,29 @@ class NoiseRobustCSWinGenerator(nn.Module):
         except Exception:
             self._iteration_count = 0
         return result
-        
+
+    def set_iteration(self, iteration: int) -> None:
+        """Set the canonical training-step counter.
+
+        The trainer should call this once per optimizer step so that
+        delayed-sigmoid and clamp-after-iters thresholds key off true
+        optimizer-step count, not per-forward calls.
+        See ``forward`` for the auto-increment fallback.
+        """
+        iteration = max(int(iteration), 0)
+        self._iteration_count = iteration
+        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+            with torch.no_grad():
+                self.iteration_count.fill_(iteration)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Update iteration count during training (torch.jit safe)
-        # v5.1: Add torch.no_grad() for safety
+        # Auto-increment fallback for callers that do not invoke
+        # ``set_iteration`` (legacy behavior, kept for backwards compat).
+        # NOTE: this counts forwards-with-grad, not optimizer steps. Under
+        # gradient accumulation or DDP the count drifts by an
+        # accumulation/replica-dependent factor — pass the canonical step
+        # via ``set_iteration`` from the trainer when reproducibility of the
+        # delayed_sigmoid / clamp_after_iters cutovers matters.
         if self.training:
             self._iteration_count += 1
             if not torch.jit.is_scripting() and not torch.jit.is_tracing():
@@ -447,20 +466,29 @@ class NoiseRobustCSWinGenerator(nn.Module):
         x = self.to_spectral(x + emb)
         
         # Apply output activation based on configuration
+        delayed_sigmoid_active = (
+            self.output_activation == "delayed_sigmoid"
+            and iter_idx > self.activation_delay_iters
+        )
         if self.output_activation == "sigmoid":
             x = torch.sigmoid(x)
         elif self.output_activation == "tanh":
             x = 0.5 * (torch.tanh(x) + 1.0)  # Map to [0, 1]
-        elif self.output_activation == "delayed_sigmoid":
-            # Only apply sigmoid after specified iterations
-            if iter_idx > self.activation_delay_iters:
-                x = torch.sigmoid(x)
+        elif delayed_sigmoid_active:
+            x = torch.sigmoid(x)
         # else: no activation (linear output)
-        
-        # Optional: Soft clipping to prevent extreme values
-        # FIX: Actually use the config values instead of hardcoded ±10!
-        if self.training and self.output_activation == "none":
+
+        # Soft clipping to prevent extreme values during the linear-output
+        # phase. Apply for both ``output_activation == 'none'`` AND for
+        # ``delayed_sigmoid`` while the sigmoid has not yet been switched on,
+        # since the pre-sigmoid logits are unconstrained and can blow up
+        # under early adversarial training. Sigmoid/tanh paths need no clamp.
+        in_linear_phase = (
+            self.output_activation == "none"
+            or (self.output_activation == "delayed_sigmoid" and not delayed_sigmoid_active)
+        )
+        if self.training and in_linear_phase:
             if self.clamp_after_iters == 0 or iter_idx < self.clamp_after_iters:
                 x = torch.clamp(x, -self.clamp_range, self.clamp_range)
-        
+
         return x

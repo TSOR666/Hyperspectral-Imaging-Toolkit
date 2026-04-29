@@ -254,51 +254,49 @@ class EnhancedMSWRLoss(nn.Module):
         """
         total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         loss_dict = {}
-        
-        # L1 loss (base loss)
+
+        # Linear warmup factor for non-L1 components, in [1/W, 1] over W epochs.
+        # Using (epoch + 1) instead of (epoch) ensures the auxiliary losses
+        # contribute at epoch 0 — otherwise they are exactly zero for the first
+        # epoch and the loss landscape changes abruptly when warmup completes.
+        if self.warmup_epochs > 0 and self.current_epoch < self.warmup_epochs:
+            warmup_scale = float(self.current_epoch + 1) / float(self.warmup_epochs)
+        else:
+            warmup_scale = 1.0
+
+        # L1 loss (base loss — no warmup; this is the primary signal)
         if self.l1_weight > 0:
             l1_loss = self.l1_loss(pred, target)
             total_loss = total_loss + self.l1_weight * l1_loss
             loss_dict['l1'] = l1_loss.detach()
-        
+
         # MRAE loss (using fixed version from utils)
         if self.mrae_weight > 0:
-            mrae_weight = self.mrae_weight
-            if self.current_epoch < self.warmup_epochs:
-                mrae_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
-            
+            mrae_weight = self.mrae_weight * warmup_scale
             mrae_loss = self.mrae_loss(pred, target)
             total_loss = total_loss + mrae_weight * mrae_loss
             loss_dict['mrae'] = mrae_loss.detach()
-        
+
         # SSIM loss (with warmup)
         if self.ssim_weight > 0:
-            ssim_weight = self.ssim_weight
-            if self.current_epoch < self.warmup_epochs:
-                ssim_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
-            
+            ssim_weight = self.ssim_weight * warmup_scale
             ssim_loss = self._ssim_loss(pred, target)
             total_loss = total_loss + ssim_weight * ssim_loss
             loss_dict['ssim'] = ssim_loss.detach()
-        
+
         # SAM loss (using fixed version from utils, for hyperspectral)
         if self.sam_weight > 0 and pred.size(1) > 3:  # Only for hyperspectral (>3 channels)
-            sam_weight = self.sam_weight
-            if self.current_epoch < self.warmup_epochs:
-                sam_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
-            
+            sam_weight = self.sam_weight * warmup_scale
             sam_loss = self.sam_loss(pred, target)
             # Convert from radians to degrees for better interpretability in logging
             sam_loss_deg = sam_loss * 180.0 / np.pi
             total_loss = total_loss + sam_weight * sam_loss  # Use radians for optimization
             loss_dict['sam'] = sam_loss.detach()  # Store in radians
             loss_dict['sam_deg'] = sam_loss_deg.detach()  # Also store in degrees for display
-        
+
         # Gradient loss (with warmup)
         if self.gradient_weight > 0:
-            grad_weight = self.gradient_weight
-            if self.current_epoch < self.warmup_epochs:
-                grad_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
+            grad_weight = self.gradient_weight * warmup_scale
             
             grad_loss = self._gradient_loss(pred, target)
             total_loss = total_loss + grad_weight * grad_loss
@@ -858,13 +856,31 @@ class EnhancedTrainer:
         self.ema = None
         self._consecutive_nan_count = 0  # Convergence safeguard: halt after N consecutive NaN losses
 
-        # Setup components
+        # Setup model + data first
         self._setup_model()
         self._setup_data()
-        self._setup_optimization()
-        self._setup_loss()
 
-        # Enhanced monitoring setup
+        # CRITICAL: scaler / EMA / early-stopping must exist BEFORE _load_checkpoint
+        # runs (inside _setup_optimization). Otherwise their saved states are
+        # silently dropped on resume — the model would resume with a fresh AMP
+        # scaler and a fresh EMA copy, regressing loss curves and metric history.
+        if self.config.use_amp and torch.cuda.is_available():
+            try:
+                self.scaler = GradScaler('cuda')
+            except TypeError:
+                self.scaler = GradScaler()
+        else:
+            self.scaler = None
+
+        if self.config.use_ema:
+            self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
+            self.logger.info(
+                f"EMA enabled (decay={self.config.ema_decay}, "
+                f"start_epoch={self.config.ema_start_epoch}, eval_mode={self.config.ema_eval_mode})"
+            )
+        else:
+            self.logger.info("EMA is disabled.")
+
         if config.early_stopping_mode != 'off':
             self.early_stopping = EarlyStoppingMonitor(
                 patience=config.early_stopping_patience,
@@ -878,25 +894,10 @@ class EnhancedTrainer:
         else:
             self.logger.info("Early stopping is disabled (mode='off').")
 
-        if self.config.use_ema:
-            self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
-            self.logger.info(
-                f"EMA enabled (decay={self.config.ema_decay}, "
-                f"start_epoch={self.config.ema_start_epoch}, eval_mode={self.config.ema_eval_mode})"
-            )
-        else:
-            self.logger.info("EMA is disabled.")
-        
-        # Mixed precision with compatibility
-        if self.config.use_amp and torch.cuda.is_available():
-            try:
-                # PyTorch 2.0+ style
-                self.scaler = GradScaler('cuda')
-            except TypeError:
-                # PyTorch < 2.0 style
-                self.scaler = GradScaler()
-        else:
-            self.scaler = None
+        # Now build optimizer/scheduler and resume — _load_checkpoint will see
+        # the already-constructed scaler / ema / early_stopping and restore them.
+        self._setup_optimization()
+        self._setup_loss()
         
         # Wandb setup
         self.wandb = None
@@ -1253,11 +1254,17 @@ class EnhancedTrainer:
             # Forward + backward with OOM recovery
             try:
                 # Forward pass
+                # Note: do NOT clamp predictions before computing the loss.
+                # clamp() has zero gradient outside [min, max], so any
+                # out-of-range prediction would receive no corrective signal —
+                # silently freezing learning on those elements. The L1/SSIM/SAM
+                # losses against [0, 1] targets pull predictions into range
+                # naturally; only NaN/Inf must be guarded here.
                 if self.scaler is not None:
                     with autocast('cuda'):
                         output = self.model(images)
                     # Compute loss in fp32 outside autocast for numerical stability
-                    output_fp32 = output.float().clamp(0.0, 1.0)
+                    output_fp32 = output.float()
                     labels_fp32 = labels.float()
                     if not torch.isfinite(output_fp32).all():
                         self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
@@ -1271,7 +1278,6 @@ class EnhancedTrainer:
                         loss = self.criterion(output_fp32, labels_fp32) / self.config.gradient_accumulation_steps
                 else:
                     output = self.model(images)
-                    output = output.clamp(0.0, 1.0)
                     if not torch.isfinite(output).all():
                         self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
                         self.optimizer.zero_grad()

@@ -410,3 +410,205 @@ class TestConvergenceSafeguards:
 
         loss = mrae_fn(pred, target)
         assert torch.isfinite(loss), f"MRAE not finite for near-zero labels: {loss}"
+
+
+# ---------------------------------------------------------------------------
+# B-2 (NEW BLOCKER): training-time clamp must not kill gradients
+# ---------------------------------------------------------------------------
+class TestTrainingClampGradientFlow:
+    """The training loop must not clamp predictions before computing the loss.
+
+    A `pred = pred.clamp(0, 1)` before the loss zeros gradients on any element
+    that strays outside [0, 1], silently freezing training on those elements.
+    The fix removes the clamp; gradient must flow for out-of-range predictions.
+    """
+
+    def test_out_of_range_predictions_get_gradient(self):
+        """Predictions outside [0, 1] must receive corrective gradient."""
+        try:
+            from train_mswr_v212_logging import EnhancedMSWRLoss
+        except ImportError:
+            pytest.skip("train_mswr_v212_logging not importable")
+
+        # Pure L1 to make gradient analysis trivial
+        loss_fn = EnhancedMSWRLoss(
+            l1_weight=1.0, ssim_weight=0.0, sam_weight=0.0,
+            gradient_weight=0.0, mrae_weight=0.0,
+        )
+        # Predictions strongly out-of-range; targets in [0, 1]
+        pred = torch.full((1, 31, 8, 8), 1.5, requires_grad=True)
+        target = torch.full((1, 31, 8, 8), 0.5)
+
+        total, _ = loss_fn(pred, target)
+        total.backward()
+
+        # If a clamp(0, 1) were applied to pred before loss, grad would be 0
+        # (saturated region of clamp). Without clamp, L1 gives sign(pred-target).
+        assert pred.grad is not None, "No gradient flowed at all"
+        assert pred.grad.abs().mean().item() > 0, (
+            "Gradient is zero for out-of-range predictions; "
+            "clamp before loss is suppressing the corrective signal."
+        )
+
+    def test_train_step_without_clamp_pulls_predictions_inrange(self):
+        """A few SGD steps with pred initialised >1 should reduce |pred-target|."""
+        try:
+            from train_mswr_v212_logging import EnhancedMSWRLoss
+        except ImportError:
+            pytest.skip("train_mswr_v212_logging not importable")
+
+        loss_fn = EnhancedMSWRLoss(
+            l1_weight=1.0, ssim_weight=0.0, sam_weight=0.0,
+            gradient_weight=0.0, mrae_weight=0.0,
+        )
+        pred = torch.full((1, 31, 8, 8), 2.0, requires_grad=True)
+        target = torch.full((1, 31, 8, 8), 0.5)
+
+        opt = torch.optim.SGD([pred], lr=0.1)
+        initial_err = (pred.detach() - target).abs().mean().item()
+        for _ in range(5):
+            opt.zero_grad()
+            total, _ = loss_fn(pred, target)
+            total.backward()
+            opt.step()
+        final_err = (pred.detach() - target).abs().mean().item()
+
+        assert final_err < initial_err, (
+            f"Predictions did not move toward target ({initial_err:.3f} -> {final_err:.3f}); "
+            "gradient flow is blocked."
+        )
+
+
+# ---------------------------------------------------------------------------
+# B-3 (NEW BLOCKER): scaler / EMA must be constructed BEFORE _load_checkpoint
+# ---------------------------------------------------------------------------
+class TestResumeStateRestoration:
+    """Verify trainer init order: scaler + EMA exist by the time the
+    checkpoint is loaded, so their saved state actually round-trips."""
+
+    def test_scaler_is_set_before_load_checkpoint_runs(self):
+        """Inspect EnhancedTrainer source: _setup_optimization must run AFTER
+        scaler/EMA construction. We don't want to instantiate a real trainer
+        (requires data), so we inspect the __init__ source order."""
+        try:
+            from train_mswr_v212_logging import EnhancedTrainer
+        except ImportError:
+            pytest.skip("train_mswr_v212_logging not importable")
+
+        import inspect
+        src = inspect.getsource(EnhancedTrainer.__init__)
+
+        # scaler must be assigned before _setup_optimization (which calls
+        # _load_checkpoint when resume_path is set).
+        scaler_idx = src.find("self.scaler =")
+        opt_idx = src.find("self._setup_optimization()")
+        assert scaler_idx != -1, "self.scaler not assigned in __init__"
+        assert opt_idx != -1, "_setup_optimization not called in __init__"
+        assert scaler_idx < opt_idx, (
+            "self.scaler must be initialised BEFORE _setup_optimization() "
+            "(which can call _load_checkpoint). Otherwise scaler state on "
+            "a resumed AMP run is silently dropped."
+        )
+
+        # Same constraint for EMA
+        ema_idx = src.find("self.ema = ModelEMA")
+        if ema_idx != -1:  # EMA may be skipped in tests
+            assert ema_idx < opt_idx, (
+                "self.ema must be initialised BEFORE _setup_optimization() so "
+                "checkpoint EMA state is restored on resume."
+            )
+
+
+# ---------------------------------------------------------------------------
+# H-5: silent wavelet exception fallback removed
+# ---------------------------------------------------------------------------
+class TestNoSilentWaveletFallback:
+    """The wavelet branch must not be wrapped in a blanket try/except. A
+    silent fallback hid the original B-1 reshape bug for months — now that
+    the bug is fixed, the fallback is removed so any future failure is loud."""
+
+    def test_wavelet_forward_has_no_blanket_except(self):
+        try:
+            from model.mswr_net_v212 import EnhancedWaveletDualTransformerBlock
+        except ImportError:
+            pytest.skip("model module not available")
+
+        import inspect
+        src = inspect.getsource(EnhancedWaveletDualTransformerBlock._wavelet_forward)
+        assert "except Exception" not in src, (
+            "Blanket 'except Exception' in _wavelet_forward masks bugs. "
+            "It was the reason BLOCKER B-1 went undetected; do not reintroduce."
+        )
+        # Sanity: dwt is still called (we only removed the try/except, not the logic)
+        assert "self.dwt(" in src, "_wavelet_forward should still invoke self.dwt"
+
+
+# ---------------------------------------------------------------------------
+# H-7: loss warmup must not zero non-L1 components at epoch 0
+# ---------------------------------------------------------------------------
+class TestLossWarmupFloor:
+    """At epoch 0 with warmup>0 the auxiliary losses (SSIM, SAM, gradient,
+    MRAE) must contribute non-zero weight. The previous formula
+    weight *= epoch/warmup gave exactly 0 at epoch 0; the fix uses
+    (epoch+1)/warmup so weight starts at 1/warmup, not 0."""
+
+    def test_ssim_nonzero_at_epoch_zero_with_warmup(self):
+        try:
+            from train_mswr_v212_logging import EnhancedMSWRLoss
+        except ImportError:
+            pytest.skip("train_mswr_v212_logging not importable")
+
+        loss_fn = EnhancedMSWRLoss(
+            l1_weight=0.0,           # disable L1 so SSIM is the sole signal
+            ssim_weight=1.0,
+            sam_weight=0.0,
+            gradient_weight=0.0,
+            mrae_weight=0.0,
+            warmup_epochs=10,
+        )
+        loss_fn.set_epoch(0)
+
+        # Use predictably-different inputs so SSIM is clearly non-zero.
+        torch.manual_seed(0)
+        pred = torch.rand(1, 31, 32, 32)
+        target = torch.rand(1, 31, 32, 32)
+
+        total, loss_dict = loss_fn(pred, target)
+        # SSIM raw value must be > 0 (different inputs)
+        assert loss_dict['ssim'].item() > 0, "SSIM raw value should be non-zero"
+        # And the WEIGHTED total must be > 0 (no zeroing-out at epoch 0)
+        assert total.item() > 0, (
+            f"Total loss is zero at epoch 0 (warmup_scale=0); "
+            f"warmup must use (epoch+1)/warmup not epoch/warmup."
+        )
+
+    def test_warmup_progresses_linearly(self):
+        """warmup_scale should be 1/W, 2/W, ..., 1.0 at epochs 0, 1, ..., W-1, W+."""
+        try:
+            from train_mswr_v212_logging import EnhancedMSWRLoss
+        except ImportError:
+            pytest.skip("train_mswr_v212_logging not importable")
+
+        loss_fn = EnhancedMSWRLoss(
+            l1_weight=0.0, ssim_weight=1.0, sam_weight=0.0,
+            gradient_weight=0.0, mrae_weight=0.0, warmup_epochs=4,
+        )
+        torch.manual_seed(1)
+        pred = torch.rand(1, 31, 32, 32)
+        target = torch.rand(1, 31, 32, 32)
+
+        # Capture totals at successive epochs; must be monotonic non-decreasing
+        totals = []
+        for ep in range(0, 5):
+            loss_fn.set_epoch(ep)
+            total, _ = loss_fn(pred, target)
+            totals.append(total.item())
+
+        # Strictly increasing during warmup (epochs 0..3)
+        for i in range(3):
+            assert totals[i + 1] > totals[i], (
+                f"warmup not progressing: epoch {i} total={totals[i]:.4f}, "
+                f"epoch {i+1} total={totals[i+1]:.4f}"
+            )
+        # Plateau at full weight after warmup
+        assert abs(totals[4] - totals[3]) <= abs(totals[3]) * 1.0  # post-warmup ≈ epoch W-1 + step
