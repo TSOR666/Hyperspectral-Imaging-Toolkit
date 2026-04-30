@@ -1,54 +1,118 @@
 # HSIFusion & SHARP — Transformer Baselines for HSI Reconstruction
 
-This directory packages the two transformer-based baselines we maintain alongside the CNN models in this monorepo:
+Two production-hardened transformer models for reconstructing 31-band hyperspectral images from RGB inputs, both operating on ARAD-1K style datasets and sharing the same data pipeline.
 
-- **HSIFusionNet v2.5.3 ("Lightning Pro")** – a lightweight spectrum-aware ViT that favours fast convergence and AMP-friendly kernels.
-- **SHARP v3.2.2 (Hardened)** – a sparse attention reconstruction pipeline with the audit fixes applied for production use.
+| Model | Version | Type | Best For |
+|---|---|---|---|
+| **HSIFusionNet ("Lightning Pro")** | v2.5.3 | Lightweight ViT | Fast convergence, AMP-friendly, easy to extend |
+| **SHARP (Hardened)** | v3.2.2 | Sparse hierarchical transformer | Memory-efficient, production-stable, best PSNR |
 
-Both projects share the same data preparation code and operate on ARAD-1K style hyperspectral datasets (31 channels). The scripts here mirror the ones we run internally after incorporating stability fixes, deterministic logging, and memory-usage guards.
+---
 
-## Directory structure
+## Table of Contents
+
+1. [Architecture Overview](#architecture-overview)
+   - [HSIFusionNet v2.5.3](#hsifusionnet-v253-lightning-pro)
+   - [SHARP v3.2.2](#sharp-v322-hardened)
+2. [Environment Setup](#environment-setup)
+3. [Dataset Preparation](#dataset-preparation)
+4. [Training HSIFusionNet](#training-hsifusionnet-v253)
+5. [Training SHARP](#training-sharp-v322)
+6. [SHARP Inference](#sharp-inference)
+7. [Configuration Reference](#configuration-reference)
+   - [HSIFusionNet Config](#hsifusionnet-lightningproconfig)
+   - [SHARP Config](#sharp-sharpv32config)
+8. [Distributed Training](#distributed-training)
+9. [SLURM Batch Jobs](#slurm-batch-jobs)
+10. [Tests](#tests)
+11. [Troubleshooting](#troubleshooting)
+12. [Project Structure](#project-structure)
+
+---
+
+## Architecture Overview
+
+### HSIFusionNet v2.5.3 ("Lightning Pro")
+
+File: `hsifusion_v252_complete.py` — class `LightningProConfig`, factory `create_hsifusion_lightning_pro`
 
 ```
-HSIFUSION&SHARP/
-├─ hsifusion_training.py           # HSIFusionNet Lightning Pro trainer
-├─ hsifusion_v252_complete.py      # Model factory (tiny/small/base/large variants)
-├─ sharp_training_script_fixed.py  # SHARP v3.2.2 hardened trainer
-├─ sharp_inference.py              # Offline inference / patch-based tiling utility
-├─ sharp_v322_hardened.py          # Model + trainer implementations
-├─ optimized_dataloader.py         # Memory-efficient MST++ dataloaders + losses
-├─ common_utils_v32.py             # Shared utilities for both models
-├─ dataset_setup.py                # Helper to stage ARAD-1K splits and caches
-├─ train_job_HSI.sh                # Example SLURM launcher for HSIFusion
-├─ train_job_SHARP.sh              # Example SLURM launcher for SHARP
-└─ README.md
+RGB (3ch) → Patch Embed → Encoder Stages → Decoder Stages → Conv Head → HSI (31ch)
+                               │                  ↑
+                         LightningProBlocks   Cross-Attention Fusion
 ```
 
-## Environment setup
+**LightningProBlock internals:**
+1. Sliding-window self-attention with **Rotary Position Embedding (RoPE)**
+2. **Spectral attention** — channel-wise over the 31-band dimension
+3. Optional **Mixture of Experts (MoE)** FFN
+4. GELU MLP with LayerScale + DropPath
+5. GroupNorm in encoder stages; optional uncertainty head in decoder
 
-1. Create / activate a Python 3.9+ environment with CUDA-enabled PyTorch 1.13 or newer.
-2. Install the core dependencies used by both trainers:
-   ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   pip install numpy hydra-core h5py psutil tqdm tensorboard einops
-   ```
-3. (Optional) Install extra logging / experiment tracking tools as required (e.g. `wandb`).
+**Additional features:**
+- `torch.compile` compatible (version-gated, auto-disables on older PyTorch)
+- `channels_last` memory format for faster convolutions on modern GPUs
+- Optional uncertainty estimation head for confidence maps
+- AMP/bfloat16 safe throughout
 
-Set the following environment variables to keep outputs consistent with the rest of the toolkit:
+---
 
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `HSI_DATA_DIR` | Root folder that contains `train/`, `val/`, and `test/` HSI tiles. | `./data/ARAD_1K` |
-| `HSI_LOG_DIR` | Where training logs (TensorBoard + JSON) will be written. | `./artifacts/logs` |
-| `HSI_CKPT_DIR` | Folder to store checkpoints per experiment. | `./artifacts/checkpoints` |
-| `PYTORCH_CUDA_ALLOC_CONF` | Recommended allocator tweak to avoid fragmentation. | `expandable_segments:True,max_split_size_mb:256` |
+### SHARP v3.2.2 (Hardened)
 
-## Dataset preparation
+File: `sharp_v322_hardened.py` — class `SHARPv32Config`, factory `create_sharp_v32`
 
-Use the bundled `dataset_setup.py` helper to stage ARAD-1K data with MST++ style crops, statistics, and channel metadata. Example:
+```
+RGB (3ch) → Multi-scale Encoder (streaming sparse attention)
+           → Bottleneck
+           → Decoder (cross-attention fusion) → Spectral Head → HSI (31ch)
+```
+
+**Attention mechanism:**
+- `sparse_attention_topk_streaming`: retains top-k tokens + local window fallback
+- Default sparsity: `sparse_sparsity_ratio=0.9` — 90% of tokens pruned per head
+- RBF key projection modes: `mean` (default) / `linear` / `none`
+- `ChannelRMSNorm` with eval-time caches for numerical stability
+
+**Additional features:**
+- Spectral basis regularization in the reconstruction head
+- **EMA (Exponential Moving Average)** weight tracking: `ema_decay=0.999`
+- `torch.compile` support (version-gated)
+- Overlap-and-blend tiling in `sharp_inference.py` for arbitrary image sizes
+
+---
+
+## Environment Setup
 
 ```bash
 cd "HSIFUSION&SHARP"
+python -m venv .venv
+source .venv/bin/activate            # Linux/macOS
+# .venv\Scripts\activate             # Windows
+
+# PyTorch — choose CUDA version matching your driver
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118  # CUDA 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # CUDA 12.1
+
+# Dependencies
+pip install einops numpy h5py psutil tqdm tensorboard pyyaml
+```
+
+**Environment variables:**
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `HSI_DATA_DIR` | Dataset root containing `train/`, `val/` | `./data/ARAD_1K` |
+| `HSI_LOG_DIR` | TensorBoard + JSON log directory | `./artifacts/logs` |
+| `HSI_CKPT_DIR` | Checkpoint directory | `./artifacts/checkpoints` |
+| `PYTORCH_CUDA_ALLOC_CONF` | CUDA allocator tweak | `expandable_segments:True,max_split_size_mb:256` |
+
+---
+
+## Dataset Preparation
+
+Use the bundled `dataset_setup.py` to produce MST++ style crops from raw ARAD-1K files:
+
+```bash
 python dataset_setup.py \
   --arad-root /path/to/ARAD_1K_raw \
   --output-root ./data/ARAD_1K \
@@ -57,118 +121,389 @@ python dataset_setup.py \
   --workers 8
 ```
 
-The script populates `train/` and `val/` directories with `.npy` spectral tensors and generates lookup tables consumed by both trainers. Skip this step if you already have a curated dataset prepared for MSWR/CSWIN in the repository root.
+This populates:
+
+```
+data/ARAD_1K/
+├── train/
+│   ├── RGB/        # cropped 128×128 RGB patches (.png)
+│   └── HSI/        # corresponding 31-band cubes (.npy)
+└── val/
+    ├── RGB/
+    └── HSI/
+```
+
+Skip this step if you already have a staged dataset from MSWR or CSWIN in the repository root — all four models share the same layout.
+
+---
 
 ## Training HSIFusionNet v2.5.3
+
+### Minimal command
 
 ```bash
 cd "HSIFUSION&SHARP"
 python hsifusion_training.py \
-  --data_root ${HSI_DATA_DIR:-./data/ARAD_1K} \
-  --batch_size 12 \
-  --model_size base \
-  --use_amp \
-  --compile_model
+  --data_root ./data/ARAD_1K
 ```
 
-Key CLI flags exposed by the dataclass configuration:
-
-| Flag | Description | Default |
-| --- | --- | --- |
-| `--model_size {tiny,small,base,large}` | Chooses the backbone variant in `hsifusion_v252_complete.py`. | `base` |
-| `--memory_mode {standard,float16,lazy}` | Controls dataloader caching and precision. | `float16` |
-| `--accumulate_steps` | Gradient accumulation steps to emulate larger batches. | `1` |
-| `--warmup_epochs` | Number of cosine warm-up epochs. | `5` |
-| `--compile_model/--no-compile_model` | Toggle `torch.compile` for the forward pass. | Enabled |
-
-Checkpoints and TensorBoard logs are stored under `./experiments/hsifusion_*` by default. Resume training with `--resume_from path/to/checkpoint.pt`.
-
-## Training SHARP v3.2.2 Hardened
+### Full command with common options
 
 ```bash
-cd "HSIFUSION&SHARP"
-python sharp_training_script_fixed.py \
-  --data_root ${HSI_DATA_DIR:-./data/ARAD_1K} \
-  --batch_size 20 \
+python hsifusion_training.py \
+  --data_root ./data/ARAD_1K \
   --model_size base \
+  --batch_size 12 \
+  --accumulate_steps 2 \
+  --warmup_epochs 5 \
+  --memory_mode float16 \
+  --use_amp \
+  --compile_model \
+  --use_channels_last
+```
+
+### Resume from checkpoint
+
+```bash
+python hsifusion_training.py \
+  --data_root ./data/ARAD_1K \
+  --resume_from experiments/hsifusion_base/checkpoint_epoch050.pt
+```
+
+### All HSIFusionNet CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data_root` | `./data/ARAD_1K` | Dataset root (train/ and val/ subfolders) |
+| `--model_size` | `base` | `tiny` / `small` / `base` / `large` |
+| `--batch_size` | `12` | Training batch size per GPU |
+| `--accumulate_steps` | `1` | Gradient accumulation steps |
+| `--warmup_epochs` | `5` | Cosine warm-up epochs |
+| `--memory_mode` | `float16` | `standard` / `float16` / `lazy` |
+| `--use_amp` / `--no_use_amp` | enabled | Automatic mixed precision |
+| `--compile_model` / `--no_compile_model` | enabled | `torch.compile` for the forward pass |
+| `--use_channels_last` / `--no_use_channels_last` | disabled | NHWC memory format |
+| `--resume_from` | `None` | Path to checkpoint to resume from |
+| `--log_dir` | `./experiments/hsifusion_*` | Output directory |
+
+---
+
+## Training SHARP v3.2.2
+
+### Minimal command
+
+```bash
+python sharp_training_script_fixed.py \
+  --data_root ./data/ARAD_1K
+```
+
+### Full command
+
+```bash
+python sharp_training_script_fixed.py \
+  --data_root ./data/ARAD_1K \
+  --model_size base \
+  --batch_size 20 \
   --sparse_sparsity_ratio 0.9 \
+  --sparse_block_size 64 \
+  --sparse_q_block_size 32 \
+  --sparse_max_tokens 256 \
+  --sparse_window_size 8 \
+  --rbf_centers_per_head 8 \
+  --key_rbf_mode mean \
+  --ema_decay 0.999 \
+  --ema_update_every 10 \
   --use_amp
 ```
 
-Important parameters:
+### All SHARP CLI flags
 
-- `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, and `--sparse_window_size` tune the streaming attention kernels and must respect GPU memory limits.
-- `--ema_decay` together with `--ema_update_every` mirrors the production EMA scheme – keep these defaults unless you benchmark alternatives.
-- Set `--memory_mode lazy` if you need to stream tiles from slower storage without blowing host RAM.
+| Flag | Default | Description |
+|---|---|---|
+| `--data_root` | `./data/ARAD_1K` | Dataset root |
+| `--model_size` | `base` | `tiny` / `small` / `base` / `large` |
+| `--batch_size` | `20` | Training batch size per GPU |
+| `--sparse_sparsity_ratio` | `0.9` | Fraction of tokens pruned (0 = dense) |
+| `--sparse_block_size` | `64` | Key/value block size for streaming attention |
+| `--sparse_q_block_size` | `32` | Query block size |
+| `--sparse_max_tokens` | `256` | Maximum tokens retained after pruning |
+| `--sparse_window_size` | `8` | Local window size for fallback attention |
+| `--rbf_centers_per_head` | `8` | RBF kernel centers per attention head |
+| `--key_rbf_mode` | `mean` | Key projection mode: `mean` / `linear` / `none` |
+| `--ema_decay` | `0.999` | EMA decay factor |
+| `--ema_update_every` | `10` | Steps between EMA updates |
+| `--use_amp` / `--no_use_amp` | enabled | Automatic mixed precision |
+| `--memory_mode` | `float16` | `standard` / `float16` / `lazy` |
+| `--compile_model` / `--no_compile_model` | version-gated | `torch.compile` |
+| `--gradient_clip` | `1.0` | Max gradient norm |
+| `--resume_from` | `None` | Checkpoint to resume |
 
-Distributed training works by wrapping the invocation with `torch.distributed.run` in the same fashion as the CSWIN trainer.
+> Setting `--sparse_sparsity_ratio 0` disables token pruning and falls back to dense attention. The `k_cap` parameter is automatically disabled in this mode.
 
-## SHARP inference
+---
 
-The standalone inference utility loads checkpoints (with or without embedded configs) and optionally tiles large RGB inputs.
+## SHARP Inference
+
+`sharp_inference.py` loads a trained checkpoint and reconstructs HSI from a single RGB image or a batch. It supports overlap-and-blend tiling to handle images larger than the training patch size.
+
+### Single image
 
 ```bash
 python sharp_inference.py \
   --checkpoint experiments/sharp/best.ckpt \
-  --input tests/rgb/frame.png \
-  --output outputs/hsis/frame.npy \
-  --patch-size 256 \
+  --input path/to/rgb.png \
+  --output outputs/hsi.npy \
   --device cuda
 ```
 
-When `--patch-size` is provided the script applies overlap-and-blend tiling to avoid seams. Outputs are compatible with the [`hsi_viz_suite`](../hsi_viz_suite/README.md) plotting scripts.
+### Tiled inference for large images
 
-## Batch jobs
+```bash
+python sharp_inference.py \
+  --checkpoint experiments/sharp/best.ckpt \
+  --input path/to/high_res_rgb.png \
+  --output outputs/hsi.npy \
+  --patch-size 256 \
+  --overlap 32 \
+  --device cuda
+```
 
-Two SLURM-ready job templates (`train_job_HSI.sh`, `train_job_SHARP.sh`) demonstrate how we schedule multi-GPU experiments with pre-configured environment variables. Adapt them to your cluster (account names, partitions, `srun` args) before use.
+### Batch directory
 
-## Interoperability tips
+```bash
+python sharp_inference.py \
+  --checkpoint experiments/sharp/best.ckpt \
+  --input-dir data/test/RGB \
+  --output-dir outputs/hsi \
+  --patch-size 256
+```
 
-- The dataloaders in `optimized_dataloader.py` match the MST++ patching logic used by CSWIN and MSWR, so you can reuse cached datasets and evaluation metrics across projects.
-- Run [`../hsi_viz_suite/scripts/generate_all_visualizations.py`](../hsi_viz_suite/README.md) on SHARP or HSIFusion outputs to produce publication-grade figures.
-- Compare transformer and CNN baselines by exporting checkpoints to the shared `artifacts/` directory and pointing the visualization suite at the combined results.
+### All inference flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--checkpoint` | required | Path to `.ckpt` file |
+| `--input` | — | Single RGB image path |
+| `--input-dir` | — | Directory of RGB images (batch mode) |
+| `--output` | — | Single output `.npy` path |
+| `--output-dir` | — | Directory for batch outputs |
+| `--patch-size` | `None` | Patch size for tiling (None = no tiling) |
+| `--overlap` | `16` | Overlap in pixels between tiles |
+| `--device` | `cuda` | `cuda` or `cpu` |
+
+Outputs are `.npy` files of shape `(H, W, 31)` compatible with the [HSI Viz Suite](../hsi_viz_suite/README.md).
+
+---
+
+## Configuration Reference
+
+### HSIFusionNet `LightningProConfig`
+
+```python
+LightningProConfig(
+    # I/O
+    in_channels=3,          # RGB input
+    out_channels=31,        # HSI output bands
+
+    # Model scale
+    base_channels=64,       # Channel width at first stage
+    depths=[2, 2, 6, 2],    # Transformer blocks per stage
+    num_heads=[2, 4, 8, 16],
+
+    # Attention
+    window_size=8,          # Sliding window size
+    use_rope=True,          # Rotary position embedding
+    use_sliding_window=True,
+    use_sparse_attention=False,
+
+    # Spectral
+    enable_spectral=True,   # Spectral attention head
+
+    # MoE
+    use_moe=False,          # Mixture of Experts FFN
+    num_experts=4,
+
+    # FFN
+    mlp_ratio=4.0,
+
+    # Regularization
+    drop_path=0.1,
+    dropout=0.1,
+    auxiliary_loss_weight=0.4,
+
+    # Decoder
+    use_channels_last=False,
+    min_input_size=32,      # Minimum accepted spatial resolution
+)
+```
+
+Model size presets (automatically set `depths`, `num_heads`, `base_channels`):
+
+| Size | Params | `base_channels` | `depths` |
+|---|---|---|---|
+| `tiny` | ~6 M | 32 | [2, 2, 2, 2] |
+| `small` | ~15 M | 48 | [2, 2, 4, 2] |
+| `base` | ~35 M | 64 | [2, 2, 6, 2] |
+| `large` | ~80 M | 96 | [2, 2, 8, 2] |
+
+---
+
+### SHARP `SHARPv32Config`
+
+```python
+SHARPv32Config(
+    # I/O
+    in_channels=3,
+    out_channels=31,
+
+    # Model scale
+    base_dim=64,
+    depths=[2, 2, 6, 2],
+    heads=[2, 4, 8, 16],
+    mlp_ratios=[4, 4, 4, 4],
+
+    # Sparse attention
+    sparse_block_size=64,
+    sparse_q_block_size=32,
+    sparse_max_tokens=256,
+    sparse_window_size=8,
+    sparse_k_cap=None,          # auto-computed from sparsity_ratio
+    sparse_sparsity_ratio=0.9,  # 90% tokens pruned
+    sparsemax_pad_value=-1e9,   # padding for pruned positions
+
+    # RBF key projection
+    rbf_centers_per_head=8,
+    key_rbf_mode='mean',        # 'mean' | 'linear' | 'none'
+
+    # Regularization
+    drop_path_rate=0.1,
+
+    # Memory
+    use_checkpoint=True,        # gradient checkpointing
+
+    # Runtime
+    compile_mode=None,          # None | 'default' | 'reduce-overhead'
+    ema_update_every=10,
+)
+```
+
+---
+
+## Distributed Training
+
+Both models support DDP via `torch.distributed.run`:
+
+```bash
+# HSIFusion on 4 GPUs
+python -m torch.distributed.run --nproc_per_node=4 \
+  hsifusion_training.py \
+  --data_root ./data/ARAD_1K \
+  --model_size base
+
+# SHARP on 4 GPUs
+python -m torch.distributed.run --nproc_per_node=4 \
+  sharp_training_script_fixed.py \
+  --data_root ./data/ARAD_1K \
+  --model_size base
+```
+
+---
+
+## SLURM Batch Jobs
+
+Ready-to-use job templates are provided:
+
+```bash
+# HSIFusion
+sbatch train_job_HSI.sh
+
+# SHARP
+sbatch train_job_SHARP.sh
+```
+
+Edit the templates to set your cluster account, partition, node count, and data paths before submitting.
+
+---
+
+## Tests
+
+Tests are in the project-level `tests/` directory:
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+---
+
+## Troubleshooting
+
+### `torch.compile` crashes on older PyTorch
+
+Both models auto-detect the PyTorch version and disable `torch.compile` when it is not stable. If you see compile-related errors, add `--no_compile_model` to disable it manually.
+
+### Memory errors with SHARP
+
+SHARP is memory-intensive with its multi-scale architecture. Try:
+1. Reduce `--batch_size 8`
+2. Lower `--sparse_max_tokens 128`
+3. Use `--memory_mode lazy`
+4. Reduce `--model_size small`
+
+### SHARP sparse config warnings
+
+```
+UserWarning: k_cap was set but sparse_sparsity_ratio=0 — disabling k_cap
+```
+
+This is expected when you set `--sparse_sparsity_ratio 0` for dense evaluation. The warning is informational.
+
+### HSIFusion `min_input_size` error
+
+```
+ValueError: Input spatial size (H x W) is below min_input_size=32
+```
+
+This means the encoder down-sampled the feature map below the minimum window size. Either use larger input patches (`--patch-size 64` minimum) or reduce `--model_size tiny`.
+
+### Checkpoint loading fails
+
+Checkpoints saved with `torch.save(..., weights_only=False)` may fail to load on newer PyTorch versions. Both trainers now use `weights_only=True` for secure loading. If you have an older checkpoint, load it with:
+
+```python
+ckpt = torch.load('path/to/ckpt.pt', weights_only=False, map_location='cpu')
+```
+
+---
+
+## Project Structure
+
+```
+HSIFUSION&SHARP/
+├── hsifusion_training.py          # HSIFusionNet trainer
+├── hsifusion_v252_complete.py     # LightningProConfig + model factory
+├── sharp_training_script_fixed.py # SHARP trainer (hardened)
+├── sharp_inference.py             # Overlap-blend tiling inference
+├── sharp_v322_hardened.py         # SHARPv32Config + model factory
+├── optimized_dataloader.py        # MST++ dataloaders + EnhancedMSWRLoss
+├── common_utils_v32.py            # Shared metrics, logging, helpers
+├── dataset_setup.py               # ARAD-1K staging utility
+├── train_job_HSI.sh               # SLURM launcher for HSIFusion
+├── train_job_SHARP.sh             # SLURM launcher for SHARP
+└── README.md
+```
+
+---
+
+## Related Projects
+
+- [`../CSWIN v2`](../CSWIN%20v2/README.md) — Sinkhorn-GAN with similar MST++ data pipeline
+- [`../mswr_v2`](../mswr_v2/README.md) — CNN baseline, shares same dataset layout
+- [`../hsi_viz_suite`](../hsi_viz_suite/README.md) — visualization suite for outputs
+- [`../WaveDiff`](../WaveDiff/README.md) — latent diffusion alternative
+
+---
 
 ## License
 
-The HSIFusion and SHARP implementations are distributed under the [MIT License](LICENSE). Contributions to this folder are accepted under the same terms.
-
-## Architecture Details
-
-- HSIFusionNet v2.5.3 (Lightning Pro)
-  - Blocks: `LightningProBlock` with sliding‑window attention (RoPE), spectral attention, optional MoE, and GELU MLP; layer‑scale and drop‑path.
-  - Topology: Encoder–decoder hierarchy with GroupNorm, staged down/upsampling, optional cross‑attention fusion, optional uncertainty head.
-  - Robustness: Torch compile compatibility, safe sliding window merge, dtype handling, AMP/bfloat16 support.
-  - Reference: `hsifusion_v252_complete.py` (`LightningProConfig`, factory `create_hsifusion_lightning_pro`).
-
-- SHARP v3.2.2 (Hardened)
-  - Attention: Multi‑scale attention + streaming sparse attention (`sparse_attention_topk_streaming`) with top‑k and local window fallback; RBF query/key projection modes (mean/linear/none).
-  - Norm: Channel RMSNorm with eval‑time caches; cross‑attention fusion in the decoder.
-  - Topology: Hierarchical encoder–decoder with ChannelRMSNorm, spectral basis regularization in the head.
-  - Reference: `sharp_v322_hardened.py` (`SHARPv32Config`, factory `create_sharp_v32`).
-
-## Training Overview
-
-- HSIFusionNet (`hsifusion_training.py`)
-  - Data: `optimized_dataloader.py` (MST++ compatible) with `memory_mode` (standard/float16/lazy).
-  - Optimizer: AdamW, cosine LR with warmup (`LambdaLR`).
-  - Runtime: AMP (`GradScaler/auto_cast`), optional `torch.compile`, channels_last, gradient accumulation, TB logging.
-  - Common flags: `--model_size`, `--batch_size`, `--accumulate_steps`, `--warmup_epochs`, `--compile_model`, `--use_channels_last`.
-
-- SHARP (`sharp_training_script_fixed.py`)
-  - Sparse config: `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, `--sparse_window_size`, `--sparse_sparsity_ratio`, `--rbf_centers_per_head`, `--key_rbf_mode`.
-  - Optimizer/Runtime: AdamW, AMP, gradient clipping, EMA with configurable `ema_update_every`, optional `torch.compile` (version‑gated).
-  - Distributed: Wrapper via `torch.distributed.run` identical to CSWIN.
-
-## Key Configuration
-
-- HSIFusion (Lightning Pro)
-  - Model: `in_channels`, `out_channels`, `base_channels`, `depths`, `num_heads`, `window_size`, `mlp_ratio`.
-  - Features: `enable_spectral`, `use_sparse_attention`, `use_sliding_window`, `use_moe`, `num_experts`, `use_rope`, `use_channels_last`.
-  - Regularization: `drop_path`, `dropout`, `auxiliary_loss_weight`, `min_input_size`.
-
-- SHARP v3.2.2
-  - Core: `in_channels`, `out_channels`, `base_dim`, `depths`, `heads`, `mlp_ratios`, `drop_path_rate`, `use_checkpoint`.
-  - Sparse: `sparse_block_size`, `sparse_max_tokens`, `sparse_window_size`, `sparse_k_cap`, `sparse_q_block_size`, `sparse_sparsity_ratio`, `rbf_centers_per_head`, `key_rbf_mode`, `sparsemax_pad_value`.
-  - Runtime: `compile_mode`, `ema_update_every`.
-
-Tip: With `sparse_sparsity_ratio=0`, SHARP auto‑disables `k_cap` for dense attention; windowed fallback is used for very long sequences.
+Distributed under the [MIT License](LICENSE).

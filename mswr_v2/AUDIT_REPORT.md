@@ -178,7 +178,146 @@ Audit-specific tests:
 ## Recommendations for Future Work
 
 1. **Re-train with patched wavelet**: The B-1 fix fundamentally changes wavelet decomposition. Any existing checkpoints were trained with scrambled subbands and should be retrained.
-2. **Remove wavelet try/except** (M-2): Now that the reshape bug is fixed, the silent fallback is unnecessary and dangerous.
+2. **Remove wavelet try/except** (M-2): ✅ done in second pass (H-5).
 3. **Add epoch to worker seed** (M-1): One-line fix in `_setup_data()`.
 4. **Add wavelet correctness test to CI**: The `test_subband_separation_multichannel` test catches the class of bug that B-1 represents.
 5. **Profile GPU training**: Run `smoke_train.py --device cuda` before and after the H-2 sync fix to measure throughput improvement.
+
+---
+
+# MSWR-Net v2.1.2 — Deep Learning Systems Audit (Second Pass)
+
+**Date:** 2026-04-29
+**Auditor:** Claude Opus 4.7 (1M context)
+**Scope:** Verification of prior audit, search for additional issues, plus patches and regression tests.
+
+## Executive Summary
+
+The first audit's BLOCKER and HIGH fixes (B-1, H-1..H-4) are all in place and behave correctly under regression tests. A second pass uncovered **two additional BLOCKERs** and **two additional HIGH** issues that the first pass missed. All four are now patched, with new regression tests added (25/25 audit tests pass; 121/121 full suite tests pass).
+
+| Issue | Severity | What broke | Where | Status |
+|-------|----------|-----------|-------|--------|
+| **B-2** | BLOCKER | `output.clamp(0, 1)` ran on the prediction *before* the loss in both AMP and non-AMP paths. Clamp has zero gradient in saturated regions, so out-of-range predictions received no corrective signal. Training silently freezes on those elements. | `train_mswr_v212_logging.py` train_epoch (formerly lines 1260, 1274) | **PATCHED** |
+| **B-3** | BLOCKER | `self.scaler` and `self.ema` were created **after** `_setup_optimization()` ran, but `_setup_optimization()` calls `_load_checkpoint()` on resume. So `self.scaler is None` and `self.ema is None` at restore time, and the `if self.scaler is not None and 'scaler' in checkpoint` / `if self.ema is not None and ...` guards always evaluated False. Scaler and EMA states were saved but never restored — the H-4 fix from pass 1 was a no-op in production. | `train_mswr_v212_logging.py` `EnhancedTrainer.__init__` ordering | **PATCHED** |
+| **H-5** | HIGH | `EnhancedWaveletDualTransformerBlock._wavelet_forward` wrapped its body in `try: ... except Exception: <fallback to attn>`. This is exactly the construct that hid B-1 (wavelet reshape) for months — every wavelet failure became a silent log warning while training proceeded with wavelets disabled. With B-1 fixed there is no longer a known recoverable failure mode, so the fallback now hides nothing it should hide. Removed; failures are loud. | `model/mswr_net_v212.py` `_wavelet_forward` | **PATCHED** |
+| **H-7** | HIGH (escalated from M-3) | Loss warmup formula was `weight *= current_epoch / max(warmup_epochs, 1)`. At epoch 0 this gives **exactly 0** for SSIM, SAM, MRAE, and gradient losses — the entire first epoch is L1-only, then auxiliary terms snap on at epoch 1. Loss-component logs misleadingly show `0` for all aux losses. Replaced with `(epoch + 1) / warmup_epochs`, so weight starts at `1/W` and reaches full at `epoch = W - 1`. Refactored into a single shared `warmup_scale` for clarity. | `train_mswr_v212_logging.py` `EnhancedMSWRLoss.forward` | **PATCHED** |
+
+## Detailed Findings
+
+### B-2 — Output clamped before loss kills gradient flow
+
+**Evidence:** `train_mswr_v212_logging.py` (pre-patch):
+```python
+with autocast('cuda'):
+    output = self.model(images)
+output_fp32 = output.float().clamp(0.0, 1.0)   # <-- clamp before loss
+...
+loss, loss_dict = self.criterion(output_fp32, labels_fp32)
+```
+And the non-AMP branch:
+```python
+output = self.model(images)
+output = output.clamp(0.0, 1.0)                # <-- same problem
+```
+
+**Why it matters:** `torch.clamp` has gradient 1 inside `[min, max]` and gradient 0 outside. If the model predicts 1.5 against a target of 0.5, L1 sees `|clamp(1.5)-0.5| = 0.5` and the gradient w.r.t. pred is **0** (saturated). The model gets no signal to pull 1.5 back into range. With Kaiming init and small skip-init scaling the model starts near zero, so clamp doesn't bite immediately, but as training progresses any single layer that drifts out of range produces dead pixels in the prediction.
+
+**Fix:** Remove both clamps. The `torch.isfinite` guard remains — that's the real safety net (a NaN really should skip the batch). Letting the loss see raw predictions means L1/SSIM/SAM all push them back into [0, 1] naturally because the targets are in [0, 1].
+
+**Regression test:** `TestTrainingClampGradientFlow::test_out_of_range_predictions_get_gradient` initialises `pred = 1.5` against `target = 0.5`, runs L1 loss, and asserts `pred.grad.abs().mean() > 0`. The companion test runs five SGD steps and asserts `|pred - target|` decreases.
+
+### B-3 — Scaler / EMA state never restored on resume
+
+**Evidence:** `EnhancedTrainer.__init__` order (pre-patch):
+```python
+self._setup_model()
+self._setup_data()
+self._setup_optimization()      # internally calls self._load_checkpoint(...)
+self._setup_loss()
+...
+if self.config.use_ema:
+    self.ema = ModelEMA(...)    # constructed AFTER _load_checkpoint
+...
+if self.config.use_amp and torch.cuda.is_available():
+    self.scaler = GradScaler('cuda')   # constructed AFTER _load_checkpoint
+```
+Inside `_load_checkpoint`:
+```python
+if self.scaler is not None and 'scaler' in checkpoint:
+    self.scaler.load_state_dict(...)   # never reached
+if self.ema is not None and checkpoint.get('ema'):
+    self.ema.load_state_dict(...)      # never reached
+```
+
+**Why it matters:** Resuming an AMP run from checkpoint silently produces a fresh `GradScaler(scale=65536.0)`. If the previous run had reduced scale through repeated overflow handling, the resumed run experiences a burst of overflows on the first few steps and the optimizer.step() is skipped. EMA is even worse: a long run that built up a smooth EMA of weights restarts from a fresh `deepcopy(model)`, throwing away the entire averaging window. Validation metrics on EMA weights will drop sharply on resume.
+
+The first audit *attempted* to fix scaler restoration but only patched the inside of `_load_checkpoint`. Because the fix relied on `self.scaler is not None`, and `self.scaler` was still `None` at that point, the `if` was always False. The fix never executed in production.
+
+**Fix:** Reorder `__init__` so `self.scaler`, `self.ema`, and `self.early_stopping` are constructed **before** `self._setup_optimization()` runs. The existing guards now evaluate True and the load actually happens.
+
+**Regression test:** `TestResumeStateRestoration::test_scaler_is_set_before_load_checkpoint_runs` inspects `EnhancedTrainer.__init__` source via `inspect.getsource` and asserts the textual order: `self.scaler =` appears before `self._setup_optimization()`. Same constraint for EMA. This is a lightweight order check that doesn't need a real dataset.
+
+### H-5 — Silent wavelet fallback removed
+
+**Evidence:** `_wavelet_forward` previously caught `Exception` and fell back to standard attention. The previous AUDIT_REPORT itself called this out as M-2 and recommended removal once B-1 was fixed.
+
+**Why it matters:** Specific failure modes (e.g. CUDA OOM, einops shape mismatch, NaN propagation) deserve specific handling, not a swallow-all. A silent fallback in a wavelet block means a model claimed to be using wavelets is actually running plain attention — and the output will look fine, validation will look fine, but capability is silently absent.
+
+**Fix:** Removed the `try/except`. The dwt/gate/idwt logic is unchanged; failures now propagate.
+
+**Regression test:** `TestNoSilentWaveletFallback::test_wavelet_forward_has_no_blanket_except` asserts the substring `"except Exception"` is no longer present in the function source. Static check with no runtime cost.
+
+### H-7 — Loss warmup floor
+
+**Evidence (pre-patch):**
+```python
+ssim_weight = self.ssim_weight
+if self.current_epoch < self.warmup_epochs:
+    ssim_weight *= (self.current_epoch / max(self.warmup_epochs, 1))
+```
+At `epoch=0`, `ssim_weight = 0`. Same for SAM, gradient, MRAE.
+
+**Why it matters:** Three concrete harms.
+1. The first epoch is L1-only. Loss curves look smooth, but the optimization landscape changes shape at epoch 1 when SSIM/SAM/gradient terms switch on.
+2. Telemetry: per-component logs report `SSIM: 0.0000` for epoch 0, indistinguishable from a broken loss head.
+3. Overfitting/early-stopping logic that watches `train_metrics['ssim']` gets a meaningless first sample.
+
+**Fix:** Replace the per-term scaling with a single `warmup_scale` computed once: `(epoch + 1) / warmup_epochs` during warmup, `1.0` after. Applied to MRAE, SSIM, SAM, and gradient. L1 stays unwarmed (it's the primary signal that should always be on).
+
+**Regression tests:**
+- `TestLossWarmupFloor::test_ssim_nonzero_at_epoch_zero_with_warmup` — disable L1, set SSIM as sole loss, advance to epoch 0 with `warmup_epochs=10`, and assert the total loss is non-zero.
+- `TestLossWarmupFloor::test_warmup_progresses_linearly` — measure totals at epochs 0..4 with `warmup_epochs=4`, assert strict monotonic increase across the warmup window.
+
+## Test Results (Second Pass)
+
+```
+tests/ — 121 passed, 17 skipped (CUDA / optional deps)
+tests/test_audit_fixes.py — 25 passed
+  including 6 new regression tests for B-2, B-3, H-5, H-7
+```
+
+## Benchmark Note (CPU, synthetic data, post-patches)
+
+| Metric | Value | Δ vs. first audit |
+|--------|-------|------------------|
+| smoke_train (5 steps, B=2, 64×64, tiny model) | 117.6 ms/step avg | -8% (542 → ~118 ms; the prior number was 3-step JIT-warm; this is 5 steps) |
+| smoke_infer 64×64 | 1588 ms (cold; JIT) | first call dominated by lazy tracing |
+| smoke_infer 128×128 | 63 ms | similar |
+| smoke_infer 256×256 | 196 ms | similar |
+| Peak VRAM (CPU run) | N/A | — |
+
+> The patches are correctness-only; no measurable throughput change is expected on CPU. For GPU benchmarks, run `python smoke_train.py --device cuda`. The H-2 sync flag (`PerformanceMonitor.sync_cuda=False` by default) remains the single biggest win for GPU training throughput in this codebase.
+
+## Bottlenecks Worth Future Attention
+
+1. **Quadratic attention at full resolution.** `OptimizedWindowAttention2D` already partitions into windows of size 8×8 (good), but `OptimizedLandmarkAttention2D` at the deepest stage attends `H*W` tokens to `num_landmarks=64`. For ARAD-1K full-image inference (482×512) at the bottleneck stage that's still `(120×128)≈15k` queries per landmark — fine memory-wise but worth profiling.
+2. **`torch.compile` is applied in two places** (model `__init__` if `compile_model=True`, and inference at `_load_model`). The double-compile is idempotent but obscures error paths. Consider gating compile in inference behind an explicit `--compile` flag.
+3. **Dataloader keeps the entire training set in RAM** (`self.rgb_images` and `self.hsi_cubes` are lists of decoded numpy arrays). For ARAD-1K (~950 cubes × ~482×512×31 × 4 bytes = ~28 GB), this is infeasible on smaller machines. The README points users at `MST_MEMORY_MODE=lazy` from CSWIN v2 but that knob isn't wired into mswr_v2's loader.
+
+## Files Modified (Second Pass)
+
+| File | Changes |
+|------|---------|
+| `train_mswr_v212_logging.py` | B-2: removed `clamp(0,1)` before loss in both AMP and non-AMP paths. B-3: reordered `EnhancedTrainer.__init__` to construct `self.scaler` / `self.ema` / `self.early_stopping` before `_setup_optimization` calls `_load_checkpoint`. H-7: refactored loss warmup to use a shared `warmup_scale = (epoch+1)/warmup_epochs`. |
+| `model/mswr_net_v212.py` | H-5: removed the `try/except Exception` wrapper from `_wavelet_forward`. |
+| `tests/test_audit_fixes.py` | Added 6 regression tests across 4 new test classes: `TestTrainingClampGradientFlow`, `TestResumeStateRestoration`, `TestNoSilentWaveletFallback`, `TestLossWarmupFloor`. |
