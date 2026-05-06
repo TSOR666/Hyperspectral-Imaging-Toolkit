@@ -56,6 +56,27 @@ def test_adaptive_weights_warn_on_decrease(caplog):
     assert any("Iteration decreased" in record.message for record in caplog.records)
 
 
+def test_noise_robust_loss_accepts_amp_prediction_dtype():
+    """AMP may feed fp16 predictions and fp32 targets into the fp32 loss path."""
+    criterion = NoiseRobustLoss(
+        {
+            "lambda_perceptual": 0.0,
+            "lambda_adversarial": 0.0,
+            "lambda_sam": 0.0,
+            "use_adaptive_weights": False,
+        }
+    )
+    pred = torch.rand(1, 31, 4, 4, dtype=torch.float16, requires_grad=True)
+    target = torch.rand(1, 31, 4, 4, dtype=torch.float32)
+
+    loss, components = criterion(pred, target)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(components["reconstruction"])
+    loss.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+
+
 # GATE 2.6: Sinkhorn Gradient Test
 def test_sinkhorn_gradcheck():
     """Test that Sinkhorn backward pass yields finite gradients (Finding 2.6)."""

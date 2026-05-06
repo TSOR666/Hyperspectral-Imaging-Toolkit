@@ -95,3 +95,35 @@ def test_mst_dataset_constant_rgb_no_division_by_zero():
         assert float(np.max(rgb_full)) == 0.0
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_mst_valid_dataset_prefers_validation_directories():
+    root = Path(__file__).resolve().parents[1] / ".tmp_manual_dataset"
+    case_dir = root / f"mst_val_case_{uuid.uuid4().hex}"
+    spec_dir = case_dir / "Test_Spec"
+    rgb_dir = case_dir / "Test_RGB"
+    split_dir = case_dir / "split_txt"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir.mkdir(parents=True, exist_ok=True)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    scene = "ARAD_1K_0901"
+    (split_dir / "valid_list.txt").write_text(f"{scene}\n", encoding="utf-8")
+
+    try:
+        hyper = np.random.rand(31, 4, 4).astype(np.float32)
+        with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
+            mat.create_dataset("cube", data=hyper)
+
+        rgb = np.random.randint(0, 255, (4, 4, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb)
+
+        valid_dataset = MST_ValidDataset(data_root=str(case_dir), bgr2rgb=True)
+        assert len(valid_dataset) == 1
+        rgb_full, hsi_full = valid_dataset[0]
+        assert rgb_full.shape == (3, 4, 4)
+        assert hsi_full.shape == (31, 4, 4)
+        assert np.isfinite(rgb_full).all()
+        assert np.isfinite(hsi_full).all()
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)

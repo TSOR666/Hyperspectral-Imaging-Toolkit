@@ -15,12 +15,13 @@ Memory intensive but follows original MST++ implementation exactly.
 import os
 import logging
 import random
+from pathlib import Path
 import numpy as np
 import h5py
 import cv2
 import torch
 from torch.utils.data import Dataset
-from typing import Any, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from ...constants import (
     ARAD1K_FULL_HEIGHT,
@@ -30,6 +31,41 @@ from ...constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VALID_SPEC_DIRS = (
+    "Valid_Spec",
+    "Validation_Spec",
+    "Val_Spec",
+    "Test_Spec",
+    "Train_Spec",
+)
+_VALID_RGB_DIRS = (
+    "Valid_RGB",
+    "Validation_RGB",
+    "Val_RGB",
+    "Test_RGB",
+    "Train_RGB",
+)
+_RGB_SUFFIXES = (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def _read_split_stems(split_path: Path) -> list[str]:
+    with split_path.open("r", encoding="utf-8") as fin:
+        return [Path(line.strip()).stem for line in fin if line.strip()]
+
+
+def _resolve_dataset_file(
+    data_root: Path,
+    stem: str,
+    subdirs: Sequence[str],
+    suffixes: Sequence[str],
+) -> Optional[Path]:
+    for subdir in subdirs:
+        for suffix in suffixes:
+            candidate = data_root / subdir / f"{stem}{suffix}"
+            if candidate.exists():
+                return candidate
+    return None
 
 
 class MST_TrainDataset(Dataset):
@@ -256,28 +292,33 @@ class MST_ValidDataset(Dataset):
         memory_mode: str = "standard",
         **_: Any,
     ):
+        data_root_path = Path(data_root)
         self.hypers = []
         self.bgrs = []
         self.memory_mode = memory_mode
 
-        # MST++ file paths
-        hyper_data_path = f"{data_root}/Train_Spec/"
-        bgr_data_path = f"{data_root}/Train_RGB/"
-
         # Load validation split
-        with open(f"{data_root}/split_txt/valid_list.txt", "r") as fin:
-            hyper_list = [line.replace("\n", ".mat") for line in fin]
-            bgr_list = [line.replace("mat", "jpg") for line in hyper_list]
+        split_path = data_root_path / "split_txt" / "valid_list.txt"
+        if not split_path.exists():
+            split_path = data_root_path / "split_txt" / "val_list.txt"
+        scene_stems = sorted(_read_split_stems(split_path))
 
-        hyper_list.sort()
-        bgr_list.sort()
-
-        logger.info(f"MST++ Valid Dataset - Loading {len(hyper_list)} scenes")
+        logger.info(f"MST++ Valid Dataset - Loading {len(scene_stems)} scenes")
 
         # Load all validation data into memory
-        for i in range(len(hyper_list)):
-            hyper_path = hyper_data_path + hyper_list[i]
-            if "mat" not in hyper_path:
+        for i, scene_stem in enumerate(scene_stems):
+            hyper_path = _resolve_dataset_file(
+                data_root_path,
+                scene_stem,
+                _VALID_SPEC_DIRS,
+                (".mat",),
+            )
+            if hyper_path is None:
+                logger.warning(
+                    "Failed to load validation %s: .mat file not found in %s",
+                    scene_stem,
+                    ", ".join(_VALID_SPEC_DIRS),
+                )
                 continue
 
             # Load HSI using h5py (MST++ way)
@@ -290,12 +331,24 @@ class MST_ValidDataset(Dataset):
                 continue
 
             # Load RGB using OpenCV (MST++ way)
-            bgr_path = bgr_data_path + bgr_list[i]
-            assert (
-                hyper_list[i].split(".")[0] == bgr_list[i].split(".")[0]
-            ), "Hyper and RGB come from different scenes."
+            bgr_path = _resolve_dataset_file(
+                data_root_path,
+                scene_stem,
+                _VALID_RGB_DIRS,
+                _RGB_SUFFIXES,
+            )
+            if bgr_path is None:
+                logger.warning(
+                    "Failed to load validation %s: RGB file not found in %s",
+                    scene_stem,
+                    ", ".join(_VALID_RGB_DIRS),
+                )
+                continue
 
-            bgr = cv2.imread(bgr_path)
+            bgr = cv2.imread(str(bgr_path))
+            if bgr is None:
+                logger.warning("Failed to read validation RGB image: %s", bgr_path)
+                continue
             if bgr2rgb:
                 bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -320,7 +373,7 @@ class MST_ValidDataset(Dataset):
             self.hypers.append(hyper)
             self.bgrs.append(bgr)
 
-            logger.info(f"Loaded validation scene {i+1}/{len(hyper_list)}")
+            logger.info(f"Loaded validation scene {i+1}/{len(scene_stems)}")
 
         logger.info("MST++ Valid Dataset initialized with %d images", len(self.hypers))
 

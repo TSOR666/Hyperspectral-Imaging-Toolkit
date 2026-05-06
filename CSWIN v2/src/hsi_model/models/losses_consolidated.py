@@ -774,11 +774,15 @@ class NoiseRobustLoss(nn.Module):
         Returns:
             Tuple of (total_loss, loss_components_dict)
         """
-        # Validate dtype and device consistency
-        if pred.dtype != target.dtype:
-            raise TypeError(f"Dtype mismatch: pred={pred.dtype}, target={target.dtype}")
+        # Validate device consistency before any tensor math. Mixed precision
+        # training can legitimately produce fp16 predictions with fp32 targets;
+        # the actual loss terms below are computed in fp32.
         if pred.device != target.device:
             raise RuntimeError(f"Device mismatch: pred={pred.device}, target={target.device}")
+        if not pred.is_floating_point() or not target.is_floating_point():
+            raise TypeError(
+                f"Loss expects floating point tensors: pred={pred.dtype}, target={target.dtype}"
+            )
 
         loss_components = {}
 
