@@ -221,3 +221,97 @@ def test_compute_sam_value_nonzero_on_shifted_spectra():
     target = torch.randn(2, 31, 8, 8).abs()
     val = compute_sam_value(pred, target)
     assert val.item() > 1.0
+
+
+# ---------------------------------------------------------------------------
+# HIGH 4: CSWin relative-position bias is translation-invariant in long_axis
+# mode (the new default). Pre-fix the bias was window-cyclic — diagonals had
+# non-zero std (e.g. 21.9, 20.6, 15.1, ...). Post-fix every diagonal must have
+# std = 0 exactly because ``bias[h, i, j] = f(h, i - j)`` by construction.
+# ---------------------------------------------------------------------------
+
+def test_cswin_long_axis_bias_is_translation_invariant():
+    from hsi_model.models.attention import CSWinAttentionBlock
+
+    s = 4
+    block = CSWinAttentionBlock(
+        dim=8, num_heads=2, split_size=s,
+        config={"cswin_bias_mode": "long_axis", "cswin_max_long_axis": 64},
+    )
+    assert block._bias_mode == "long_axis"
+    # Set deterministic table values so the test does not depend on init RNG.
+    with torch.no_grad():
+        for h in range(block.num_heads):
+            block.relative_position_bias_table_h_long[:, h] = (
+                torch.arange(2 * 64 - 1, dtype=block.relative_position_bias_table_h_long.dtype)
+                + 1000.0 * h
+            )
+
+    bias = block._long_axis_bias(block.relative_position_bias_table_h_long, length=16)
+    assert bias.shape == (block.num_heads, 16, 16)
+
+    # Translation invariance: for every signed offset k = i - j, the slice
+    # bias[h, i, j] with i - j = k is constant.
+    for h in range(block.num_heads):
+        for k in range(-15, 16):
+            diag = torch.diagonal(bias[h], offset=k)
+            assert diag.numel() > 0
+            assert torch.allclose(diag, diag[0].expand_as(diag)), (
+                f"long_axis bias is not translation-invariant on diagonal "
+                f"offset {k} for head {h}: std={diag.std().item():.4f}"
+            )
+
+
+def test_cswin_long_axis_bias_default_mode():
+    """Default mode must be ``long_axis`` so users get the correct bias out
+    of the box without explicit config plumbing."""
+    from hsi_model.models.attention import CSWinAttentionBlock
+
+    block = CSWinAttentionBlock(dim=8, num_heads=2, split_size=4)
+    assert block._bias_mode == "long_axis"
+    assert hasattr(block, "relative_position_bias_table_h_long")
+
+
+def test_cswin_window_cyclic_mode_still_available_for_legacy_checkpoints():
+    """``window_cyclic`` mode kept for back-compat with pre-audit checkpoints."""
+    from hsi_model.models.attention import CSWinAttentionBlock
+
+    block = CSWinAttentionBlock(
+        dim=8, num_heads=2, split_size=4,
+        config={"cswin_bias_mode": "window_cyclic"},
+    )
+    assert block._bias_mode == "window_cyclic"
+    # Legacy params remain trainable in legacy mode.
+    assert block.relative_position_bias_table_h.requires_grad
+    # Long table is NOT allocated in legacy mode (keeps state_dict minimal).
+    assert not hasattr(block, "relative_position_bias_table_h_long")
+
+
+def test_cswin_long_axis_block_forward_shape():
+    """End-to-end: a forward pass through long_axis-mode CSWin produces the
+    correct shape and finite outputs."""
+    from hsi_model.models.attention import CSWinAttentionBlock
+
+    block = CSWinAttentionBlock(
+        dim=8, num_heads=2, split_size=4,
+        config={"cswin_bias_mode": "long_axis", "cswin_max_long_axis": 64},
+    )
+    x = torch.randn(1, 8, 16, 16)
+    out = block(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
+def test_cswin_long_axis_raises_when_input_exceeds_max():
+    from hsi_model.models.attention import CSWinAttentionBlock
+
+    block = CSWinAttentionBlock(
+        dim=8, num_heads=2, split_size=4,
+        config={"cswin_bias_mode": "long_axis", "cswin_max_long_axis": 16},
+    )
+    # 32 > max_long_axis=16 ⇒ must raise rather than silently produce
+    # out-of-bounds index lookups.
+    x = torch.randn(1, 8, 32, 32)
+    import pytest
+    with pytest.raises(ValueError, match="exceeds cswin_max_long_axis"):
+        _ = block(x)

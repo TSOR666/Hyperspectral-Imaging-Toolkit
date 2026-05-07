@@ -28,11 +28,11 @@ Verdict: **Partial** before this patch set. The repo trains and the prior audit 
 | 1 | BLOCKER | `NoiseRobustLoss` returns a graph-disconnected `torch.tensor(1.0, requires_grad=True)` on NaN input — `backward()` is a silent no-op, the trainer's `isfinite(gen_loss)` guard cannot detect it. | **Fixed** |
 | 2 | BLOCKER | Legacy `SinkhornLoss` log-space update has wrong math (`log_a = -ε · LSE(...)`) — returns 0.0023 against a reference 5.62 (3 orders of magnitude off); exported and importable. | **Fixed** |
 | 3 | HIGH | `SinkhornDivergence` self-OT terms use `OT(X, X.detach())` — only half the entropic-debiasing gradient flows; divergence is biased. | **Fixed** |
-| 4 | HIGH | `CSWinAttentionBlock` "relative position" bias along the long axis is **window-cyclic**, not relative — diagonals of the bias matrix have non-zero standard deviation where a true relative-position bias has std=0. | Documented (semantics-affecting; not patched) |
+| 4 | HIGH | `CSWinAttentionBlock` "relative position" bias along the long axis is **window-cyclic**, not relative — diagonals of the bias matrix have non-zero standard deviation where a true relative-position bias has std=0. | **Fixed** (default mode `long_axis`; legacy `window_cyclic` available for back-compat) |
 | 5 | MED | Generator iteration counter drifts: trainer calls `set_iteration(iteration)` *and* the forward auto-increments — counter advances by `accumulation_steps × n_replicas` per optimizer step. | **Fixed** (trainer-managed mode) |
 | 6 | LOW | `compute_sam_value` uses `acos(clamp(., -1+ε, 1-ε))` which floors identical spectra at ~`sqrt(2ε)` rad. Inconsistent with `SAMLoss` (which the prior audit fixed to `atan2`). | **Fixed** |
 
-After the patch set: **80 tests pass, 2 skipped** (was 70+2 before patches; +10 new tests). `smoke_run.py` exits cleanly on CPU.
+After the patch set: **85 tests pass, 2 skipped** (was 70+2 before patches; +15 new tests). `smoke_run.py` exits cleanly on CPU.
 
 ## 3. Risk register with evidence
 
@@ -58,17 +58,20 @@ After the patch set: **80 tests pass, 2 skipped** (was 70+2 before patches; +10 
 - **Fix**: Compute `ot_xx = self._sinkhorn_cost(X, X)` symmetrically (no detach). Cost: the backward graph for the self-OT terms now flows through both `X` arguments — roughly 1.5–2× more autograd memory in the OT backward. Bounded by the existing `max_points` cap (default 1024).
 - **Test**: `test_sinkhorn_divergence_at_diagonal_has_small_gradient` (asserts `||grad|| < 1e-3` at the diagonal vs the pre-fix 7.8e-3).
 
-### HIGH #4 — CSWin "relative position" bias is window-cyclic (NOT patched)
+### HIGH #4 — CSWin relative-position bias along the long axis
 
-- **Evidence**: Probe with deterministic table values `bias_table[i, j, h] = 100*i + 10*j + h`, split_size=4, 16-token long axis:
+- **Pre-fix evidence**: Probe with deterministic table values `bias_table[i, j, h] = 100*i + 10*j + h`, split_size=4, 16-token long axis:
   ```
   expanded[0] first row : [330, 320, 310, 300, 330, 320, 310, 300, ...]   # cycles every s=4
-  expanded[0] diagonal  : [330, 330, ...]                                 # ok
   Per-diagonal std       : 0, 0, 0, 21.9, 20.6, 15.1, 0, 20.0, ...        # mostly non-zero
   ```
-- **Why it matters**: A true relative-position bias along W has the form `bias[i, j] = f(i - j)` and therefore is constant along each diagonal of the (W, W) attention matrix — std = 0 on every offset. The current `_expand_bias` tiles a `(s, s)` intra-window bias across W, so token 0 attends to tokens `0, s, 2s, …` with the **same** bias value. The model can still train (the bias is learned), but it learns a window-cyclic position prior, not a translation-invariant relative-position prior. This is inconsistent with the docstring's claim of being a relative-position bias.
-- **Why it is NOT patched**: Replacing with a true `(2W-1)`-entry table changes the parameterization and likely changes training dynamics; downstream checkpoints would not be loadable. Recommended as a separate, opt-in change with a config flag (e.g. `cswin_bias_mode: 'window_cyclic' | 'relative_long_axis'`) and a fresh training run.
-- **Recommended next step**: Add `cswin_bias_mode` flag and a unit test asserting per-diagonal std = 0 in `relative_long_axis` mode.
+- **Why it matters**: A true relative-position bias along W has the form `bias[i, j] = f(i − j)` and therefore is constant along each diagonal of the (W, W) attention matrix — std = 0 on every offset. The pre-fix `_expand_bias` tiled a `(s, s)` intra-window bias across W, so token 0 attended to tokens `0, s, 2s, …` with the **same** bias value. The model still trained (the bias is learned), but it learned a window-cyclic position prior, not a translation-invariant relative-position prior — inconsistent with the docstring and with the standard CSWin formulation.
+- **Fix**: Added two modes in [attention.py](src/hsi_model/models/attention.py):
+  - `cswin_bias_mode='long_axis'` (**new default**): a true 1-D relative-position table of shape `(2 · max_long_axis − 1, num_heads)` per direction; `_long_axis_bias` materialises a `(num_heads, L, L)` mask indexed by `(i − j) + max_long_axis − 1` so every diagonal is exactly constant. Configured by `cswin_max_long_axis` (default 1024 — covers ARAD-1K's 482×512 with margin). Out-of-range inputs raise `ValueError` rather than silently overflowing the table.
+  - `cswin_bias_mode='window_cyclic'`: the legacy buggy parameterization, kept for loading pre-audit checkpoints. The legacy `(2s−1, 2s−1, num_heads)` parameter remains in `state_dict` (frozen in long_axis mode) so old checkpoints still load with `strict=False` and skip the unused params.
+- **Probe post-fix**: with deterministic table values, `long_axis bias[0] first row : [63., 62., 61., 60., 59., 58., ...]` (linear in offset) and `worst std across all diagonals: 0.0000e+00`.
+- **Tradeoff**: adds `(2 · max_long_axis − 1) · num_heads · 2` extra parameters per CSWin block (~16 KiB at default config) — negligible compared to the rest of the model. Forward cost is unchanged: still a `(L, L)` bias added to the attention logits.
+- **Tests**: `test_cswin_long_axis_bias_is_translation_invariant`, `test_cswin_long_axis_bias_default_mode`, `test_cswin_window_cyclic_mode_still_available_for_legacy_checkpoints`, `test_cswin_long_axis_block_forward_shape`, `test_cswin_long_axis_raises_when_input_exceeds_max`.
 
 ### MED #5 — Generator iteration counter drifts under set_iteration
 
@@ -111,6 +114,10 @@ All in this PR / commit. Files changed:
   - Added `import math`.
 - [src/hsi_model/models/generator_v3.py](src/hsi_model/models/generator_v3.py)
   - Added `_iteration_externally_managed` flag; `set_iteration` flips it; forward skips auto-increment when flagged.
+- [src/hsi_model/models/attention.py](src/hsi_model/models/attention.py)
+  - Added `cswin_bias_mode` (`'long_axis'` default, `'window_cyclic'` legacy) and `cswin_max_long_axis` config keys.
+  - In `long_axis` mode allocates two new 1-D relative-position tables (`relative_position_bias_table_h_long`, `..._v_long`) and added `_long_axis_bias` helper that builds a translation-invariant `(num_heads, L, L)` bias.
+  - `_compute_horizontal_attention` and `_compute_vertical_attention` route to `_long_axis_bias` when `_bias_mode == 'long_axis'`; legacy `_expand_bias` path retained for `window_cyclic`.
 - [src/hsi_model/utils/metrics.py](src/hsi_model/utils/metrics.py)
   - `compute_sam_value`: `acos(clamp)` → `atan2(||orth||, cos)` form.
 
@@ -125,7 +132,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 & '.\.venv-audit\Scripts\python.exe' -m pytest -q
 ```
 
-Result on this commit: `80 passed, 2 skipped`.
+Result on this commit: `85 passed, 2 skipped`.
 
 Reproducing the original probes (pre-fix vs post-fix evidence):
 
@@ -162,6 +169,6 @@ Captured by `probes/bench_audit_v2.py` (5-iteration average):
 
 - **Real ARAD/MST data not available** in this environment: the data-pipeline shape/orientation checks reproduce the prior audit's findings (transpose `[0,2,1]` after h5py read is correct for `.mat v7.3` cubes), but actual scene-level alignment between RGB and HSI is unverified.
 - **GPU not available**: bf16/fp16 stability of the SDPA + symmetric Sinkhorn path remains unverified. Recommended: rerun the test suite on a CUDA host with `mixed_precision=True`.
-- **CSWin bias mathematical defect** is documented but not patched (HIGH #4). If you intend to publish numbers as "CSWin", this is the most important remaining item.
+- **CSWin bias mathematical defect (HIGH #4) — fixed but breaks pre-audit checkpoints by default.** New default mode `cswin_bias_mode='long_axis'` introduces two new parameters per block (`relative_position_bias_table_h_long`, `..._v_long`); checkpoints saved before this commit will fail to load with `strict=True`. Either retrain (recommended) or pass `cswin_bias_mode='window_cyclic'` in the config to load legacy weights as-is. Both modes are covered by tests.
 - **ERGAS metric still missing** from `utils/metrics.py` — flagged by the prior audit; not added in this pass.
 - **`worker_init_fn=lambda`** breaks DataLoader on Windows spawn-mode multiprocessing. Linux fork is unaffected.

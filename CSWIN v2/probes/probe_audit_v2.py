@@ -128,6 +128,34 @@ print(f"  ... (showing first 8 of {len(diag_consistency)})")
 print("Reference: a true (W,W) relative-position bias has std=0 on every "
       "diagonal (translation-invariance).")
 
+# Probe 3b: long_axis mode (the post-fix default) MUST be translation-invariant.
+print("\n--- Post-fix: cswin_bias_mode='long_axis' (default) ---")
+torch.manual_seed(0)
+block_long = CSWinAttentionBlock(
+    dim=8, num_heads=2, split_size=4,
+    config={"cswin_bias_mode": "long_axis", "cswin_max_long_axis": 64,
+            "ckpt_min_tokens": 1, "use_fp16_bias": False, "norm_groups": 8},
+)
+# Set deterministic table values
+with torch.no_grad():
+    for h in range(block_long.num_heads):
+        block_long.relative_position_bias_table_h_long[:, h] = (
+            torch.arange(2 * 64 - 1).float() + 1000.0 * h
+        )
+bias_long = block_long._long_axis_bias(
+    block_long.relative_position_bias_table_h_long, length=16
+)
+print(f"long_axis bias[0] first row : {bias_long[0, 0]}")
+print("Per-diagonal std (must all be 0 for translation invariance):")
+worst = 0.0
+for k in range(-15, 16):
+    d = torch.diagonal(bias_long[0], offset=k)
+    if d.numel() > 1:
+        s_ = d.std().item()
+        worst = max(worst, s_)
+print(f"  worst std across all diagonals: {worst:.4e}  "
+      f"(pre-fix worst was ~21.9)")
+
 
 # ----------------------------------------------------------------------
 # Probe 4: NoiseRobustLoss failure-mode disconnection

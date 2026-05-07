@@ -160,17 +160,75 @@ class CSWinAttentionBlock(nn.Module):
 
         if use_fp16_bias:
             logger.warning("use_fp16_bias=True may reduce attention precision; enable only if memory constrained.")
-        
+
         bias_dtype = torch.float16 if use_fp16_bias else torch.float32
-        
+
+        # ------------------------------------------------------------------
+        # Audit (HIGH) fix: relative-position bias along the long axis.
+        #
+        # Pre-fix: the (2s-1, 2s-1, num_heads) table was sliced down to a
+        # (s, s, num_heads) block and tiled across the long axis (length W
+        # for horizontal, H for vertical). The result is window-cyclic
+        # (bias[i, j] = bias_ss[i mod s, j mod s]), NOT a translation-invariant
+        # relative-position bias. The probe in ``probes/probe_audit_v2.py``
+        # confirmed: per-diagonal std varies (e.g. 0, 21.9, 20.6, 15.1, 0,
+        # 20.0, ...) where a true relative-position bias has std=0 on every
+        # diagonal.
+        #
+        # Post-fix: ``cswin_bias_mode='long_axis'`` (default) gives a 1-D
+        # learnable bias of shape ``(2*max_long_axis-1, num_heads)`` and the
+        # forward path indexes it by the actual relative offset (i-j) along
+        # the long axis. The result is exactly translation-invariant:
+        # bias[h, i, j] = f(h, i-j).
+        # ``cswin_bias_mode='window_cyclic'`` retains the legacy parameter
+        # layout for back-compat with pre-audit checkpoints.
+        # ------------------------------------------------------------------
+        if config is not None:
+            self._bias_mode = str(config.get('cswin_bias_mode', 'long_axis')).lower()
+            self._max_long_axis = int(config.get('cswin_max_long_axis', 1024))
+        else:
+            self._bias_mode = 'long_axis'
+            self._max_long_axis = 1024
+        if self._bias_mode not in ('long_axis', 'window_cyclic'):
+            raise ValueError(
+                f"cswin_bias_mode must be 'long_axis' or 'window_cyclic', got {self._bias_mode!r}"
+            )
+        if self._max_long_axis < split_size:
+            raise ValueError(
+                f"cswin_max_long_axis ({self._max_long_axis}) must be >= split_size ({split_size})"
+            )
+
+        # Legacy (s, s)-block table — kept for ``window_cyclic`` mode and for
+        # back-compat with pre-audit checkpoints. Always allocated so attribute
+        # lookups (and ``state_dict`` keys) remain stable; in long_axis mode it
+        # is unused (frozen) and contributes only ``(2s-1)^2 * num_heads``
+        # parameters which is negligible (≤ a few KiB).
         table_shape = (2 * split_size - 1, 2 * split_size - 1, num_heads)
         self.relative_position_bias_table_h = nn.Parameter(
-            torch.zeros(table_shape, dtype=bias_dtype))
+            torch.zeros(table_shape, dtype=bias_dtype),
+            requires_grad=(self._bias_mode == 'window_cyclic'),
+        )
         self.relative_position_bias_table_v = nn.Parameter(
-            torch.zeros(table_shape, dtype=bias_dtype))
-
+            torch.zeros(table_shape, dtype=bias_dtype),
+            requires_grad=(self._bias_mode == 'window_cyclic'),
+        )
         nn.init.trunc_normal_(self.relative_position_bias_table_h, std=0.02)
         nn.init.trunc_normal_(self.relative_position_bias_table_v, std=0.02)
+
+        # Long-axis relative-position table. ``2*M - 1`` entries cover all
+        # signed offsets in ``[-(M-1), +(M-1)]``. Only allocated in long_axis
+        # mode — keeps ``window_cyclic`` checkpoints loadable without extra
+        # missing-keys.
+        if self._bias_mode == 'long_axis':
+            long_table_shape = (2 * self._max_long_axis - 1, num_heads)
+            self.relative_position_bias_table_h_long = nn.Parameter(
+                torch.zeros(long_table_shape, dtype=bias_dtype)
+            )
+            self.relative_position_bias_table_v_long = nn.Parameter(
+                torch.zeros(long_table_shape, dtype=bias_dtype)
+            )
+            nn.init.trunc_normal_(self.relative_position_bias_table_h_long, std=0.02)
+            nn.init.trunc_normal_(self.relative_position_bias_table_v_long, std=0.02)
 
         idx = torch.arange(split_size, dtype=torch.long)
         relative_index = idx[:, None] - idx[None, :] + split_size - 1  # (s, s)
@@ -183,7 +241,28 @@ class CSWinAttentionBlock(nn.Module):
             persistent=False,
         )
 
-        logger.debug(f"CSWinAttentionBlock initialized with bias dtype: {bias_dtype}")
+        logger.debug(
+            "CSWinAttentionBlock initialized with bias dtype %s, mode %s, max_long_axis %d",
+            bias_dtype, self._bias_mode, self._max_long_axis,
+        )
+
+    def _long_axis_bias(self, table: torch.Tensor, length: int) -> torch.Tensor:
+        """Build a translation-invariant ``(num_heads, length, length)`` bias
+        from a 1-D ``(2*max_long_axis - 1, num_heads)`` table.
+
+        ``bias[h, i, j] = table[(i - j) + max_long_axis - 1, h]``, so on every
+        diagonal ``i - j = const`` the entry is constant — translation
+        invariance.
+        """
+        if length > self._max_long_axis:
+            raise ValueError(
+                f"long-axis length {length} exceeds cswin_max_long_axis "
+                f"{self._max_long_axis}; raise the config value."
+            )
+        idx = torch.arange(length, device=table.device)
+        rel = idx[:, None] - idx[None, :] + self._max_long_axis - 1  # (L, L) int64
+        bias = table[rel]  # (L, L, num_heads)
+        return bias.permute(2, 0, 1).contiguous()
         
     def _expand_bias(self, bias_ss_head: torch.Tensor, tiles_long: int) -> torch.Tensor:
         """
@@ -257,12 +336,20 @@ class CSWinAttentionBlock(nn.Module):
 
         use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
-        rel_cols = self._relative_position_index
-        bias_ss = self.relative_position_bias_table_h[
-            self._relative_center_index, rel_cols, :
-        ]
-        w_windows = padded_W // self.split_size
-        bias = self._expand_bias(bias_ss, tiles_long=w_windows)
+        if self._bias_mode == 'long_axis':
+            # True (W, W) relative-position bias indexed by (i - j) along the
+            # long axis. Diagonals are constant by construction
+            # ⇒ translation-invariant.
+            bias = self._long_axis_bias(
+                self.relative_position_bias_table_h_long, padded_W
+            )
+        else:
+            rel_cols = self._relative_position_index
+            bias_ss = self.relative_position_bias_table_h[
+                self._relative_center_index, rel_cols, :
+            ]
+            w_windows = padded_W // self.split_size
+            bias = self._expand_bias(bias_ss, tiles_long=w_windows)
 
         if use_sdpa:
             # SDPA handles numerical stability internally
@@ -351,12 +438,17 @@ class CSWinAttentionBlock(nn.Module):
 
         use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
-        rel_rows = self._relative_position_index
-        bias_ss = self.relative_position_bias_table_v[
-            rel_rows, self._relative_center_index, :
-        ]
-        h_windows = padded_H // self.split_size
-        bias = self._expand_bias(bias_ss, tiles_long=h_windows)
+        if self._bias_mode == 'long_axis':
+            bias = self._long_axis_bias(
+                self.relative_position_bias_table_v_long, padded_H
+            )
+        else:
+            rel_rows = self._relative_position_index
+            bias_ss = self.relative_position_bias_table_v[
+                rel_rows, self._relative_center_index, :
+            ]
+            h_windows = padded_H // self.split_size
+            bias = self._expand_bias(bias_ss, tiles_long=h_windows)
 
         if use_sdpa:
             # SDPA handles numerical stability internally
