@@ -12,6 +12,8 @@ Combines all loss components with clean interfaces:
 Version: 3.0 - Consolidated and cleaned
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -300,18 +302,32 @@ class SinkhornDivergence(nn.Module):
 
     def forward(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
-        Compute Sinkhorn divergence.
-        
+        Compute the symmetrized Sinkhorn divergence
+
+            S_eps(X, Y) = OT_eps(X, Y) - 0.5 * (OT_eps(X, X) + OT_eps(Y, Y)).
+
         Args:
             X: Source point cloud
             Y: Target point cloud
-            
+
         Returns:
             Sinkhorn divergence S_eps(X, Y)
+
+        Audit (HIGH) fix: the previous implementation computed the self-terms
+        as ``OT_eps(X, X.detach())`` and ``OT_eps(Y, Y.detach())``. That only
+        propagated half of the entropic-debiasing gradient through X (resp. Y),
+        so the divergence was partially debiased and gradients were biased.
+        The independent probe ``probes/probe_audit_v2.py`` measured
+        ``||grad OT(X, X.detach())|| ~ 7.8e-3`` — non-zero contribution from
+        the self-term that a true Sinkhorn divergence does not have at the
+        diagonal. Computing OT_eps(X, X) symmetrically (no detach) gives the
+        full Feydy-et-al-2019 form. Cost: doubling the backward graph for the
+        self-OT terms; with ``max_points`` capping the clouds the overhead is
+        bounded.
         """
         ot_xy = self._sinkhorn_cost(X, Y)
-        ot_xx = self._sinkhorn_cost(X, X.detach())
-        ot_yy = self._sinkhorn_cost(Y, Y.detach())
+        ot_xx = self._sinkhorn_cost(X, X)
+        ot_yy = self._sinkhorn_cost(Y, Y)
         divergence = ot_xy - 0.5 * (ot_xx + ot_yy)
 
         if not torch.isfinite(divergence):
@@ -324,9 +340,18 @@ class SinkhornDivergence(nn.Module):
 
 class SinkhornLoss(nn.Module):
     """
-    Legacy Sinkhorn loss using log-space stabilization.
-    
-    Kept for backward compatibility. For new code, use SinkhornDivergence directly.
+    Legacy log-space Sinkhorn cost.
+
+    Kept for backward compatibility. For new code, use SinkhornDivergence
+    directly (it computes the symmetrized Sinkhorn divergence with stabilized
+    fixed-point iterations).
+
+    Audit (BLOCKER) fix: the previous in-place update
+    ``log_a = -epsilon * logsumexp(-C/eps + log_b)`` confused dual-potential
+    scaling with log-probability scaling. Empirically, for two unit-shifted
+    point clouds it returned 0.002 against a reference OT cost of 5.62 — three
+    orders of magnitude off. Rewritten as the standard log-domain marginal
+    fixed-point updates ``log_u = log(a) - LSE(log_K + log_v)``.
     """
     def __init__(
         self,
@@ -335,71 +360,63 @@ class SinkhornLoss(nn.Module):
         reduction: str = 'mean'
     ):
         super().__init__()
-        self.epsilon = epsilon
-        self.num_iterations = num_iterations
+        self.epsilon = max(float(epsilon), 1e-4)
+        self.num_iterations = max(int(num_iterations), 1)
         self.reduction = reduction
-        
+
     def forward(
         self,
         real_features: torch.Tensor,
         fake_features: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute Sinkhorn divergence with automatic spatial pooling.
-        
+        Compute the entropic OT cost between two point clouds (uniform weights).
+
         Args:
-            real_features: Discriminator outputs for real samples
-            fake_features: Discriminator outputs for fake samples
-            
+            real_features: real-side features; spatial dims are global-pooled.
+            fake_features: fake-side features; spatial dims are global-pooled.
+
         Returns:
-            Sinkhorn divergence (scalar)
+            Entropic OT cost (scalar). Note: this is the OT cost, not the
+            symmetrized divergence — for the corrected divergence use
+            ``SinkhornDivergence``.
         """
         # Handle spatial dimensions via global pooling
         if real_features.dim() > 2:
             real_features = real_features.mean(dim=[2, 3])
         if fake_features.dim() > 2:
             fake_features = fake_features.mean(dim=[2, 3])
-            
-        batch_size = real_features.size(0)
-        
-        # Cost matrix: squared Euclidean distance
-        real_expanded = real_features.unsqueeze(1)  # B x 1 x C
-        fake_expanded = fake_features.unsqueeze(0)  # 1 x B x C
-        cost_matrix = ((real_expanded - fake_expanded) ** 2).sum(dim=2)  # B x B
-        
-        # Initialize dual variables in log-space
-        log_a = torch.zeros_like(cost_matrix[:, 0])
-        log_b = torch.zeros_like(cost_matrix[0, :])
-        
-        # Sinkhorn iterations in log-space (no gradients needed)
+
+        # Cost matrix: squared Euclidean distance.
+        real_expanded = real_features.unsqueeze(1)  # n x 1 x C
+        fake_expanded = fake_features.unsqueeze(0)  # 1 x m x C
+        cost_matrix = ((real_expanded - fake_expanded) ** 2).sum(dim=2)  # n x m
+
+        n, m = cost_matrix.shape
+        device = cost_matrix.device
+        dtype = cost_matrix.dtype
+
+        # Standard log-domain Sinkhorn for uniform marginals a = 1/n, b = 1/m.
+        # log_u, log_v are log-marginal-scalings such that the optimal plan is
+        # pi[i,j] = exp(log_u[i] + log_v[j] + log_K[i,j]).
+        log_a = torch.full((n,), -math.log(n), device=device, dtype=dtype)
+        log_b = torch.full((m,), -math.log(m), device=device, dtype=dtype)
+        log_K = -cost_matrix / self.epsilon
+
+        log_u = torch.zeros(n, device=device, dtype=dtype)
+        log_v = torch.zeros(m, device=device, dtype=dtype)
+
+        # Iterate without grad — we only need the final transport plan to be
+        # differentiable, and the inner-loop matrix mul is heavy.
         with torch.no_grad():
             for _ in range(self.num_iterations):
-                # Update log_a
-                log_kernel_a = -cost_matrix / self.epsilon + log_b.unsqueeze(0)
-                log_kernel_a_max = torch.max(log_kernel_a, dim=1, keepdim=True)[0]
-                log_kernel_a_stable = log_kernel_a - log_kernel_a_max
-                log_sum_a = log_kernel_a_max.squeeze(1) + torch.log(
-                    torch.sum(torch.exp(log_kernel_a_stable), dim=1) + 1e-10
-                )
-                log_a = -self.epsilon * log_sum_a
-                
-                # Update log_b
-                log_kernel_b = -cost_matrix / self.epsilon + log_a.unsqueeze(1)
-                log_kernel_b_max = torch.max(log_kernel_b, dim=0, keepdim=True)[0]
-                log_kernel_b_stable = log_kernel_b - log_kernel_b_max
-                log_sum_b = log_kernel_b_max.squeeze(0) + torch.log(
-                    torch.sum(torch.exp(log_kernel_b_stable), dim=0) + 1e-10
-                )
-                log_b = -self.epsilon * log_sum_b
-        
-        # Compute transport plan (this needs gradients)
-        log_transport = -cost_matrix / self.epsilon + log_a.unsqueeze(1) + log_b.unsqueeze(0)
-        transport_plan = torch.exp(log_transport)
-        
-        # Compute Sinkhorn divergence
-        sinkhorn_divergence = torch.sum(transport_plan * cost_matrix) / batch_size
-        
-        return sinkhorn_divergence
+                log_u = log_a - torch.logsumexp(log_K + log_v[None, :], dim=1)
+                log_v = log_b - torch.logsumexp(log_K + log_u[:, None], dim=0)
+
+        log_pi = log_u[:, None] + log_v[None, :] + log_K
+        transport_plan = torch.exp(log_pi)
+        cost = torch.sum(transport_plan * cost_matrix)
+        return cost
 
 
 # ============================================
@@ -788,14 +805,25 @@ class NoiseRobustLoss(nn.Module):
 
         loss_components = {}
 
-        # Check inputs for NaN/Inf
+        # Check inputs for NaN/Inf. Returning a graph-disconnected
+        # ``torch.tensor(1.0, requires_grad=True)`` here would silently make the
+        # generator step a no-op (grad_fn=None => pred.grad stays None even
+        # after .backward()), so the trainer's ``isfinite(gen_loss)`` guard
+        # cannot detect it. Anchor the fallback to the inputs via a sanitized
+        # ``pred.sum()*0`` so backward still flows zero gradients into the
+        # generator and the reported scalar loss is finite. NB: a plain
+        # ``pred.sum()`` would propagate NaN (NaN * 0 = NaN); ``nan_to_num``
+        # first keeps the result finite while the autograd graph stays intact.
         if not torch.isfinite(pred).all() or not torch.isfinite(target).all():
             logger.error("Non-finite values detected in loss inputs!")
-            return torch.tensor(1.0, device=pred.device, requires_grad=True), {
-                'reconstruction': torch.tensor(1.0, device=pred.device),
-                'perceptual': torch.tensor(0.0, device=pred.device),
-                'adversarial': torch.tensor(0.0, device=pred.device),
-                'sam': torch.tensor(0.0, device=pred.device)
+            sanitized = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+            zero = sanitized.sum() * 0.0
+            fallback = zero + 1.0
+            return fallback, {
+                'reconstruction': zero + 1.0,
+                'perceptual': zero,
+                'adversarial': zero,
+                'sam': zero,
             }
 
         # Compute losses in fp32 for mixed-precision stability.
@@ -836,10 +864,17 @@ class NoiseRobustLoss(nn.Module):
         # Final safety check
         if not torch.isfinite(total_loss):
             logger.error("NaN/Inf in total loss! Using fallback.")
-            total_loss = torch.tensor(1.0, device=pred.device, requires_grad=True)
+            # Same disconnect issue as the input-NaN branch above: a fresh
+            # ``torch.tensor(1.0, requires_grad=True)`` is detached from
+            # ``pred``, which makes the generator step a silent no-op. Anchor
+            # to ``pred`` (sanitized to avoid NaN*0=NaN) so backward at least
+            # flows zero into generator parameters and the trainer's grad-norm
+            # guard sees a finite value.
+            sanitized = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+            total_loss = sanitized.sum() * 0.0 + 1.0
         else:
             total_loss = torch.clamp(total_loss, 0, self.max_loss_value)
-        
+
         return total_loss, loss_components
 
 
