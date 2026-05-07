@@ -486,36 +486,36 @@ def _create_window(window_size: int, channel: int, sigma: float) -> torch.Tensor
 def compute_sam_value(pred: torch.Tensor, target: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     """
     Compute Spectral Angle Mapper (SAM) value between predicted and target HSI.
-    Numerically stable implementation.
-    
+
     Args:
         pred: Predicted HSI tensor of shape (B, C, H, W)
         target: Target HSI tensor of shape (B, C, H, W)
-        epsilon: Small value for numerical stability
-    
+        epsilon: Small value for numerical stability of L2-normalization
+
     Returns:
         Mean SAM value (in degrees)
+
+    Audit (LOW) fix: the previous ``acos(clamp(., -1+eps, 1-eps))`` form had a
+    nonzero floor for identical spectra (~ ``sqrt(2*eps)`` rad), so PSNR-style
+    "perfect" reconstructions still reported a small positive SAM. Switched to
+    the ``atan2(||u - (u.v)v||, u.v)`` formulation used by ``SAMLoss``: it
+    returns exactly 0 for identical unit-normalized spectra and has well
+    behaved gradients near cos = 1.
     """
-    # Normalize the spectral vectors
     pred_norm = F.normalize(pred, dim=1, eps=epsilon)
     target_norm = F.normalize(target, dim=1, eps=epsilon)
-    
-    # Compute dot product
-    dot_product = torch.sum(pred_norm * target_norm, dim=1)
-    
-    # Improved numerical stability
-    # Clamp to slightly inside [-1, 1] to avoid arccos issues
-    dot_product = torch.clamp(dot_product, -1.0 + epsilon, 1.0 - epsilon)
-    
-    # Compute angle in radians
-    sam_rad = torch.acos(dot_product)
-    
-    # Handle any remaining NaN values (shouldn't happen with proper clamping)
+
+    cosine_sim = torch.sum(pred_norm * target_norm, dim=1)
+    cosine_sim = torch.clamp(cosine_sim, -1.0, 1.0)
+
+    orthogonal = pred_norm - target_norm * cosine_sim.unsqueeze(1)
+    sine_sim = torch.linalg.vector_norm(orthogonal, dim=1)
+    sam_rad = torch.atan2(sine_sim, cosine_sim)
+    sam_rad = torch.clamp(sam_rad, min=0.0, max=float(torch.pi))
+
     sam_rad = torch.where(torch.isnan(sam_rad), torch.zeros_like(sam_rad), sam_rad)
-    
-    # Convert to degrees and compute mean
+
     sam_deg = sam_rad * 180.0 / torch.pi
-    
     return torch.mean(sam_deg)
 
 

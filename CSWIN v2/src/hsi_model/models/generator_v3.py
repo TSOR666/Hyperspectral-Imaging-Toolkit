@@ -321,6 +321,11 @@ class NoiseRobustCSWinGenerator(nn.Module):
         self.clamp_after_iters = config.get("clamp_after_iters", 0)  # Can disable clamping after warmup
         self.register_buffer('iteration_count', torch.zeros(1, dtype=torch.long))
         self._iteration_count: int = 0
+        # When the trainer calls ``set_iteration`` we switch off the
+        # forward-pass auto-increment so the two paths do not double-count.
+        # Auto-increment then only fires for callers that never call
+        # ``set_iteration`` (legacy/test scripts).
+        self._iteration_externally_managed: bool = False
         
         # Initial denoising
         self.denoising = nn.Sequential(
@@ -389,23 +394,27 @@ class NoiseRobustCSWinGenerator(nn.Module):
         The trainer should call this once per optimizer step so that
         delayed-sigmoid and clamp-after-iters thresholds key off true
         optimizer-step count, not per-forward calls.
-        See ``forward`` for the auto-increment fallback.
+
+        Calling this also flips ``_iteration_externally_managed=True`` so the
+        forward-pass auto-increment does not fight the trainer's value.
+        See ``forward`` for the legacy auto-increment fallback.
         """
         iteration = max(int(iteration), 0)
         self._iteration_count = iteration
+        self._iteration_externally_managed = True
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             with torch.no_grad():
                 self.iteration_count.fill_(iteration)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Auto-increment fallback for callers that do not invoke
-        # ``set_iteration`` (legacy behavior, kept for backwards compat).
-        # NOTE: this counts forwards-with-grad, not optimizer steps. Under
-        # gradient accumulation or DDP the count drifts by an
-        # accumulation/replica-dependent factor — pass the canonical step
-        # via ``set_iteration`` from the trainer when reproducibility of the
-        # delayed_sigmoid / clamp_after_iters cutovers matters.
-        if self.training:
+        # ``set_iteration``. Once ``set_iteration`` has been called the
+        # trainer is treated as the source of truth and forward stops
+        # incrementing — otherwise the two paths double-counted (probe v2
+        # showed counter advancing by 2 per optimizer step under
+        # accumulation_steps=2 even though the trainer set the value at the
+        # top of every loop iteration).
+        if self.training and not self._iteration_externally_managed:
             self._iteration_count += 1
             if not torch.jit.is_scripting() and not torch.jit.is_tracing():
                 with torch.no_grad():
