@@ -48,6 +48,19 @@ def test_sam_loss_finite():
     assert 0.0 <= value.item() <= 3.2
 
 
+def test_sam_loss_identical_spectra_zero_and_finite_grad():
+    """Identical spectra should be the true SAM optimum, not a positive floor."""
+    loss = SAMLoss()
+    pred = torch.rand(1, 31, 4, 4, requires_grad=True)
+    value = loss(pred, pred)
+    assert torch.isfinite(value)
+    assert value.item() == pytest.approx(0.0, abs=1e-7)
+
+    value.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+
+
 def test_adaptive_weights_warn_on_decrease(caplog):
     loss = NoiseRobustLoss({"use_adaptive_weights": True})
     with caplog.at_level(logging.WARNING):

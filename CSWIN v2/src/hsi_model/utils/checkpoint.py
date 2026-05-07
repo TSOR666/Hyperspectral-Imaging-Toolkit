@@ -128,7 +128,8 @@ def load_checkpoint(
     optimizers: Optional[Dict[str, torch.optim.Optimizer]] = None,
     scalers: Optional[Dict[str, GradScaler]] = None,
     checkpoint_path: str = "", 
-    device: torch.device = torch.device("cpu")
+    device: torch.device = torch.device("cpu"),
+    strict: bool = True,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Load model weights from checkpoint with support for resuming training.
@@ -139,6 +140,7 @@ def load_checkpoint(
         scalers: Optional dictionary of gradient scalers to load states into
         checkpoint_path: Path to checkpoint file
         device: Device to load model on
+        strict: Require an exact model key match after DDP prefix adaptation
         
     Returns:
         Tuple of (loaded_model, checkpoint_info_dict)
@@ -154,7 +156,7 @@ def load_checkpoint(
         
         # Handle DDP module prefix mismatch
         is_model_ddp = isinstance(model, DDP)
-        state_dict = checkpoint.get('model_state_dict', {})
+        state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', {}))
         
         if not state_dict:
             logger.warning(f"No model state dict found in checkpoint: {checkpoint_path}")
@@ -173,11 +175,13 @@ def load_checkpoint(
                 state_dict = {f"module.{k}": v for k, v in state_dict.items()}
                 logger.info("Added 'module.' prefix to checkpoint keys")
         
-        # Load the state dict with strict=False to handle partial loading
+        # Load the state dict. Default to strict matching so incompatible
+        # architecture/config changes fail loudly instead of silently producing
+        # a partially initialized model.
         if is_model_ddp:
-            missing_keys, unexpected_keys = model.module.load_state_dict(state_dict, strict=False)
+            missing_keys, unexpected_keys = model.module.load_state_dict(state_dict, strict=strict)
         else:
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
         
         if missing_keys:
             logger.warning(f"Missing keys in checkpoint: {missing_keys}")
@@ -187,9 +191,14 @@ def load_checkpoint(
         # If optimizers provided, load their states for resuming training
         if optimizers is not None:
             for name, optimizer in optimizers.items():
-                if optimizer is not None and f'{name}_state_dict' in checkpoint:
+                optimizer_key = None
+                for candidate in (f'{name}_state_dict', name):
+                    if candidate in checkpoint:
+                        optimizer_key = candidate
+                        break
+                if optimizer is not None and optimizer_key is not None:
                     try:
-                        optimizer.load_state_dict(checkpoint[f'{name}_state_dict'])
+                        optimizer.load_state_dict(checkpoint[optimizer_key])
                         logger.info(f"Loaded optimizer state for {name}")
                     except Exception as e:
                         logger.warning(f"Failed to load optimizer state for {name}: {str(e)}")
@@ -197,9 +206,14 @@ def load_checkpoint(
         # If scalers provided, load their states
         if scalers is not None:
             for name, scaler in scalers.items():
-                if scaler is not None and f'{name}_scaler_state_dict' in checkpoint:
+                scaler_key = None
+                for candidate in (f'{name}_scaler_state_dict', name):
+                    if candidate in checkpoint:
+                        scaler_key = candidate
+                        break
+                if scaler is not None and scaler_key is not None:
                     try:
-                        scaler.load_state_dict(checkpoint[f'{name}_scaler_state_dict'])
+                        scaler.load_state_dict(checkpoint[scaler_key])
                         logger.info(f"Loaded scaler state for {name}")
                     except Exception as e:
                         logger.warning(f"Failed to load scaler state for {name}: {str(e)}")
@@ -207,9 +221,11 @@ def load_checkpoint(
         # Extract training info for resuming
         training_info = {
             'epoch': checkpoint.get('epoch', 0),
+            'iteration': checkpoint.get('iteration', checkpoint.get('iter', 0)),
             'resolution': checkpoint.get('resolution', 0),
             'config': checkpoint.get('config', None),
-            'val_metrics': checkpoint.get('val_metrics', None)
+            'val_metrics': checkpoint.get('val_metrics', None),
+            'best_mrae': checkpoint.get('best_mrae', None),
         }
         
         logger.info(f"Successfully loaded checkpoint from {checkpoint_path} (epoch {training_info['epoch']})")
@@ -217,6 +233,8 @@ def load_checkpoint(
         
     except Exception as e:
         logger.error(f"Failed to load checkpoint {checkpoint_path}: {str(e)}")
+        if strict:
+            raise
         return model, {}
 
 

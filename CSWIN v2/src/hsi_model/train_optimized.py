@@ -68,7 +68,10 @@ if str(_SRC_DIR) not in sys.path:
 
 # Local imports
 from hsi_model.models import NoiseRobustCSWinModel
-from hsi_model.models.losses_consolidated import NoiseRobustLoss
+from hsi_model.models.losses_consolidated import (
+    ComputeSinkhornDiscriminatorLoss,
+    NoiseRobustLoss,
+)
 from hsi_model.constants import (
     DEFAULT_DATA_DIR,
     DEFAULT_CHECKPOINT_DIR,
@@ -205,7 +208,13 @@ def validate_mst_style(
                         disc_real = model.discriminator(rgb_tensor, hsi_tensor)
                         disc_fake = model.discriminator(rgb_tensor, pred_hsi)
 
-                    gen_loss, loss_components = criterion(pred_hsi, hsi_tensor, disc_real, disc_fake)
+                    gen_loss, loss_components = criterion(
+                        pred_hsi,
+                        hsi_tensor,
+                        disc_real,
+                        disc_fake,
+                        current_iteration=iteration,
+                    )
 
                 # Accumulate on GPU (no .item() calls inside loop!)
                 total_gen_loss += gen_loss
@@ -249,6 +258,7 @@ def train_mst_gan_optimized(
     optimizers: Dict[str, torch.optim.Optimizer],
     schedulers: Dict[str, torch.optim.lr_scheduler._LRScheduler],
     criterion: nn.Module,
+    disc_criterion: nn.Module,
     scalers: Dict[str, GradScaler],
     config: Dict[str, Any],
     device: torch.device,
@@ -352,6 +362,9 @@ def train_mst_gan_optimized(
             
             lr_g = optimizer_g.param_groups[0]['lr']
             lr_d = optimizer_d.param_groups[0]['lr']
+
+            if hasattr(generator, "set_iteration"):
+                generator.set_iteration(iteration)
             
             # ========== Train Generator (v3.0 OPTIMIZED) ==========
             optimizer_g.zero_grad(set_to_none=True)
@@ -379,7 +392,8 @@ def train_mst_gan_optimized(
                     fake_hsi,
                     hsi_tensor,
                     disc_real_for_g,
-                    disc_fake_for_g
+                    disc_fake_for_g,
+                    current_iteration=iteration,
                 )
 
             if not torch.isfinite(gen_loss):
@@ -412,15 +426,7 @@ def train_mst_gan_optimized(
                     optimizer_d.zero_grad(set_to_none=True)
                     continue
 
-                real_logits = real_pred.float()
-                fake_logits = fake_pred.float()
-                real_loss = nn.functional.binary_cross_entropy_with_logits(
-                    real_logits, torch.ones_like(real_logits)
-                )
-                fake_loss = nn.functional.binary_cross_entropy_with_logits(
-                    fake_logits, torch.zeros_like(fake_logits)
-                )
-                disc_loss = (real_loss + fake_loss) * 0.5
+                disc_loss = disc_criterion(real_pred, fake_pred)
 
             if not torch.isfinite(disc_loss):
                 logger.warning("Non-finite discriminator loss at iteration %s; skipping D step", iteration)
@@ -640,6 +646,7 @@ def main(config: DictConfig) -> None:
         
         # Create loss function
         criterion = NoiseRobustLoss(cfg)
+        disc_criterion = ComputeSinkhornDiscriminatorLoss(criterion)
         
         # Wrap with DDP
         if is_distributed:
@@ -657,6 +664,7 @@ def main(config: DictConfig) -> None:
             optimizers,
             schedulers,
             criterion,
+            disc_criterion,
             scalers,
             cfg,
             device,

@@ -47,6 +47,34 @@ For the memory-optimized pipeline, run:
 python src/hsi_model/train_optimized.py --config-name config
 ```
 
+### GPU preflight gate
+
+To make training start only after required GPU checks pass, launch through the
+preflight runner:
+
+```bash
+python gpu_preflight_train.py --trainer sinkhorn -- --config-name config data_dir=/datasets/ARAD_1K
+```
+
+The runner prints one PASS/FAIL row per item (CUDA visibility, free memory,
+data paths, model allocation, finite forward pass, Sinkhorn train step, AMP
+step, and metrics). If any row fails, training is not started. If every row is
+green, the console prints `All GPU preflight checks passed.` followed by
+`Training is starting now:` and then starts the selected training script.
+
+Useful options:
+
+```bash
+# Memory-optimized trainer after the same gate
+python gpu_preflight_train.py --trainer optimized -- --config-name config data_dir=/datasets/ARAD_1K
+
+# Multi-GPU launch after a single-device preflight
+python gpu_preflight_train.py --nproc-per-node 4 -- --config-name config data_dir=/datasets/ARAD_1K
+
+# Check command and results without starting training
+python gpu_preflight_train.py --dry-run -- --config-name config data_dir=/datasets/ARAD_1K
+```
+
 ### Distributed training
 
 Both drivers support multi-GPU setups via PyTorch Distributed:
