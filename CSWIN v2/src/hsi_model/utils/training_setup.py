@@ -46,18 +46,37 @@ def setup_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     data_dir = Path(config.get("data_dir", DEFAULT_DATA_DIR))
     checkpoint_dir = Path(config.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR))
     log_dir = Path(config.get("log_dir", DEFAULT_LOG_DIR))
+    dataset_source = str(
+        config.get("dataset_source", config.get("data_source", "mst"))
+    ).strip().lower()
 
-    if not data_dir.exists():
-        raise FileNotFoundError(
-            f"Dataset directory not found: {data_dir.resolve()} "
-            "(set `data_dir` in the Hydra config or environment)."
-        )
+    uses_huggingface = dataset_source in {"huggingface", "hf", "hf_arad", "arad_hsdb"}
 
-    required_dirs = ["Train_RGB", "Train_Spec", "Test_RGB", "split_txt"]
-    for req_dir in required_dirs:
-        full_path = data_dir / req_dir
-        if not full_path.exists():
-            raise FileNotFoundError(f"Required MST++ directory not found: {full_path}")
+    if not uses_huggingface:
+        if not data_dir.exists():
+            raise FileNotFoundError(
+                f"Dataset directory not found: {data_dir.resolve()} "
+                "(set `data_dir` in the Hydra config or environment)."
+            )
+
+        required_dirs = ["Train_RGB", "Train_Spec", "split_txt"]
+        for req_dir in required_dirs:
+            full_path = data_dir / req_dir
+            if not full_path.exists():
+                raise FileNotFoundError(f"Required MST++ directory not found: {full_path}")
+
+        valid_rgb_dirs = ("Valid_RGB", "Validation_RGB", "Val_RGB", "Test_RGB", "Train_RGB")
+        valid_spec_dirs = ("Valid_Spec", "Validation_Spec", "Val_Spec", "Test_Spec", "Train_Spec")
+        if not any((data_dir / name).exists() for name in valid_rgb_dirs):
+            raise FileNotFoundError(
+                f"Required validation RGB directory not found under {data_dir}; "
+                f"expected one of {valid_rgb_dirs}"
+            )
+        if not any((data_dir / name).exists() for name in valid_spec_dirs):
+            raise FileNotFoundError(
+                f"Required validation spectral directory not found under {data_dir}; "
+                f"expected one of {valid_spec_dirs}"
+            )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +85,10 @@ def setup_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     config["checkpoint_dir"] = str(checkpoint_dir)
     config["log_dir"] = str(log_dir)
 
-    setup_logger.info("Data directory: %s", data_dir)
+    if uses_huggingface:
+        setup_logger.info("Dataset source: %s (local data_dir validation skipped)", dataset_source)
+    else:
+        setup_logger.info("Data directory: %s", data_dir)
     setup_logger.info("Checkpoint directory: %s", checkpoint_dir)
     setup_logger.info("Log directory: %s", log_dir)
 

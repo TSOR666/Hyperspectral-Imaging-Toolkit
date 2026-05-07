@@ -418,7 +418,14 @@ class CSWinAttentionBlock(nn.Module):
         pad_w = (self.split_size - W % self.split_size) % self.split_size
         
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
+            # Reflect padding matches the documented symmetric-padding path and
+            # avoids injecting artificial zero borders into stripe attention.
+            # Tiny feature maps can be smaller than the required reflect pad;
+            # replicate padding is the nearest safe fallback for those cases.
+            pad_mode = "reflect"
+            if (pad_h > 0 and H <= pad_h) or (pad_w > 0 and W <= pad_w):
+                pad_mode = "replicate"
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
             padded_H, padded_W = H + pad_h, W + pad_w
         else:
             padded_H, padded_W = H, W

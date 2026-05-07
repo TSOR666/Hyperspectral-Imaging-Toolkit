@@ -29,7 +29,6 @@ from ..constants import (
     SINKHORN_EPS_STABILITY,
     EPSILON_LARGE,
     EPSILON_SMALL,
-    SAM_COSINE_CLAMP,
     DEFAULT_LAMBDA_REC,
     DEFAULT_LAMBDA_PERCEPTUAL,
     DEFAULT_LAMBDA_ADVERSARIAL,
@@ -160,17 +159,20 @@ class SAMLoss(nn.Module):
         
         # Compute cosine similarity
         cosine_sim = torch.sum(pred_norm * target_norm, dim=1)
+
+        # Use atan2(||u - (u.v)v||, u.v) instead of acos(u.v).  This returns
+        # exactly zero for identical spectra, avoids the old 0.999 clamp floor,
+        # and has much friendlier gradients near cos(theta)=1.
+        cosine_sim = torch.clamp(cosine_sim, -1.0, 1.0)
+        orthogonal = pred_norm - target_norm * cosine_sim.unsqueeze(1)
+        sine_sim = torch.linalg.vector_norm(orthogonal, dim=1)
+        angles = torch.atan2(sine_sim, cosine_sim)
+        angles = torch.clamp(angles, min=0.0, max=torch.pi)
         
-        # Clamp to prevent numerical issues in arccos
-        cosine_sim = torch.clamp(cosine_sim, -SAM_COSINE_CLAMP, SAM_COSINE_CLAMP)
-        
-        # Compute angle in radians
-        angles = torch.acos(cosine_sim)
-        
-        # Check for NaN
-        if torch.isnan(angles).any():
-            logger.warning("NaN detected in SAM loss, replacing with zeros")
-            angles = torch.where(torch.isnan(angles), torch.zeros_like(angles), angles)
+        # Check for NaN/Inf
+        if not torch.isfinite(angles).all():
+            logger.warning("Non-finite SAM loss angles detected, replacing with zeros")
+            angles = torch.where(torch.isfinite(angles), angles, torch.zeros_like(angles))
         
         return angles.mean()
 

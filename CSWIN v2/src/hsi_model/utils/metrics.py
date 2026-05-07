@@ -626,19 +626,28 @@ def compute_metrics(
         Dictionary of metrics
     """
     with torch.no_grad():
+        # Metrics must run in float32: pytorch_msssim's cached gaussian window is
+        # fp32, so passing fp16 inputs (e.g. autocast outputs from validation)
+        # raises "expected scalar type Float but found Half". PSNR/MSE/log are
+        # also precision-sensitive enough that fp32 is the correct choice.
+        if pred.dtype != torch.float32:
+            pred = pred.float()
+        if target.dtype != torch.float32:
+            target = target.float()
+
         metrics = {
             'psnr': compute_psnr(pred, target).item(),
             'mrae': compute_mrae(pred, target).item(),
             'rmse': compute_rmse(pred, target).item(),
         }
-        
+
         if compute_all:
             metrics.update({
                 'ssim': compute_ssim(pred, target).item(),
                 'sam': compute_sam_value(pred, target).item(),
                 'mae': compute_mae(pred, target).item(),
             })
-    
+
     return metrics
 
 

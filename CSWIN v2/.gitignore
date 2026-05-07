@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.tmp_manual_dataset/pytest_temp/
+.uv-cache/

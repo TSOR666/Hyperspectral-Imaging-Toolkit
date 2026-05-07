@@ -190,10 +190,12 @@ class DualTransformerBlock(nn.Module):
         self.norm3 = adaptive_group_norm(channels, base_groups)
         
         # Wrap attention modules with NaN protection
-        spectral_attn = EfficientSpectralAttention(channels, num_heads=num_heads)
+        spectral_attn = EfficientSpectralAttention(channels, num_heads=num_heads, config=config)
         self.spectral_attn = NaNSafeAttention(spectral_attn)
         
-        spatial_attn = CSWinAttentionBlock(channels, num_heads=num_heads, split_size=split_size)
+        spatial_attn = CSWinAttentionBlock(
+            channels, num_heads=num_heads, split_size=split_size, config=config
+        )
         self.spatial_attn = NaNSafeAttention(spatial_attn)
         
         self.ffn = FeedForwardNetwork(channels, config=config)

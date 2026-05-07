@@ -253,3 +253,31 @@ def test_generator_set_iteration_persists_buffer():
     gen.set_iteration(12345)
     assert int(gen.iteration_count.item()) == 12345
     assert gen._iteration_count == 12345
+
+
+def test_generator_propagates_attention_config():
+    """Nested attention blocks must honor memory/precision config fields."""
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 16,
+        "split_sizes": [2, 2, 2],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "output_activation": "none",
+        "ckpt_min_tokens": 1,
+        "use_fp16_bias": True,
+    }
+    gen = NoiseRobustCSWinGenerator(config)
+    cswin_blocks = [
+        module.attention
+        for module in gen.modules()
+        if module.__class__.__name__ == "NaNSafeAttention"
+        and module.attention.__class__.__name__ == "CSWinAttentionBlock"
+    ]
+    assert cswin_blocks
+    assert all(block._ckpt_min_tokens == 1 for block in cswin_blocks)
+    assert all(
+        block.relative_position_bias_table_h.dtype == torch.float16
+        for block in cswin_blocks
+    )
