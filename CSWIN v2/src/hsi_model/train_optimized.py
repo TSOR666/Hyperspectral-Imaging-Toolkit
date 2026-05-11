@@ -148,6 +148,14 @@ def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
         param.requires_grad_(requires_grad)
 
 
+def first_nonfinite_parameter_name(module: nn.Module) -> Optional[str]:
+    """Return the first parameter name containing NaN/Inf, if any."""
+    for name, param in module.named_parameters():
+        if not torch.isfinite(param.detach()).all():
+            return name
+    return None
+
+
 def validate_mst_style(
     model: nn.Module,
     val_dataset: Any,
@@ -337,6 +345,10 @@ def train_mst_gan_optimized(
     current_epoch = 0
     generator = model.module.generator if hasattr(model, "module") else model.generator
     discriminator = model.module.discriminator if hasattr(model, "module") else model.discriminator
+    consecutive_nonfinite_generator_outputs = 0
+    max_consecutive_nonfinite_generator_outputs = int(
+        config.get("max_consecutive_nonfinite_generator_outputs", 3)
+    )
     
     # Main training loop
     while iteration < total_iteration:
@@ -373,9 +385,34 @@ def train_mst_gan_optimized(
                 fake_hsi = generator(rgb_tensor)
 
             if not torch.isfinite(fake_hsi).all():
-                logger.warning("Non-finite generator output at iteration %s; skipping batch", iteration)
+                consecutive_nonfinite_generator_outputs += 1
+                logger.warning(
+                    "Non-finite generator output at iteration %s; retry %s/%s",
+                    iteration,
+                    consecutive_nonfinite_generator_outputs,
+                    max_consecutive_nonfinite_generator_outputs,
+                )
                 optimizer_g.zero_grad(set_to_none=True)
+                bad_param = first_nonfinite_parameter_name(generator)
+                if bad_param is not None:
+                    raise FloatingPointError(
+                        "Generator parameter contains NaN/Inf after a non-finite "
+                        f"forward pass: {bad_param}. Resume from the last finite "
+                        "checkpoint with a lower generator LR or disable mixed_precision."
+                    )
+                if (
+                    max_consecutive_nonfinite_generator_outputs > 0
+                    and consecutive_nonfinite_generator_outputs
+                    >= max_consecutive_nonfinite_generator_outputs
+                ):
+                    raise FloatingPointError(
+                        "Generator produced non-finite outputs on "
+                        f"{consecutive_nonfinite_generator_outputs} consecutive "
+                        f"batches at iteration {iteration}. Stopping instead of "
+                        "retrying the same iteration indefinitely."
+                    )
                 continue
+            consecutive_nonfinite_generator_outputs = 0
 
             set_requires_grad(discriminator, False)
             try:
