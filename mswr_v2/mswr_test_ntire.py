@@ -80,8 +80,13 @@ class TestConfig:
     
     # Testing settings
     batch_size: int = 1
-    center_crop: bool = True
-    crop_size: int = 256
+    # Border-crop convention used by the public NTIRE 2022 / ARAD‑1K leaderboard:
+    # full-image inference, then drop `crop_border` pixels from each side of the
+    # PREDICTION (and the matching GT) before computing metrics. 482x512 -> 226x256.
+    # `center_crop` is kept for backwards compatibility but is now a no-op.
+    center_crop: bool = False
+    crop_size: int = 0  # legacy; replaced by crop_border
+    crop_border: int = 128
     use_amp: bool = True
     
     # Metrics
@@ -218,9 +223,14 @@ class MetricsCalculator:
         if calculate_per_pixel:
             self._calculate_per_pixel_metrics(pred, target)
         
-        # Store raw errors for statistical analysis
-        error = torch.abs(pred - target).cpu().numpy()
-        self.raw_errors.append(error)
+        # Store raw errors for statistical analysis. CAP the buffer: for a
+        # 1000-image test set at 482x512x31 fp32, the original unbounded list
+        # would consume ~28 GB. Keep at most 32 full-resolution error volumes
+        # (~900 MB) — large enough for normality tests, small enough to avoid
+        # OOM. Downstream `_statistical_analysis` already checks `size < 1e6`.
+        if len(self.raw_errors) < 32:
+            error = torch.abs(pred - target).cpu().numpy()
+            self.raw_errors.append(error)
     
     def _calculate_per_band_metrics(self, pred: torch.Tensor, target: torch.Tensor):
         """Calculate metrics for each spectral band"""
@@ -332,11 +342,12 @@ class DataLoader:
                 if gt_file.exists():
                     self.gt_files.append(gt_file)
                 else:
-                    # Try alternative naming patterns
+                    # Try alternative naming patterns. NOTE: `Path / str + str` is a
+                    # TypeError — we must build the full string FIRST, then make a Path.
                     alternatives = [
-                        gt_path / test_file.stem.replace('rgb', 'hsi') + test_file.suffix,
-                        gt_path / test_file.stem.replace('RGB', 'HSI') + test_file.suffix,
-                        gt_path / (test_file.stem + '_gt' + test_file.suffix)
+                        gt_path / (test_file.stem.replace('rgb', 'hsi') + test_file.suffix),
+                        gt_path / (test_file.stem.replace('RGB', 'HSI') + test_file.suffix),
+                        gt_path / (test_file.stem + '_gt' + test_file.suffix),
                     ]
                     for alt in alternatives:
                         if alt.exists():
@@ -392,16 +403,17 @@ class DataLoader:
                 # Channel first
                 data = np.transpose(data, (1, 2, 0))
         
-        # Center crop if specified
+        # Intentionally NO crop here. The NTIRE protocol runs inference on the
+        # full image and then drops a border from the prediction before
+        # computing metrics. Cropping the RGB pre-inference gave the network a
+        # different receptive-field context than the published protocol and
+        # made metric numbers non-comparable. Border crop is applied in
+        # TestEngine on (pred, gt) just before MetricsCalculator.update().
         if self.config.center_crop and self.config.crop_size > 0:
-            h, w = data.shape[:2]
-            crop_h = min(self.config.crop_size, h)
-            crop_w = min(self.config.crop_size, w)
-            
-            start_h = (h - crop_h) // 2
-            start_w = (w - crop_w) // 2
-            
-            data = data[start_h:start_h+crop_h, start_w:start_w+crop_w]
+            logger.warning(
+                "center_crop=True is deprecated and now ignored. "
+                "Use --crop_border (default 128) for the NTIRE border-crop protocol."
+            )
         
         # Convert to tensor
         tensor = torch.from_numpy(data.transpose(2, 0, 1)).float()
@@ -769,11 +781,20 @@ class NTIRETestEngine:
     def _load_model(self) -> nn.Module:
         """Load model for testing"""
         logger.info(f"Loading model from: {self.config.model_path}")
-        
-        # Load checkpoint
-        # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
-        checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
-        
+
+        # weights_only=True is safe but rejects non-tensor globals (numpy
+        # scalars, dataclass-derived metadata) that our own trainer writes;
+        # retry without it for trusted checkpoints.
+        try:
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
+        except Exception as load_exc:
+            logger.warning(
+                "weights_only=True load failed (%s); retrying with "
+                "weights_only=False. Only do this for checkpoints you trust.",
+                load_exc,
+            )
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
+
         # Create model
         if 'model_config' in checkpoint:
             model_config = MSWRDualConfig(**checkpoint['model_config'])
@@ -787,12 +808,27 @@ class NTIRETestEngine:
                 'large': create_mswr_large
             }
             model = model_registry[self.config.model_size]()
-        
-        # Load weights
-        if 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'], strict=False)
-        else:
-            model.load_state_dict(checkpoint, strict=False)
+
+        # Prefer EMA weights when present (the trainer evaluates and reports
+        # against EMA by default, so testing the base state_dict trails the
+        # headline numbers).
+        ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
+        ema_used = False
+        if ema_state and isinstance(ema_state, dict):
+            shadow = ema_state.get('shadow', ema_state) if isinstance(ema_state, dict) else ema_state
+            if isinstance(shadow, dict) and shadow:
+                try:
+                    model.load_state_dict(shadow, strict=False)
+                    ema_used = True
+                    logger.info("Loaded EMA shadow weights for testing (preferred over base state_dict).")
+                except Exception as ema_exc:
+                    logger.warning("Failed to load EMA weights (%s); falling back to base state_dict.", ema_exc)
+
+        if not ema_used:
+            if 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'], strict=False)
+            else:
+                model.load_state_dict(checkpoint, strict=False)
         
         model = model.to(self.device)
         model.eval()
@@ -807,8 +843,8 @@ class NTIRETestEngine:
                          name: str = 'test') -> Dict[str, Any]:
         """Test single image"""
         rgb = rgb.to(self.device)
-        
-        # Inference
+
+        # Inference (full image; border crop is applied below to (pred, gt))
         with torch.no_grad():
             if self.config.use_amp:
                 from torch.cuda.amp import autocast
@@ -816,27 +852,47 @@ class NTIRETestEngine:
                     pred = self._run_inference(rgb)
             else:
                 pred = self._run_inference(rgb)
-        
+
+        # Predictions are float32 from here on for protocol compliance.
+        # Under AMP the model output can be fp16; metric / save code expects fp32.
+        pred = pred.float()
+
         result = {'name': name, 'prediction': pred}
-        
+
         # Calculate metrics if ground truth available
         if gt is not None:
-            gt = gt.to(self.device)
-            
+            gt = gt.to(self.device).float()
+
             # Ensure same spatial dimensions
             if pred.shape[-2:] != gt.shape[-2:]:
                 # Center crop to match
                 h_diff = gt.shape[-2] - pred.shape[-2]
                 w_diff = gt.shape[-1] - pred.shape[-1]
-                
+
                 if h_diff > 0 or w_diff > 0:
                     h_start = h_diff // 2
                     w_start = w_diff // 2
                     gt = gt[:, :, h_start:h_start+pred.shape[-2], w_start:w_start+pred.shape[-1]]
-            
+
+            # NTIRE protocol: drop `crop_border` pixels from each side of the
+            # prediction and matching GT, then compute metrics on the interior.
+            # Use a metric-only view so the full-resolution prediction is still
+            # available for saving (NTIRE submissions are full-image).
+            b = int(getattr(self.config, "crop_border", 0))
+            if b > 0 and pred.shape[-2] > 2 * b and pred.shape[-1] > 2 * b:
+                pred_for_metrics = pred[:, :, b:-b, b:-b]
+                gt_for_metrics = gt[:, :, b:-b, b:-b]
+            else:
+                pred_for_metrics, gt_for_metrics = pred, gt
+
+            # Clamp predictions to [0, 1]. Loss_PSNR clamps internally but
+            # Loss_MRAE/Loss_RMSE/Loss_SAM do not — out-of-range outputs would
+            # otherwise inflate the reported errors relative to the leaderboard.
+            pred_for_metrics = pred_for_metrics.clamp(0.0, 1.0)
+
             # Update metrics
             self.metrics_calculator.update(
-                pred, gt,
+                pred_for_metrics, gt_for_metrics,
                 calculate_per_band=self.config.per_band_metrics,
                 calculate_per_pixel=self.config.per_pixel_metrics
             )
@@ -882,23 +938,37 @@ class NTIRETestEngine:
                 lambda x: torch.flip(x, dims=[2, 3]),
             ]
         
+        # Inverse transforms must mirror the forward augmentation EXACTLY,
+        # otherwise the averaged prediction is misaligned with the GT and the
+        # ensemble becomes worse than a single forward pass. The previous
+        # implementation only handled 'flip' and 'rotate'; 'full' silently
+        # averaged un-inverted flipped predictions and produced garbage.
+        if self.config.ensemble_mode == 'flip':
+            inverses = [
+                lambda y: y,
+                lambda y: torch.flip(y, dims=[2]),
+                lambda y: torch.flip(y, dims=[3]),
+            ]
+        elif self.config.ensemble_mode == 'rotate':
+            inverses = [
+                lambda y, k=i: torch.rot90(y, k=-k, dims=[2, 3])
+                for i in range(4)
+            ]
+        else:  # 'full': identity, flip H, flip W, flip both — each is its own inverse
+            inverses = [
+                lambda y: y,
+                lambda y: torch.flip(y, dims=[2]),
+                lambda y: torch.flip(y, dims=[3]),
+                lambda y: torch.flip(y, dims=[2, 3]),
+            ]
+
         # Apply augmentations and get predictions
-        for i, aug in enumerate(augs):
+        for aug, inv in zip(augs, inverses):
             aug_input = aug(rgb)
             pred = self.model(aug_input)
-            
-            # Apply inverse transform
-            if self.config.ensemble_mode == 'flip':
-                if i == 1:
-                    pred = torch.flip(pred, dims=[2])
-                elif i == 2:
-                    pred = torch.flip(pred, dims=[3])
-            elif self.config.ensemble_mode == 'rotate':
-                if i > 0:
-                    pred = torch.rot90(pred, k=-i, dims=[2, 3])
-            
+            pred = inv(pred)
             predictions.append(pred)
-        
+
         # Average predictions
         return torch.stack(predictions).mean(dim=0)
     
@@ -975,15 +1045,24 @@ class NTIRETestEngine:
         return final_results
     
     def _save_prediction(self, pred: torch.Tensor, name: str):
-        """Save prediction to file"""
-        pred_np = pred.squeeze(0).cpu().numpy()
-        
+        """Save prediction in NTIRE submission format.
+
+        NTIRE 2022 / ARAD‑1K expects:
+          - variable name 'cube'
+          - shape (H, W, 31) (HWC), not the network's native (31, H, W)
+          - dtype float32
+          - values clamped to [0, 1]
+        """
+        pred_clamped = pred.squeeze(0).clamp(0.0, 1.0).float()
+        # (31, H, W) -> (H, W, 31)
+        pred_np = pred_clamped.permute(1, 2, 0).cpu().numpy().astype(np.float32)
+
         save_dir = self.output_dir / 'predictions'
         save_dir.mkdir(exist_ok=True)
-        
+
         if self.config.save_format == 'mat':
             save_path = save_dir / f'{name}_pred.mat'
-            sio.savemat(str(save_path), {'prediction': pred_np})
+            sio.savemat(str(save_path), {'cube': pred_np})
         elif self.config.save_format == 'npy':
             save_path = save_dir / f'{name}_pred.npy'
             np.save(str(save_path), pred_np)

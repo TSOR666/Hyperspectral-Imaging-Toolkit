@@ -37,7 +37,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from packaging import version
 
 # Compatibility import for AMP (PyTorch < 2.4 uses torch.cuda.amp)
@@ -57,6 +60,7 @@ import yaml
 import logging
 import sys
 import time
+import math
 import psutil
 from collections import defaultdict
 import traceback
@@ -152,6 +156,61 @@ MODEL_SIZES = {
     'base': create_mswr_base,
     'large': create_mswr_large
 }
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying module for DataParallel/DDP wrappers."""
+    return model.module if hasattr(model, "module") else model
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cuda_bf16_supported() -> bool:
+    return bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+
+
+def resolve_amp_dtype(requested: str) -> torch.dtype:
+    """Resolve requested CUDA autocast dtype, falling back safely."""
+    if requested == "bf16":
+        return torch.bfloat16 if _cuda_bf16_supported() else torch.float16
+    if requested == "fp16":
+        return torch.float16
+    if requested == "auto":
+        return torch.bfloat16 if _cuda_bf16_supported() else torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {requested}")
+
+
+def cuda_autocast(dtype: torch.dtype):
+    """Compatibility wrapper for torch.amp and torch.cuda.amp autocast."""
+    try:
+        return autocast("cuda", dtype=dtype)
+    except TypeError:
+        return autocast(dtype=dtype)
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard eval data across ranks without padding/duplicating samples."""
+    def __init__(self, dataset, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        if len(self.dataset) <= self.rank:
+            return 0
+        return (len(self.dataset) - 1 - self.rank) // self.num_replicas + 1
 
 # UPDATED: Enhanced loss function using Loss_SAM from utils
 class EnhancedMSWRLoss(nn.Module):
@@ -351,6 +410,8 @@ class TrainingConfig:
         
         # Advanced training parameters
         self.use_amp = args.use_amp
+        self.amp_dtype = getattr(args, 'amp_dtype', 'auto')
+        self.channels_last = getattr(args, 'channels_last', True)
         self.gradient_clip = args.gradient_clip
         self.gradient_accumulation_steps = args.gradient_accumulation_steps
         self.save_frequency = args.save_frequency
@@ -372,6 +433,20 @@ class TrainingConfig:
         self.early_stopping_warmup = getattr(args, 'early_stopping_warmup', 0)
         self.memory_monitoring = getattr(args, 'memory_monitoring', True)
         self.profile_model = getattr(args, 'profile_model', False)
+
+        # Distributed training. torchrun sets WORLD_SIZE/RANK/LOCAL_RANK; the
+        # CLI flag is kept for explicit single-node launches.
+        self.distributed = bool(
+            getattr(args, 'distributed', False) or _env_int('WORLD_SIZE', 1) > 1
+        )
+        self.local_rank = _env_int('LOCAL_RANK', getattr(args, 'local_rank', 0))
+        self.rank = _env_int('RANK', 0)
+        self.world_size = _env_int('WORLD_SIZE', 1)
+        if not self.distributed:
+            self.local_rank = 0
+            self.rank = 0
+            self.world_size = 1
+        self.ddp_find_unused_parameters = getattr(args, 'ddp_find_unused_parameters', False)
         
         # EMA settings
         self.use_ema = getattr(args, 'use_ema', True)
@@ -452,12 +527,26 @@ def parse_arguments():
     # Advanced training parameters
     parser.add_argument("--use_amp", action='store_true', default=True,
                        help='use automatic mixed precision')
+    parser.add_argument("--amp_dtype", type=str, default='auto',
+                       choices=['auto', 'fp16', 'bf16'],
+                       help="CUDA autocast dtype: auto prefers bf16 when supported")
+    parser.add_argument("--channels_last", dest="channels_last", action='store_true',
+                       default=True,
+                       help="use channels-last memory format for CUDA training")
+    parser.add_argument("--no_channels_last", dest="channels_last", action='store_false',
+                       help="disable channels-last memory format")
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--save_frequency", type=int, default=5000)
     parser.add_argument("--validate_frequency", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", action='store_true', default=True)
+    parser.add_argument("--distributed", action='store_true',
+                       help="enable DistributedDataParallel (auto-enabled under torchrun)")
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int,
+                       default=0, help="local process rank for distributed launchers")
+    parser.add_argument("--ddp_find_unused_parameters", action='store_true',
+                       help="set DDP find_unused_parameters=True for debugging dynamic graphs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action='store_true', default=False,
                        help="Enable deterministic mode for reproducibility (slower but fully reproducible)")
@@ -545,9 +634,30 @@ def load_config(args):
 
 def setup_environment(config: TrainingConfig):
     """Setup training environment with enhanced monitoring - FIXED VERSION"""
-    # Set GPU
+    # Set GPU visibility for single-process training. Under torchrun each
+    # process receives LOCAL_RANK/WORLD_SIZE and CUDA visibility should be
+    # controlled by the launcher or parent environment.
     os.environ["CUDA_DEVICE_ORDER"] = 'PCI_BUS_ID'
-    os.environ["CUDA_VISIBLE_DEVICES"] = config.gpu_id
+    if not config.distributed and config.gpu_id:
+        os.environ["CUDA_VISIBLE_DEVICES"] = config.gpu_id
+
+    # Initialize distributed process group early so all ranks share a timestamp
+    # and data loaders can use DistributedSampler.
+    if config.distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(config.local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        if not dist.is_available():
+            raise RuntimeError("Distributed training requested but torch.distributed is unavailable.")
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+        config.rank = dist.get_rank()
+        config.world_size = dist.get_world_size()
+        timestamp_holder = [config.run_timestamp if config.rank == 0 else ""]
+        dist.broadcast_object_list(timestamp_holder, src=0)
+        config.run_timestamp = timestamp_holder[0]
     
     # Set random seeds for reproducibility
     random.seed(config.seed)
@@ -575,14 +685,18 @@ def setup_environment(config: TrainingConfig):
     # Create directories
     log_dir = os.path.join(config.log_base, config.run_timestamp)
     checkpoint_dir = os.path.join(config.checkpoint_base, config.run_timestamp)
-    
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
+    if config.rank == 0:
+        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    if config.distributed:
+        dist.barrier()
+
     # Save config
     config_path = os.path.join(log_dir, 'config.json')
-    with open(config_path, 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    if config.rank == 0:
+        with open(config_path, 'w') as f:
+            json.dump(config.to_dict(), f, indent=4)
     
     # System info logging
     system_info = {
@@ -600,15 +714,17 @@ def setup_environment(config: TrainingConfig):
                                    for i in range(torch.cuda.device_count())]
     
     system_info_path = os.path.join(log_dir, 'system_info.json')
-    with open(system_info_path, 'w') as f:
-        json.dump(system_info, f, indent=4)
+    if config.rank == 0:
+        with open(system_info_path, 'w') as f:
+            json.dump(system_info, f, indent=4)
     
     # FIX: Don't print here - return the paths and log them after logger is created
     return log_dir, checkpoint_dir, config_path, system_info_path
 
-def create_logger(log_dir: str, name: str = 'mswr_train') -> logging.Logger:
+def create_logger(log_dir: str, name: str = 'mswr_train', rank: int = 0) -> logging.Logger:
     """Create enhanced logger with detailed formatting - FIXED VERSION"""
-    logger = logging.getLogger(name)
+    logger_name = name if rank == 0 else f"{name}_rank{rank}"
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     
     # Properly close and remove existing handlers to avoid file descriptor leaks
@@ -626,20 +742,21 @@ def create_logger(log_dir: str, name: str = 'mswr_train') -> logging.Logger:
     )
     
     # File handler
-    log_file = os.path.join(log_dir, 'train.log')
+    log_file = os.path.join(log_dir, 'train.log' if rank == 0 else f'train_rank{rank}.log')
     fh = logging.FileHandler(log_file, mode='a')
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    # Console handler: keep stdout readable under DDP by only echoing rank 0.
+    if rank == 0:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
     
     # Error handler (separate file for errors)
-    error_file = os.path.join(log_dir, 'errors.log')
+    error_file = os.path.join(log_dir, 'errors.log' if rank == 0 else f'errors_rank{rank}.log')
     eh = logging.FileHandler(error_file, mode='a')
     eh.setLevel(logging.ERROR)
     eh.setFormatter(formatter)
@@ -699,72 +816,56 @@ def create_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Op
 
 def create_scheduler(optimizer: torch.optim.Optimizer, config: TrainingConfig, 
                     steps_per_epoch: int):
-    """Create enhanced learning rate scheduler"""
-    total_steps = steps_per_epoch * config.end_epoch
-    warmup_steps = steps_per_epoch * config.warmup_epochs
-    
-    if config.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps - warmup_steps, eta_min=config.min_lr
-        )
-    elif config.scheduler == 'step':
-        milestones = [int(0.3 * config.end_epoch), int(0.6 * config.end_epoch), int(0.9 * config.end_epoch)]
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
-    elif config.scheduler == 'exponential':
-        gamma = (config.min_lr / config.init_lr) ** (1.0 / config.end_epoch)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-    else:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=config.min_lr
-        )
-    
-    # Warmup wrapper
-    if config.warmup_epochs > 0:
-        scheduler = WarmupScheduler(scheduler, warmup_steps, config.init_lr)
-    
-    return scheduler
+    """Create a continuous per-optimizer-step LR schedule.
 
-class WarmupScheduler:
-    """Enhanced warmup scheduler with linear warmup"""
-    def __init__(self, scheduler, warmup_steps: int, base_lr: float):
-        self.scheduler = scheduler
-        self.warmup_steps = warmup_steps
-        self.base_lr = base_lr
-        self.step_count = 0
-        
-    def step(self):
-        if self.step_count < self.warmup_steps:
-            # Linear warmup
-            lr_scale = (self.step_count + 1) / self.warmup_steps
-            for param_group in self.scheduler.optimizer.param_groups:
-                param_group['lr'] = param_group.get('initial_lr', self.base_lr) * lr_scale
-        else:
-            # Transition to main scheduler
-            if self.step_count == self.warmup_steps:
-                # Reset scheduler's last_epoch to avoid extra step
-                self.scheduler.last_epoch = -1
-            self.scheduler.step()
-        self.step_count += 1
-        
-    def state_dict(self):
-        return {
-            'scheduler': self.scheduler.state_dict(),
-            'warmup_steps': self.warmup_steps,
-            'step_count': self.step_count,
-            'base_lr': self.base_lr
-        }
-    
-    def load_state_dict(self, state_dict):
-        self.scheduler.load_state_dict(state_dict['scheduler'])
-        self.warmup_steps = state_dict['warmup_steps']
-        self.step_count = state_dict['step_count']
-        self.base_lr = state_dict.get('base_lr', self.base_lr)
+    LambdaLR handles warmup and the main schedule in one stateful scheduler, so
+    the warmup->cosine boundary has no manual last_epoch reset or LR jump.
+    """
+    steps_per_epoch = max(1, int(steps_per_epoch))
+    total_steps = max(1, steps_per_epoch * int(config.end_epoch))
+    warmup_steps = max(0, min(total_steps, steps_per_epoch * int(config.warmup_epochs)))
+    min_factor = config.min_lr / config.init_lr if config.init_lr > 0 else 0.0
+    min_factor = max(0.0, min(1.0, min_factor))
+
+    step_milestones = [
+        int(frac * config.end_epoch) * steps_per_epoch
+        for frac in (0.3, 0.6, 0.9)
+    ]
+
+    def warmup_factor(step: int) -> float:
+        if warmup_steps <= 0:
+            return 1.0
+        if step < warmup_steps:
+            return min(1.0, float(step + 1) / float(warmup_steps))
+        return 1.0
+
+    def lr_lambda(step: int) -> float:
+        warm = warmup_factor(step)
+        if step < warmup_steps:
+            return warm
+
+        main_step = max(0, step - warmup_steps)
+        main_total = max(1, total_steps - warmup_steps - 1)
+
+        if config.scheduler == 'step':
+            drops = sum(step >= milestone for milestone in step_milestones)
+            return max(min_factor, 0.1 ** drops)
+
+        if config.scheduler == 'exponential':
+            progress = min(1.0, main_step / main_total)
+            return min_factor ** progress if min_factor > 0 else 0.0
+
+        # Default / cosine schedule.
+        progress = min(1.0, main_step / main_total)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 class ModelEMA:
     """Exponential moving average (EMA) of model parameters for better generalization"""
     def __init__(self, model: nn.Module, decay: float = 0.999):
-        if isinstance(model, nn.DataParallel):
-            model = model.module
+        model = unwrap_model(model)
         self.decay = decay
         self.ema_model = copy.deepcopy(model)
         self.ema_model.eval()
@@ -776,7 +877,7 @@ class ModelEMA:
         return self
 
     def update(self, model: nn.Module):
-        source_model = model.module if isinstance(model, nn.DataParallel) else model
+        source_model = unwrap_model(model)
         ema_params = dict(self.ema_model.named_parameters())
         src_params = dict(source_model.named_parameters())
         src_buffers = dict(source_model.named_buffers())
@@ -842,7 +943,18 @@ class EnhancedTrainer:
         self.logger = logger  # Now properly configured with no propagation
         self.log_dir = log_dir
         self.checkpoint_dir = checkpoint_dir
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.distributed = bool(config.distributed and dist.is_available() and dist.is_initialized())
+        self.rank = dist.get_rank() if self.distributed else 0
+        self.world_size = dist.get_world_size() if self.distributed else 1
+        self.local_rank = config.local_rank
+        if self.distributed and torch.cuda.is_available():
+            self.device = torch.device('cuda', self.local_rank)
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.channels_last = bool(config.channels_last and self.device.type == 'cuda')
+        self.amp_enabled = bool(config.use_amp and self.device.type == 'cuda')
+        self.amp_dtype = resolve_amp_dtype(config.amp_dtype) if self.amp_enabled else torch.float32
+        self.amp_dtype_name = 'bf16' if self.amp_dtype == torch.bfloat16 else 'fp16'
         
         # Training state
         self.iteration = 0
@@ -864,13 +976,20 @@ class EnhancedTrainer:
         # runs (inside _setup_optimization). Otherwise their saved states are
         # silently dropped on resume — the model would resume with a fresh AMP
         # scaler and a fresh EMA copy, regressing loss curves and metric history.
-        if self.config.use_amp and torch.cuda.is_available():
+        if self.amp_enabled and self.amp_dtype == torch.float16:
             try:
                 self.scaler = GradScaler('cuda')
             except TypeError:
                 self.scaler = GradScaler()
         else:
             self.scaler = None
+        if self.amp_enabled:
+            if self.config.amp_dtype == 'bf16' and self.amp_dtype != torch.bfloat16:
+                self.logger.warning("bf16 AMP requested but unsupported on this CUDA device; using fp16.")
+            scale_msg = "with GradScaler" if self.scaler is not None else "without GradScaler"
+            self.logger.info(f"AMP enabled: dtype={self.amp_dtype_name} {scale_msg}")
+        else:
+            self.logger.info("AMP disabled.")
 
         if self.config.use_ema:
             self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
@@ -901,7 +1020,7 @@ class EnhancedTrainer:
         
         # Wandb setup
         self.wandb = None
-        if config.use_wandb:
+        if config.use_wandb and self.rank == 0:
             self.wandb = get_wandb()
             self.wandb.init(
                 project="mswr-v212-cnn-wavelets",
@@ -951,11 +1070,28 @@ class EnhancedTrainer:
             )
             self.model = IntegratedMSWRNet(model_config)
         
-        # Move model to device
+        # Move model to device and memory format before wrapping.
         self.model = self.model.to(self.device)
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+            self.logger.info("Using channels-last memory format for model and batches.")
         
         # Multi-GPU support
-        if torch.cuda.device_count() > 1:
+        if self.distributed:
+            ddp_kwargs = {
+                "find_unused_parameters": self.config.ddp_find_unused_parameters,
+            }
+            if self.device.type == 'cuda':
+                ddp_kwargs.update({
+                    "device_ids": [self.local_rank],
+                    "output_device": self.local_rank,
+                })
+            self.logger.info(
+                f"Using DistributedDataParallel "
+                f"(rank={self.rank}/{self.world_size}, local_rank={self.local_rank})"
+            )
+            self.model = DDP(self.model, **ddp_kwargs)
+        elif torch.cuda.device_count() > 1:
             self.logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
             self.model = nn.DataParallel(self.model)
         
@@ -964,7 +1100,7 @@ class EnhancedTrainer:
             self._profile_model()
         
         # Log model info
-        model_info = self.model.module.get_model_info() if hasattr(self.model, 'module') else self.model.get_model_info()
+        model_info = unwrap_model(self.model).get_model_info()
         self.logger.info("="*60)
         self.logger.info("MODEL INFORMATION")
         self.logger.info("="*60)
@@ -978,6 +1114,8 @@ class EnhancedTrainer:
         """Profile model performance"""
         self.logger.info("Profiling model performance...")
         dummy_input = torch.randn(1, 3, self.config.patch_size, self.config.patch_size).to(self.device)
+        if self.channels_last:
+            dummy_input = dummy_input.to(memory_format=torch.channels_last)
         
         # Warmup
         with torch.no_grad():
@@ -1011,10 +1149,7 @@ class EnhancedTrainer:
             self.logger.info(f"Throughput: {throughput:.2f} FPS")
         
         # Get detailed performance summary
-        if hasattr(self.model, 'module'):
-            perf_summary = self.model.module.get_performance_summary()
-        else:
-            perf_summary = self.model.get_performance_summary()
+        perf_summary = unwrap_model(self.model).get_performance_summary()
         
         if perf_summary['stage_times_ms']:
             self.logger.info("Stage breakdown:")
@@ -1052,10 +1187,25 @@ class EnhancedTrainer:
                 return {"prefetch_factor": max(2, getattr(self.config, "prefetch_factor", 2))}
             return {}
 
+        self.train_sampler = DistributedSampler(
+            self.train_dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            seed=self.config.seed,
+            drop_last=True,
+        ) if self.distributed else None
+
+        self.val_sampler = DistributedEvalSampler(
+            self.val_dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+        ) if self.distributed else None
+
         # REPRODUCIBILITY FIX: Worker init function to ensure reproducible augmentations
         # Each worker gets a deterministic seed based on the main seed + worker_id
         def worker_init_fn(worker_id: int):
-            worker_seed = self.config.seed + worker_id
+            worker_seed = self.config.seed + self.rank * 1000 + worker_id
             np.random.seed(worker_seed)
             random.seed(worker_seed)
             # Also set torch seed for any torch random operations in workers
@@ -1064,7 +1214,8 @@ class EnhancedTrainer:
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=self.train_sampler is None,
+            sampler=self.train_sampler,
             num_workers=self.config.num_workers,
             pin_memory=self.config.pin_memory,
             drop_last=True,
@@ -1080,6 +1231,7 @@ class EnhancedTrainer:
             self.val_dataset,
             batch_size=1,
             shuffle=False,
+            sampler=self.val_sampler,
             num_workers=val_num_workers,
             pin_memory=self.config.pin_memory,
             persistent_workers=True if val_num_workers > 0 else False,
@@ -1100,7 +1252,14 @@ class EnhancedTrainer:
         for group in self.optimizer.param_groups:
             group['initial_lr'] = group['lr']
         
-        steps_per_epoch = len(self.train_loader)
+        # Scheduler stepping is gated by gradient_accumulation_steps in
+        # train_epoch (only on accumulation boundaries). The total number of
+        # scheduler.step() calls per epoch is therefore floor(N / accum), not N.
+        # Without this division the cosine schedule would only complete
+        # 1/accum of its trajectory by the time training ends, and warmup
+        # would last accum× longer than configured.
+        accum = max(1, int(getattr(self.config, "gradient_accumulation_steps", 1)))
+        steps_per_epoch = max(1, len(self.train_loader) // accum)
         self.scheduler = create_scheduler(self.optimizer, self.config, steps_per_epoch)
         
         # Resume from checkpoint if specified
@@ -1148,6 +1307,32 @@ class EnhancedTrainer:
         self.criterion_rmse = Loss_RMSE().to(self.device)
         self.criterion_psnr = Loss_PSNR().to(self.device)
         self.criterion_sam = Loss_SAM().to(self.device)  # Add SAM for validation
+
+    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Move a batch tensor to the training device with optional NHWC layout."""
+        if self.channels_last and tensor.dim() == 4:
+            return tensor.to(
+                self.device,
+                non_blocking=True,
+                memory_format=torch.channels_last,
+            )
+        return tensor.to(self.device, non_blocking=True)
+
+    def _sync_metric_meters(self, metrics: Dict[str, AverageMeter]) -> Dict[str, float]:
+        """Average validation meters across DDP ranks."""
+        results = {}
+        for key, meter in metrics.items():
+            packed = torch.tensor(
+                [float(meter.sum), float(meter.count)],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            if self.distributed:
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            total, count = packed.tolist()
+            if count > 0:
+                results[key] = total / count
+        return results
     
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint with enhanced error handling"""
@@ -1157,14 +1342,24 @@ class EnhancedTrainer:
         
         try:
             self.logger.info(f"Loading checkpoint: {checkpoint_path}")
-            # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            # Prefer weights_only=True (safe deserialization). On PyTorch >= 2.6
+            # this whitelist refuses unknown globals; full checkpoints written by
+            # this very trainer can contain numpy scalars / dataclass-derived
+            # state, so fall back to weights_only=False ONLY for checkpoints
+            # produced by our own training pipeline (never load untrusted files
+            # with this fallback).
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            except Exception as load_exc:
+                self.logger.warning(
+                    "weights_only=True load failed (%s); retrying with "
+                    "weights_only=False. Only do this for checkpoints you trust.",
+                    load_exc,
+                )
+                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             
             # Load model state
-            if isinstance(self.model, nn.DataParallel):
-                incompatible = self.model.module.load_state_dict(checkpoint['state_dict'], strict=False)
-            else:
-                incompatible = self.model.load_state_dict(checkpoint['state_dict'], strict=False)
+            incompatible = unwrap_model(self.model).load_state_dict(checkpoint['state_dict'], strict=False)
 
             if incompatible.missing_keys or incompatible.unexpected_keys:
                 self.logger.warning(
@@ -1227,6 +1422,8 @@ class EnhancedTrainer:
     def train_epoch(self) -> Dict[str, float]:
         """Enhanced training epoch with detailed monitoring including SAM and EMA updates"""
         self.model.train()
+        if self.train_sampler is not None:
+            self.train_sampler.set_epoch(self.epoch)
         losses = AverageMeter()
         loss_components = defaultdict(AverageMeter)
         grad_norms = AverageMeter()
@@ -1239,10 +1436,10 @@ class EnhancedTrainer:
         if self.config.memory_monitoring and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}')
+        pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}', disable=self.rank != 0)
         for i, (images, labels) in enumerate(pbar):
-            images = images.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
+            images = self._to_device(images)
+            labels = self._to_device(labels)
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1260,8 +1457,8 @@ class EnhancedTrainer:
                 # silently freezing learning on those elements. The L1/SSIM/SAM
                 # losses against [0, 1] targets pull predictions into range
                 # naturally; only NaN/Inf must be guarded here.
-                if self.scaler is not None:
-                    with autocast('cuda'):
+                if self.amp_enabled:
+                    with cuda_autocast(self.amp_dtype):
                         output = self.model(images)
                     # Compute loss in fp32 outside autocast for numerical stability
                     output_fp32 = output.float()
@@ -1512,14 +1709,14 @@ class EnhancedTrainer:
             'sam': AverageMeter()
         }
         
-        pbar = tqdm(self.val_loader, desc=desc, leave=False)
+        pbar = tqdm(self.val_loader, desc=desc, leave=False, disable=self.rank != 0)
         
         for images, labels in pbar:
-            images = images.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
+            images = self._to_device(images)
+            labels = self._to_device(labels)
             
-            if self.scaler is not None and torch.cuda.is_available():
-                with autocast('cuda'):
+            if self.amp_enabled:
+                with cuda_autocast(self.amp_dtype):
                     output = model(images)
             else:
                 output = model(images)
@@ -1530,7 +1727,15 @@ class EnhancedTrainer:
                 labels_crop = labels[:, :, crop_size:-crop_size, crop_size:-crop_size]
             else:
                 output_crop, labels_crop = output, labels
-            
+
+            # Clamp predictions to the valid [0, 1] reflectance range BEFORE
+            # computing metrics. Loss_PSNR clamps internally but Loss_MRAE /
+            # Loss_RMSE / Loss_SAM do not, so out-of-range outputs (common
+            # early in training or under AMP) inflate the reported errors
+            # versus the published ARAD‑1K protocol. Targets are already in
+            # [0, 1] for ARAD‑1K so the clamp on labels is a no-op there.
+            output_crop = output_crop.clamp(0.0, 1.0)
+
             mrae = self.criterion_mrae(output_crop, labels_crop)
             rmse = self.criterion_rmse(output_crop, labels_crop)
             psnr = self.criterion_psnr(output_crop, labels_crop, data_range=1.0)
@@ -1553,7 +1758,7 @@ class EnhancedTrainer:
             
             pbar.set_postfix(postfix)
         
-        return {key: meter.avg for key, meter in metrics.items() if meter.count > 0}
+        return self._sync_metric_meters(metrics)
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -1607,13 +1812,13 @@ class EnhancedTrainer:
 
     def save_checkpoint(self, filename: str, is_best: bool = False):
         """Enhanced checkpoint saving with metadata"""
+        if self.rank != 0:
+            return
+
         # Prepare model state
-        if isinstance(self.model, nn.DataParallel):
-            model_state = self.model.module.state_dict()
-            model_config = self.model.module.config.to_dict() if hasattr(self.model.module, 'config') else {}
-        else:
-            model_state = self.model.state_dict()
-            model_config = self.model.config.to_dict() if hasattr(self.model, 'config') else {}
+        model_for_state = unwrap_model(self.model)
+        model_state = model_for_state.state_dict()
+        model_config = model_for_state.config.to_dict() if hasattr(model_for_state, 'config') else {}
         
         # Track optional states
         early_state = None
@@ -1687,7 +1892,12 @@ class EnhancedTrainer:
         self.logger.info(f"Batch size: {self.config.batch_size}")
         self.logger.info(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         self.logger.info(f"Using CNN-based wavelets: {self.config.use_wavelet} ({self.config.wavelet_type})")
-        self.logger.info(f"Mixed precision: {self.config.use_amp}")
+        self.logger.info(
+            f"Mixed precision: {self.amp_enabled} "
+            f"(dtype={self.amp_dtype_name if self.amp_enabled else 'none'})"
+        )
+        self.logger.info(f"Channels-last: {self.channels_last}")
+        self.logger.info(f"DDP: {self.distributed} (world_size={self.world_size})")
         self.logger.info(f"Flash attention: {self.config.use_flash_attn}")
         self.logger.info(f"SAM loss weight: {self.config.sam_weight}")
         self.logger.info("="*80)
@@ -1862,7 +2072,7 @@ def main():
         log_dir, checkpoint_dir, config_path, system_info_path = setup_environment(config)
         
         # Initialize the main logger
-        logger = create_logger(log_dir)
+        logger = create_logger(log_dir, rank=getattr(config, 'rank', 0))
         
         # NOW log all the setup information
         logger.info("="*80)

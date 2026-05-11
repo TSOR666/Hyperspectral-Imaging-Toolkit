@@ -117,8 +117,8 @@ Reference: `model/mswr_net_v212.py` (`IntegratedMSWRNet`, `MSWRDualConfig`).
 
 - Driver: `train_mswr_v212_logging.py` with robust logging and error capture.
 - Loss: `EnhancedMSWRLoss` combines L1, SSIM, SAM (radians, logged in degrees), and gradient loss with warm‑up weighting.
-- Optimizer: AdamW/Adam/SGD with grouped parameter decay; warm‑up + cosine/step/exponential scheduler via wrapper.
-- Efficiency: AMP, gradient checkpointing, gradient accumulation, optional `torch.compile`, multi‑GPU (DDP), EMA.
+- Optimizer: AdamW/Adam/SGD with grouped parameter decay; continuous warm‑up + cosine/step/exponential scheduler via `LambdaLR`.
+- Efficiency: AMP with `--amp_dtype auto|fp16|bf16`, channels-last CUDA training, gradient checkpointing, gradient accumulation, optional `torch.compile`, multi‑GPU DDP, EMA.
 - Data: `dataloader.py` (ARAD‑1K MST++ style). Patch extraction by `patch_size` and `stride`, optional RGB BGR→RGB, min/max scaling.
 
 Example:
@@ -128,7 +128,8 @@ python train_mswr_v212_logging.py \
   --model_size base --data_root /path/to/ARAD_1K \
   --batch_size 8 --end_epoch 300 --init_lr 2e-4 \
   --use_wavelet --wavelet_type db2 --use_enhanced_loss \
-  --use_amp --use_checkpoint --use_flash_attn
+  --use_amp --amp_dtype auto --channels_last \
+  --use_checkpoint --use_flash_attn
 ```
 
 ## Key Configuration (MSWRDualConfig)
@@ -136,7 +137,7 @@ python train_mswr_v212_logging.py \
 - Core: `input_channels`, `output_channels`, `base_channels`, `num_stages`, `channel_expansion`.
 - Attention: `attention_type` (window/dual/landmark/hybrid), `num_heads`, `window_size`, `num_landmarks`, `landmark_pooling`, `local_global_fusion`.
 - Wavelets: `use_wavelet`, `wavelet_type` (haar/db1–db4), `wavelet_levels`, `wavelet_gate_reuse`.
-- Network: `mlp_ratio`, `ffn_type` (standard/gated), `fuse_qkv_small_maps`.
+- Network: `mlp_ratio`, `ffn_type` (standard/gated), `fuse_qkv_small_maps` (backward-compatible no-op; QKV always uses the shared 1x1 conv path).
 - Regularization: `dropout`, `attention_dropout`, `drop_path`, `layer_scale_init`.
 - Performance: `use_checkpoint`, `checkpoint_blocks`, `use_flash_attn`, `compile_model`, `mixed_precision`, `memory_efficient`.
 - Other: `norm_type` (layer/group/batch/none), `use_multi_scale_input`, `use_skip_init`, `performance_monitoring`.

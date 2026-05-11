@@ -13,13 +13,13 @@ CRITICAL FIXES IN THIS VERSION:
 7. ✅ Comprehensive performance monitoring
 8. ✅ Enhanced gradient checkpointing strategy
 9. ✅ Improved multi-GPU and distributed training support
-10. ✅ FIXED QKV linear path dimension mismatch for small feature maps
+10. ✅ Removed divergent QKV linear path for small feature maps
 11. ✅ FIXED BatchNorm/GroupNorm in attention/FFN blocks
 
 LATEST FIXES (Critical):
-- Fixed the dimension mismatch in OptimizedWindowAttention2D when using linear path
-  for small feature maps (H*W <= 256). The linear path now properly reshapes the QKV
-  tensor from 5D [B, 3, C, H, W] to 4D [B, 3*C, H, W] to match einops expectations.
+- Removed the separate qkv_linear small-feature-map path in OptimizedWindowAttention2D.
+  A 1x1 Conv2d is mathematically the same per-token projection, and using only
+  qkv_conv prevents train/validation parameter divergence across crop sizes.
   
 - Fixed BatchNorm/GroupNorm in attention and FFN blocks by using AdaptiveNorm2d
   which properly handles NCHW format instead of expecting NHWC after permutation.
@@ -30,10 +30,6 @@ LATEST FIXES (Critical):
 
 - Enhanced test suite to be GPU-aware and handle memory constraints.
   
-Alternative solution if issues persist:
-- Set fuse_qkv_small_maps=False when creating the model to disable the linear path:
-  model = create_mswr_base(fuse_qkv_small_maps=False)
-
 Performance Optimizations:
 - Fused operations where possible
 - Optimized memory layout and tensor operations  
@@ -61,6 +57,17 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+
+def _wrap_block_with_checkpoint(block: nn.Module) -> nn.Module:
+    """Apply activation checkpointing with the supported torch.utils API."""
+    original_forward = block.forward
+
+    def checkpointed_forward(x: torch.Tensor) -> torch.Tensor:
+        return checkpoint.checkpoint(original_forward, x, use_reentrant=False)
+
+    block.forward = checkpointed_forward
+    return block
 
 # ===================== OPTIMIZED CNN WAVELET TRANSFORM =====================
 
@@ -179,9 +186,28 @@ class OptimizedCNNWaveletTransform(nn.Module):
         for j in range(self.J):
             kernel_size = filters.shape[-1]
             padding = (kernel_size - 1) // 2
-            
-            # Optimized grouped convolution with proper padding
-            coeffs = F.conv2d(current, filters, stride=2, padding=padding, groups=C)  # (B, C, H, W) -> (B, 4*C, H/2, W/2)
+
+            # Even-dimensions assertion: odd H or W would make the IDWT round-trip
+            # come back at the wrong spatial size, breaking the residual addition
+            # in the wavelet block. The encoder's downsamples preserve this, but
+            # callers feeding arbitrary inputs would otherwise hit silent shape
+            # mismatches downstream.
+            H_in, W_in = current.shape[-2], current.shape[-1]
+            assert H_in % 2 == 0 and W_in % 2 == 0, (
+                f"OptimizedCNNWaveletTransform requires even H,W; got {H_in}x{W_in} "
+                f"at DWT level {j} (wave={self.wave}, J={self.J})."
+            )
+
+            # Optimized grouped convolution with proper padding.
+            # For mode='periodic' use circular F.pad so longer Daubechies filters
+            # (db2/db3/db4) get a clean boundary instead of zero-bleed, which
+            # noticeably improves DWT/IDWT round-trip fidelity. For db1/haar the
+            # filter is 2-tap so padding is 0 either way (mode is moot).
+            if self.mode == 'periodic' and padding > 0:
+                current_padded = F.pad(current, [padding, padding, padding, padding], mode='circular')
+                coeffs = F.conv2d(current_padded, filters, stride=2, padding=0, groups=C)  # (B, C, H, W) -> (B, 4*C, H/2, W/2)
+            else:
+                coeffs = F.conv2d(current, filters, stride=2, padding=padding, groups=C)  # (B, C, H, W) -> (B, 4*C, H/2, W/2)
             
             # Grouped conv output order: [ch0_f0..ch0_f3, ch1_f0..ch1_f3, ...]
             # Reshape as (B, C, 4, H2, W2) so dim=2 indexes subbands [LL, LH, HL, HH]
@@ -389,7 +415,10 @@ class MSWRDualConfig:
     # Network Architecture
     mlp_ratio: float = 4.0
     ffn_type: Literal['standard', 'gated'] = 'standard'
-    fuse_qkv_small_maps: bool = True
+    # Backward-compatible config knob. The separate linear path was removed in
+    # favor of always using qkv_conv so small crops and full-res validation train
+    # the same parameters.
+    fuse_qkv_small_maps: bool = False
     
     # Regularization
     dropout: float = 0.0
@@ -573,7 +602,7 @@ class OptimizedWindowAttention2D(nn.Module):
     
     def __init__(self, dim: int, num_heads: int, window_size: int,
                  use_flash: bool = True, dropout: float = 0.0,
-                 fuse_qkv_small_maps: bool = True, memory_efficient: bool = True) -> None:
+                 fuse_qkv_small_maps: bool = False, memory_efficient: bool = True) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -581,13 +610,13 @@ class OptimizedWindowAttention2D(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.use_flash = use_flash and hasattr(F, 'scaled_dot_product_attention')
-        self.fuse_qkv_small_maps = fuse_qkv_small_maps
+        self.fuse_qkv_small_maps = False
         self.memory_efficient = memory_efficient
         
-        # Optimized QKV projection
+        # Optimized QKV projection. A 1x1 Conv2d is the same per-token affine
+        # projection as Linear on NHWC-flattened pixels, but keeping one module
+        # ensures all input sizes update the same parameters.
         self.qkv_conv = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        if fuse_qkv_small_maps:
-            self.qkv_linear = nn.Linear(dim, dim * 3, bias=False)
         
         self.proj = nn.Conv2d(dim, dim, 1)
         self.dropout = nn.Dropout(dropout)
@@ -623,11 +652,6 @@ class OptimizedWindowAttention2D(nn.Module):
         """
         B, C, H, W = x.shape  # (B, C, H, W)
         
-        # Dynamic QKV computation based on input size
-        use_linear = (self.fuse_qkv_small_maps and 
-                     hasattr(self, 'qkv_linear') and 
-                     H * W <= 256)
-        
         # Efficient padding for window partitioning
         pad_h = (self.window_size - H % self.window_size) % self.window_size
         pad_w = (self.window_size - W % self.window_size) % self.window_size
@@ -648,14 +672,7 @@ class OptimizedWindowAttention2D(nn.Module):
         assert (H_pad % self.window_size == 0) and (W_pad % self.window_size == 0), \
             f"Padding failed: {H_pad}x{W_pad} not divisible by window_size={self.window_size}"
 
-        # Optimized QKV generation
-        if use_linear:
-            x_flat = x.permute(0, 2, 3, 1).reshape(B * H_pad * W_pad, C)  # (B, C, H_pad, W_pad) -> (B*H_pad*W_pad, C)
-            qkv = self.qkv_linear(x_flat).reshape(B, H_pad, W_pad, 3, C).permute(0, 3, 4, 1, 2)  # (B*H_pad*W_pad, 3*C) -> (B, 3, C, H_pad, W_pad)
-            # FIX: Flatten the k=3 dimension with C to get 4D tensor for rearrange
-            qkv = qkv.reshape(B, 3 * C, H_pad, W_pad)  # (B, 3, C, H_pad, W_pad) -> (B, 3*C, H_pad, W_pad)
-        else:
-            qkv = self.qkv_conv(x)  # (B, C, H_pad, W_pad) -> (B, 3*C, H_pad, W_pad)
+        qkv = self.qkv_conv(x)  # (B, C, H_pad, W_pad) -> (B, 3*C, H_pad, W_pad)
         
         # Efficient window partitioning with optimized tensor operations
         num_windows_h, num_windows_w = H_pad // self.window_size, W_pad // self.window_size
@@ -1367,21 +1384,7 @@ class IntegratedMSWRNet(nn.Module):
             
             # Intelligent gradient checkpointing
             if config.use_checkpoint and i in (config.checkpoint_blocks or []):
-                if hasattr(checkpoint, 'checkpoint_wrapper'):
-                    # Modern PyTorch (1.11+)
-                    block = checkpoint.checkpoint_wrapper(block)
-                else:
-                    # Fallback for older PyTorch versions
-                    # Create a proper wrapper that captures the original forward method
-                    original_forward = block.forward
-
-                    def make_checkpointed_forward(orig_fwd):
-                        """Factory to avoid late binding issues"""
-                        def checkpointed_forward(x):
-                            return checkpoint.checkpoint(orig_fwd, x, use_reentrant=False)
-                        return checkpointed_forward
-
-                    block.forward = make_checkpointed_forward(original_forward)
+                block = _wrap_block_with_checkpoint(block)
             
             self.encoder_stages.append(block)
             
@@ -1430,37 +1433,34 @@ class IntegratedMSWRNet(nn.Module):
             )
             
             if config.use_checkpoint and decoder_idx in (config.checkpoint_blocks or []):
-                if hasattr(checkpoint, 'checkpoint_wrapper'):
-                    # Modern PyTorch (1.11+)
-                    block = checkpoint.checkpoint_wrapper(block)
-                else:
-                    # Fallback for older PyTorch versions
-                    # Create a proper wrapper that captures the original forward method
-                    original_forward = block.forward
-
-                    def make_checkpointed_forward(orig_fwd):
-                        """Factory to avoid late binding issues"""
-                        def checkpointed_forward(x):
-                            return checkpoint.checkpoint(orig_fwd, x, use_reentrant=False)
-                        return checkpointed_forward
-
-                    block.forward = make_checkpointed_forward(original_forward)
+                block = _wrap_block_with_checkpoint(block)
             
             self.decoder_stages.append(block)
             channels = out_ch
         
         # Enhanced output projection
         self.output_proj = EnhancedOutputProjection(config.base_channels, config.output_channels)
-        
+
         # Learnable input skip connection
         self.input_skip = nn.Conv2d(config.input_channels, config.output_channels, 1)
+
+        # Apply enhanced (Kaiming) initialization FIRST so it does not overwrite
+        # the per-layer soft-identity inits applied below. Previously this call
+        # ran AFTER EnhancedOutputProjection.__init__ had set proj2.weight=0.01
+        # and after we set input_skip.weight=0.01, silently wiping both — so the
+        # model never actually started from the documented near-identity head.
+        self.apply(self._init_weights)
+
+        # Re-apply soft-identity init on the output head and the input skip.
+        # These small initial weights make the model start close to a learned
+        # linear RGB->HSI mapping and avoid wild early-training outputs.
+        nn.init.constant_(self.output_proj.proj2.weight, 0.01)
+        if self.output_proj.proj2.bias is not None:
+            nn.init.zeros_(self.output_proj.proj2.bias)
         if config.use_skip_init:
             nn.init.constant_(self.input_skip.weight, 0.01)
             if self.input_skip.bias is not None:
                 nn.init.zeros_(self.input_skip.bias)
-        
-        # Apply enhanced initialization
-        self.apply(self._init_weights)
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):
@@ -1516,7 +1516,7 @@ class IntegratedMSWRNet(nn.Module):
         logger.info(f"Flash Attention: {self.config.use_flash_attn}")
         logger.info(f"Normalization: {self.config.norm_type}")
         logger.info("✅ LayerNorm dimension mismatch FIXED")
-        logger.info("✅ QKV linear path dimension mismatch FIXED")
+        logger.info("✅ Single qkv_conv projection path (no small-map divergence)")
         logger.info("✅ BatchNorm/GroupNorm in attention/FFN blocks FIXED")
         logger.info("✅ All normalization layers properly configured")
         logger.info("="*70)
@@ -1676,7 +1676,7 @@ class IntegratedMSWRNet(nn.Module):
             f"  Parameters: {sum(p.numel() for p in self.parameters()):,}\n"
             f"  Memory Efficient: {self.config.memory_efficient}\n"
             f"  ✅ All normalization issues FIXED\n"
-            f"  ✅ QKV linear path dimension mismatch FIXED\n"
+            f"  ✅ Single qkv_conv projection path\n"
             f"  ✅ BatchNorm/GroupNorm compatibility FIXED\n"
         )
 
@@ -1744,7 +1744,7 @@ if __name__ == "__main__":
     print("✅ Added AdaptiveNorm2d for automatic format handling")
     print("✅ Fixed all downsampling and upsampling normalization")
     print("✅ Fixed grouped convolution parameter errors")
-    print("✅ Fixed QKV linear path dimension mismatch for small feature maps")
+    print("✅ Removed divergent QKV linear path for small feature maps")
     print("✅ Enhanced memory efficiency")
     print("✅ Production-quality error handling")
     print("="*80)
@@ -1816,12 +1816,12 @@ if __name__ == "__main__":
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
         
-        # Test 5: Specific test for the problematic case (16x16 feature maps)
+        # Test 5: Specific test for the former small-map divergence case
         print("\nTest 5: Specific test for small feature maps (16x16 case)")
         x_problem = torch.randn(1, 3, 128, 128, device=device)  # (B=1, C=3, H=128, W=128)
         model_test = create_mswr_base(
             use_wavelet=True, 
-            fuse_qkv_small_maps=True  # Explicitly enable the linear path
+            fuse_qkv_small_maps=True  # Backward-compatible no-op; qkv_conv is always used
         )
         model_test = model_test.to(device)
         
@@ -1859,7 +1859,7 @@ if __name__ == "__main__":
         print("1. LayerNorm2d wrapper for CNN contexts")
         print("2. AdaptiveNorm2d for automatic format handling")
         print("3. Proper normalization in all Sequential blocks")
-        print("4. Fixed QKV linear path dimension mismatch")
+        print("4. Removed divergent QKV linear branch")
         print("5. Fixed BatchNorm/GroupNorm in attention/FFN blocks")
         print("6. Enhanced error handling and validation")
         print("\nYou can now use this model in your training script without errors.")
