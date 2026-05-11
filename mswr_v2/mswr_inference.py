@@ -432,11 +432,21 @@ class MSWRInference:
     def _load_model(self) -> nn.Module:
         """Load and prepare model for inference"""
         logger.info(f"Loading model from: {self.config.model_path}")
-        
-        # Load checkpoint
-        # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution via pickled payloads
-        checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
-        
+
+        # Load checkpoint. Prefer weights_only=True (safe), fall back to
+        # weights_only=False ONLY for our own trainer's checkpoints, which can
+        # contain numpy scalars / dataclass-derived metadata that the PyTorch
+        # 2.6+ safelist refuses.
+        try:
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=True)
+        except Exception as load_exc:
+            logger.warning(
+                "weights_only=True load failed (%s); retrying with "
+                "weights_only=False. Only do this for checkpoints you trust.",
+                load_exc,
+            )
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
+
         # Extract model configuration if available
         if 'model_config' in checkpoint:
             model_config = MSWRDualConfig(**checkpoint['model_config'])
@@ -447,12 +457,32 @@ class MSWRInference:
                 model = MODEL_REGISTRY[self.config.model_size]()
             else:
                 raise ValueError(f"Unknown model size: {self.config.model_size}")
-        
-        # Load state dict
-        if 'state_dict' in checkpoint:
-            incompatible = model.load_state_dict(checkpoint['state_dict'], strict=False)
-        else:
-            incompatible = model.load_state_dict(checkpoint, strict=False)
+
+        # Prefer EMA weights when the checkpoint provides them: EMA is what the
+        # trainer evaluates and reports "best_mrae" against (see
+        # train_mswr_v212_logging.py validate() with ema_eval_mode='ema'), so
+        # inference must mirror that to reproduce headline numbers. The base
+        # state_dict trails the EMA by the EMA decay window and produces worse
+        # outputs in practice.
+        ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
+        ema_used = False
+        if ema_state and isinstance(ema_state, dict):
+            # The trainer's ModelEMA.state_dict() shape may either be
+            # {'shadow': {...params...}, 'num_updates': N} or a bare param dict.
+            shadow = ema_state.get('shadow', ema_state) if isinstance(ema_state, dict) else ema_state
+            if isinstance(shadow, dict) and shadow:
+                try:
+                    incompatible = model.load_state_dict(shadow, strict=False)
+                    ema_used = True
+                    logger.info("Loaded EMA shadow weights for inference (preferred over base state_dict).")
+                except Exception as ema_exc:
+                    logger.warning("Failed to load EMA weights (%s); falling back to base state_dict.", ema_exc)
+
+        if not ema_used:
+            if 'state_dict' in checkpoint:
+                incompatible = model.load_state_dict(checkpoint['state_dict'], strict=False)
+            else:
+                incompatible = model.load_state_dict(checkpoint, strict=False)
 
         if incompatible.missing_keys or incompatible.unexpected_keys:
             logger.warning(
@@ -497,20 +527,28 @@ class MSWRInference:
         elif image_path.suffix == '.mat':
             # Load from MATLAB file
             mat_data = sio.loadmat(str(image_path))
-            # Try common variable names
-            for key in ['rgb', 'RGB', 'img', 'image', 'data']:
-                if key in mat_data:
-                    image = mat_data[key].astype(np.float32)
+            image = None
+            key = None
+            # Try common variable names first
+            for k in ['rgb', 'RGB', 'img', 'image', 'data']:
+                if k in mat_data:
+                    image = mat_data[k].astype(np.float32)
+                    key = k
                     break
-            else:
-                # Use first non-metadata variable
-                for key, value in mat_data.items():
-                    if not key.startswith('__') and isinstance(value, np.ndarray):
+            if image is None:
+                # Fall back to the first non-metadata ndarray variable.
+                for k, value in mat_data.items():
+                    if not k.startswith('__') and isinstance(value, np.ndarray):
                         image = value.astype(np.float32)
+                        key = k
                         break
-            
+            if image is None:
+                raise ValueError(
+                    f".mat file at {image_path} contains no recognisable image "
+                    f"variable (looked for rgb/RGB/img/image/data, then any ndarray)."
+                )
+
             image = normalize_rgb_like_training(image)
-            
             metadata['original_dtype'] = str(mat_data[key].dtype)
             
         elif image_path.suffix == '.npy':
@@ -569,19 +607,28 @@ class MSWRInference:
         return tensor
     
     def postprocess(self, output: torch.Tensor) -> np.ndarray:
-        """Postprocess model output"""
+        """Postprocess model output.
+
+        Returns an HWC float32 numpy array in [0, 1]. The fp32 cast happens
+        BEFORE the numpy conversion so AMP fp16 outputs don't leak fp16 onto
+        disk (downstream tooling and the NTIRE submission spec expect fp32).
+        """
         # Remove batch dimension if present
         if output.dim() == 4:
             output = output.squeeze(0)
-        
+
+        # Cast to fp32 in torch (avoids np.clip preserving the fp16 dtype)
+        # and clamp to valid reflectance range while still on-device.
+        output = output.float().clamp(0.0, 1.0)
+
         # Convert to numpy
-        output = output.cpu().numpy()
-        
+        output = output.cpu().numpy().astype(np.float32)
+
         # C, H, W -> H, W, C
         if output.shape[0] == 31:
             output = output.transpose(1, 2, 0)
-        
-        # Clip to valid range
+
+        # Extra np.clip as a defensive belt-and-braces (already clamped above).
         output = np.clip(output, 0, 1)
         
         # Optional post-processing
@@ -665,23 +712,30 @@ class MSWRInference:
         input_name = Path(input_path).stem
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         
+        # `output` is HWC float32 in [0, 1] from postprocess(). All on-disk
+        # formats use the ARAD‑1K / NTIRE convention: variable name 'cube',
+        # shape (H, W, 31), dtype float32. Earlier this script used 'hsi' as
+        # the variable name and saved .npy in HWC while the dataloader expects
+        # CHW under 'cube' — round-tripping outputs was broken.
+        cube = np.ascontiguousarray(output.astype(np.float32))
         if self.config.save_format == 'mat':
             output_path = self.output_dir / f"{input_name}_hsi_{timestamp}.mat"
-            sio.savemat(str(output_path), {'hsi': output, 'metadata': metadata})
-            
+            sio.savemat(str(output_path), {'cube': cube, 'metadata': metadata})
+
         elif self.config.save_format == 'npy':
             output_path = self.output_dir / f"{input_name}_hsi_{timestamp}.npy"
-            np.save(str(output_path), output)
-            
+            # Save CHW to match the Train_Spec convention consumed by dataloader.
+            np.save(str(output_path), np.transpose(cube, (2, 0, 1)))
+
             # Save metadata separately
             meta_path = self.output_dir / f"{input_name}_metadata_{timestamp}.json"
             with open(meta_path, 'w') as f:
                 json.dump(metadata, f, indent=4, default=str)
-                
+
         elif self.config.save_format == 'h5':
             output_path = self.output_dir / f"{input_name}_hsi_{timestamp}.h5"
             with h5py.File(str(output_path), 'w') as f:
-                f.create_dataset('hsi', data=output, compression='gzip')
+                f.create_dataset('cube', data=cube, compression='gzip')
                 # Save metadata as attributes
                 for key, value in metadata.items():
                     f.attrs[key] = str(value)
