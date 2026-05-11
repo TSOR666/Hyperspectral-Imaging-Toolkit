@@ -287,8 +287,7 @@ class TestModelSmokeForwardBackward:
         loss = F.l1_loss(out, target)
         loss.backward()
 
-        # At least some params should have gradients (conditional paths
-        # like qkv_linear vs qkv_conv mean not all params are used)
+        # At least some params should have gradients.
         grads_found = 0
         for name, p in model.named_parameters():
             if p.requires_grad and p.grad is not None:
