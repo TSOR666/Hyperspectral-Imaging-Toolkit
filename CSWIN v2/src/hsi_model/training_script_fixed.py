@@ -87,17 +87,44 @@ def clear_memory():
     serialises the queue and empty_cache returns blocks to the driver which
     the caching allocator would otherwise reuse, both of which are
     counter-productive for throughput.
+
+    Robustness note: ``torch.cuda.is_available()`` can return True on HPC
+    nodes where the driver loaded but no GPU was actually allocated to the
+    job (e.g. missing ``--gres=gpu`` in Slurm, or a held device in exclusive
+    mode). In that case the first real device call would raise an opaque
+    ``CUDA error: device(s) busy or unavailable``. We wrap the calls in a
+    try/except so callers can decide whether to fall back to CPU rather
+    than die mid-``main()`` — the underlying error is logged once with a
+    clear hint at the cluster-side cause.
     """
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            logger.error(
+                "CUDA call failed in clear_memory(): %s. This usually means "
+                "no GPU was actually allocated to the job (check "
+                "$CUDA_VISIBLE_DEVICES / Slurm --gres=gpu) or another process "
+                "holds the device in exclusive mode.",
+                exc,
+            )
+            raise
 
 
 def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
     """Toggle gradient computation for all parameters in a module."""
     for param in module.parameters():
         param.requires_grad_(requires_grad)
+
+
+def first_nonfinite_parameter_name(module: nn.Module) -> Optional[str]:
+    """Return the first parameter name containing NaN/Inf, if any."""
+    for name, param in module.named_parameters():
+        if not torch.isfinite(param.detach()).all():
+            return name
+    return None
 
 
 # ============================================
@@ -449,8 +476,13 @@ def train_sinkhorn_gan(
     epoch_losses = []
     current_epoch = 0
     nan_count = 0
+    nonfinite_recovery_count = 0
     max_memory_gb = 0
-    consecutive_nan_tolerance = 3
+    consecutive_nan_tolerance = max(
+        1,
+        int(config.get("max_consecutive_nonfinite_generator_outputs", 3)),
+    )
+    max_nonfinite_recoveries = int(config.get("max_nonfinite_generator_recoveries", 1))
     
     # Moving average for discriminator loss logging
     disc_loss_ma = 0.0
@@ -526,7 +558,26 @@ def train_sinkhorn_gan(
                 nan_count += 1
                 logger.warning(f"Non-finite generator output detected. Consecutive count={nan_count}")
 
+                bad_param = first_nonfinite_parameter_name(generator)
+                if bad_param is not None:
+                    raise FloatingPointError(
+                        "Generator parameter contains NaN/Inf after a non-finite "
+                        f"forward pass: {bad_param}. Resume from the last finite "
+                        "checkpoint with a lower generator LR or disable mixed_precision."
+                    )
+
                 if nan_count >= consecutive_nan_tolerance:
+                    nonfinite_recovery_count += 1
+                    if (
+                        max_nonfinite_recoveries >= 0
+                        and nonfinite_recovery_count > max_nonfinite_recoveries
+                    ):
+                        raise FloatingPointError(
+                            "Generator produced non-finite outputs after "
+                            f"{nonfinite_recovery_count - 1} recovery attempt(s) "
+                            f"at iteration {iteration}. Stopping instead of "
+                            "retrying the same iteration indefinitely."
+                        )
                     logger.warning("Too many non-finite generator outputs; running recovery")
                     optimizer_g.zero_grad(set_to_none=True)
                     for param_group in optimizer_g.param_groups:
@@ -541,6 +592,7 @@ def train_sinkhorn_gan(
                 continue
 
             nan_count = 0
+            nonfinite_recovery_count = 0
 
             # Compute disc(real, rgb) once.  Keep the autograd graph alive
             # when D will step this iteration so the same tensor can be

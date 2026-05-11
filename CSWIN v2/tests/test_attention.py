@@ -24,6 +24,18 @@ def test_efficient_spectral_attention_preserves_dtype():
     assert out.dtype == x.dtype
 
 
+def test_efficient_spectral_attention_sanitizes_nonfinite_value_projection():
+    attn = EfficientSpectralAttention(8, num_heads=2, config={"norm_groups": 2})
+    with torch.no_grad():
+        attn.to_v.weight.fill_(float("inf"))
+
+    x = torch.ones(1, 8, 4, 4)
+    out = attn(x)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
 # GATE 4.2: Edge Case Tests
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("height,width", [(7, 7), (8, 8), (17, 19)])

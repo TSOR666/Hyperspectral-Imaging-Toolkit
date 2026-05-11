@@ -48,6 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import logging
+from contextlib import nullcontext
 from typing import Optional, Mapping
 from einops import rearrange, repeat
 from torch.utils.checkpoint import checkpoint
@@ -59,6 +60,38 @@ ConfigDict = Mapping[str, object]
 
 # Numerical stability epsilon - defined once and reused
 EPS = 1e-8
+
+
+def _autocast_disabled(device_type: str):
+    """Return a context manager that runs ops outside autocast."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast(device_type=device_type, enabled=False)
+        except TypeError:
+            pass
+    if device_type == "cuda" and hasattr(torch.cuda, "amp"):
+        return torch.cuda.amp.autocast(enabled=False)
+    return nullcontext()
+
+
+def _replace_nonfinite(
+    tensor: torch.Tensor,
+    message: str,
+    clamp_value: Optional[float] = None,
+) -> torch.Tensor:
+    """Replace NaN/Inf values without letting them poison later layers."""
+    if torch.isfinite(tensor).all():
+        return tensor
+
+    logger.warning(message)
+    if clamp_value is not None and clamp_value > 0:
+        return torch.nan_to_num(
+            tensor,
+            nan=0.0,
+            posinf=clamp_value,
+            neginf=-clamp_value,
+        ).clamp(-clamp_value, clamp_value)
+    return torch.nan_to_num(tensor)
 
 
 class LePEAttention(nn.Module):
@@ -576,6 +609,16 @@ class EfficientSpectralAttention(nn.Module):
             raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.force_fp32 = (
+            bool(config.get("spectral_attention_force_fp32", True))
+            if config
+            else True
+        )
+        self.finite_clamp = (
+            float(config.get("spectral_attention_finite_clamp", 1e4))
+            if config
+            else 1e4
+        )
         
         # Handle None config
         norm_groups = config.get("norm_groups", 8) if config else 8
@@ -615,52 +658,106 @@ class EfficientSpectralAttention(nn.Module):
             Attention-processed tensor of shape (B, C, H, W)
         """
         B, C, H, W = x.shape
-        
-        # Compute Q, K, V
-        q = self.to_q(x)  # (B, C, H, W)
-        k = self.to_k(x)  # (B, C, H, W)
-        v = self.to_v(x)  # (B, C, H, W)
-        
-        # Global channel descriptors
-        q_global = q.mean(dim=(2, 3))  # (B, C)
-        k_global = k.mean(dim=(2, 3))  # (B, C)
-        
-        # Reshape for multi-head attention
-        q_global = rearrange(q_global, 'b (h d) -> b h d', h=self.num_heads)
-        k_global = rearrange(k_global, 'b (h d) -> b h d', h=self.num_heads)
-        
-        # Normalize for cosine similarity (more robust to noise)
-        q_norm = F.normalize(q_global, dim=-1, eps=EPS)
-        k_norm = F.normalize(k_global, dim=-1, eps=EPS)
-        if not torch.isfinite(q_norm).all() or not torch.isfinite(k_norm).all():
-            logger.warning("Non-finite values in normalized Q/K; replacing with zeros")
-            q_norm = torch.nan_to_num(q_norm)
-            k_norm = torch.nan_to_num(k_norm)
-        
-        # Compute channel attention (B, H, d, d)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.einsum('b h i, b h j -> b h i j', q_norm, k_norm) * scale
-        attn = attn - attn.amax(dim=-1, keepdim=True)  # Stabilize softmax
-        attn_dtype = attn.dtype
-        if attn_dtype in (torch.float16, torch.bfloat16):
-            attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
-        else:
-            attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to spatial features
-        v_reshaped = rearrange(v, 'b (h d) H W -> b h d (H W)', h=self.num_heads)
-        if attn.dtype != v_reshaped.dtype:
-            attn = attn.to(v_reshaped.dtype)
-        out = torch.einsum('b h i j, b h j s -> b h i s', attn, v_reshaped)
-        
-        # Reshape back to image format
-        out = rearrange(out, 'b h d (H W) -> b (h d) H W', H=H, W=W)
-        
-        # Apply position embedding and projection
-        pos = self.pos_embed(x)
-        out = out + pos
-        out = self.proj(out)
-        
+        output_dtype = x.dtype
+        param_dtype = self.to_v.weight.dtype
+        run_fp32 = self.force_fp32 and param_dtype == torch.float32
+
+        # Spectral attention is especially sensitive under fp16 autocast:
+        # a 1x1 projection can overflow before GroupNorm/F.normalize has a
+        # chance to rescale it, which is exactly what produces non-finite
+        # normalized Q/K. Keep this small channel-attention path in fp32 when
+        # the model weights are fp32, then cast back to the caller dtype.
+        ctx = _autocast_disabled(x.device.type) if run_fp32 else nullcontext()
+        with ctx:
+            x_work = x.float() if run_fp32 else x
+            x_work = _replace_nonfinite(
+                x_work,
+                "Non-finite values entering spectral attention; replacing with bounded values",
+                self.finite_clamp,
+            )
+
+            # Compute Q, K, V
+            q = self.to_q(x_work)  # (B, C, H, W)
+            k = self.to_k(x_work)  # (B, C, H, W)
+            v = self.to_v(x_work)  # (B, C, H, W)
+
+            q = _replace_nonfinite(
+                q,
+                "Non-finite values in Q projection; replacing with bounded values",
+                self.finite_clamp,
+            )
+            k = _replace_nonfinite(
+                k,
+                "Non-finite values in K projection; replacing with bounded values",
+                self.finite_clamp,
+            )
+            v = _replace_nonfinite(
+                v,
+                "Non-finite values in V projection; replacing with bounded values",
+                self.finite_clamp,
+            )
+
+            # Global channel descriptors
+            q_global = q.mean(dim=(2, 3))  # (B, C)
+            k_global = k.mean(dim=(2, 3))  # (B, C)
+
+            # Reshape for multi-head attention
+            q_global = rearrange(q_global, 'b (h d) -> b h d', h=self.num_heads)
+            k_global = rearrange(k_global, 'b (h d) -> b h d', h=self.num_heads)
+
+            # Normalize for cosine similarity (more robust to noise)
+            norm_eps = 1e-6 if q_global.dtype in (torch.float16, torch.bfloat16) else EPS
+            q_norm = F.normalize(q_global, dim=-1, eps=norm_eps)
+            k_norm = F.normalize(k_global, dim=-1, eps=norm_eps)
+            if not torch.isfinite(q_norm).all() or not torch.isfinite(k_norm).all():
+                logger.warning("Non-finite values in normalized Q/K; replacing with zeros")
+                q_norm = torch.nan_to_num(q_norm)
+                k_norm = torch.nan_to_num(k_norm)
+
+            # Compute channel attention (B, H, d, d)
+            scale = 1.0 / math.sqrt(self.head_dim)
+            attn = torch.einsum('b h i, b h j -> b h i j', q_norm, k_norm) * scale
+            attn = attn - attn.amax(dim=-1, keepdim=True)  # Stabilize softmax
+            attn_dtype = attn.dtype
+            if attn_dtype in (torch.float16, torch.bfloat16):
+                attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
+            else:
+                attn = F.softmax(attn, dim=-1)
+            attn = _replace_nonfinite(
+                attn,
+                "Non-finite spectral attention weights; replacing with zeros",
+            )
+
+            # Apply attention to spatial features
+            v_reshaped = rearrange(v, 'b (h d) H W -> b h d (H W)', h=self.num_heads)
+            if attn.dtype != v_reshaped.dtype:
+                attn = attn.to(v_reshaped.dtype)
+            out = torch.einsum('b h i j, b h j s -> b h i s', attn, v_reshaped)
+
+            # Reshape back to image format
+            out = rearrange(out, 'b h d (H W) -> b (h d) H W', H=H, W=W)
+
+            # Apply position embedding and projection
+            pos = self.pos_embed(x_work)
+            out = out + pos
+            out = self.proj(out)
+            out = _replace_nonfinite(
+                out,
+                "Non-finite spectral attention output; replacing with bounded values",
+                self.finite_clamp,
+            )
+
+        if out.dtype != output_dtype:
+            if output_dtype in (torch.float16, torch.bfloat16):
+                dtype_limit = torch.finfo(output_dtype).max
+                clamp_value = (
+                    min(self.finite_clamp, dtype_limit)
+                    if self.finite_clamp > 0
+                    else dtype_limit
+                )
+                out = out.clamp(-clamp_value, clamp_value)
+            out = out.to(output_dtype)
+
         return out
 
 
