@@ -18,6 +18,16 @@ from packaging import version
 logger = logging.getLogger(__name__)
 cv2.setNumThreads(0)
 TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
+RGB_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+
+
+def _resolve_rgb_path(rgb_dir: str, name: str) -> Optional[str]:
+    """Resolve an RGB sample across the supported image extensions."""
+    for extension in RGB_EXTENSIONS:
+        candidate = os.path.join(rgb_dir, f"{name}{extension}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 class OptimizedTrainDataset(Dataset):
@@ -66,13 +76,18 @@ class OptimizedTrainDataset(Dataset):
         hsi_dir = os.path.join(self.data_root, 'Train_Spec')
         
         for name in file_names:
-            rgb_path = os.path.join(rgb_dir, f"{name}.jpg")
+            rgb_path = _resolve_rgb_path(rgb_dir, name)
             hsi_path = os.path.join(hsi_dir, f"{name}.mat")
             
-            if os.path.exists(rgb_path) and os.path.exists(hsi_path):
+            if rgb_path is not None and os.path.exists(hsi_path):
                 self.rgb_files.append(rgb_path)
                 self.hsi_files.append(hsi_path)
-        
+
+        if not self.rgb_files:
+            raise FileNotFoundError(
+                f"No matched training RGB/HSI pairs found under {self.data_root}. "
+                f"Expected RGB extensions {RGB_EXTENSIONS} and HSI '.mat' files."
+            )
         logger.info(f"Found {len(self.rgb_files)} training images")
 
     def _infer_image_shape(self, idx: int) -> Tuple[int, int]:
@@ -123,6 +138,8 @@ class OptimizedTrainDataset(Dataset):
         """Load a single RGB-HSI pair"""
         # Load RGB
         rgb = cv2.imread(self.rgb_files[idx])
+        if rgb is None:
+            raise RuntimeError(f"Failed to load RGB image: {self.rgb_files[idx]}")
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb = rgb.astype(np.float32) / 255.0
         
@@ -313,13 +330,18 @@ class OptimizedValDataset(Dataset):
         hsi_dir = os.path.join(self.data_root, 'Train_Spec')
         
         for name in file_names:
-            rgb_path = os.path.join(rgb_dir, f"{name}.jpg")
+            rgb_path = _resolve_rgb_path(rgb_dir, name)
             hsi_path = os.path.join(hsi_dir, f"{name}.mat")
             
-            if os.path.exists(rgb_path) and os.path.exists(hsi_path):
+            if rgb_path is not None and os.path.exists(hsi_path):
                 self.rgb_files.append(rgb_path)
                 self.hsi_files.append(hsi_path)
-        
+
+        if not self.rgb_files:
+            raise FileNotFoundError(
+                f"No matched validation RGB/HSI pairs found under {self.data_root}. "
+                f"Expected RGB extensions {RGB_EXTENSIONS} and HSI '.mat' files."
+            )
         logger.info(f"Found {len(self.rgb_files)} validation images")
     
     def _preload_data(self):
@@ -385,6 +407,9 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
     batch_size = config.batch_size
     num_workers = config.num_workers
     memory_mode = memory_mode or config.memory_mode
+    augment = getattr(config, "augment", True)
+    cache_size = int(getattr(config, "cache_size", 100 if memory_mode == 'lazy' else 0))
+    base_seed = int(getattr(config, "seed", 42))
     
     # Create datasets
     train_dataset = OptimizedTrainDataset(
@@ -392,8 +417,8 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         crop_size=config.patch_size,
         stride=config.stride,
         memory_mode=memory_mode,
-        augment=True,
-        cache_size=100 if memory_mode == 'lazy' else 0
+        augment=augment,
+        cache_size=cache_size,
     )
     
     val_dataset = OptimizedValDataset(
@@ -413,11 +438,12 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
             pass
         
         # Set random seed
-        np.random.seed(42 + worker_id)
-        random.seed(42 + worker_id)
+        np.random.seed(base_seed + worker_id)
+        random.seed(base_seed + worker_id)
     
+    pin_memory = torch.cuda.is_available()
     pin_memory_kwargs: Dict[str, object] = {}
-    if torch.cuda.is_available() and TORCH_VERSION >= version.parse("2.0.0"):
+    if pin_memory and TORCH_VERSION >= version.parse("2.0.0"):
         pin_memory_kwargs["pin_memory_device"] = "cuda"
 
     def _prefetch_kwargs(worker_count: int) -> Dict[str, int]:
@@ -431,7 +457,7 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
         worker_init_fn=worker_init_fn,
         persistent_workers=num_workers > 0 and memory_mode == 'lazy',
@@ -439,15 +465,15 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         **pin_memory_kwargs,
     )
     
-    val_workers = 2
+    val_workers = max(0, int(getattr(config, "val_num_workers", min(2, num_workers))))
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,  # Full images for validation
         shuffle=False,
         num_workers=val_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         worker_init_fn=worker_init_fn,
-        persistent_workers=True,
+        persistent_workers=val_workers > 0,
         **_prefetch_kwargs(val_workers),
         **pin_memory_kwargs,
     )

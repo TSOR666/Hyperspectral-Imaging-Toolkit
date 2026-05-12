@@ -134,6 +134,7 @@ class SHARPTrainingConfig:
     val_interval: int = 10
     val_crop: bool = True  # Center crop 226x256 for MST++ protocol
     val_crop_size: Tuple[int, int] = (226, 256)
+    psnr_data_range: float = 1.0
     early_stopping_patience: int = 35
     early_stopping_min_delta: float = 1e-5
     
@@ -175,6 +176,8 @@ class SHARPTrainingConfig:
 
         if self.accumulate_steps <= 0:
             raise ValueError("accumulate_steps must be > 0")
+        if self.psnr_data_range <= 0:
+            raise ValueError("psnr_data_range must be > 0")
 
 
 class SHARPLoss(nn.Module):
@@ -234,12 +237,15 @@ class DedicatedSHARPTrainer:
         
         # Create model
         self.model = self._create_model()
+
+        # Create dataloaders before trainers/schedulers so step counts reflect the real dataset.
+        self.train_loader, self.val_loader = self._create_dataloaders()
         
         # Optimization setup
-        self.use_sharp_trainer = SHARP_TRAINER_AVAILABLE
+        self.use_sharp_trainer = SHARP_TRAINER_AVAILABLE and config.accumulate_steps == 1
         if self.use_sharp_trainer:
             # Use built-in SHARP trainer
-            total_steps = config.epochs * self._estimate_steps_per_epoch()
+            total_steps = config.epochs * max(1, math.ceil(len(self.train_loader) / config.accumulate_steps))
             self.sharp_trainer = SHARPv32Trainer(
                 model=self.model,
                 learning_rate=config.learning_rate,
@@ -248,14 +254,17 @@ class DedicatedSHARPTrainer:
                 total_steps=total_steps,
                 gradient_clip=config.gradient_clip,
                 ema_decay=config.ema_decay,
-                use_amp=config.use_amp
+                use_amp=config.use_amp,
+                ema_update_every=config.ema_update_every,
             )
         else:
+            if SHARP_TRAINER_AVAILABLE and config.accumulate_steps > 1:
+                warnings.warn(
+                    "accumulate_steps > 1 is not supported by SHARPv32Trainer; "
+                    "falling back to the manual training loop to preserve the requested behavior."
+                )
             # Manual setup
             self._setup_training_components()
-        
-        # Create dataloaders
-        self.train_loader, self.val_loader = self._create_dataloaders()
         
         # Logging
         self.writer = SummaryWriter(self.exp_dir / 'logs')
@@ -316,49 +325,23 @@ class DedicatedSHARPTrainer:
     def _create_model(self) -> nn.Module:
         """Create SHARP v3.2.2 model"""
         try:
-            # Create SHARP config
-            sharp_config = SHARPv32Config(
-                in_channels=self.config.in_channels,
-                out_channels=self.config.out_channels,
-                use_checkpoint=self.config.use_checkpoint,
-                compile_mode='reduce-overhead' if self.config.compile_model else None,
-                # v3.2.2 streaming attention parameters
-                sparse_block_size=self.config.sparse_block_size,
-                sparse_max_tokens=self.config.sparse_max_tokens,
-                sparse_window_size=self.config.sparse_window_size,
-                sparse_k_cap=self.config.sparse_k_cap,
-                sparse_q_block_size=self.config.sparse_q_block_size,
-                sparse_sparsity_ratio=self.config.sparse_sparsity_ratio,
-                rbf_centers_per_head=self.config.rbf_centers_per_head,
-                # v3.2.2 new features
-                key_rbf_mode=self.config.key_rbf_mode,
-                sparsemax_pad_value=self.config.sparsemax_pad_value,
-                ema_update_every=self.config.ema_update_every
-            )
-            
-            # Update config based on model size
-            size_configs = {
-                'tiny': {'base_dim': 48, 'depths': [2, 2, 2, 2], 'heads': [3, 6, 12, 24]},
-                'small': {'base_dim': 64, 'depths': [2, 2, 4, 2], 'heads': [4, 8, 16, 32]},
-                'base': {'base_dim': 96, 'depths': [2, 2, 6, 2], 'heads': [6, 12, 24, 48]},
-                'large': {'base_dim': 128, 'depths': [2, 2, 8, 2], 'heads': [8, 16, 32, 64]}
-            }
-            
-            if self.config.model_size in size_configs:
-                for key, value in size_configs[self.config.model_size].items():
-                    setattr(sharp_config, key, value)
-            
             # Create model
             model = create_sharp_v32(
                 model_size=self.config.model_size,
                 in_channels=self.config.in_channels,
                 out_channels=self.config.out_channels,
                 compile_model=self.config.compile_model,
+                use_checkpoint=self.config.use_checkpoint,
                 sparse_sparsity_ratio=self.config.sparse_sparsity_ratio,
                 rbf_centers_per_head=self.config.rbf_centers_per_head,
                 sparse_k_cap=self.config.sparse_k_cap,
+                sparse_block_size=self.config.sparse_block_size,
+                sparse_q_block_size=self.config.sparse_q_block_size,
+                sparse_window_size=self.config.sparse_window_size,
+                sparse_max_tokens=self.config.sparse_max_tokens,
                 key_rbf_mode=self.config.key_rbf_mode,
                 sparsemax_pad_value=self.config.sparsemax_pad_value,
+                ema_update_every=self.config.ema_update_every,
                 verbose=True
             )
             
@@ -375,8 +358,10 @@ class DedicatedSHARPTrainer:
     
     def _setup_training_components(self):
         """Setup training components if not using SHARPv32Trainer"""
-        # Loss function - use MST++ loss if available
-        if DATALOADER_AVAILABLE:
+        # Keep the optimization objective aligned with the built-in trainer path.
+        if hasattr(self.model, "compute_loss"):
+            self.criterion = self.model.compute_loss
+        elif DATALOADER_AVAILABLE:
             self.criterion = MSTPlusPlusLoss()
         else:
             self.criterion = SHARPLoss()
@@ -416,13 +401,13 @@ class DedicatedSHARPTrainer:
     
     def _create_scheduler(self):
         """Create cosine scheduler with warmup"""
-        total_steps = self.config.epochs * self._estimate_steps_per_epoch()
+        total_steps = self.config.epochs * max(1, math.ceil(len(self.train_loader) / self.config.accumulate_steps))
         warmup_steps = int(total_steps * self.config.warmup_ratio)
         
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
-                return step / warmup_steps
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.5 * (1 + math.cos(math.pi * progress))
         
         return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
@@ -464,9 +449,12 @@ class DedicatedSHARPTrainer:
                 data_root=self.config.data_root,
                 batch_size=self.config.batch_size,
                 num_workers=self.config.num_workers,
+                augment=self.config.augment,
                 memory_mode=self.config.memory_mode,
                 patch_size=self.config.patch_size,
-                stride=self.config.stride
+                stride=self.config.stride,
+                seed=self.config.seed,
+                val_num_workers=min(2, self.config.num_workers),
             )
             
             return create_optimized_dataloaders(dataloader_config, memory_mode=self.config.memory_mode)
@@ -710,7 +698,7 @@ class DedicatedSHARPTrainer:
         self.model.eval()
         
         if self.use_sharp_trainer:
-            metrics = self.sharp_trainer.evaluate(self.val_loader, psnr_max=2.0)
+            metrics = self.sharp_trainer.evaluate(self.val_loader, psnr_max=self.config.psnr_data_range)
         else:
             metrics = self._manual_validate()
         
@@ -758,7 +746,10 @@ class DedicatedSHARPTrainer:
             mrae = self._safe_mrae(pred, hsi).item()
             rmse = torch.sqrt(torch.mean((pred - hsi) ** 2)).item()
             mse = torch.mean((pred - hsi) ** 2)
-            psnr = 20 * torch.log10(torch.tensor(2.0) / torch.sqrt(mse.clamp(min=1e-8))).item()
+            psnr = 20 * torch.log10(
+                torch.tensor(self.config.psnr_data_range, device=mse.device, dtype=mse.dtype)
+                / torch.sqrt(mse.clamp(min=1e-8))
+            ).item()
             
             total_mrae += mrae
             total_rmse += rmse
@@ -901,6 +892,8 @@ def main():
                         help='Stop training after this many validations without improvement')
     parser.add_argument('--early_stopping_min_delta', type=float, default=1e-5,
                         help='Minimum MRAE improvement to reset early stopping counter')
+    parser.add_argument('--psnr_data_range', type=float, default=1.0,
+                        help='Reference intensity range used when reporting PSNR')
     parser.add_argument('--min_mrae_denom', type=float, default=1e-6,
                         help='Clamp floor for MRAE denominator to avoid division by zero')
     parser.add_argument('--max_consecutive_nonfinite', type=int, default=8,
@@ -945,6 +938,7 @@ def main():
         use_checkpoint=args.checkpoint,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        psnr_data_range=args.psnr_data_range,
         min_mrae_denom=args.min_mrae_denom,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         skip_oom_batches=not args.disable_oom_skip,
@@ -961,4 +955,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

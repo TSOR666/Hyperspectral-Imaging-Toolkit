@@ -78,6 +78,7 @@ from hsi_model.constants import (
     DEFAULT_LOG_DIR,
     DEFAULT_PATCH_SIZE,
     DEFAULT_STRIDE,
+    DEFAULT_GRADIENT_CLIP_NORM,
 )
 from hsi_model.utils import (
     setup_logging, MetricsLogger, save_checkpoint, load_checkpoint
@@ -439,6 +440,23 @@ def train_mst_gan_optimized(
                 continue
 
             scaler_g.scale(gen_loss).backward()
+            # Unscale + clip BEFORE step. scaler.step only skips on Inf/NaN
+            # gradients; a finite-but-large gradient slips through and drives
+            # the weights toward Inf over many iterations (root cause of the
+            # generator-NaN-then-infinite-retry crash). Clip to bound the
+            # step size like training_script_fixed.py does.
+            scaler_g.unscale_(optimizer_g)
+            g_grad_norm = torch.nn.utils.clip_grad_norm_(
+                generator.parameters(),
+                max_norm=DEFAULT_GRADIENT_CLIP_NORM,
+            )
+            if not torch.isfinite(g_grad_norm):
+                logger.warning(
+                    "Non-finite generator grad norm at iter %s; skipping optimizer step",
+                    iteration,
+                )
+                optimizer_g.zero_grad(set_to_none=True)
+                continue
             old_scale_g = scaler_g.get_scale()
             scaler_g.step(optimizer_g)
             scaler_g.update()
@@ -471,6 +489,18 @@ def train_mst_gan_optimized(
                 continue
 
             scaler_d.scale(disc_loss).backward()
+            scaler_d.unscale_(optimizer_d)
+            d_grad_norm = torch.nn.utils.clip_grad_norm_(
+                discriminator.parameters(),
+                max_norm=DEFAULT_GRADIENT_CLIP_NORM,
+            )
+            if not torch.isfinite(d_grad_norm):
+                logger.warning(
+                    "Non-finite discriminator grad norm at iter %s; skipping optimizer step",
+                    iteration,
+                )
+                optimizer_d.zero_grad(set_to_none=True)
+                continue
             old_scale_d = scaler_d.get_scale()
             scaler_d.step(optimizer_d)
             scaler_d.update()
@@ -583,11 +613,11 @@ def train_mst_gan_optimized(
                     del hsi_tensor
                 memory_cleanup()
                 continue
-            logger.error(f"Training runtime error: {str(e)}", exc_info=True)
-            continue
-        except Exception as e:
-            logger.error(f"Training error: {str(e)}", exc_info=True)
-            continue
+            # Non-OOM RuntimeErrors are usually structural (shape mismatch,
+            # CUDA assert). Re-raise so the caller actually sees them — the
+            # previous swallow-and-continue turned every fatal error into a
+            # silent infinite retry.
+            raise
     
     # Final cleanup
     logger.info("Training completed, cleaning up...")

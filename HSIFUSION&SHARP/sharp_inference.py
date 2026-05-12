@@ -28,7 +28,11 @@ class SHARPInference:
     """SHARP v3.2.2 inference wrapper."""
     
     def __init__(self, checkpoint_path: str, device: str = 'cuda'):
-        self.device = torch.device(device)
+        requested_device = torch.device(device)
+        if requested_device.type == 'cuda' and not torch.cuda.is_available():
+            print("CUDA requested but not available; falling back to CPU.")
+            requested_device = torch.device('cpu')
+        self.device = requested_device
         
         # Load checkpoint
         print(f"Loading checkpoint from: {checkpoint_path}")
@@ -123,7 +127,8 @@ class SHARPInference:
             rgb_image = rgb_image.unsqueeze(0)
         
         B, C, H, W = rgb_image.shape
-        assert C == self.in_channels, f"Expected {self.in_channels} channels, got {C}"
+        if C != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} channels, got {C}")
         
         # Move to device
         rgb_image = rgb_image.to(self.device)

@@ -1334,7 +1334,7 @@ class SHARPv32Trainer:
         }
         
     @torch.no_grad()
-    def evaluate(self, dataloader, psnr_max: float = 2.0) -> Dict[str, float]:
+    def evaluate(self, dataloader, psnr_max: float = 1.0) -> Dict[str, float]:
         """Evaluate model."""
         if psnr_max <= 0:
             raise ValueError("psnr_max must be positive")

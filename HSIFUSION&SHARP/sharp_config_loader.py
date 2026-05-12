@@ -38,16 +38,17 @@ def parse_config_value(value: str) -> ConfigValue:
     if value.strip() == '':
         return None
     
+    stripped = value.strip()
+
     # Try to parse as number
     try:
-        # Try integer first
-        if '.' not in value:
-            return int(value)
-        else:
-            return float(value)
+        return int(stripped)
     except ValueError:
-        # Return as string
-        return value
+        try:
+            return float(stripped)
+        except ValueError:
+            # Return as string
+            return value
 
 
 def load_config_file(config_path: Path) -> Dict[str, Any]:
