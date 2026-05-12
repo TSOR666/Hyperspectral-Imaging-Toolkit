@@ -50,7 +50,7 @@ def time_block(label: str, fn, n: int = 5):
         if rss_before is not None and rss_after is not None
         else "n/a"
     )
-    print(f"  {label:<50s} {elapsed*1000:>8.1f} ms/iter   RSS Δ {rss_delta}")
+    print(f"  {label:<50s} {elapsed*1000:>8.1f} ms/iter   RSS delta {rss_delta}")
     return elapsed
 
 
@@ -63,7 +63,7 @@ print("=" * 78)
 # ---------------------------------------------------------------------------
 # Bench 1: Generator forward+backward at smoke-run-sized config
 # ---------------------------------------------------------------------------
-print("\n[1] NoiseRobustCSWinGenerator(forward+backward) — single 1×3×64×64 patch")
+print("\n[1] NoiseRobustCSWinGenerator(forward+backward) - single 1x3x64x64 patch")
 gen_cfg = {
     "in_channels": 3, "out_channels": 31, "base_channels": 32,
     "split_sizes": [4, 4, 4], "num_heads": 4, "norm_groups": 8,
@@ -87,7 +87,7 @@ time_block("forward+backward (legacy auto-increment)", gen_step)
 
 
 def gen_step_managed():
-    gen.set_iteration(1)  # external mode — auto-increment off
+    gen.set_iteration(1)  # external mode - auto-increment off
     out = gen(x)
     loss = out.pow(2).mean()
     loss.backward()
@@ -100,7 +100,7 @@ time_block("forward+backward (set_iteration trainer-managed)", gen_step_managed)
 # ---------------------------------------------------------------------------
 # Bench 2: SinkhornDivergence forward+backward (the fixed-symmetric path)
 # ---------------------------------------------------------------------------
-print("\n[2] SinkhornDivergence(X, Y) — 1024-point 1-D clouds (default cap)")
+print("\n[2] SinkhornDivergence(X, Y) - 1024-point 1-D clouds (default cap)")
 sd = SinkhornDivergence(epsilon=0.1, n_iters=50, max_points=1024)
 
 
