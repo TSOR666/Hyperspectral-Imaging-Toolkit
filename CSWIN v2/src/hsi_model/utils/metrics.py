@@ -211,7 +211,8 @@ def profile_model(
 def validate_model_architecture(
     model: nn.Module,
     expected_input_size: Tuple[int, int, int, int],
-    strict: bool = False
+    strict: bool = False,
+    expected_out_channels: Optional[int] = None,
 ) -> bool:
     """
     Validate model architecture matches expected configuration.
@@ -239,8 +240,13 @@ def validate_model_architecture(
             else:
                 output = model(test_input)
         
-        # Check output shape
-        expected_out_channels = 31  # ARAD-1K
+        # Check output shape. Default to the generator's configured final
+        # projection when available so custom-band models do not fail a
+        # hard-coded ARAD-31 assumption.
+        if expected_out_channels is None:
+            generator = model.generator if hasattr(model, "generator") else model
+            to_spectral = getattr(generator, "to_spectral", None)
+            expected_out_channels = int(getattr(to_spectral, "out_channels", 31))
         if output.shape[1] != expected_out_channels:
             msg = f"Model output channels {output.shape[1]} != expected {expected_out_channels}"
             if strict:
@@ -533,7 +539,8 @@ def compute_mrae(pred: torch.Tensor, target: torch.Tensor, epsilon: float = 1e-8
     Returns:
         MRAE value
     """
-    return torch.mean(torch.abs(pred - target) / (target + epsilon))
+    denominator = target.abs().clamp_min(epsilon)
+    return torch.mean(torch.abs(pred - target) / denominator)
 
 
 def compute_mae(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -625,6 +632,14 @@ def compute_metrics(
     Returns:
         Dictionary of metrics
     """
+    if pred.shape != target.shape:
+        raise ValueError(
+            "Metric shape mismatch: "
+            f"pred={tuple(pred.shape)} target={tuple(target.shape)}. "
+            "Metrics require exactly aligned B,C,H,W tensors; implicit "
+            "broadcasting would report invalid spectral scores."
+        )
+
     with torch.no_grad():
         # Metrics must run in float32: pytorch_msssim's cached gaussian window is
         # fp32, so passing fp16 inputs (e.g. autocast outputs from validation)

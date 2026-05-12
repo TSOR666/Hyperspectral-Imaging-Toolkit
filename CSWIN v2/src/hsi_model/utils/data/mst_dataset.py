@@ -23,12 +23,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Any, Optional, Sequence, Tuple
 
-from ...constants import (
-    ARAD1K_FULL_HEIGHT,
-    ARAD1K_FULL_WIDTH,
-    DEFAULT_PATCH_SIZE,
-    DEFAULT_STRIDE,
-)
+from ...constants import ARAD1K_NUM_BANDS, DEFAULT_PATCH_SIZE, DEFAULT_STRIDE
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +61,41 @@ def _resolve_dataset_file(
             if candidate.exists():
                 return candidate
     return None
+
+
+def _cube_to_chw(cube: np.ndarray, source: Path) -> np.ndarray:
+    if cube.ndim != 3:
+        raise ValueError(f"Expected 3D HSI cube in {source}, got shape {cube.shape}")
+    cube = np.float32(cube)
+    if cube.shape[0] == ARAD1K_NUM_BANDS:
+        return cube
+    if cube.shape[-1] == ARAD1K_NUM_BANDS:
+        return np.transpose(cube, (2, 0, 1))
+    raise ValueError(
+        f"Expected a {ARAD1K_NUM_BANDS}-band HSI cube in {source}, got shape {cube.shape}"
+    )
+
+
+def _load_mst_cube(path: Path) -> np.ndarray:
+    with h5py.File(path, "r") as mat:
+        cube = np.array(mat["cube"])
+    cube_chw = _cube_to_chw(cube, path)
+    # MST++ ARAD files are commonly stored as C,W,H; this converts them to C,H,W.
+    return np.transpose(cube_chw, [0, 2, 1])
+
+
+def _align_hyper_to_rgb(hyper: np.ndarray, bgr_hw: Tuple[int, int], source: Path) -> np.ndarray:
+    hyper_hw = (hyper.shape[1], hyper.shape[2])
+    if hyper_hw == bgr_hw:
+        return hyper
+    if hyper_hw == (bgr_hw[1], bgr_hw[0]):
+        logger.warning(
+            "HSI spatial axes were swapped after MST transpose for %s; correcting to match RGB %s",
+            source,
+            bgr_hw,
+        )
+        return np.transpose(hyper, [0, 2, 1])
+    raise ValueError(f"Spatial mismatch for {source}: hyper={hyper_hw} rgb={bgr_hw}")
 
 
 class MST_TrainDataset(Dataset):
@@ -106,12 +136,10 @@ class MST_TrainDataset(Dataset):
         self.arg = arg
         self.memory_mode = memory_mode
 
-        # ARAD-1K image dimensions (MST++ hardcoded)
-        h, w = ARAD1K_FULL_HEIGHT, ARAD1K_FULL_WIDTH
         self.stride = stride
-        self.patch_per_line = (w - crop_size) // stride + 1
-        self.patch_per_column = (h - crop_size) // stride + 1
-        self.patch_per_img = self.patch_per_line * self.patch_per_column
+        self.patch_per_line = 0
+        self.patch_per_column = 0
+        self.patch_per_img = 0
 
         # MST++ file paths
         hyper_data_path = f"{data_root}/Train_Spec/"
@@ -135,11 +163,7 @@ class MST_TrainDataset(Dataset):
 
             # Load HSI using h5py (MST++ way)
             try:
-                with h5py.File(hyper_path, "r") as mat:
-                    # MST++ loads 'cube' variable as float32
-                    hyper = np.float32(np.array(mat["cube"]))
-                # MST++ exact transpose: [31, H, W] -> [31, W, H] -> [H, W, 31]
-                hyper = np.transpose(hyper, [0, 2, 1])
+                hyper = _load_mst_cube(Path(hyper_path))
             except Exception as exc:
                 logger.warning(f"Failed to load {hyper_path}: {exc}")
                 continue
@@ -160,15 +184,11 @@ class MST_TrainDataset(Dataset):
             if hyper.ndim != 3 or bgr.ndim != 3:
                 logger.warning("Unexpected shapes for %s: hyper=%s rgb=%s", hyper_path, hyper.shape, bgr.shape)
                 continue
-            hyper_hw = (hyper.shape[1], hyper.shape[2])
             bgr_hw = (bgr.shape[0], bgr.shape[1])
-            if hyper_hw != bgr_hw and hyper_hw != (bgr_hw[1], bgr_hw[0]):
-                logger.warning(
-                    "Spatial mismatch for %s: hyper=%s rgb=%s",
-                    hyper_path,
-                    hyper_hw,
-                    bgr_hw,
-                )
+            try:
+                hyper = _align_hyper_to_rgb(hyper, bgr_hw, Path(hyper_path))
+            except ValueError as exc:
+                logger.warning(str(exc))
                 continue
 
             # MST++ RGB normalization: per-image min-max
@@ -197,6 +217,22 @@ class MST_TrainDataset(Dataset):
                 logger.info(f"Loaded {i+1}/{len(hyper_list)} training scenes")
 
         self.img_num = len(self.hypers)
+        if self.img_num > 0:
+            h, w = self.bgrs[0].shape[1:]
+            if h < crop_size or w < crop_size:
+                raise ValueError(
+                    f"Loaded MST images are smaller than crop_size={crop_size}: {(h, w)}"
+                )
+            for sample_idx, (bgr, hyper) in enumerate(zip(self.bgrs, self.hypers)):
+                if bgr.shape[1:] != (h, w) or hyper.shape[1:] != (h, w):
+                    raise ValueError(
+                        "MST_TrainDataset requires consistent spatial sizes; "
+                        f"sample {sample_idx} has rgb={bgr.shape[1:]} hsi={hyper.shape[1:]}, "
+                        f"expected {(h, w)}"
+                    )
+            self.patch_per_line = (w - crop_size) // stride + 1
+            self.patch_per_column = (h - crop_size) // stride + 1
+            self.patch_per_img = self.patch_per_line * self.patch_per_column
         logger.info("Finished loading MST++ training dataset")
 
     @staticmethod
@@ -323,9 +359,7 @@ class MST_ValidDataset(Dataset):
 
             # Load HSI using h5py (MST++ way)
             try:
-                with h5py.File(hyper_path, "r") as mat:
-                    hyper = np.float32(np.array(mat["cube"]))
-                hyper = np.transpose(hyper, [0, 2, 1])
+                hyper = _load_mst_cube(hyper_path)
             except Exception as exc:
                 logger.warning(f"Failed to load validation {hyper_path}: {exc}")
                 continue
@@ -351,6 +385,11 @@ class MST_ValidDataset(Dataset):
                 continue
             if bgr2rgb:
                 bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            try:
+                hyper = _align_hyper_to_rgb(hyper, (bgr.shape[0], bgr.shape[1]), hyper_path)
+            except ValueError as exc:
+                logger.warning(str(exc))
+                continue
 
             # MST++ RGB normalization
             bgr = np.float32(bgr)

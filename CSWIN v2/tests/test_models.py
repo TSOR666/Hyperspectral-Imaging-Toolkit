@@ -43,6 +43,22 @@ def test_discriminator_with_sinkhorn_outputs():
     assert features.shape[1] == output.shape[2] * output.shape[3]
 
 
+def test_discriminator_honors_configured_hsi_channels():
+    config = {
+        "in_channels": 3,
+        "out_channels": 16,
+        "discriminator_base_dim": 8,
+        "discriminator_num_heads": 2,
+        "discriminator_num_blocks": [1, 1],
+    }
+    disc = SNTransformerDiscriminator(config)
+    rgb = torch.randn(1, 3, 16, 16)
+    hsi = torch.randn(1, 16, 16, 16)
+    out = disc(rgb, hsi)
+    assert out.shape[0] == 1
+    assert out.shape[1] == 1
+
+
 def test_gradient_penalty_scalar():
     config = {
         "discriminator_base_dim": 8,

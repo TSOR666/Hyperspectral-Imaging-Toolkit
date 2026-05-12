@@ -275,7 +275,9 @@ class SNTransformerDiscriminator(nn.Module):
         super().__init__()
         
         # Configuration
-        in_channels = 3 + 31  # RGB + HSI
+        rgb_channels = int(config.get("in_channels", 3))
+        hsi_channels = int(config.get("out_channels", 31))
+        in_channels = rgb_channels + hsi_channels  # RGB + HSI
         base_dim = config.get('discriminator_base_dim', 64)
         num_heads = config.get('discriminator_num_heads', 8)
         num_blocks = config.get('discriminator_num_blocks', [2, 2, 2])  # Per resolution

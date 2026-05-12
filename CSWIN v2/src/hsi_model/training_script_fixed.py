@@ -153,10 +153,16 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
             factor = (self.last_epoch + 2) / (self.warmup_steps + 1)
         else:
             # Cosine annealing
-            progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
-            factor = self.eta_min + (1 - self.eta_min) * 0.5 * (1 + np.cos(np.pi * progress))
-        
-        return [base_lr * factor for base_lr in self.base_lrs]
+            denom = max(1, self.total_steps - self.warmup_steps)
+            progress = (self.last_epoch - self.warmup_steps) / denom
+            factor = 0.5 * (1 + np.cos(np.pi * float(np.clip(progress, 0.0, 1.0))))
+
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * factor for base_lr in self.base_lrs]
+        return [
+            self.eta_min + (base_lr - self.eta_min) * factor
+            for base_lr in self.base_lrs
+        ]
 
 
 # ============================================
@@ -224,7 +230,7 @@ def validate_gan_safe(
     total_metrics = {}
     num_batches = 0
     num_valid_batches = 0
-    use_amp = config.get("mixed_precision", True)
+    use_amp = config.get("mixed_precision", True) and device.type == "cuda"
     
     with torch.no_grad():
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
@@ -477,7 +483,7 @@ def train_sinkhorn_gan(
     # Training state
     iteration = start_iteration
     record_mrae_loss = best_mrae
-    use_amp = config.get("mixed_precision", True)
+    use_amp = config.get("mixed_precision", True) and device.type == "cuda"
     epoch_losses = []
     current_epoch = 0
     nan_count = 0
