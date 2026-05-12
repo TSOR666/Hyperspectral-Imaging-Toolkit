@@ -90,6 +90,22 @@ def test_noise_robust_loss_accepts_amp_prediction_dtype():
     assert torch.isfinite(pred.grad).all()
 
 
+def test_noise_robust_loss_rejects_broadcastable_shape_mismatch():
+    criterion = NoiseRobustLoss(
+        {
+            "lambda_perceptual": 0.0,
+            "lambda_adversarial": 0.0,
+            "lambda_sam": 0.0,
+            "use_adaptive_weights": False,
+        }
+    )
+    pred = torch.rand(1, 31, 4, 4)
+    target = torch.rand(1, 1, 4, 4)
+
+    with pytest.raises(ValueError, match="Loss shape mismatch"):
+        criterion(pred, target)
+
+
 # GATE 2.6: Sinkhorn Gradient Test
 def test_sinkhorn_gradcheck():
     """Test that Sinkhorn backward pass yields finite gradients (Finding 2.6)."""

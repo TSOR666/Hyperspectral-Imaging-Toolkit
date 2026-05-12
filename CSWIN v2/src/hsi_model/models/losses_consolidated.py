@@ -814,6 +814,13 @@ class NoiseRobustLoss(nn.Module):
         # the actual loss terms below are computed in fp32.
         if pred.device != target.device:
             raise RuntimeError(f"Device mismatch: pred={pred.device}, target={target.device}")
+        if pred.shape != target.shape:
+            raise ValueError(
+                "Loss shape mismatch: "
+                f"pred={tuple(pred.shape)} target={tuple(target.shape)}. "
+                "RGB-to-HSI losses require exactly aligned B,C,H,W tensors; "
+                "implicit broadcasting would corrupt spectral supervision."
+            )
         if not pred.is_floating_point() or not target.is_floating_point():
             raise TypeError(
                 f"Loss expects floating point tensors: pred={pred.dtype}, target={target.dtype}"

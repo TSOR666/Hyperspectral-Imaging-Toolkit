@@ -83,11 +83,15 @@ class PatchInference:
                 # Handle edge case where image is smaller than patch size
                 if h_end - h_start < self.patch_size or w_end - w_start < self.patch_size:
                     # Pad the patch
+                    pad_h = self.patch_size - (h_end - h_start)
+                    pad_w = self.patch_size - (w_end - w_start)
+                    pad_mode = "reflect"
+                    if (h_end - h_start) <= pad_h or (w_end - w_start) <= pad_w:
+                        pad_mode = "replicate"
                     patch = F.pad(
                         img[:, :, h_start:h_end, w_start:w_end],
-                        (0, self.patch_size - (w_end - w_start), 
-                         0, self.patch_size - (h_end - h_start)),
-                        mode='reflect'
+                        (0, pad_w, 0, pad_h),
+                        mode=pad_mode
                     )
                 else:
                     patch = img[:, :, h_start:h_end, w_start:w_end]

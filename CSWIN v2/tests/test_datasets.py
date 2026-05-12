@@ -69,11 +69,12 @@ def test_mst_dataset_constant_rgb_no_division_by_zero():
     (split_dir / "valid_list.txt").write_text(f"{scene}\n", encoding="utf-8")
 
     try:
-        hyper = np.random.rand(31, 4, 4).astype(np.float32)
+        # Non-square W,H storage exercises the MST C,W,H -> C,H,W transpose.
+        hyper = np.random.rand(31, 5, 4).astype(np.float32)
         with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
             mat.create_dataset("cube", data=hyper)
 
-        rgb_const = np.full((4, 4, 3), 127, dtype=np.uint8)
+        rgb_const = np.full((4, 5, 3), 127, dtype=np.uint8)
         assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb_const)
 
         train_dataset = MST_TrainDataset(
@@ -83,13 +84,18 @@ def test_mst_dataset_constant_rgb_no_division_by_zero():
             arg=False,
             bgr2rgb=True,
         )
+        assert len(train_dataset) == 12
         rgb_patch, hsi_patch = train_dataset[0]
+        assert rgb_patch.shape == (3, 2, 2)
+        assert hsi_patch.shape == (31, 2, 2)
         assert np.isfinite(rgb_patch).all()
         assert np.isfinite(hsi_patch).all()
         assert float(np.max(rgb_patch)) == 0.0
 
         valid_dataset = MST_ValidDataset(data_root=str(case_dir), bgr2rgb=True)
         rgb_full, hsi_full = valid_dataset[0]
+        assert rgb_full.shape == (3, 4, 5)
+        assert hsi_full.shape == (31, 4, 5)
         assert np.isfinite(rgb_full).all()
         assert np.isfinite(hsi_full).all()
         assert float(np.max(rgb_full)) == 0.0
@@ -111,18 +117,19 @@ def test_mst_valid_dataset_prefers_validation_directories():
     (split_dir / "valid_list.txt").write_text(f"{scene}\n", encoding="utf-8")
 
     try:
-        hyper = np.random.rand(31, 4, 4).astype(np.float32)
+        # C,H,W storage is also accepted and corrected after the MST transpose.
+        hyper = np.random.rand(31, 4, 5).astype(np.float32)
         with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
             mat.create_dataset("cube", data=hyper)
 
-        rgb = np.random.randint(0, 255, (4, 4, 3), dtype=np.uint8)
+        rgb = np.random.randint(0, 255, (4, 5, 3), dtype=np.uint8)
         assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb)
 
         valid_dataset = MST_ValidDataset(data_root=str(case_dir), bgr2rgb=True)
         assert len(valid_dataset) == 1
         rgb_full, hsi_full = valid_dataset[0]
-        assert rgb_full.shape == (3, 4, 4)
-        assert hsi_full.shape == (31, 4, 4)
+        assert rgb_full.shape == (3, 4, 5)
+        assert hsi_full.shape == (31, 4, 5)
         assert np.isfinite(rgb_full).all()
         assert np.isfinite(hsi_full).all()
     finally:

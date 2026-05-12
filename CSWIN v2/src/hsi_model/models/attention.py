@@ -62,6 +62,13 @@ ConfigDict = Mapping[str, object]
 EPS = 1e-8
 
 
+def _adaptive_group_norm(channels: int, requested_groups: int) -> nn.GroupNorm:
+    groups = min(int(requested_groups), channels)
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
+
+
 def _autocast_disabled(device_type: str):
     """Return a context manager that runs ops outside autocast."""
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
@@ -626,18 +633,18 @@ class EfficientSpectralAttention(nn.Module):
         # Linear projections for Q, K, V with group normalization for better stability
         self.to_q = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.GroupNorm(norm_groups, channels)
+            _adaptive_group_norm(channels, norm_groups)
         )
         self.to_k = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.GroupNorm(norm_groups, channels)
+            _adaptive_group_norm(channels, norm_groups)
         )
         self.to_v = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         
         # Output projection with group normalization
         self.proj = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1),
-            nn.GroupNorm(norm_groups, channels)
+            _adaptive_group_norm(channels, norm_groups)
         )
         
         # Position embedding
@@ -787,9 +794,9 @@ class ChannelAttention(nn.Module):
         # Channel attention with two FC layers
         # v3.1: Removed inplace=True to prevent autograd issues with checkpointing
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
+            nn.Linear(channels, max(1, channels // reduction), bias=False),
             nn.ReLU(),
-            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Linear(max(1, channels // reduction), channels, bias=False),
             nn.Sigmoid()
         )
         
