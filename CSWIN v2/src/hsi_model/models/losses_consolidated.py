@@ -73,7 +73,7 @@ def _safe_normalize(points: torch.Tensor, eps: float = EPSILON_SMALL) -> torch.T
 
 
 def _jointly_rescale(
-    a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6
+    a: torch.Tensor, b: torch.Tensor, eps: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Divide both point clouds by the same scalar so the OT cost stays finite.
 
@@ -82,6 +82,16 @@ def _jointly_rescale(
     magnitude difference that distinguishes real from fake disc outputs, while
     still bounding values to [-1, 1] so Sinkhorn's kernel exponent ``-C/eps``
     does not under/overflow.
+
+    Important: the scale floor must be ≥ 1, NOT a tiny epsilon. The previous
+    ``eps=1e-6`` meant that at initialisation (when D output proj uses
+    gain=0.1 and outputs are O(0.01)), the per-batch scale was tiny and the
+    backward gradient through ``a / scale`` was amplified by ``1/scale ≈ 100``.
+    Under fp16 autocast that gradient amplification produces immediate
+    overflow at iter 0 (the signature you saw: scaler 65536 → 0.2 in ~190
+    steps). With ``eps=1.0`` the rescale is a *no-op* when max-abs ≤ 1 and
+    only ever shrinks gradient magnitudes for larger inputs — gradient gain
+    is bounded above by 1.0 regardless of D output magnitude.
     """
     a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
     b = torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)

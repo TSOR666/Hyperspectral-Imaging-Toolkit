@@ -48,7 +48,7 @@ from hsi_model.utils.data import (
     mst_to_gan_batch, compute_mst_center_crop_metrics, worker_init_fn_mst
 )
 from hsi_model.utils.training_setup import (
-    setup_paths, setup_distributed_training, setup_seed,
+    setup_paths, setup_distributed_training, setup_seed, pick_amp_dtype,
 )
 from hsi_model.constants import (
     DEFAULT_BATCH_SIZE,
@@ -230,26 +230,28 @@ def validate_gan_safe(
     total_metrics = {}
     num_batches = 0
     num_valid_batches = 0
-    use_amp = config.get("mixed_precision", True) and device.type == "cuda"
-    
+    amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
+    use_amp = amp_dtype is not None
+    autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+
     with torch.no_grad():
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
             if batch_idx >= 10:  # Limit validation
                 break
-                
+
             try:
                 rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
-                
+
                 if rgb_tensor.numel() == 0 or hsi_tensor.numel() == 0:
                     continue
-                
+
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
                 if not torch.isfinite(rgb_tensor).all() or not torch.isfinite(hsi_tensor).all():
                     logger_val.warning(f"Non-finite validation batch at index {batch_idx}; skipping")
                     continue
-                
-                with autocast(enabled=use_amp):
+
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     if hasattr(model, 'module'):
                         pred_hsi = model.module.generator(rgb_tensor)
                         disc_real = model.module.discriminator(rgb_tensor, hsi_tensor)
@@ -483,7 +485,18 @@ def train_sinkhorn_gan(
     # Training state
     iteration = start_iteration
     record_mrae_loss = best_mrae
-    use_amp = config.get("mixed_precision", True) and device.type == "cuda"
+    # GPU-aware precision pick (auto -> bf16 on A100+, fp16 on V100/T4,
+    # fp32 elsewhere). bf16 has fp32 exponent range so backward gradients
+    # cannot overflow — the GradScaler-cycling-down failure mode goes away
+    # entirely on Ampere+.
+    amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
+    use_amp = amp_dtype is not None
+    autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+    logger.info(
+        "Mixed precision: dtype=%s, enabled=%s",
+        "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
+        use_amp,
+    )
     epoch_losses = []
     current_epoch = 0
     nan_count = 0
@@ -562,7 +575,7 @@ def train_sinkhorn_gan(
             # discriminator forward pass on D-step iterations.
             run_disc_step = is_step_boundary and (iteration % n_critic == 0)
 
-            with autocast(enabled=use_amp):
+            with autocast(enabled=use_amp, dtype=autocast_dtype):
                 fake_hsi = generator(rgb_tensor)
 
             if not torch.isfinite(fake_hsi).all():
@@ -611,23 +624,23 @@ def train_sinkhorn_gan(
             # tensor is used in the D-step so disc_loss.backward() still
             # flows gradients through it into D's parameters.
             if run_disc_step:
-                with autocast(enabled=use_amp):
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     disc_real_full = discriminator(rgb_tensor, hsi_tensor)
                 disc_real_for_g = disc_real_full.detach()
             else:
                 disc_real_full = None
                 with torch.no_grad():
-                    with autocast(enabled=use_amp):
+                    with autocast(enabled=use_amp, dtype=autocast_dtype):
                         disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
 
             set_requires_grad(discriminator, False)
             try:
-                with autocast(enabled=use_amp):
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     disc_fake_for_g = discriminator(rgb_tensor, fake_hsi)
             finally:
                 set_requires_grad(discriminator, True)
 
-            with autocast(enabled=use_amp):
+            with autocast(enabled=use_amp, dtype=autocast_dtype):
                 gen_loss, loss_components = criterion(
                     fake_hsi,
                     hsi_tensor,
@@ -665,7 +678,7 @@ def train_sinkhorn_gan(
             if run_disc_step:
                 fake_hsi_detached = fake_hsi.detach()
 
-                with autocast(enabled=use_amp):
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     # Reuse the disc(real) tensor computed before the G-step.
                     # Its autograd graph is still intact because the G-step
                     # only consumed the .detach()'d view; the original tensor
@@ -901,6 +914,9 @@ def main(config: DictConfig) -> None:
     cfg.setdefault("sinkhorn_loss_clip", DEFAULT_SINKHORN_LOSS_CLIP)
     cfg.setdefault("generator_lr", DEFAULT_GENERATOR_LR)
     cfg.setdefault("discriminator_lr", DEFAULT_DISCRIMINATOR_LR)
+    # AMP dtype: "auto" picks bf16 on A100+ (no GradScaler cycling), fp16 on
+    # older Tensor Core GPUs, fp32 elsewhere. Override with "bf16"/"fp16"/"fp32".
+    cfg.setdefault("mixed_precision_dtype", "auto")
     
     logger = setup_logging(cfg["log_dir"], logging.INFO, rank)
     
@@ -946,9 +962,15 @@ def main(config: DictConfig) -> None:
     scheduler_d = WarmupCosineScheduler(optimizer_d, warmup_steps, total_iterations, eta_min=1e-6)
     schedulers = {'scheduler_g': scheduler_g, 'scheduler_d': scheduler_d}
     
-    # Create scalers
-    scaler_g = GradScaler(enabled=cfg.get("mixed_precision", True), growth_interval=100)
-    scaler_d = GradScaler(enabled=cfg.get("mixed_precision", True), growth_interval=100)
+    # Create scalers. Only fp16 needs a loss scaler — bf16 has fp32's
+    # exponent range so backward gradients cannot overflow (and PyTorch
+    # refuses to scale bf16 grads). Disabled scaler is transparent:
+    # scale()/unscale_()/update() are no-ops and step() calls
+    # optimizer.step() directly.
+    _amp_dtype = pick_amp_dtype(cfg) if device.type == "cuda" else None
+    _needs_scaler = _amp_dtype == torch.float16
+    scaler_g = GradScaler(enabled=_needs_scaler, growth_interval=100)
+    scaler_d = GradScaler(enabled=_needs_scaler, growth_interval=100)
     scalers = {'scaler_g': scaler_g, 'scaler_d': scaler_d}
     
     # Create loss functions

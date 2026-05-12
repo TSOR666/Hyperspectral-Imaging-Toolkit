@@ -20,7 +20,7 @@ import logging
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -159,9 +159,84 @@ def setup_seed(seed: int, rank: int = 0) -> None:
     )
 
 
+_DTYPE_ALIASES: Dict[str, Optional[torch.dtype]] = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "fp32": None,
+    "float32": None,
+    "off": None,
+    "none": None,
+    "disabled": None,
+}
+
+
+def pick_amp_dtype(config: Dict[str, Any]) -> Optional[torch.dtype]:
+    """Choose an autocast dtype based on config + GPU capability.
+
+    Decision rule (when ``mixed_precision_dtype == 'auto'``, the default):
+
+    * compute capability >= 8.0 (A100, A40, H100, RTX 30/40)  -> bf16
+      bf16 has fp32's 8-bit exponent, so backward gradients cannot overflow
+      the way fp16 does; this removes the GradScaler-cycling-down failure
+      mode entirely on Ampere+ GPUs.
+    * compute capability >= 7.0 (V100, T4)  -> fp16
+      Tensor Cores accelerate fp16 here but bf16 isn't supported; fall back.
+    * older GPUs / CPU                       -> None (run fp32, skip autocast)
+
+    The explicit overrides ``"bf16"``, ``"fp16"``, ``"fp32"`` (and aliases)
+    bypass the detection and pick the named dtype, returning ``None`` for
+    fp32 to mean "do not enable autocast".
+
+    Legacy ``mixed_precision: bool`` is honoured: ``False`` forces fp32,
+    ``True`` falls through to the auto rule.
+    """
+    override = config.get("mixed_precision_dtype")
+    if override is None and "mixed_precision" in config:
+        # Map the legacy bool. True -> let auto-detect choose; False -> off.
+        if not config.get("mixed_precision", True):
+            return None
+        override = "auto"
+
+    if override is None:
+        override = "auto"
+
+    if isinstance(override, str):
+        key = override.strip().lower()
+        if key == "auto":
+            pass  # fall through to detection
+        elif key in _DTYPE_ALIASES:
+            return _DTYPE_ALIASES[key]
+        else:
+            raise ValueError(
+                f"Unknown mixed_precision_dtype={override!r}; expected one of "
+                "'auto', 'bf16', 'fp16', 'fp32' (or aliases)."
+            )
+    elif isinstance(override, torch.dtype):
+        # Explicit dtype object — trust it.
+        return override if override in (torch.bfloat16, torch.float16) else None
+
+    # Auto path.
+    if not torch.cuda.is_available():
+        return None
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except (RuntimeError, AssertionError):
+        return None
+
+    if major >= 8:
+        return torch.bfloat16
+    if major >= 7:
+        return torch.float16
+    return None
+
+
 __all__ = [
     "setup_paths",
     "setup_distributed_training",
     "setup_seed",
     "cleanup",
+    "pick_amp_dtype",
 ]
