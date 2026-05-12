@@ -85,6 +85,7 @@ from hsi_model.utils import (
 )
 from hsi_model.utils.training_setup import (
     cleanup,
+    pick_amp_dtype,
     setup_distributed_training,
     setup_paths,
     setup_seed,
@@ -196,7 +197,10 @@ def validate_mst_style(
     total_gen_loss = torch.tensor(0.0, device=device)
     total_metrics = {}
     num_batches = 0
-    use_amp = config.get("mixed_precision", True) and device.type == 'cuda'
+    amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
+    use_amp = amp_dtype is not None
+    # Pass dtype unconditionally; autocast ignores it when enabled=False.
+    autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
 
     with torch.no_grad():  # v2.0: Ensure no gradients during validation
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
@@ -205,7 +209,7 @@ def validate_mst_style(
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
 
-                with autocast(enabled=use_amp):
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     if hasattr(model, 'module'):
                         pred_hsi = model.module.generator(rgb_tensor)
                         # v2.0: Discriminator calls already under no_grad context
@@ -341,7 +345,18 @@ def train_mst_gan_optimized(
     # Training state
     iteration = start_iteration
     record_mrae_loss = best_mrae
-    use_amp = config.get("mixed_precision", True) and device.type == 'cuda'
+    # GPU-aware precision pick. On A100 (cc>=8) this picks bf16, which has
+    # fp32's dynamic range — eliminating the GradScaler-cycling-down failure
+    # mode you saw at iter 0 (65536 -> 0.2 over ~190 iters). fp16 is still
+    # selected on V100/T4 (cc 7.x); fp32 falls back when nothing else fits.
+    amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
+    use_amp = amp_dtype is not None
+    autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+    logger.info(
+        "Mixed precision: dtype=%s, enabled=%s",
+        "fp32" if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
+        use_amp,
+    )
     epoch_losses = []
     current_epoch = 0
     generator = model.module.generator if hasattr(model, "module") else model.generator
@@ -382,7 +397,7 @@ def train_mst_gan_optimized(
             # ========== Train Generator (v3.0 OPTIMIZED) ==========
             optimizer_g.zero_grad(set_to_none=True)
             
-            with autocast(enabled=use_amp):
+            with autocast(enabled=use_amp, dtype=autocast_dtype):
                 fake_hsi = generator(rgb_tensor)
 
             if not torch.isfinite(fake_hsi).all():
@@ -417,15 +432,15 @@ def train_mst_gan_optimized(
 
             set_requires_grad(discriminator, False)
             try:
-                with autocast(enabled=use_amp):
+                with autocast(enabled=use_amp, dtype=autocast_dtype):
                     disc_fake_for_g = discriminator(rgb_tensor, fake_hsi)
                 with torch.no_grad():
-                    with autocast(enabled=use_amp):
+                    with autocast(enabled=use_amp, dtype=autocast_dtype):
                         disc_real_for_g = discriminator(rgb_tensor, hsi_tensor)
             finally:
                 set_requires_grad(discriminator, True)
 
-            with autocast(enabled=use_amp):
+            with autocast(enabled=use_amp, dtype=autocast_dtype):
                 gen_loss, loss_components = criterion(
                     fake_hsi,
                     hsi_tensor,
@@ -473,7 +488,7 @@ def train_mst_gan_optimized(
             # v3.0: Detach fake_hsi to prevent gradients flowing to generator
             fake_hsi_detached = fake_hsi.detach()
 
-            with autocast(enabled=use_amp):
+            with autocast(enabled=use_amp, dtype=autocast_dtype):
                 real_pred = discriminator(rgb_tensor, hsi_tensor)
                 fake_pred = discriminator(rgb_tensor, fake_hsi_detached)
                 if not torch.isfinite(real_pred).all() or not torch.isfinite(fake_pred).all():
@@ -658,6 +673,9 @@ def main(config: DictConfig) -> None:
         cfg.setdefault("learning_rate", 4e-4)
         cfg.setdefault("num_workers", 8)
         cfg.setdefault("memory_mode", "standard")  # Options: standard, float16, lazy
+        # AMP dtype: "auto" picks bf16 on A100+ (no GradScaler cycling), fp16 on
+        # older Tensor Core GPUs, fp32 elsewhere. Override with "bf16"/"fp16"/"fp32".
+        cfg.setdefault("mixed_precision_dtype", "auto")
         
         log_level = getattr(logging, cfg.get("log_level", "INFO"))
         logger = setup_logging(cfg["log_dir"], log_level, rank)
@@ -706,9 +724,15 @@ def main(config: DictConfig) -> None:
         scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_d, total_iterations, eta_min=1e-6)
         schedulers = {'scheduler_g': scheduler_g, 'scheduler_d': scheduler_d}
         
-        # Create scalers
-        scaler_g = GradScaler(enabled=cfg.get("mixed_precision", True))
-        scaler_d = GradScaler(enabled=cfg.get("mixed_precision", True))
+        # Create scalers. GradScaler is only meaningful for fp16 — bf16 has
+        # fp32's exponent range so backward gradients cannot overflow, and
+        # PyTorch will warn/error if you scale bf16 grads. fp32 obviously
+        # needs no scaler either. Disabled scalers are transparent: scale()
+        # is a no-op, step() calls optimizer.step() directly.
+        _amp_dtype = pick_amp_dtype(cfg) if device.type == "cuda" else None
+        _needs_scaler = _amp_dtype == torch.float16
+        scaler_g = GradScaler(enabled=_needs_scaler)
+        scaler_d = GradScaler(enabled=_needs_scaler)
         scalers = {'scaler_g': scaler_g, 'scaler_d': scaler_d}
         
         # Create loss function
