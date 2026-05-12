@@ -118,14 +118,20 @@ class SpectralSelfAttention(nn.Module):
         
         qkv = self.qkv_dwconv(self.qkv(x))
         q, k, v = qkv.chunk(3, dim=1)
-        
+
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        
-        # L2 normalize Q and K for stability
-        q = F.normalize(q, dim=-1, eps=1e-12)
-        k = F.normalize(k, dim=-1, eps=1e-12)
+
+        # L2 normalize Q and K for stability. eps must survive the working
+        # dtype: 1e-12 underflows under fp16 autocast (fp16 min positive
+        # normal ≈ 6.1e-5), which turned a near-zero row into 0/0 = NaN and
+        # produced the "Non-finite attention weights" RuntimeError that
+        # cascaded into the generator-NaN crash. EfficientSpectralAttention
+        # already uses this pattern; mirror it here.
+        norm_eps = 1e-6 if q.dtype in (torch.float16, torch.bfloat16) else 1e-12
+        q = F.normalize(q, dim=-1, eps=norm_eps)
+        k = F.normalize(k, dim=-1, eps=norm_eps)
         
         # Compute attention with clamping
         attn = (q @ k.transpose(-2, -1)) * self.temperature
@@ -478,8 +484,10 @@ class DiscriminatorWithSinkhorn(nn.Module):
             B, C, H, W = disc_output.shape
             features = disc_output.view(B, -1)  # (B, H'*W')
 
-            # L2 normalize for stability
-            features = F.normalize(features, p=2, dim=1, eps=1e-12)
+            # L2 normalize for stability; raise eps under fp16 to avoid
+            # 0/0 = NaN on near-zero rows (see SpectralSelfAttention).
+            feat_eps = 1e-6 if features.dtype in (torch.float16, torch.bfloat16) else 1e-12
+            features = F.normalize(features, p=2, dim=1, eps=feat_eps)
 
             return disc_output, features
 

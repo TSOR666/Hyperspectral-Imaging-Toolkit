@@ -348,7 +348,7 @@ def apply_r1_regularization(
         R1 penalty (scalar)
     """
     real_data.requires_grad_(True)
-    
+
     grad_real = torch.autograd.grad(
         outputs=disc_real.sum(),
         inputs=real_data,
@@ -356,8 +356,13 @@ def apply_r1_regularization(
         retain_graph=True,
         only_inputs=True
     )[0]
-    
-    grad_penalty = (grad_real.pow(2).sum([1, 2, 3])).mean() * gamma
+
+    # Standard R1 (Mescheder 2018) is (γ/2) · E[‖∇D(x)‖²]. The 0.5 was
+    # missing here, which made the penalty effectively 2× stronger than
+    # the configured γ implied — that extra pressure on ‖∂D/∂x‖→0 is
+    # what pushes D into the gradient-flat regime where its QKV
+    # projections produce non-finite values.
+    grad_penalty = 0.5 * gamma * (grad_real.pow(2).sum([1, 2, 3])).mean()
     return grad_penalty
 
 

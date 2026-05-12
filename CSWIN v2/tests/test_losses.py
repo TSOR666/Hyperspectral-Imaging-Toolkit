@@ -107,14 +107,19 @@ def test_sinkhorn_gradcheck():
 
 
 def test_sinkhorn_with_empty_inputs():
-    """Empty point clouds should yield finite zero divergence fallback."""
+    """Empty point clouds should yield a finite, near-zero divergence fallback.
+
+    Post soft-floor: the divergence passes through softplus(d/τ)·τ with τ=1e-3
+    so even an underlying d=0 yields τ·ln(2) ≈ 6.9e-4 — small enough to be
+    negligible against any real working-range signal but no longer exactly 0.
+    """
     sinkhorn = SinkhornDivergence(epsilon=0.1, n_iters=5)
     X_empty = torch.randn(0, 2)
     Y = torch.randn(5, 2)
 
     divergence = sinkhorn(X_empty, Y)
     assert torch.isfinite(divergence)
-    assert divergence.item() == 0.0
+    assert divergence.item() < 2e-3
 
 
 def test_sinkhorn_with_zeros():

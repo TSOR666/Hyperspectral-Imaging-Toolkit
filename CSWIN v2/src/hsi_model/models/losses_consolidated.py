@@ -333,9 +333,21 @@ class SinkhornDivergence(nn.Module):
         if not torch.isfinite(divergence):
             logger.warning("Invalid Sinkhorn divergence detected; returning zero")
             return divergence * 0.0
-        if (divergence < -1e-6).any():
-            logger.warning("Sinkhorn divergence negative (min=%.6f); clamping to zero", divergence.min().item())
-        return torch.clamp(divergence, min=0.0, max=1e4)
+        if (divergence < -1e-3).any():
+            logger.warning("Sinkhorn divergence large-negative (min=%.6f); smoothing", divergence.min().item())
+        # Soft floor instead of hard clamp at 0. The symmetric Sinkhorn
+        # divergence is theoretically non-negative, but finite-iteration noise
+        # can produce small negatives near convergence. A hard clamp at 0
+        # kills the gradient exactly when distributions are converging — the
+        # regime where the generator needs the signal most. softplus(d/τ)·τ
+        # smoothly maps:
+        #   d ≫ τ  ⇒ ≈ d      (identity for the working range)
+        #   d ≈ 0  ⇒ ≈ τ·ln2 (small constant, gradient = 0.5)
+        #   d ≪ -τ ⇒ ≈ 0      (numerical noise absorbed)
+        # so gradient flows through zero instead of dying there.
+        smoothing = 1e-3
+        smoothed = F.softplus(divergence / smoothing) * smoothing
+        return torch.clamp(smoothed, max=1e4)
 
 
 class SinkhornLoss(nn.Module):
@@ -713,7 +725,11 @@ class NoiseRobustLoss(nn.Module):
                 loss_batch.append(loss_b)
 
             adv_loss = torch.stack(loss_batch).mean()
-            adv_loss = torch.clamp(adv_loss, 0, self.sinkhorn_loss_clip)
+            # Upper bound only — SinkhornDivergence already applies a softplus
+            # floor that keeps each per-batch term non-negative-with-gradient.
+            # A lower clamp at 0 here would re-introduce the dead-gradient
+            # behaviour the soft floor was designed to avoid.
+            adv_loss = torch.clamp(adv_loss, max=self.sinkhorn_loss_clip)
             if not torch.isfinite(adv_loss):
                 logger.warning("Non-finite adversarial loss computed; using zero fallback")
                 return differentiable_zero

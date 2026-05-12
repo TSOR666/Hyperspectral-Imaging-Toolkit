@@ -21,8 +21,6 @@ def test_unicode_fix():
     print("[WARNING] Warning marker")
 
     print("\n[OK] TEST 1 PASSED: No Unicode encoding errors")
-    return True
-
 def test_dtype_consistency():
     """Test dtype conversion fix for AMP compatibility"""
     print("\n" + "="*60)
@@ -43,8 +41,6 @@ def test_dtype_consistency():
 
     print(f"[PASS] Dtype conversion works: {weights_to_add.dtype} == {dispatch.dtype}")
     print("\n[OK] TEST 2 PASSED: AMP dtype fix working")
-    return True
-
 def test_float16_conversion():
     """Test float16 to float32 conversion"""
     print("\n" + "="*60)
@@ -62,8 +58,6 @@ def test_float16_conversion():
 
     print(f"[PASS] Float16 array converted to float32 tensor: {tensor.dtype}")
     print("\n[OK] TEST 3 PASSED: Float16 conversion working")
-    return True
-
 def test_division_by_zero_guard():
     """Test division by zero guard"""
     print("\n" + "="*60)
@@ -89,8 +83,6 @@ def test_division_by_zero_guard():
 
     print(f"[PASS] Normal division works: deg = {deg:.2f}%")
     print("\n[OK] TEST 4 PASSED: Division by zero guard working")
-    return True
-
 def test_epsilon_stability():
     """Test epsilon value for float16 compatibility"""
     print("\n" + "="*60)
@@ -112,8 +104,6 @@ def test_epsilon_stability():
 
     print("[PASS] No NaN or Inf values")
     print("\n[OK] TEST 5 PASSED: Epsilon stability fix working")
-    return True
-
 def test_value_error_instead_of_assert():
     """Test ValueError instead of assert for production safety"""
     print("\n" + "="*60)
@@ -128,13 +118,11 @@ def test_value_error_instead_of_assert():
         if tensor_shape != expected_shape:
             raise ValueError(f"Shape error: expected {expected_shape}, got {tensor_shape}")
         print("[FAIL] Should have raised ValueError")
-        return False
+        raise AssertionError("Expected ValueError was not raised")
     except ValueError as e:
         print(f"[PASS] ValueError raised correctly: {e}")
 
     print("\n[OK] TEST 6 PASSED: ValueError instead of assert working")
-    return True
-
 def test_type_hints():
     """Test that type hints are properly defined"""
     print("\n" + "="*60)
@@ -155,8 +143,6 @@ def test_type_hints():
         print(f"[PASS] ConfigValue accepts {type(val).__name__}: {val}")
 
     print("\n[OK] TEST 7 PASSED: Type hints properly defined")
-    return True
-
 def run_all_tests():
     """Run all audit fix tests"""
     print("\n" + "="*80)
@@ -176,8 +162,8 @@ def run_all_tests():
     results = []
     for name, test_func in tests:
         try:
-            result = test_func()
-            results.append((name, result))
+            test_func()
+            results.append((name, True))
         except Exception as e:
             print(f"\n[FAIL] TEST FAILED: {name}")
             print(f"Error: {e}")

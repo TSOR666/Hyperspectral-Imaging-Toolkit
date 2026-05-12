@@ -4,16 +4,24 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
+import pytest
 import torch
+import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
 from hsifusion_training import HSIFusionTrainer, should_optimizer_step as hsifusion_should_step
 from hsifusion_classifier_v253 import create_hsifusion_lightning_classifier
 from hsifusion_v252_complete import RobustEnhancedSpectralAttention, create_hsifusion_lightning_pro
-from optimized_dataloader import MSTPlusPlusLoss
-from sharp_training_script_fixed import should_optimizer_step as sharp_should_step
+from optimized_dataloader import MSTPlusPlusLoss, create_optimized_dataloaders
+from sharp_training_script_fixed import (
+    DedicatedSHARPTrainer,
+    SHARPTrainingConfig,
+    should_optimizer_step as sharp_should_step,
+)
+from sharp_config_loader import parse_config_value
 from sharp_inference import SHARPInference, _torch_load_compat
 from sharp_v322_hardened import (
     SHARPv32,
@@ -186,6 +194,130 @@ def test_blend_weight_has_positive_floor() -> None:
     runner = SHARPInference.__new__(SHARPInference)
     weight = SHARPInference._create_blend_weight(runner, 16, 16)
     assert float(weight.min()) > 0.0
+
+
+def test_sharp_inference_rejects_channel_mismatch() -> None:
+    runner = SHARPInference.__new__(SHARPInference)
+    runner.device = torch.device("cpu")
+    runner.in_channels = 3
+    runner.out_channels = 31
+    runner.model = nn.Identity()
+
+    with pytest.raises(ValueError, match="Expected 3 channels"):
+        SHARPInference.predict(runner, torch.rand(1, 4, 8, 8))
+
+
+def test_optimized_dataloaders_respect_augment_flag_and_png_inputs() -> None:
+    tmp_dir = _local_tmp_dir("png_dataset")
+    (tmp_dir / "split_txt").mkdir(parents=True, exist_ok=True)
+    (tmp_dir / "Train_RGB").mkdir(exist_ok=True)
+    (tmp_dir / "Train_Spec").mkdir(exist_ok=True)
+
+    rgb = (np.random.rand(8, 8, 3) * 255.0).astype(np.uint8)
+    Image.fromarray(rgb).save(tmp_dir / "Train_RGB" / "sample.png")
+    with h5py.File(tmp_dir / "Train_Spec" / "sample.mat", "w") as handle:
+        handle.create_dataset("cube", data=np.random.rand(31, 8, 8).astype(np.float32))
+
+    (tmp_dir / "split_txt" / "train_list.txt").write_text("sample\n", encoding="utf-8")
+    (tmp_dir / "split_txt" / "valid_list.txt").write_text("sample\n", encoding="utf-8")
+
+    config = SimpleNamespace(
+        data_root=str(tmp_dir),
+        batch_size=1,
+        num_workers=0,
+        val_num_workers=0,
+        memory_mode="standard",
+        patch_size=4,
+        stride=4,
+        augment=False,
+        seed=7,
+    )
+    train_loader, val_loader = create_optimized_dataloaders(config)
+
+    assert train_loader.dataset.augment is False
+    assert train_loader.dataset.rgb_files[0].endswith(".png")
+    rgb_batch, hsi_batch = next(iter(train_loader))
+    assert rgb_batch.shape == (1, 3, 4, 4)
+    assert hsi_batch.shape == (1, 31, 4, 4)
+    assert len(val_loader) == 1
+
+
+def test_dedicated_sharp_trainer_forwards_sparse_config_to_factory(monkeypatch) -> None:
+    captured = {}
+
+    class DummyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+
+        @property
+        def num_parameters(self):
+            return {"total": 1, "trainable": 1, "size_mb": 0.0}
+
+    def _fake_factory(*args, **kwargs):
+        captured.update(kwargs)
+        return DummyModel()
+
+    monkeypatch.setattr("sharp_training_script_fixed.create_sharp_v32", _fake_factory)
+
+    trainer = DedicatedSHARPTrainer.__new__(DedicatedSHARPTrainer)
+    trainer.config = SHARPTrainingConfig(
+        model_size="tiny",
+        compile_model=False,
+        use_checkpoint=True,
+        sparse_sparsity_ratio=0.35,
+        sparse_block_size=321,
+        sparse_q_block_size=123,
+        sparse_window_size=17,
+        sparse_max_tokens=777,
+        sparse_k_cap=55,
+        rbf_centers_per_head=11,
+        key_rbf_mode="linear",
+        ema_update_every=5,
+        device="cpu",
+    )
+    trainer.device = torch.device("cpu")
+
+    model = DedicatedSHARPTrainer._create_model(trainer)
+
+    assert isinstance(model, DummyModel)
+    assert captured["use_checkpoint"] is True
+    assert captured["sparse_block_size"] == 321
+    assert captured["sparse_q_block_size"] == 123
+    assert captured["sparse_window_size"] == 17
+    assert captured["sparse_max_tokens"] == 777
+    assert captured["sparse_k_cap"] == 55
+    assert captured["rbf_centers_per_head"] == 11
+    assert captured["key_rbf_mode"] == "linear"
+    assert captured["ema_update_every"] == 5
+
+
+def test_sharp_trainer_psnr_defaults_to_unit_range() -> None:
+    class DummyEvalModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+            self.config = SimpleNamespace(ema_update_every=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((x.shape[0], 31, x.shape[2], x.shape[3]), device=x.device)
+
+        def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return torch.mean((pred - target) ** 2)
+
+    trainer = SHARPv32Trainer(model=DummyEvalModel(), total_steps=4, use_amp=False)
+    loader = DataLoader(
+        TensorDataset(torch.zeros(1, 3, 4, 4), torch.ones(1, 31, 4, 4)),
+        batch_size=1,
+    )
+    metrics = trainer.evaluate(loader)
+
+    assert abs(metrics["psnr"]) < 1e-6
+
+
+def test_sharp_config_loader_parses_scientific_notation() -> None:
+    assert parse_config_value("4e-4") == pytest.approx(4e-4)
+    assert parse_config_value("1E-3") == pytest.approx(1e-3)
 
 
 def test_hsifusion_factory_explicit_none_disables_compile(monkeypatch) -> None:
