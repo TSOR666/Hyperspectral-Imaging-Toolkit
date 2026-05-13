@@ -27,7 +27,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -36,6 +36,24 @@ from torch.utils.data import Dataset
 import cv2
 
 __all__ = ["TrainDataset", "ValidDataset", "DatasetConfig"]
+
+_TRAIN_RGB_DIRS = ("Train_RGB",)
+_TRAIN_HSI_DIRS = ("Train_Spec",)
+_VALID_RGB_DIRS = (
+    "Valid_RGB",
+    "Validation_RGB",
+    "Val_RGB",
+    "Test_RGB",
+    "Train_RGB",
+)
+_VALID_HSI_DIRS = (
+    "Valid_Spec",
+    "Validation_Spec",
+    "Val_Spec",
+    "Test_Spec",
+    "Train_Spec",
+)
+_RGB_SUFFIXES = (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
 @dataclass
@@ -46,26 +64,37 @@ class DatasetConfig:
     logger: logging.Logger
     bgr2rgb: bool
 
-    def rgb_path(self, stem: str) -> Optional[Path]:
-        """Return the RGB image path for ``stem`` if it exists."""
-        rgb_dir = self.data_root / "Train_RGB"
-        jpg_path = rgb_dir / f"{stem}.jpg"
-        if jpg_path.exists():
-            return jpg_path
-        png_path = rgb_dir / f"{stem}.png"
-        if png_path.exists():
-            return png_path
-        self.logger.warning("RGB image missing for %s (checked .jpg/.png)", stem)
+    def _resolve_path(
+        self,
+        stem: str,
+        subdirs: Sequence[str],
+        suffixes: Sequence[str],
+        kind: str,
+    ) -> Optional[Path]:
+        for subdir in subdirs:
+            for suffix in suffixes:
+                candidate = self.data_root / subdir / f"{stem}{suffix}"
+                if candidate.exists():
+                    return candidate
+        checked = ", ".join(f"{subdir}/*{suffix}" for subdir in subdirs for suffix in suffixes)
+        self.logger.warning("%s missing for %s (checked %s)", kind, stem, checked)
         return None
 
-    def hsi_path(self, stem: str) -> Optional[Path]:
+    def rgb_path(
+        self,
+        stem: str,
+        subdirs: Sequence[str] = _TRAIN_RGB_DIRS,
+    ) -> Optional[Path]:
+        """Return the RGB image path for ``stem`` if it exists."""
+        return self._resolve_path(stem, subdirs, _RGB_SUFFIXES, "RGB image")
+
+    def hsi_path(
+        self,
+        stem: str,
+        subdirs: Sequence[str] = _TRAIN_HSI_DIRS,
+    ) -> Optional[Path]:
         """Return the hyperspectral cube path for ``stem`` if it exists."""
-        hsi_dir = self.data_root / "Train_Spec"
-        mat_path = hsi_dir / f"{stem}.mat"
-        if mat_path.exists():
-            return mat_path
-        self.logger.warning("HSI cube missing for %s", stem)
-        return None
+        return self._resolve_path(stem, subdirs, (".mat",), "HSI cube")
 
 
 def _load_hsi_cube(path: Path) -> np.ndarray:
@@ -108,8 +137,19 @@ def _read_split_file(path: Path) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(f"Split file not found: {path}")
     with path.open("r") as handle:
-        stems = [line.strip() for line in handle if line.strip()]
+        stems = [Path(line.strip()).stem for line in handle if line.strip()]
     return stems
+
+
+def _first_existing_split(data_root: Path, names: Sequence[str]) -> Path:
+    """Return the first split file that exists under ``split_txt``."""
+    split_dir = data_root / "split_txt"
+    for name in names:
+        split_path = split_dir / name
+        if split_path.exists():
+            return split_path
+    checked = ", ".join(str(split_dir / name) for name in names)
+    raise FileNotFoundError(f"Split file not found; checked: {checked}")
 
 
 class TrainDataset(Dataset):
@@ -138,7 +178,7 @@ class TrainDataset(Dataset):
         self.stride = int(stride)
         self.augment = bool(arg)
 
-        split_file = data_root_path / "split_txt" / "train_list.txt"
+        split_file = _first_existing_split(data_root_path, ("train_list.txt",))
         stems = _read_split_file(split_file)
         if not stems:
             raise RuntimeError(f"No entries found in {split_file}")
@@ -274,7 +314,7 @@ class ValidDataset(Dataset):
             bgr2rgb=bgr2rgb,
         )
 
-        split_file = data_root_path / "split_txt" / "val_list.txt"
+        split_file = _first_existing_split(data_root_path, ("valid_list.txt", "val_list.txt"))
         stems = _read_split_file(split_file)
         if not stems:
             raise RuntimeError(f"No entries found in {split_file}")
@@ -285,8 +325,8 @@ class ValidDataset(Dataset):
         self.config.logger.info("Loading %d validation scenes from %s", len(stems), data_root_path)
 
         for stem in stems:
-            rgb_path = self.config.rgb_path(stem)
-            hsi_path = self.config.hsi_path(stem)
+            rgb_path = self.config.rgb_path(stem, _VALID_RGB_DIRS)
+            hsi_path = self.config.hsi_path(stem, _VALID_HSI_DIRS)
             if rgb_path is None or hsi_path is None:
                 continue
             try:
@@ -300,7 +340,13 @@ class ValidDataset(Dataset):
             self.hsi_cubes.append(torch.from_numpy(np.ascontiguousarray(hsi)))
 
         if not self.rgb_images:
-            raise RuntimeError("No validation samples were loaded; check dataset integrity.")
+            preview = ", ".join(stems[:5])
+            raise RuntimeError(
+                f"No validation samples were loaded from {split_file}. "
+                f"Checked RGB dirs={list(_VALID_RGB_DIRS)} and HSI dirs={list(_VALID_HSI_DIRS)} "
+                f"for {len(stems)} split entries"
+                f"{f' (first entries: {preview})' if preview else ''}."
+            )
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.rgb_images)
