@@ -156,6 +156,64 @@ class TestTensorConversion:
         assert tensor.is_contiguous()
 
 
+class TestValidDatasetLayout:
+    """Tests for validation split and directory resolution."""
+
+    @staticmethod
+    def _write_scene(root, scene, *, rgb_dir_name="Test_RGB", hsi_dir_name="Test_Spec"):
+        h5py = pytest.importorskip("h5py")
+        cv2 = pytest.importorskip("cv2")
+
+        rgb_dir = root / rgb_dir_name
+        hsi_dir = root / hsi_dir_name
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+        hsi_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store as C,W,H so the loader's ARAD/MST transpose yields C,H,W.
+        hsi = np.random.rand(31, 5, 4).astype(np.float32)
+        with h5py.File(hsi_dir / f"{scene}.mat", "w") as mat:
+            mat.create_dataset("cube", data=hsi)
+
+        rgb = np.random.randint(0, 255, (4, 5, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb)
+
+    def test_valid_dataset_finds_test_directories(self, workspace_tmp_dir):
+        from dataloader import ValidDataset
+
+        scene = "ARAD_1K_0901"
+        split_dir = workspace_tmp_dir / "split_txt"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "val_list.txt").write_text(f"{scene}\n", encoding="utf-8")
+        self._write_scene(workspace_tmp_dir, scene)
+
+        dataset = ValidDataset(data_root=str(workspace_tmp_dir), bgr2rgb=True)
+
+        assert len(dataset) == 1
+        rgb, hsi = dataset[0]
+        assert rgb.shape == (3, 4, 5)
+        assert hsi.shape == (31, 4, 5)
+        assert torch.isfinite(rgb).all()
+        assert torch.isfinite(hsi).all()
+
+    def test_valid_dataset_accepts_valid_list_and_split_suffixes(self, workspace_tmp_dir):
+        from dataloader import ValidDataset
+
+        scene = "scene001"
+        split_dir = workspace_tmp_dir / "split_txt"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "valid_list.txt").write_text(f"{scene}.mat\n", encoding="utf-8")
+        self._write_scene(
+            workspace_tmp_dir,
+            scene,
+            rgb_dir_name="Train_RGB",
+            hsi_dir_name="Train_Spec",
+        )
+
+        dataset = ValidDataset(data_root=str(workspace_tmp_dir), bgr2rgb=True)
+
+        assert len(dataset) == 1
+
+
 # ============================================================================
 # EDGE CASE TESTS (FINDING 4.2)
 # Tests for edge cases: batch_size=1, odd dimensions, boundary conditions
