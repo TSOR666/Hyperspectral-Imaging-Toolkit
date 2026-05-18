@@ -11,6 +11,7 @@ try:
         create_mswr_tiny,
         create_mswr_small,
         create_mswr_base,
+        IntegratedMSWRNet,
         OptimizedCNNWaveletTransform,
         OptimizedCNNInverseWaveletTransform,
     )
@@ -21,6 +22,7 @@ except ImportError:
     create_mswr_tiny = None
     create_mswr_small = None
     create_mswr_base = None
+    IntegratedMSWRNet = None
     OptimizedCNNWaveletTransform = None
     OptimizedCNNInverseWaveletTransform = None
 
@@ -133,6 +135,30 @@ class TestModelForward:
             with torch.no_grad():
                 output = model(x)
             assert output.shape == (1, 31, h, w), f"Failed for size {h}x{w}"
+
+    def test_forward_pads_wavelet_stage_and_crops_back(self):
+        """Full-image validation sizes should survive odd intermediate stages."""
+        config = MSWRDualConfig(
+            base_channels=16,
+            num_heads=4,
+            num_stages=2,
+            use_wavelet=True,
+            wavelet_type="db2",
+            wavelet_levels=[1, 2],
+            window_size=4,
+            num_landmarks=4,
+            use_checkpoint=False,
+            use_flash_attn=False,
+            performance_monitoring=False,
+        )
+        model = IntegratedMSWRNet(config)
+        model.eval()
+
+        x = torch.randn(1, 3, 34, 32)
+        with torch.no_grad():
+            output = model(x)
+
+        assert output.shape == (1, 31, 34, 32)
 
 
 class TestModelGradients:

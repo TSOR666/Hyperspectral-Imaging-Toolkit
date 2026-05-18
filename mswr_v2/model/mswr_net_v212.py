@@ -1479,6 +1479,36 @@ class IntegratedMSWRNet(nn.Module):
         
         if self.rank == 0:
             self._log_model_info()
+
+    def _required_spatial_multiple(self) -> int:
+        """Return the input multiple needed by encoder wavelet/downsample stages."""
+        required_power = 0
+
+        if self.config.use_wavelet:
+            for stage_idx, level in enumerate(self.config.wavelet_levels or []):
+                if stage_idx >= self.config.num_stages:
+                    break
+                if level > 0:
+                    required_power = max(required_power, stage_idx + level)
+
+        return 2 ** required_power
+
+    def _pad_to_required_multiple(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Pad H/W on the bottom/right so all wavelet stages receive valid sizes."""
+        multiple = self._required_spatial_multiple()
+        if multiple <= 1:
+            return x, (0, 0)
+
+        H, W = x.shape[-2:]
+        pad_h = (multiple - H % multiple) % multiple
+        pad_w = (multiple - W % multiple) % multiple
+
+        if pad_h == 0 and pad_w == 0:
+            return x, (0, 0)
+
+        pad_mode = "reflect" if pad_h < H and pad_w < W else "replicate"
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
+        return x, (pad_h, pad_w)
     
     def _init_weights(self, m: nn.Module) -> None:
         """Enhanced weight initialization"""
@@ -1544,13 +1574,17 @@ class IntegratedMSWRNet(nn.Module):
             raise ValueError(
                 f"Input channels mismatch: expected {self.config.input_channels}, got {C}"
             )
-        
+
         min_size = 2 ** (self.config.num_stages + 2)
         if H < min_size or W < min_size:
             raise ValueError(
                 f"Input size ({H}, {W}) too small for {self.config.num_stages} stages. "
                 f"Minimum required: ({min_size}, {min_size})"
             )
+
+        orig_H, orig_W = H, W
+        x, (pad_h, pad_w) = self._pad_to_required_multiple(x)
+        H, W = x.shape[-2:]
         
         # Clear cache for new forward pass
         if self.wavelet_gate_cache is not None:
@@ -1629,6 +1663,9 @@ class IntegratedMSWRNet(nn.Module):
             )  # (B, C_out, H_in, W_in) -> (B, C_out, H, W)
         
         x = x + input_skip  # (B, C_out, H, W)
+        if pad_h or pad_w:
+            x = x[:, :, :orig_H, :orig_W].contiguous()
+
         self.perf_monitor.end_stage("output")
         self.perf_monitor.end_stage("total")
         

@@ -96,9 +96,12 @@ class MetricsLogger:
         for key, value in metrics.items():
             name = f"{prefix}/{key}" if prefix else key
             
-            # Log to text logger
+            # Log to text logger. .6g keeps 6 significant digits, so values
+            # spanning many orders of magnitude (LR ~ 1e-4, loss ~ 1e0, MRAE
+            # ~ 1e-1) all render usefully — previously .4f rounded LR=3.6e-4
+            # to "0.0004" and made the cosine schedule look flat.
             if self.local_rank == 0:
-                self.logger.info(f"{name}: {value:.4f}")
+                self.logger.info(f"{name}: {value:.6g}")
             
             # Log to tensorboard
             if self.writer is not None:
