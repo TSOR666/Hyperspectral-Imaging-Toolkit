@@ -79,6 +79,9 @@ from hsi_model.constants import (
     DEFAULT_PATCH_SIZE,
     DEFAULT_STRIDE,
     DEFAULT_GRADIENT_CLIP_NORM,
+    CHECKPOINT_BEST_NAME,
+    CHECKPOINT_LATEST_NAME,
+    CHECKPOINT_KEEP_COUNT,
 )
 from hsi_model.utils import (
     setup_logging, MetricsLogger, save_checkpoint, load_checkpoint
@@ -86,6 +89,7 @@ from hsi_model.utils import (
 from hsi_model.utils.training_setup import (
     cleanup,
     pick_amp_dtype,
+    resume_training_state,
     setup_distributed_training,
     setup_paths,
     setup_seed,
@@ -156,6 +160,43 @@ def first_nonfinite_parameter_name(module: nn.Module) -> Optional[str]:
         if not torch.isfinite(param.detach()).all():
             return name
     return None
+
+
+def _atomic_torch_save(obj: Dict[str, Any], path: str) -> None:
+    """Write a checkpoint via .tmp + os.replace so an HPC kill mid-save
+    never leaves a half-written file. Same idiom as utils.checkpoint."""
+    tmp_path = path + ".tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _prune_epoch_checkpoints(checkpoint_dir: str, keep: int = CHECKPOINT_KEEP_COUNT) -> None:
+    """Keep only the ``keep`` most-recent ``net_*epoch.pth`` files.
+
+    Best and latest checkpoints are kept regardless because their names
+    don't match the ``net_*epoch.pth`` pattern. Errors are logged and
+    swallowed — checkpoint hygiene must never interrupt training.
+    """
+    try:
+        snapshots = []
+        for filename in os.listdir(checkpoint_dir):
+            if filename.startswith("net_") and filename.endswith("epoch.pth"):
+                full = os.path.join(checkpoint_dir, filename)
+                snapshots.append((full, os.path.getmtime(full)))
+        if len(snapshots) <= keep:
+            return
+        snapshots.sort(key=lambda t: t[1], reverse=True)
+        for path, _ in snapshots[keep:]:
+            try:
+                os.remove(path)
+            except OSError as e:
+                logging.getLogger(__name__).warning(
+                    "Failed to prune %s: %s", path, e
+                )
+    except OSError as e:
+        logging.getLogger(__name__).warning(
+            "Checkpoint pruning skipped (%s): %s", checkpoint_dir, e
+        )
 
 
 def validate_mst_style(
@@ -566,45 +607,85 @@ def train_mst_gan_optimized(
                     f"Train Loss: {avg_train_loss:.9f}, Test MRAE: {current_mrae:.9f}"
                 )
                 
+                # train_loss and lr_g are the only true training-side scalars
+                # here; val_metrics are computed on the held-out val set and
+                # MUST be logged under a separate prefix or every "train/*"
+                # tag in tensorboard is just the validation result mislabelled.
                 metrics_logger.log_scalars({
                     'train_loss': avg_train_loss,
                     'lr_g': lr_g,
-                    **val_metrics
                 }, epoch_num, "train")
+                metrics_logger.log_scalars(val_metrics, epoch_num, "val")
                 
-                # Save checkpoint
+                # Save checkpoint.
+                # Three-tier save policy:
+                #   1. latest_checkpoint.pth — overwritten every validation.
+                #      Resume target after HPC time-out; user never needs to
+                #      know an epoch number.
+                #   2. best_model.pth      — overwritten whenever val MRAE
+                #      improves. Logged at INFO so you can grep "NEW BEST".
+                #   3. net_{N}epoch.pth    — periodic snapshot every 5k iters,
+                #      pruned to the CHECKPOINT_KEEP_COUNT most recent so the
+                #      checkpoint_dir doesn't grow unboundedly.
+                # All writes go through _atomic_torch_save (.tmp + os.replace)
+                # so an HPC kill mid-save can't leave a corrupted checkpoint.
                 if config.get("local_rank", 0) == 0:
                     is_best = current_mrae < record_mrae_loss
-                    
-                    if is_best or iteration % 5000 == 0:
-                        checkpoint_dict = {
-                            'epoch': epoch_num,
-                            'iter': iteration,
-                            'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-                            'optimizer_g': optimizer_g.state_dict(),
-                            'optimizer_d': optimizer_d.state_dict(),
-                            'scheduler_g': scheduler_g.state_dict(),
-                            'scheduler_d': scheduler_d.state_dict(),
-                            'scaler_g': scaler_g.state_dict(),
-                            'scaler_d': scaler_d.state_dict(),
-                            'best_mrae': min(current_mrae, record_mrae_loss),
-                            'config': config,
-                            # RNG state for deterministic resume.
-                            'torch_rng_state': torch.get_rng_state(),
-                            'cuda_rng_state_all': (
-                                torch.cuda.get_rng_state_all()
-                                if torch.cuda.is_available() else None
-                            ),
-                            'numpy_rng_state': np.random.get_state(),
-                        }
-                        
-                        checkpoint_path = os.path.join(config["checkpoint_dir"], f'net_{epoch_num}epoch.pth')
-                        torch.save(checkpoint_dict, checkpoint_path)
-                        
-                        if is_best:
-                            record_mrae_loss = current_mrae
-                            best_path = os.path.join(config["checkpoint_dir"], 'best_model.pth')
-                            torch.save(checkpoint_dict, best_path)
+                    checkpoint_dir = config["checkpoint_dir"]
+
+                    checkpoint_dict = {
+                        'epoch': epoch_num,
+                        'iter': iteration,
+                        'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+                        'optimizer_g': optimizer_g.state_dict(),
+                        'optimizer_d': optimizer_d.state_dict(),
+                        'scheduler_g': scheduler_g.state_dict(),
+                        'scheduler_d': scheduler_d.state_dict(),
+                        'scaler_g': scaler_g.state_dict(),
+                        'scaler_d': scaler_d.state_dict(),
+                        'best_mrae': min(current_mrae, record_mrae_loss),
+                        'val_metrics': val_metrics,
+                        'config': config,
+                        # RNG state for deterministic resume.
+                        'torch_rng_state': torch.get_rng_state(),
+                        'cuda_rng_state_all': (
+                            torch.cuda.get_rng_state_all()
+                            if torch.cuda.is_available() else None
+                        ),
+                        'numpy_rng_state': np.random.get_state(),
+                    }
+
+                    # (1) latest — always overwritten so resume is one-liner
+                    _atomic_torch_save(
+                        checkpoint_dict,
+                        os.path.join(checkpoint_dir, CHECKPOINT_LATEST_NAME),
+                    )
+
+                    # (2) best — only on MRAE improvement, logged loudly
+                    if is_best:
+                        previous_best = record_mrae_loss
+                        record_mrae_loss = current_mrae
+                        _atomic_torch_save(
+                            checkpoint_dict,
+                            os.path.join(checkpoint_dir, CHECKPOINT_BEST_NAME),
+                        )
+                        logger.info(
+                            "NEW BEST: MRAE %.6f -> %.6f at iter %d (epoch %d); "
+                            "saved %s",
+                            previous_best,
+                            current_mrae,
+                            iteration,
+                            epoch_num,
+                            CHECKPOINT_BEST_NAME,
+                        )
+
+                    # (3) periodic snapshot, then prune
+                    if iteration % 5000 == 0:
+                        _atomic_torch_save(
+                            checkpoint_dict,
+                            os.path.join(checkpoint_dir, f"net_{epoch_num}epoch.pth"),
+                        )
+                        _prune_epoch_checkpoints(checkpoint_dir, CHECKPOINT_KEEP_COUNT)
                 
                 epoch_losses = []
                 memory_cleanup()
@@ -676,6 +757,9 @@ def main(config: DictConfig) -> None:
         # AMP dtype: "auto" picks bf16 on A100+ (no GradScaler cycling), fp16 on
         # older Tensor Core GPUs, fp32 elsewhere. Override with "bf16"/"fp16"/"fp32".
         cfg.setdefault("mixed_precision_dtype", "auto")
+        # Resume from a checkpoint when non-empty. Override on the CLI:
+        #   python train_optimized.py resume_checkpoint=/path/to/best_model.pth
+        cfg.setdefault("resume_checkpoint", None)
         
         log_level = getattr(logging, cfg.get("log_level", "INFO"))
         logger = setup_logging(cfg["log_dir"], log_level, rank)
@@ -742,10 +826,27 @@ def main(config: DictConfig) -> None:
         # Wrap with DDP
         if is_distributed:
             model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        
+
+        # Resume from a previous checkpoint if requested. Hydra syntax:
+        #   python train_optimized.py resume_checkpoint=/path/to/best_model.pth
+        # Restores model + both optimizers + both schedulers + both scalers +
+        # iteration counter + best-MRAE record + RNG state. Loading must
+        # happen AFTER DDP wrapping so module-prefix matching works.
+        resume_info: Optional[Dict[str, Any]] = None
+        resume_path = cfg.get("resume_checkpoint")
+        if resume_path:
+            resume_info = resume_training_state(
+                checkpoint_path=str(resume_path),
+                model=model,
+                optimizers=optimizers,
+                schedulers=schedulers,
+                scalers=scalers,
+                device=device,
+            )
+
         # Set up metrics logger
         metrics_logger = MetricsLogger(cfg["log_dir"], rank)
-        
+
         # Start training
         logger.info("Starting optimized training (v3.0)")
         train_mst_gan_optimized(
@@ -762,7 +863,8 @@ def main(config: DictConfig) -> None:
             metrics_logger,
             is_distributed,
             cfg.get("seed", 42),
-            rank
+            rank,
+            resume_info=resume_info,
         )
         
         if rank == 0:

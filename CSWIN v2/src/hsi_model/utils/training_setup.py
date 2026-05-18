@@ -233,10 +233,100 @@ def pick_amp_dtype(config: Dict[str, Any]) -> Optional[torch.dtype]:
     return None
 
 
+def resume_training_state(
+    checkpoint_path: str,
+    model: "torch.nn.Module",
+    optimizers: Dict[str, "torch.optim.Optimizer"],
+    schedulers: Dict[str, Any],
+    scalers: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Restore full training state from a checkpoint saved by either trainer.
+
+    Loads (in this order, all keys optional except ``state_dict``):
+      * ``state_dict`` (or ``model_state_dict``) -> model weights
+      * ``optimizer_g`` / ``optimizer_d``         -> optimizer states
+      * ``scheduler_g`` / ``scheduler_d``         -> LR-scheduler states
+      * ``scaler_g`` / ``scaler_d``               -> GradScaler states
+      * ``torch_rng_state`` / ``cuda_rng_state_all`` / ``numpy_rng_state``
+        -> RNG states (deterministic resume)
+
+    Returns ``resume_info`` shaped for the trainer loop:
+        {"iteration": int, "best_mrae": float, "epoch": int}
+
+    Uses ``weights_only=False`` because the checkpoint contains non-tensor
+    state (config dict, numpy RNG, etc.) that PyTorch's safe-pickle does
+    not handle. Only resume from checkpoints YOU produced.
+    """
+    if not checkpoint_path:
+        return {}
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+
+    ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Model state. Tolerate both 'state_dict' (trainer schema) and
+    # 'model_state_dict' (utils.checkpoint schema).
+    state_dict = ck.get("state_dict") or ck.get("model_state_dict")
+    if not state_dict:
+        raise KeyError(
+            f"Checkpoint {checkpoint_path} contains no model state "
+            f"(looked for 'state_dict' and 'model_state_dict')."
+        )
+    target = model.module if hasattr(model, "module") else model
+    target.load_state_dict(state_dict, strict=True)
+
+    # Optimizers / schedulers / scalers — each block tolerates missing keys
+    # because pre-fix checkpoints may not have every component.
+    for name, opt in optimizers.items():
+        if opt is not None and name in ck:
+            opt.load_state_dict(ck[name])
+    for name, sched in schedulers.items():
+        if sched is not None and name in ck:
+            sched.load_state_dict(ck[name])
+    for name, sc in scalers.items():
+        if sc is not None and name in ck:
+            sc.load_state_dict(ck[name])
+
+    # RNG state — best-effort. Mismatched CUDA device counts at resume can
+    # raise; log and continue rather than die because RNG drift across
+    # resumes is acceptable for GAN training.
+    if "torch_rng_state" in ck:
+        try:
+            torch.set_rng_state(ck["torch_rng_state"].cpu())
+        except (RuntimeError, AttributeError) as e:
+            logger.warning("Could not restore torch RNG state: %s", e)
+    if ck.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(ck["cuda_rng_state_all"])
+        except RuntimeError as e:
+            logger.warning("Could not restore CUDA RNG state: %s", e)
+    if "numpy_rng_state" in ck:
+        try:
+            np.random.set_state(ck["numpy_rng_state"])
+        except (TypeError, ValueError) as e:
+            logger.warning("Could not restore numpy RNG state: %s", e)
+
+    info = {
+        "iteration": int(ck.get("iter", ck.get("iteration", 0))),
+        "epoch": int(ck.get("epoch", 0)),
+        "best_mrae": float(ck.get("best_mrae", float("inf"))),
+    }
+    logger.info(
+        "Resumed from %s | iter=%d, epoch=%d, best_mrae=%.6f",
+        checkpoint_path,
+        info["iteration"],
+        info["epoch"],
+        info["best_mrae"],
+    )
+    return info
+
+
 __all__ = [
     "setup_paths",
     "setup_distributed_training",
     "setup_seed",
     "cleanup",
     "pick_amp_dtype",
+    "resume_training_state",
 ]
