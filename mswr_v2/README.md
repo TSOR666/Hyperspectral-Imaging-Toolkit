@@ -51,24 +51,147 @@ python train_mswr_v212_logging.py \
   --use_enhanced_loss
 ```
 
-Key options:
+### Configuration workflow
 
-| Flag | Description | Default |
-| --- | --- | --- |
-| `--model_size {tiny,small,base,large}` | Selects the model constructor inside `model/mswr_net_v212.py`. | `base` |
-| `--use_wavelet/--no_wavelet` | Enables the CNN-based wavelet branch. | Enabled |
-| `--use_enhanced_loss/--no_enhanced_loss` | Toggles the composite loss (L1 + SAM + SSIM + gradient terms). | Enabled |
-| `--use_ema/--no_ema` | Controls exponential moving average tracking. | Enabled |
-| `--early_stopping_mode {off,min,max}` | Configure patience-based stopping. | `off` |
-| `--ema_eval_mode {ema,model,both}` | Choose which weights drive validation metrics. | `ema` |
+Training options can be supplied directly on the CLI or through a YAML file:
 
-All CLI flags are documented near the bottom of [`train_mswr_v212_logging.py`](train_mswr_v212_logging.py). Logs and checkpoints are saved under timestamped folders in `./experiments/` unless overridden.
+```bash
+python train_mswr_v212_logging.py --config configs/mswr_base.yaml --init_lr 1e-4
+```
+
+YAML keys match the CLI names without leading dashes. Explicit CLI values override YAML values, so the command above would keep the YAML setup but replace `init_lr`. Unknown YAML keys are ignored by the trainer. Logs and checkpoints are saved under timestamped folders in `./experiments/` unless `--log_base`, `--checkpoint_base`, or `MSWR_EXPERIMENTS_ROOT` are set.
+
+### Model presets
+
+`--model_size` selects one of the factory constructors in [`model/mswr_net_v212.py`](model/mswr_net_v212.py):
+
+| `--model_size` | `base_channels` | `num_stages` | `num_heads` | `window_size` | `num_landmarks` | Suggested use |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `tiny` | 32 | 2 | 4 | 4 | 32 | Fast smoke tests and memory-constrained runs. |
+| `small` | 48 | 3 | 6 | 8 | 49 | Speed/quality compromise. |
+| `base` | 64 | 3 | 8 | 8 | 64 | Default production setting. |
+| `large` | 96 | 4 | 12 | 12 | 128 | Higher-capacity runs when memory allows. |
+
+When `model_size` is one of these presets, the preset owns `base_channels`, `num_stages`, `num_heads`, `window_size`, and `num_landmarks`; passing those flags does not change the preset architecture. For custom architectures, use a YAML config with a non-preset `model_size` so the trainer falls back to `MSWRDualConfig`:
+
+```yaml
+model_size: custom
+base_channels: 80
+num_stages: 4
+num_heads: 8
+window_size: 8
+num_landmarks: 96
+wavelet_levels: [1, 1, 2, 2]
+```
+
+### Training CLI reference
+
+Run and path options:
+
+| Flag | Choices / type | Default | Notes |
+| --- | --- | --- | --- |
+| `--config` | path | `None` | Optional YAML config. CLI values take precedence. |
+| `--pretrained_model_path` | path | `None` | Resume/load path stored as `resume_path`. |
+| `--data_root` | path | `MSWR_DATA_ROOT` or `./data/ARAD_1K` | Dataset root with ARAD-style folders. |
+| `--log_base` | path | `./experiments/logs` | Timestamped run log directory is created here. |
+| `--checkpoint_base` | path | `./experiments/checkpoints` | Timestamped checkpoint directory is created here. |
+| `--experiment_name` | string | `mswr_v212` | Used for logging/W&B run naming. |
+| `--use_wandb` | flag | off | Enables Weights & Biases logging. |
+| `--gpu_id` | string | `0` | Sets visible GPU(s) for single-process training. |
+
+Data and iteration options:
+
+| Flag | Type | Default | Notes |
+| --- | --- | ---: | --- |
+| `--batch_size` | int | 20 | Per-step batch size before gradient accumulation. |
+| `--end_epoch` | int | 300 | Epoch limit; with dense patch extraction this can be very long. |
+| `--patch_size` | int | 128 | Training crop size. |
+| `--stride` | int | 8 | Patch extraction stride. |
+| `--num_workers` | int | 4 | DataLoader workers. |
+| `--pin_memory` | flag | on | Defaults to enabled; set `pin_memory: false` in YAML to disable. |
+| `--save_frequency` | int | 5000 | Iteration interval for numbered checkpoints. |
+| `--validate_frequency` | int | 1000 | Iteration interval for validation. |
+| `--seed` | int | 42 | Python/NumPy/PyTorch seed. |
+| `--deterministic` | flag | off | Slower reproducible mode; disables TF32. |
+
+Architecture and attention options:
+
+| Flag | Choices / type | Default | Notes |
+| --- | --- | --- | --- |
+| `--model_size` | `tiny`, `small`, `base`, `large` | `base` | Selects a preset factory. |
+| `--attention_type` | `window`, `dual`, `landmark`, `hybrid` | `dual` | Attention block mode. |
+| `--landmark_pooling` | `learned`, `uniform`, `adaptive` | `learned` | Landmark/global attention pooling. |
+| `--use_checkpoint` | flag | off | Enables activation checkpointing in the training config. |
+| `--use_flash_attn` | flag | on | Defaults to enabled; set `use_flash_attn: false` in YAML to disable. |
+| `--base_channels` | int | 64 | Used only by the custom `MSWRDualConfig` path. |
+| `--num_stages` | int | 3 | Used only by the custom `MSWRDualConfig` path. |
+| `--num_heads` | int | 8 | Used only by the custom `MSWRDualConfig` path. |
+| `--window_size` | int | 8 | Used only by the custom `MSWRDualConfig` path. |
+| `--num_landmarks` | int | 64 | Used only by the custom `MSWRDualConfig` path. |
+
+Wavelet options:
+
+| Flag | Choices / type | Default | Notes |
+| --- | --- | --- | --- |
+| `--use_wavelet` | flag | on | CNN wavelet branch is enabled by default; set `use_wavelet: false` in YAML to disable. |
+| `--wavelet_type` | `haar`, `db1`, `db2`, `db3`, `db4` | `db2` | Training-script default; `MSWRDualConfig` itself defaults to `db1`. |
+| `--wavelet_levels` | int list | `None` | Per-stage DWT levels, e.g. `--wavelet_levels 1 1 2`; one value is repeated across stages. |
+
+Loss options:
+
+| Flag | Type | Default | Notes |
+| --- | --- | ---: | --- |
+| `--use_enhanced_loss` | flag | off | Enables `EnhancedMSWRLoss` (`L1 + MRAE + SSIM + SAM + Gradient`). |
+| `--l1_weight` | float | 1.0 | L1 component weight. |
+| `--mrae_weight` | float | 0.0 | MRAE component weight; useful for MRAE-focused fine-tuning. |
+| `--ssim_weight` | float | 0.5 | SSIM component weight. |
+| `--sam_weight` | float | 0.1 | SAM component weight; optimized in radians, logged in degrees. |
+| `--gradient_weight` | float | 0.1 | Spatial gradient loss weight. |
+| `--loss_warmup_epochs` | int | 10 | Warmup for auxiliary loss terms. |
+
+Optimization and schedule options:
+
+| Flag | Choices / type | Default | Notes |
+| --- | --- | ---: | --- |
+| `--optimizer` | `adam`, `adamw`, `sgd` | `adamw` | Optimizer family. |
+| `--scheduler` | `cosine`, `step`, `exponential` | `cosine` | LR schedule. |
+| `--init_lr` | float | 4e-4 | Initial/base learning rate. |
+| `--min_lr` | float | 1e-6 | Lower LR bound for scheduled decay. |
+| `--warmup_epochs` | int | 5 | LR warmup duration. |
+| `--weight_decay` | float | 1e-4 | Weight decay. |
+| `--gradient_clip` | float | 1.0 | Gradient clipping threshold. |
+| `--gradient_accumulation_steps` | int | 1 | Effective batch multiplier. |
+
+Runtime, precision, EMA, and stopping options:
+
+| Flag | Choices / type | Default | Notes |
+| --- | --- | --- | --- |
+| `--use_amp` | flag | on | AMP is enabled by default; set `use_amp: false` in YAML to disable. |
+| `--amp_dtype` | `auto`, `fp16`, `bf16` | `auto` | `auto` prefers BF16 when supported. |
+| `--channels_last` / `--no_channels_last` | flag pair | on | CUDA memory format. |
+| `--memory_monitoring` | flag | on | Enables memory/performance monitoring; set false in YAML to disable. |
+| `--profile_model` | flag | off | Emits model profiling diagnostics. |
+| `--use_ema` / `--no_ema` | flag pair | on | EMA tracking for model weights. |
+| `--ema_decay` | float | 0.999 | EMA decay factor. |
+| `--ema_start_epoch` | int | 5 | Delays EMA updates until this epoch. |
+| `--ema_eval_mode` | `ema`, `model`, `both` | `ema` | Weight set used for validation metrics. |
+| `--early_stopping_mode` | `off`, `min`, `max` | `off` | Disabled by default. |
+| `--early_stopping_patience` | int | 50 | Patience once early stopping is active. |
+| `--early_stopping_warmup` | int | 5 | Epochs skipped before early stopping can trigger. |
+
+Distributed options:
+
+| Flag | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `--distributed` | flag | off | Also auto-enabled when `WORLD_SIZE > 1` under `torchrun`. |
+| `--local_rank` / `--local-rank` | int | 0 | Launcher rank compatibility. |
+| `--ddp_find_unused_parameters` | flag | off | Debug option for dynamic graphs. |
 
 ### Tips
 
 - Set `PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"` to mirror the allocator tweaks used when debugging memory spikes.
 - Use `--gradient_accumulation_steps` to fit larger effective batch sizes on smaller GPUs.
-- Enable `--profile` to emit GPU/CPU utilisation snapshots via `PerformanceMonitor`.
+- Enable `--profile_model` to emit model profiling diagnostics.
 
 ## Inference
 
@@ -132,14 +255,19 @@ python train_mswr_v212_logging.py \
   --use_checkpoint --use_flash_attn
 ```
 
-## Key Configuration (MSWRDualConfig)
+## Full Model Configuration (`MSWRDualConfig`)
 
-- Core: `input_channels`, `output_channels`, `base_channels`, `num_stages`, `channel_expansion`.
-- Attention: `attention_type` (window/dual/landmark/hybrid), `num_heads`, `window_size`, `num_landmarks`, `landmark_pooling`, `local_global_fusion`.
-- Wavelets: `use_wavelet`, `wavelet_type` (haar/db1–db4), `wavelet_levels`, `wavelet_gate_reuse`.
-- Network: `mlp_ratio`, `ffn_type` (standard/gated), `fuse_qkv_small_maps` (backward-compatible no-op; QKV always uses the shared 1x1 conv path).
-- Regularization: `dropout`, `attention_dropout`, `drop_path`, `layer_scale_init`.
-- Performance: `use_checkpoint`, `checkpoint_blocks`, `use_flash_attn`, `compile_model`, `mixed_precision`, `memory_efficient`.
-- Other: `norm_type` (layer/group/batch/none), `use_multi_scale_input`, `use_skip_init`, `performance_monitoring`.
+These fields live in [`MSWRDualConfig`](model/mswr_net_v212.py). The most common ones are exposed through `train_mswr_v212_logging.py`; lower-level architecture fields are useful when constructing the model directly. YAML configs only affect keys already known to the training parser.
 
-Tip: Set `--wavelet_levels` per stage (e.g., `--wavelet_levels 1 1 2`) or pass one value to repeat automatically.
+| Group | Fields | Defaults / choices |
+| --- | --- | --- |
+| Core channels | `input_channels`, `output_channels`, `base_channels`, `channel_expansion`, `num_stages` | `3`, `31`, `64`, `2.0`, `3` |
+| Attention | `attention_type`, `num_heads`, `window_size`, `num_landmarks`, `landmark_pooling`, `local_global_fusion` | `dual`; `8`; `8`; `64`; `learned`; `adaptive` |
+| Attention choices | `attention_type`; `landmark_pooling`; `local_global_fusion` | `window`, `dual`, `landmark`, `hybrid`; `learned`, `uniform`, `adaptive`; `adaptive`, `concat`, `add`, `gated` |
+| Wavelets | `use_wavelet`, `wavelet_type`, `wavelet_levels`, `wavelet_gate_reuse` | `True`; `db1` in the config class, `db2` in the trainer; `None` expands to `[1..num_stages]`; `False` |
+| Network block | `mlp_ratio`, `ffn_type`, `fuse_qkv_small_maps` | `4.0`; `standard` or `gated`; `False` no-op compatibility knob |
+| Regularization | `dropout`, `attention_dropout`, `drop_path`, `layer_scale_init` | `0.0`, `0.0`, `0.1`, `1e-4` |
+| Performance | `use_checkpoint`, `checkpoint_blocks`, `use_flash_attn`, `compile_model`, `mixed_precision`, `memory_efficient` | `True`; auto-selected when checkpointing; `True`; `False`; `True`; `True` |
+| Advanced features | `use_multi_scale_input`, `use_skip_init`, `norm_type`, `performance_monitoring` | `True`; `True`; `layer` (`layer`, `group`, `batch`, `none`); `True` |
+
+Tip: set `--wavelet_levels` per stage, e.g. `--wavelet_levels 1 1 2`, or pass one value to repeat it across stages. For fields that are not wired to CLI flags, create the model through Python with `MSWRDualConfig`.
