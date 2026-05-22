@@ -65,6 +65,7 @@ import psutil
 from collections import defaultdict
 import traceback
 import copy
+from itertools import islice
 
 wandb = None
 
@@ -376,6 +377,7 @@ class TrainingConfig:
         # Basic training parameters
         self.batch_size = args.batch_size
         self.end_epoch = args.end_epoch
+        self.steps_per_epoch = args.steps_per_epoch
         self.init_lr = args.init_lr
         self.weight_decay = args.weight_decay
         self.patch_size = args.patch_size
@@ -484,6 +486,15 @@ def parse_arguments():
     # Basic training parameters
     parser.add_argument("--batch_size", type=int, default=20, help="batch size")
     parser.add_argument("--end_epoch", type=int, default=300, help="number of epochs")
+    parser.add_argument(
+        "--steps_per_epoch",
+        type=int,
+        default=1000,
+        help=(
+            "number of training batches per logical epoch; "
+            "set <=0 to consume the full train loader"
+        ),
+    )
     parser.add_argument("--init_lr", type=float, default=4e-4, help="initial learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="weight decay")
     parser.add_argument("--patch_size", type=int, default=128, help="patch size")
@@ -1030,6 +1041,14 @@ class EnhancedTrainer:
             )
             # Reduced frequency for transformer models to avoid overhead
             self.wandb.watch(self.model, log='gradients', log_freq=500)
+
+    def _logical_batches_per_epoch(self) -> int:
+        """Return the number of DataLoader batches in one logical epoch."""
+        loader_batches = len(self.train_loader)
+        configured_steps = int(getattr(self.config, "steps_per_epoch", 0) or 0)
+        if configured_steps <= 0:
+            return loader_batches
+        return max(1, min(configured_steps, loader_batches))
     
     def _setup_model(self):
         """Initialize model with CNN wavelets"""
@@ -1242,7 +1261,14 @@ class EnhancedTrainer:
         
         self.logger.info(f"Training samples: {len(self.train_dataset):,}")
         self.logger.info(f"Validation samples: {len(self.val_dataset):,}")
-        self.logger.info(f"Training batches per epoch: {len(self.train_loader):,}")
+        full_batches = len(self.train_loader)
+        logical_batches = self._logical_batches_per_epoch()
+        self.logger.info(f"Full training batches available: {full_batches:,}")
+        self.logger.info(f"Training batches per logical epoch: {logical_batches:,}")
+        if logical_batches < full_batches:
+            self.logger.info(
+                f"Using iteration-capped epochs via steps_per_epoch={self.config.steps_per_epoch:,}"
+            )
     
     def _setup_optimization(self):
         """Initialize optimizer and scheduler"""
@@ -1259,7 +1285,8 @@ class EnhancedTrainer:
         # 1/accum of its trajectory by the time training ends, and warmup
         # would last accum× longer than configured.
         accum = max(1, int(getattr(self.config, "gradient_accumulation_steps", 1)))
-        steps_per_epoch = max(1, len(self.train_loader) // accum)
+        train_batches_per_epoch = self._logical_batches_per_epoch()
+        steps_per_epoch = max(1, train_batches_per_epoch // accum)
         self.scheduler = create_scheduler(self.optimizer, self.config, steps_per_epoch)
         
         # Resume from checkpoint if specified
@@ -1382,9 +1409,29 @@ class EnhancedTrainer:
                     self.logger.warning(f"Failed to load scheduler state: {e}")
             
             # Load training state
-            self.epoch = checkpoint.get('epoch', 0)
+            checkpoint_epoch = checkpoint.get('epoch', 0)
+            self.epoch = checkpoint_epoch
             self.iteration = checkpoint.get('iter', 0)
+            logical_epoch_adjusted = False
+            configured_steps = int(getattr(self.config, "steps_per_epoch", 0) or 0)
+            if configured_steps > 0 and self.iteration > 0:
+                logical_batches = self._logical_batches_per_epoch()
+                logical_epoch = self.iteration // logical_batches
+                if logical_epoch > self.epoch:
+                    self.logger.warning(
+                        "Checkpoint epoch (%s) is behind iteration-derived logical epoch (%s); "
+                        "using logical epoch because steps_per_epoch=%s.",
+                        self.epoch,
+                        logical_epoch,
+                        configured_steps,
+                    )
+                    self.epoch = logical_epoch
+                    logical_epoch_adjusted = True
             self.best_mrae = checkpoint.get('best_mrae', float('inf'))
+            legacy_ema_state_invalid = (
+                logical_epoch_adjusted
+                and checkpoint_epoch < self.config.ema_start_epoch <= self.epoch
+            )
 
             # Restore GradScaler state for AMP continuity
             if self.scaler is not None and 'scaler' in checkpoint:
@@ -1397,11 +1444,21 @@ class EnhancedTrainer:
             # Restore EMA state if available
             if self.ema is not None and checkpoint.get('ema'):
                 try:
-                    self.ema.load_state_dict(checkpoint['ema'])
-                    self.ema.to(self.device)
-                    self.logger.info("Loaded EMA state from checkpoint.")
+                    if legacy_ema_state_invalid:
+                        self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
+                        self.logger.warning(
+                            "Checkpoint EMA was saved before ema_start_epoch under the old epoch scale; "
+                            "reinitialized EMA from the loaded model weights."
+                        )
+                    else:
+                        self.ema.load_state_dict(checkpoint['ema'])
+                        self.ema.to(self.device)
+                        self.logger.info("Loaded EMA state from checkpoint.")
                 except Exception as e:
                     self.logger.warning(f"Failed to load EMA state: {e}")
+            elif self.ema is not None and not checkpoint.get('ema'):
+                self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
+                self.logger.info("Checkpoint has no EMA state; initialized EMA from loaded model weights.")
             elif checkpoint.get('ema') and self.ema is None:
                 self.logger.info("Checkpoint contains EMA weights but EMA is disabled in the current run.")
 
@@ -1436,7 +1493,13 @@ class EnhancedTrainer:
         if self.config.memory_monitoring and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}', disable=self.rank != 0)
+        max_batches = self._logical_batches_per_epoch()
+        pbar = tqdm(
+            islice(self.train_loader, max_batches),
+            desc=f'Epoch {self.epoch}',
+            total=max_batches,
+            disable=self.rank != 0,
+        )
         for i, (images, labels) in enumerate(pbar):
             images = self._to_device(images)
             labels = self._to_device(labels)
@@ -1628,7 +1691,12 @@ class EnhancedTrainer:
                 self.wandb.log(log_dict)
             
             # Validation and checkpointing
-            if self.iteration % self.config.validate_frequency == 0:
+            is_last_epoch_batch = (i + 1) >= max_batches
+            if (
+                self.config.validate_frequency > 0
+                and self.iteration % self.config.validate_frequency == 0
+                and not is_last_epoch_batch
+            ):
                 val_metrics = self.validate()
                 evaluation_source = val_metrics.get('evaluation_model', 'model')
                 
@@ -1685,7 +1753,7 @@ class EnhancedTrainer:
                 self.model.train()
             
             # Periodic checkpoint saving
-            if self.iteration % self.config.save_frequency == 0:
+            if self.config.save_frequency > 0 and self.iteration % self.config.save_frequency == 0:
                 self.save_checkpoint(f'iter_{self.iteration}.pth')
         
         # End of epoch summary
@@ -1889,6 +1957,7 @@ class EnhancedTrainer:
         self.logger.info("STARTING MSWR-NET v2.1.2 TRAINING WITH CNN WAVELETS AND SAM")
         self.logger.info("="*80)
         self.logger.info(f"Training for {self.config.end_epoch} epochs")
+        self.logger.info(f"Steps per logical epoch: {self._logical_batches_per_epoch():,}")
         self.logger.info(f"Batch size: {self.config.batch_size}")
         self.logger.info(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         self.logger.info(f"Using CNN-based wavelets: {self.config.use_wavelet} ({self.config.wavelet_type})")

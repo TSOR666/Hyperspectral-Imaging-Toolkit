@@ -61,6 +61,8 @@ python train_mswr_v212_logging.py --config configs/mswr_base.yaml --init_lr 1e-4
 
 YAML keys match the CLI names without leading dashes. Explicit CLI values override YAML values, so the command above would keep the YAML setup but replace `init_lr`. Unknown YAML keys are ignored by the trainer. Logs and checkpoints are saved under timestamped folders in `./experiments/` unless `--log_base`, `--checkpoint_base`, or `MSWR_EXPERIMENTS_ROOT` are set.
 
+By default, MSWR uses MST++-style logical epochs: `--steps_per_epoch 1000` caps each epoch to 1000 training batches even when dense patch extraction produces far more available batches. This keeps LR warmup, cosine decay, EMA start, and loss warmup on the intended iteration scale. Set `--steps_per_epoch 0` to consume the full DataLoader each epoch. When resuming older checkpoints, the trainer derives the logical epoch from the saved iteration count if the checkpoint epoch is behind.
+
 ### Model presets
 
 `--model_size` selects one of the factory constructors in [`model/mswr_net_v212.py`](model/mswr_net_v212.py):
@@ -105,6 +107,7 @@ Data and iteration options:
 | --- | --- | ---: | --- |
 | `--batch_size` | int | 20 | Per-step batch size before gradient accumulation. |
 | `--end_epoch` | int | 300 | Epoch limit; with dense patch extraction this can be very long. |
+| `--steps_per_epoch` | int | 1000 | Training batches per logical epoch; set `<=0` for a full pass over all extracted patches. |
 | `--patch_size` | int | 128 | Training crop size. |
 | `--stride` | int | 8 | Patch extraction stride. |
 | `--num_workers` | int | 4 | DataLoader workers. |
