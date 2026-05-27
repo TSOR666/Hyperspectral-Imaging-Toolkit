@@ -1,0 +1,65 @@
+# MSWR-Net v2.1.2 — MST++-faithful baseline (MRAE-only loss)
+#
+# Purpose: train MSWR under the *same* recipe as MST++ so the ARAD-1K MRAE
+# comparison is apples-to-apples. The earlier "enhanced loss" run mixed
+# L1 + MRAE + SSIM + SAM + Gradient with hand-picked weights, which confounds
+# any MRAE benchmark — we were measuring the loss recipe, not the architecture.
+#
+# This config:
+#   - Uses MRAE-only loss (use_enhanced_loss: false → criterion = Loss_MRAE()
+#     at mswr_v2/train_mswr_v212_logging.py:1329).
+#   - Mirrors MST++ optimizer/schedule (Adam, init_lr=4e-4, cosine, 300 epochs).
+#   - Disables EMA (MST++ doesn't use it; reporting EMA blurred the prior result).
+#   - Trains from scratch — do NOT pass --pretrained_model_path, since the prior
+#     best_model.pth was trained with the enhanced loss and would taint a "fair"
+#     comparison.
+
+# ---- run / paths ----
+experiment_name: mswr_v212_mstpp_baseline
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration (MST++ defaults) ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 300
+steps_per_epoch: 1000        # MST++-style logical epochs
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+seed: 42
+
+# ---- architecture (preset) ----
+attention_type: dual
+use_flash_attn: true
+
+# ---- wavelets (MSWR's contribution; kept on — that's what we're benchmarking) ----
+use_wavelet: true
+wavelet_type: db2
+
+# ---- LOSS: MST++-faithful, MRAE only ----
+use_enhanced_loss: false     # criterion = Loss_MRAE()
+
+# ---- optimizer / schedule (matches MST++) ----
+optimizer: adam              # MST++ uses Adam, not AdamW
+scheduler: cosine
+init_lr: 4.0e-4              # MST++ default
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 0.0            # MST++ uses no weight decay
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- precision / mem (orthogonal to fairness; faster training) ----
+use_amp: true
+amp_dtype: auto              # prefers bf16 on Ampere/Hopper
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA: OFF (MST++ doesn't use EMA) ----
+use_ema: false
+
+# ---- early stopping: OFF (matches MST++ — train full schedule) ----
+early_stopping_mode: off
