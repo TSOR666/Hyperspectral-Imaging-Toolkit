@@ -233,6 +233,22 @@ def pick_amp_dtype(config: Dict[str, Any]) -> Optional[torch.dtype]:
     return None
 
 
+def _normalize_cuda_rng_state_all(cuda_rng_state_all: Any) -> list[torch.Tensor]:
+    """Return CUDA RNG states as CPU uint8 tensors for torch.cuda restore."""
+    if isinstance(cuda_rng_state_all, torch.Tensor):
+        states = [cuda_rng_state_all]
+    else:
+        states = list(cuda_rng_state_all)
+
+    normalized = []
+    for state in states:
+        if isinstance(state, torch.Tensor):
+            normalized.append(state.detach().to(device="cpu", dtype=torch.uint8))
+        else:
+            normalized.append(torch.as_tensor(state, dtype=torch.uint8, device="cpu"))
+    return normalized
+
+
 def resume_training_state(
     checkpoint_path: str,
     model: "torch.nn.Module",
@@ -298,8 +314,9 @@ def resume_training_state(
             logger.warning("Could not restore torch RNG state: %s", e)
     if ck.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
         try:
-            torch.cuda.set_rng_state_all(ck["cuda_rng_state_all"])
-        except RuntimeError as e:
+            cuda_rng_state_all = _normalize_cuda_rng_state_all(ck["cuda_rng_state_all"])
+            torch.cuda.set_rng_state_all(cuda_rng_state_all)
+        except (RuntimeError, TypeError, ValueError) as e:
             logger.warning("Could not restore CUDA RNG state: %s", e)
     if "numpy_rng_state" in ck:
         try:

@@ -3,8 +3,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+import torch
 
-from hsi_model.utils.training_setup import setup_paths
+from hsi_model.utils.training_setup import resume_training_state, setup_paths
 
 
 ROOT = Path(__file__).resolve().parents[1] / ".tmp_manual_dataset"
@@ -68,5 +69,55 @@ def test_setup_paths_still_requires_mst_data_dir():
     try:
         with pytest.raises(FileNotFoundError, match="Dataset directory not found"):
             setup_paths(cfg)
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_resume_training_state_normalizes_cuda_rng_state_all(monkeypatch):
+    case_dir = _case_dir("resume_cuda_rng")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    ckpt_path = case_dir / "latest_checkpoint.pth"
+    captured = {}
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "cuda_rng_state_all": [[1, 2, 3, 4]],
+                "iter": 17,
+                "epoch": 3,
+                "best_mrae": 0.25,
+            },
+            ckpt_path,
+        )
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        def fake_set_rng_state_all(states):
+            for state in states:
+                if not isinstance(state, torch.Tensor):
+                    raise TypeError("RNG state must be a torch.ByteTensor")
+                if state.device.type != "cpu" or state.dtype != torch.uint8:
+                    raise TypeError("RNG state must be a torch.ByteTensor")
+            captured["states"] = states
+
+        monkeypatch.setattr(torch.cuda, "set_rng_state_all", fake_set_rng_state_all)
+
+        info = resume_training_state(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            optimizers={},
+            schedulers={},
+            scalers={},
+            device=torch.device("cpu"),
+        )
+
+        assert info["iteration"] == 17
+        assert info["epoch"] == 3
+        assert info["best_mrae"] == pytest.approx(0.25)
+        assert captured["states"][0].tolist() == [1, 2, 3, 4]
+        for key, value in target.state_dict().items():
+            assert torch.allclose(value, source.state_dict()[key])
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
