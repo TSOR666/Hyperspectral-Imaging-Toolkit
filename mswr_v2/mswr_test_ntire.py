@@ -50,6 +50,12 @@ from utils import (
     AverageMeter
 )
 
+# Reuse the same validation reader the model was trained/validated against so
+# the test metrics line up with the trainer's `Val MRAE`. It handles the ARAD-1K
+# layout natively: .jpg RGB via cv2, the 'cube' HSI key via h5py, and pairing
+# through split_txt/valid_list.txt.
+from dataloader import ValidDataset
+
 # Configure plotting style
 sns.set_style("whitegrid")
 sns.set_palette("husl")
@@ -73,19 +79,15 @@ class TestConfig:
     model_size: str = 'base'
     device: str = 'cuda'
     
-    # Data settings
-    test_data_path: str = None
-    gt_data_path: str = None
-    data_format: str = 'mat'  # 'mat', 'h5', 'npy'
-    
+    # Data settings — ARAD-1K root holding Valid_RGB / Valid_Spec / split_txt.
+    data_root: str = None
+    bgr2rgb: bool = True  # cv2 reads BGR; convert to RGB to match training.
+
     # Testing settings
     batch_size: int = 1
     # Border-crop convention used by the public NTIRE 2022 / ARAD‑1K leaderboard:
     # full-image inference, then drop `crop_border` pixels from each side of the
     # PREDICTION (and the matching GT) before computing metrics. 482x512 -> 226x256.
-    # `center_crop` is kept for backwards compatibility but is now a no-op.
-    center_crop: bool = False
-    crop_size: int = 0  # legacy; replaced by crop_border
     crop_border: int = 128
     use_amp: bool = True
     
@@ -312,133 +314,6 @@ class MetricsCalculator:
                     }
         
         return results
-
-class DataLoader:
-    """Data loader for NTIRE 2022 test data"""
-    
-    def __init__(self, config: TestConfig):
-        self.config = config
-        self.test_files = []
-        self.gt_files = []
-        
-        self._load_file_lists()
-    
-    def _load_file_lists(self):
-        """Load test and ground truth file lists"""
-        test_path = Path(self.config.test_data_path)
-        
-        if self.config.data_format == 'mat':
-            self.test_files = sorted(test_path.glob('*.mat'))
-        elif self.config.data_format == 'h5':
-            self.test_files = sorted(test_path.glob('*.h5'))
-        elif self.config.data_format == 'npy':
-            self.test_files = sorted(test_path.glob('*.npy'))
-        
-        # Match ground truth files if provided
-        if self.config.gt_data_path:
-            gt_path = Path(self.config.gt_data_path)
-            for test_file in self.test_files:
-                gt_file = gt_path / test_file.name
-                if gt_file.exists():
-                    self.gt_files.append(gt_file)
-                else:
-                    # Try alternative naming patterns. NOTE: `Path / str + str` is a
-                    # TypeError — we must build the full string FIRST, then make a Path.
-                    alternatives = [
-                        gt_path / (test_file.stem.replace('rgb', 'hsi') + test_file.suffix),
-                        gt_path / (test_file.stem.replace('RGB', 'HSI') + test_file.suffix),
-                        gt_path / (test_file.stem + '_gt' + test_file.suffix),
-                    ]
-                    for alt in alternatives:
-                        if alt.exists():
-                            self.gt_files.append(alt)
-                            break
-                    else:
-                        logger.warning(f"No ground truth found for {test_file.name}")
-                        self.gt_files.append(None)
-        
-        logger.info(f"Found {len(self.test_files)} test files")
-        logger.info(f"Found {len([f for f in self.gt_files if f is not None])} ground truth files")
-    
-    def load_data(self, file_path: Path) -> np.ndarray:
-        """Load data from file"""
-        if self.config.data_format == 'mat':
-            mat_data = sio.loadmat(str(file_path))
-            # Try common keys
-            for key in ['data', 'img', 'image', 'rgb', 'RGB', 'hsi', 'HSI']:
-                if key in mat_data:
-                    return mat_data[key].astype(np.float32)
-            # Use first non-metadata key
-            for key, value in mat_data.items():
-                if not key.startswith('__') and isinstance(value, np.ndarray):
-                    return value.astype(np.float32)
-                    
-        elif self.config.data_format == 'h5':
-            with h5py.File(str(file_path), 'r') as f:
-                # Try common keys
-                for key in ['data', 'img', 'image', 'rgb', 'RGB', 'hsi', 'HSI']:
-                    if key in f:
-                        return f[key][:].astype(np.float32)
-                # Use first dataset
-                key = list(f.keys())[0]
-                return f[key][:].astype(np.float32)
-                
-        elif self.config.data_format == 'npy':
-            return np.load(str(file_path)).astype(np.float32)
-        
-        raise ValueError(f"Unable to load data from {file_path}")
-    
-    def preprocess(self, data: np.ndarray, is_rgb: bool = True) -> torch.Tensor:
-        """Preprocess data for model input"""
-        # Normalize to [0, 1] if needed
-        if data.max() > 1.0:
-            data = data / 255.0
-        
-        # Handle different input shapes
-        if len(data.shape) == 2:
-            # Single channel
-            data = np.stack([data] * 3, axis=-1) if is_rgb else data[:, :, np.newaxis]
-        elif len(data.shape) == 3:
-            if data.shape[0] in [3, 31]:
-                # Channel first
-                data = np.transpose(data, (1, 2, 0))
-        
-        # Intentionally NO crop here. The NTIRE protocol runs inference on the
-        # full image and then drops a border from the prediction before
-        # computing metrics. Cropping the RGB pre-inference gave the network a
-        # different receptive-field context than the published protocol and
-        # made metric numbers non-comparable. Border crop is applied in
-        # TestEngine on (pred, gt) just before MetricsCalculator.update().
-        if self.config.center_crop and self.config.crop_size > 0:
-            logger.warning(
-                "center_crop=True is deprecated and now ignored. "
-                "Use --crop_border (default 128) for the NTIRE border-crop protocol."
-            )
-        
-        # Convert to tensor
-        tensor = torch.from_numpy(data.transpose(2, 0, 1)).float()
-        
-        # Add batch dimension
-        if tensor.dim() == 3:
-            tensor = tensor.unsqueeze(0)
-        
-        return tensor
-    
-    def __len__(self) -> int:
-        return len(self.test_files)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], str]:
-        """Get test sample and optionally ground truth"""
-        test_file = self.test_files[idx]
-        test_data = self.load_data(test_file)
-        test_tensor = self.preprocess(test_data, is_rgb=True)
-        
-        gt_tensor = None
-        if idx < len(self.gt_files) and self.gt_files[idx] is not None:
-            gt_data = self.load_data(self.gt_files[idx])
-            gt_tensor = self.preprocess(gt_data, is_rgb=False)
-        
-        return test_tensor, gt_tensor, test_file.stem
 
 class Visualizer:
     """Comprehensive visualization for test results"""
@@ -765,7 +640,7 @@ class NTIRETestEngine:
         
         # Initialize components
         self.model = self._load_model()
-        self.data_loader = DataLoader(config)
+        self.dataset = ValidDataset(config.data_root, bgr2rgb=config.bgr2rgb, logger=logger)
         self.metrics_calculator = MetricsCalculator(
             calculate_sam=config.calculate_sam,
             calculate_ssim=config.calculate_ssim
@@ -997,9 +872,13 @@ class NTIRETestEngine:
         logger.info("="*60)
         
         # Test all images
-        for idx in tqdm(range(len(self.data_loader)), desc="Testing"):
-            rgb, gt, name = self.data_loader[idx]
-            
+        for idx in tqdm(range(len(self.dataset)), desc="Testing"):
+            rgb, gt = self.dataset[idx]
+            # ValidDataset yields (C, H, W); the engine expects a leading batch dim.
+            rgb = rgb.unsqueeze(0)
+            gt = gt.unsqueeze(0)
+            name = self.dataset.stems[idx]
+
             result = self.test_single_image(rgb, gt, name)
             self.all_results.append(result)
             
@@ -1191,21 +1070,19 @@ def main():
     # Required arguments
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to model checkpoint')
-    parser.add_argument('--test_data_path', type=str, required=True,
-                       help='Path to test RGB data')
-    parser.add_argument('--gt_data_path', type=str, required=True,
-                       help='Path to ground truth HSI data')
-    
+    parser.add_argument('--data_root', type=str, required=True,
+                       help='ARAD-1K dataset root (holds Valid_RGB/Valid_Spec/split_txt)')
+
     # Model settings
     parser.add_argument('--model_size', type=str, default='base',
                        choices=['tiny', 'small', 'base', 'large'])
     parser.add_argument('--device', type=str, default='cuda')
-    
+
     # Data settings
-    parser.add_argument('--data_format', type=str, default='mat',
-                       choices=['mat', 'h5', 'npy'])
-    parser.add_argument('--center_crop', action='store_true', default=True)
-    parser.add_argument('--crop_size', type=int, default=256)
+    parser.add_argument('--bgr2rgb', action='store_true', default=True,
+                       help='Convert OpenCV BGR to RGB (matches training preprocessing).')
+    parser.add_argument('--crop_border', type=int, default=128,
+                       help='NTIRE border-crop: pixels dropped per side before metrics.')
     
     # Metrics
     parser.add_argument('--calculate_sam', action='store_true', default=True)

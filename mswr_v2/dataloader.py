@@ -321,6 +321,7 @@ class ValidDataset(Dataset):
 
         self.rgb_images: List[torch.Tensor] = []
         self.hsi_cubes: List[torch.Tensor] = []
+        self.stems: List[str] = []
 
         self.config.logger.info("Loading %d validation scenes from %s", len(stems), data_root_path)
 
@@ -338,6 +339,7 @@ class ValidDataset(Dataset):
 
             self.rgb_images.append(torch.from_numpy(np.ascontiguousarray(rgb)))
             self.hsi_cubes.append(torch.from_numpy(np.ascontiguousarray(hsi)))
+            self.stems.append(stem)
 
         if not self.rgb_images:
             preview = ", ".join(stems[:5])
