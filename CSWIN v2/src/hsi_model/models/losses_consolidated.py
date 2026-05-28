@@ -136,6 +136,30 @@ class CharbonnierLoss(nn.Module):
         return loss.mean()
 
 
+class RelativeMRAELoss(nn.Module):
+    """
+    Smooth relative absolute error for directly training the MRAE objective.
+
+    Plain MRAE divides by the target intensity and can explode on dark pixels.
+    The denominator floor keeps those pixels influential without letting a few
+    near-zero values dominate the whole batch.
+    """
+    def __init__(
+        self,
+        denominator_epsilon: float = 1e-2,
+        charbonnier_epsilon: float = CHARBONNIER_EPSILON,
+    ):
+        super().__init__()
+        self.denominator_epsilon = max(float(denominator_epsilon), EPSILON_SMALL)
+        self.charbonnier_epsilon = max(float(charbonnier_epsilon), EPSILON_SMALL)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        denom = target.abs().clamp_min(self.denominator_epsilon)
+        relative_error = (pred - target) / denom
+        loss = torch.sqrt(relative_error.pow(2) + self.charbonnier_epsilon**2)
+        return loss.mean()
+
+
 # ============================================
 # Spectral Losses
 # ============================================
@@ -620,12 +644,17 @@ class NoiseRobustLoss(nn.Module):
         
         # Loss weights
         self.lambda_rec = config.get("lambda_rec", DEFAULT_LAMBDA_REC)
+        self.lambda_mrae = config.get("lambda_mrae", 0.0)
         self.lambda_perc = config.get("lambda_perceptual", DEFAULT_LAMBDA_PERCEPTUAL)
         self.lambda_adv = config.get("lambda_adversarial", DEFAULT_LAMBDA_ADVERSARIAL)
         self.lambda_sam = config.get("lambda_sam", DEFAULT_LAMBDA_SAM)
 
         # Loss components
         self.charbonnier = CharbonnierLoss()
+        self.relative_mrae = RelativeMRAELoss(
+            denominator_epsilon=config.get("relative_mrae_epsilon", 1e-2),
+            charbonnier_epsilon=config.get("relative_mrae_charbonnier_epsilon", CHARBONNIER_EPSILON),
+        )
         perceptual_num_bands = int(config.get("perceptual_num_bands", 31))
         perceptual_feature_extractor = config.get("perceptual_feature_extractor", None)
         if perceptual_feature_extractor is None and self.lambda_perc > 0:
@@ -765,6 +794,7 @@ class NoiseRobustLoss(nn.Module):
         if not self.use_adaptive_weights:
             return {
                 'rec': self.lambda_rec,
+                'mrae': self.lambda_mrae,
                 'perc': self.lambda_perc,
                 'adv': self.lambda_adv,
                 'sam': self.lambda_sam
@@ -784,6 +814,7 @@ class NoiseRobustLoss(nn.Module):
             warmup_factor = iteration / self.warmup_iterations
             return {
                 'rec': self.lambda_rec,
+                'mrae': self.lambda_mrae,
                 'perc': self.lambda_perc * warmup_factor,
                 'adv': self.lambda_adv * warmup_factor * 0.5,
                 'sam': self.lambda_sam * warmup_factor
@@ -793,6 +824,7 @@ class NoiseRobustLoss(nn.Module):
         progress = min(1.0, (iteration - self.warmup_iterations) / 50000)
         return {
             'rec': self.lambda_rec * (1.0 - 0.3 * progress),
+            'mrae': self.lambda_mrae,
             'perc': self.lambda_perc * (1.0 + progress),
             'adv': self.lambda_adv * (1.0 + 0.5 * progress),
             'sam': self.lambda_sam
@@ -854,6 +886,7 @@ class NoiseRobustLoss(nn.Module):
             fallback = zero + 1.0
             return fallback, {
                 'reconstruction': zero + 1.0,
+                'relative_mrae': zero,
                 'perceptual': zero,
                 'adversarial': zero,
                 'sam': zero,
@@ -870,6 +903,9 @@ class NoiseRobustLoss(nn.Module):
         # Compute individual losses
         rec_loss = self.charbonnier(pred_loss, target_loss)
         loss_components['reconstruction'] = rec_loss
+
+        relative_mrae_loss = self.relative_mrae(pred_loss, target_loss)
+        loss_components['relative_mrae'] = relative_mrae_loss
         
         perc_loss = self.perceptual_loss(pred_loss, target_loss)
         loss_components['perceptual'] = perc_loss
@@ -883,6 +919,7 @@ class NoiseRobustLoss(nn.Module):
         # Combine with adaptive weights
         total_loss = (
             weights['rec'] * rec_loss +
+            weights['mrae'] * relative_mrae_loss +
             weights['perc'] * perc_loss +
             weights['adv'] * adv_loss +
             weights['sam'] * sam_loss
@@ -890,6 +927,7 @@ class NoiseRobustLoss(nn.Module):
         
         # Log weighted components
         loss_components['weighted_rec'] = weights['rec'] * rec_loss
+        loss_components['weighted_mrae'] = weights['mrae'] * relative_mrae_loss
         loss_components['weighted_perc'] = weights['perc'] * perc_loss
         loss_components['weighted_adv'] = weights['adv'] * adv_loss
         loss_components['weighted_sam'] = weights['sam'] * sam_loss
@@ -995,6 +1033,7 @@ class ComputeSinkhornDiscriminatorLoss(nn.Module):
 
 __all__ = [
     'CharbonnierLoss',
+    'RelativeMRAELoss',
     'SAMLoss',
     'SinkhornDivergence',
     'SinkhornLoss',

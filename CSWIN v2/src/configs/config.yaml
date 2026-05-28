@@ -35,10 +35,11 @@ num_workers: 2
 n_critic: 1
 mixed_precision: true
 memory_mode: standard
+validation_max_batches: null
 
 warmup_steps: 2000
-generator_lr: 0.0002
-discriminator_lr: 0.00005
+generator_lr: 0.0001
+discriminator_lr: 0.00002
 sinkhorn_epsilon: 0.1
 sinkhorn_iters: 50
 sinkhorn_flatten_spatial: true
@@ -49,10 +50,16 @@ sinkhorn_loss_clip: 5.0
 use_r1_regularization: true
 r1_gamma: 10.0
 
+use_adaptive_weights: false
 lambda_rec: 1.0
+lambda_mrae: 0.2
+relative_mrae_epsilon: 0.01
 lambda_perceptual: 0.0
-lambda_adversarial: 0.1
-lambda_sam: 0.05
+lambda_adversarial: 0.01
+lambda_sam: 0.10
+
+output_activation: delayed_sigmoid
+activation_delay_iters: 60000
 
 checkpoint_keep: 5
 

@@ -109,6 +109,20 @@ from hsi_model.utils.data import (
 logger = logging.getLogger(__name__)
 
 
+def resolve_generator_discriminator_lrs(config: Dict[str, Any]) -> Tuple[float, float]:
+    """Resolve split G/D learning rates with legacy learning_rate fallback."""
+    legacy_lr = config.get("learning_rate", None)
+    generator_lr = config.get(
+        "generator_lr",
+        legacy_lr if legacy_lr is not None else 1e-4,
+    )
+    discriminator_lr = config.get(
+        "discriminator_lr",
+        legacy_lr if legacy_lr is not None else 2e-5,
+    )
+    return float(generator_lr), float(discriminator_lr)
+
+
 def report_memory(tag: str):
     """Report memory usage for debugging."""
     try:
@@ -242,9 +256,18 @@ def validate_mst_style(
     use_amp = amp_dtype is not None
     # Pass dtype unconditionally; autocast ignores it when enabled=False.
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+    validation_max_batches = config.get("validation_max_batches", None)
+    if validation_max_batches is not None:
+        validation_max_batches = int(validation_max_batches)
 
     with torch.no_grad():  # v2.0: Ensure no gradients during validation
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
+            if validation_max_batches is not None and validation_max_batches > 0:
+                if batch_idx >= validation_max_batches:
+                    break
+            elif validation_max_batches == 0:
+                break
+
             try:
                 rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
@@ -581,7 +604,7 @@ def train_mst_gan_optimized(
                     avg_loss = 0.0
                 logger.info(
                     f'[iter:{iteration}/{total_iteration}], lr_g={lr_g:.9f}, '
-                    f'train_loss={avg_loss:.9f}'
+                    f'lr_d={lr_d:.9f}, train_loss={avg_loss:.9f}'
                 )
             
             # v3.0: Reduced diagnostic frequency
@@ -751,7 +774,9 @@ def main(config: DictConfig) -> None:
         cfg.setdefault("batch_size", 20)
         cfg.setdefault("iterations_per_epoch", 1000)
         cfg.setdefault("epochs", 300)
-        cfg.setdefault("learning_rate", 4e-4)
+        cfg.setdefault("generator_lr", cfg.get("learning_rate", 1e-4))
+        cfg.setdefault("discriminator_lr", cfg.get("learning_rate", 2e-5))
+        cfg.setdefault("validation_max_batches", None)
         cfg.setdefault("num_workers", 8)
         cfg.setdefault("memory_mode", "standard")  # Options: standard, float16, lazy
         # AMP dtype: "auto" picks bf16 on A100+ (no GradScaler cycling), fp16 on
@@ -797,9 +822,17 @@ def main(config: DictConfig) -> None:
         report_memory("After creating model")
         
         # Create optimizers
-        lr = cfg.get("learning_rate", 4e-4)
-        optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=lr, betas=(0.9, 0.999))
-        optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr, betas=(0.9, 0.999))
+        generator_lr, discriminator_lr = resolve_generator_discriminator_lrs(cfg)
+        optimizer_g = torch.optim.Adam(
+            model.generator.parameters(),
+            lr=generator_lr,
+            betas=(0.9, 0.999),
+        )
+        optimizer_d = torch.optim.Adam(
+            model.discriminator.parameters(),
+            lr=discriminator_lr,
+            betas=(0.9, 0.999),
+        )
         optimizers = {'optimizer_g': optimizer_g, 'optimizer_d': optimizer_d}
         
         # Create schedulers
