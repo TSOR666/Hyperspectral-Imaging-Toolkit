@@ -139,11 +139,11 @@ This subproject, along with the rest of the toolkit, is distributed under the [M
 
 ## Configuration (Hydra: src/configs/config.yaml)
 
-- Data/Runtime: `data_dir`, `log_dir`, `checkpoint_dir`, `batch_size`, `val_batch_size`, `patch_size`, `stride`, `epochs`, `iterations_per_epoch`, `num_workers`, `memory_mode`, `mixed_precision`.
+- Data/Runtime: `data_dir`, `log_dir`, `checkpoint_dir`, `batch_size`, `val_batch_size`, `patch_size`, `stride`, `epochs`, `iterations_per_epoch`, `validation_max_batches`, `num_workers`, `memory_mode`, `mixed_precision`.
 - Optimizer/Scheduler: `generator_lr`, `discriminator_lr`, `warmup_steps`, `gradient_accumulation_steps`.
 - Adversarial: `n_critic`, `use_r1_regularization`, `r1_gamma`.
 - Sinkhorn: `sinkhorn_epsilon`, `sinkhorn_iters`, `sinkhorn_flatten_spatial`.
-- Loss weights: `lambda_rec`, `lambda_perceptual`, `lambda_adversarial`, `lambda_sam`.
+- Loss weights: `lambda_rec`, `lambda_mrae`, `lambda_perceptual`, `lambda_adversarial`, `lambda_sam`.
 - Checkpointing: `checkpoint_keep`.
 
 Example overrides:

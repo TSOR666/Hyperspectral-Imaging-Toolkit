@@ -5,6 +5,7 @@ import torch
 
 from hsi_model.models.losses_consolidated import (
     CharbonnierLoss,
+    RelativeMRAELoss,
     SAMLoss,
     SinkhornDivergence,
     NoiseRobustLoss,
@@ -37,6 +38,20 @@ def test_charbonnier_loss_finite():
     value = loss(pred, target)
     assert torch.isfinite(value)
     assert value.item() >= 0.0
+
+
+def test_relative_mrae_loss_uses_denominator_floor():
+    loss = RelativeMRAELoss(denominator_epsilon=0.01, charbonnier_epsilon=1e-6)
+    pred = torch.tensor([[[[0.02, 0.5]]]], requires_grad=True)
+    target = torch.tensor([[[[0.0, 0.25]]]])
+
+    value = loss(pred, target)
+    assert torch.isfinite(value)
+    assert value.item() == pytest.approx((2.0 + 1.0) / 2.0, rel=1e-5)
+
+    value.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
 
 
 def test_sam_loss_finite():
@@ -86,6 +101,31 @@ def test_noise_robust_loss_accepts_amp_prediction_dtype():
     assert torch.isfinite(loss)
     assert torch.isfinite(components["reconstruction"])
     loss.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+
+
+def test_noise_robust_loss_can_optimize_relative_mrae_component():
+    criterion = NoiseRobustLoss(
+        {
+            "lambda_rec": 0.0,
+            "lambda_mrae": 0.2,
+            "lambda_perceptual": 0.0,
+            "lambda_adversarial": 0.0,
+            "lambda_sam": 0.0,
+            "relative_mrae_epsilon": 0.01,
+            "use_adaptive_weights": False,
+        }
+    )
+    pred = torch.tensor([[[[0.02, 0.5]]]], requires_grad=True)
+    target = torch.tensor([[[[0.0, 0.25]]]])
+
+    total, components = criterion(pred, target)
+
+    assert torch.isfinite(total)
+    assert components["relative_mrae"].item() == pytest.approx(1.5, rel=1e-5)
+    assert components["weighted_mrae"].item() == pytest.approx(0.3, rel=1e-5)
+    total.backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
 

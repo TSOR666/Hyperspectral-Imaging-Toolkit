@@ -202,6 +202,13 @@ class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
         ]
 
 
+def scheduler_steps_for_accumulation(total_iterations: int, accumulation_steps: int) -> int:
+    """Return scheduler steps when stepping once per optimizer update."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    total_iterations = max(1, int(total_iterations))
+    return max(1, (total_iterations + accumulation_steps - 1) // accumulation_steps)
+
+
 # ============================================
 # Dataset Creation
 # ============================================
@@ -270,10 +277,16 @@ def validate_gan_safe(
     amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+    validation_max_batches = config.get("validation_max_batches", 10)
+    if validation_max_batches is not None:
+        validation_max_batches = int(validation_max_batches)
 
     with torch.no_grad():
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
-            if batch_idx >= 10:  # Limit validation
+            if validation_max_batches is not None and validation_max_batches > 0:
+                if batch_idx >= validation_max_batches:
+                    break
+            elif validation_max_batches == 0:
                 break
 
             try:
@@ -601,7 +614,7 @@ def train_sinkhorn_gan(
             # wrong time. Setting it explicitly each step keeps behavior
             # rank-consistent and reproducible across accumulation factors.
             if hasattr(generator, "set_iteration"):
-                generator.set_iteration(iteration)
+                generator.set_iteration(iteration // accumulation_steps)
 
             # ========== Train Generator ==========
             is_step_boundary = ((iteration + 1) % accumulation_steps == 0)
@@ -973,6 +986,7 @@ def main(config: DictConfig) -> None:
     cfg.setdefault("n_critic", 1)
     cfg.setdefault("gradient_accumulation_steps", 2)
     cfg.setdefault("warmup_steps", DEFAULT_WARMUP_STEPS)
+    cfg.setdefault("validation_max_batches", None)
     cfg.setdefault("use_r1_regularization", True)
     cfg.setdefault("r1_gamma", DEFAULT_R1_GAMMA)
     cfg.setdefault("use_sinkhorn_adversarial", True)
@@ -1031,9 +1045,13 @@ def main(config: DictConfig) -> None:
     # Create schedulers
     total_iterations = cfg['iterations_per_epoch'] * cfg['epochs']
     warmup_steps = cfg.get("warmup_steps", DEFAULT_WARMUP_STEPS)
+    scheduler_total_steps = scheduler_steps_for_accumulation(
+        total_iterations,
+        cfg.get("gradient_accumulation_steps", 1),
+    )
     
-    scheduler_g = WarmupCosineScheduler(optimizer_g, warmup_steps, total_iterations, eta_min=1e-6)
-    scheduler_d = WarmupCosineScheduler(optimizer_d, warmup_steps, total_iterations, eta_min=1e-6)
+    scheduler_g = WarmupCosineScheduler(optimizer_g, warmup_steps, scheduler_total_steps, eta_min=1e-6)
+    scheduler_d = WarmupCosineScheduler(optimizer_d, warmup_steps, scheduler_total_steps, eta_min=1e-6)
     schedulers = {'scheduler_g': scheduler_g, 'scheduler_d': scheduler_d}
     
     # Create scalers. Only fp16 needs a loss scaler — bf16 has fp32's

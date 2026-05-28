@@ -160,12 +160,13 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 | `val_batch_size` | 1 | Batch size for validation |
 | `patch_size` | 128 | Size of image patches |
 | `epochs` | 300 | Number of training epochs |
-| `generator_lr` | 0.0002 | Generator learning rate |
-| `discriminator_lr` | 0.00005 | Discriminator learning rate |
+| `generator_lr` | 0.0001 | Generator learning rate |
+| `discriminator_lr` | 0.00002 | Discriminator learning rate |
 | `lambda_rec` | 1.0 | Reconstruction loss weight |
-| `lambda_adversarial` | 0.1 | Adversarial loss weight |
-| `lambda_perceptual` | 0.1 | Perceptual loss weight |
-| `lambda_sam` | 0.05 | SAM loss weight |
+| `lambda_mrae` | 0.2 | Relative MRAE-style loss weight |
+| `lambda_adversarial` | 0.01 | Adversarial loss weight |
+| `lambda_perceptual` | 0.0 | Perceptual loss weight |
+| `lambda_sam` | 0.10 | SAM loss weight |
 | `mixed_precision` | true | Use automatic mixed precision |
 | `n_critic` | 1 | Discriminator steps per generator step |
 
