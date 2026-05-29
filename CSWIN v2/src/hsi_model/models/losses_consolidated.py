@@ -651,6 +651,22 @@ class NoiseRobustLoss(nn.Module):
 
         # Loss components
         self.charbonnier = CharbonnierLoss()
+        # Select the main reconstruction term. Charbonnier (smooth-L1) remains
+        # the default for backward compatibility; "l1" uses a true L1 (MAE)
+        # objective for pix2pix-style adversarial + L1 training. The
+        # ``reconstruction`` attribute is what ``forward`` actually calls.
+        recon_type = str(config.get("reconstruction_loss", "charbonnier")).lower()
+        if recon_type in ("l1", "mae"):
+            self.reconstruction = nn.L1Loss()
+        elif recon_type in ("charbonnier", "smooth_l1"):
+            self.reconstruction = self.charbonnier
+        else:
+            logger.warning(
+                "Unknown reconstruction_loss=%r; falling back to Charbonnier.",
+                recon_type,
+            )
+            self.reconstruction = self.charbonnier
+        self.reconstruction_loss_type = recon_type
         self.relative_mrae = RelativeMRAELoss(
             denominator_epsilon=config.get("relative_mrae_epsilon", 1e-2),
             charbonnier_epsilon=config.get("relative_mrae_charbonnier_epsilon", CHARBONNIER_EPSILON),
@@ -901,7 +917,7 @@ class NoiseRobustLoss(nn.Module):
         weights = self.get_adaptive_weights(iteration)
         
         # Compute individual losses
-        rec_loss = self.charbonnier(pred_loss, target_loss)
+        rec_loss = self.reconstruction(pred_loss, target_loss)
         loss_components['reconstruction'] = rec_loss
 
         relative_mrae_loss = self.relative_mrae(pred_loss, target_loss)
