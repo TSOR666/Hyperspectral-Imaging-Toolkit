@@ -28,10 +28,15 @@ batch_size: 20
 val_batch_size: 1
 patch_size: 128
 stride: 8
-epochs: 300
+# Cosine LR horizon = epochs * iterations_per_epoch. Keep this equal to the
+# number of epochs you ACTUALLY train. It was 300 while real runs stopped near
+# 64, so the LR had only annealed ~10% (still ~90% of initial) at epoch 64 -
+# the model never settled, which is the noisy plateau you saw. Set this to your
+# real wall-clock budget.
+epochs: 100
 iterations_per_epoch: 1000
 gradient_accumulation_steps: 2
-num_workers: 2
+num_workers: 8   # was 2; raise toward (CPU cores - 2) to speed up patch loading
 n_critic: 1
 mixed_precision: true
 memory_mode: standard
@@ -41,25 +46,37 @@ warmup_steps: 2000
 generator_lr: 0.0001
 discriminator_lr: 0.00002
 sinkhorn_epsilon: 0.1
-sinkhorn_iters: 50
+sinkhorn_iters: 25   # was 50; halves Sinkhorn cost (adversarial weight is small)
 sinkhorn_flatten_spatial: true
-sinkhorn_max_points: 1024
+sinkhorn_max_points: 512   # was 1024; ~4x cheaper OT cost matrix per batch element
 sinkhorn_kernel_clamp: 60.0
 sinkhorn_force_fp32: true
 sinkhorn_loss_clip: 5.0
 use_r1_regularization: true
 r1_gamma: 10.0
 
+# Loss = true L1 (main) + small MRAE (keeps the ARAD-1K leaderboard metric in
+# the objective) + small Sinkhorn-OT adversarial term. SAM and perceptual are
+# dropped. Weights are FIXED (use_adaptive_weights: false) so the reconstruction
+# term never decays and the adversarial term never ramps up during training.
 use_adaptive_weights: false
+reconstruction_loss: l1   # main fidelity term: true L1 (was Charbonnier)
 lambda_rec: 1.0
-lambda_mrae: 0.2
+lambda_mrae: 0.1          # was 0.2; small so MRAE stays directly optimized
 relative_mrae_epsilon: 0.01
 lambda_perceptual: 0.0
+use_sinkhorn_adversarial: true   # keep optimal-transport adversarial loss
 lambda_adversarial: 0.01
-lambda_sam: 0.10
+lambda_sam: 0.0           # was 0.10; dropped for the L1 + adversarial objective
 
-output_activation: delayed_sigmoid
-activation_delay_iters: 60000
+# Sigmoid head for the whole run (ARAD reflectance targets are in [0,1]).
+# Previously 'delayed_sigmoid' switched on at activation_delay_iters=60000
+# (~epoch 60), an abrupt linear->sigmoid output shock that matched "stops
+# learning past 60 epochs". A fixed sigmoid removes that discontinuity.
+# NOTE: changing the output head means you must train a FRESH run - do not
+# resume a checkpoint trained with the old linear/delayed-sigmoid head.
+output_activation: sigmoid
+activation_delay_iters: 0
 
 checkpoint_keep: 5
 

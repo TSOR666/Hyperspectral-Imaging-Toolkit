@@ -79,10 +79,15 @@ from hsi_model.constants import (
     DEFAULT_PATCH_SIZE,
     DEFAULT_STRIDE,
     DEFAULT_GRADIENT_CLIP_NORM,
+    DEFAULT_WARMUP_STEPS,
     CHECKPOINT_BEST_NAME,
     CHECKPOINT_LATEST_NAME,
     CHECKPOINT_KEEP_COUNT,
 )
+# Reuse the linear-warmup -> cosine-decay scheduler defined in
+# training_script_fixed.py so both trainers anneal the LR identically. The
+# import is acyclic (training_script_fixed does not import this module).
+from hsi_model.training_script_fixed import WarmupCosineScheduler
 from hsi_model.utils import (
     setup_logging, MetricsLogger, save_checkpoint, load_checkpoint
 )
@@ -831,14 +836,23 @@ def main(config: DictConfig) -> None:
         optimizer_d = torch.optim.Adam(
             model.discriminator.parameters(),
             lr=discriminator_lr,
-            betas=(0.9, 0.999),
+            # beta1=0.5 is standard GAN practice (matches training_script_fixed.py):
+            # beta1=0.9 gives the discriminator heavy momentum, producing an
+            # oscillating adversarial signal the generator chases in late epochs.
+            betas=(0.5, 0.999),
         )
         optimizers = {'optimizer_g': optimizer_g, 'optimizer_d': optimizer_d}
         
-        # Create schedulers
+        # Create schedulers. WarmupCosineScheduler = linear warmup -> cosine
+        # decay to eta_min. ``total_iterations`` is the cosine horizon, so it
+        # MUST equal the real training length (driven by cfg['epochs']) for the
+        # LR to actually anneal; a too-long horizon leaves the LR high and the
+        # model plateaus. This trainer steps the scheduler once per iteration
+        # (no gradient accumulation), so total_steps == total_iterations.
         total_iterations = cfg['iterations_per_epoch'] * cfg['epochs']
-        scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_g, total_iterations, eta_min=1e-6)
-        scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_d, total_iterations, eta_min=1e-6)
+        warmup_steps = cfg.get("warmup_steps", DEFAULT_WARMUP_STEPS)
+        scheduler_g = WarmupCosineScheduler(optimizer_g, warmup_steps, total_iterations, eta_min=1e-6)
+        scheduler_d = WarmupCosineScheduler(optimizer_d, warmup_steps, total_iterations, eta_min=1e-6)
         schedulers = {'scheduler_g': scheduler_g, 'scheduler_d': scheduler_d}
         
         # Create scalers. GradScaler is only meaningful for fp16 — bf16 has
