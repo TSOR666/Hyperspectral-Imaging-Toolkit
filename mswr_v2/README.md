@@ -209,6 +209,10 @@ python mswr_inference.py \
 
 The script loads the appropriate model configuration from the checkpoint metadata and writes reconstructed `.npy` files alongside optional RGB visualisations. Reuse these outputs with the [visualisation suite](../hsi_viz_suite/README.md).
 
+## Testing and visualization export
+
+`mswr_test_ntire.py` now supports real ARAD test samples when they are available. By default `--split auto` prefers `split_txt/test_list.txt` with `Test_RGB` / `Test_Spec`, falling back to validation splits when no test split exists. For the selected visualization samples it also exports `test_results/hsi/<sample>.npy`, `test_results/hsi/<sample>_target.npy`, and per-sample metric JSON files so `hsi_viz_suite/scripts/generate_all_visualizations.py` can consume the actual test samples directly.
+
 ## Related projects
 
 - [`../HSIFUSION&SHARP`](../HSIFUSION&SHARP/README.md) hosts the transformer-based HSIFusion and SHARP baselines that share the same dataset layout.

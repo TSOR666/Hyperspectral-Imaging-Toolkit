@@ -16,6 +16,7 @@ Public API:
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import os
 import random
@@ -249,6 +250,108 @@ def _normalize_cuda_rng_state_all(cuda_rng_state_all: Any) -> list[torch.Tensor]
     return normalized
 
 
+class GeneratorEMA:
+    """Exponential moving average (EMA) of a module's float parameters.
+
+    Maintains a shadow copy updated after each optimizer step as::
+
+        shadow = decay * shadow + (1 - decay) * param
+
+    Only trainable floating-point parameters are tracked; buffers are left
+    untouched on purpose (the generator's ``iteration_count`` is a counter, and
+    its GroupNorm layers keep no running statistics, so there is nothing to
+    average). Use :meth:`average_parameters` to temporarily swap the EMA
+    weights into the live module for validation / checkpoint snapshotting, then
+    automatically restore the training weights.
+
+    The EMA produces a smoother set of weights than the raw SGD/Adam iterate,
+    which damps the late-epoch metric noise typical of GAN training and makes
+    the *final* weights as good as the best-epoch ones.
+    """
+
+    def __init__(self, module: "torch.nn.Module", decay: float = 0.999) -> None:
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {
+            name: param.detach().clone()
+            for name, param in module.named_parameters()
+            if param.requires_grad and param.dtype.is_floating_point
+        }
+        self._backup: Optional[Dict[str, torch.Tensor]] = None
+
+    @torch.no_grad()
+    def update(self, module: "torch.nn.Module") -> None:
+        """Pull the shadow weights toward the module's current weights."""
+        decay = self.decay
+        for name, param in module.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is None:
+                continue
+            if shadow.device != param.device:
+                shadow = shadow.to(param.device)
+                self.shadow[name] = shadow
+            shadow.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+
+    @torch.no_grad()
+    def copy_to(self, module: "torch.nn.Module") -> None:
+        """Overwrite the module's parameters with the EMA (shadow) weights."""
+        for name, param in module.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is not None:
+                param.data.copy_(shadow.to(param.device))
+
+    @torch.no_grad()
+    def store(self, module: "torch.nn.Module") -> None:
+        """Snapshot the module's current (training) weights for later restore."""
+        self._backup = {
+            name: param.detach().clone()
+            for name, param in module.named_parameters()
+            if name in self.shadow
+        }
+
+    @torch.no_grad()
+    def restore(self, module: "torch.nn.Module") -> None:
+        """Put the snapshotted training weights back into the module."""
+        if self._backup is None:
+            return
+        for name, param in module.named_parameters():
+            backup = self._backup.get(name)
+            if backup is not None:
+                param.data.copy_(backup)
+        self._backup = None
+
+    @contextlib.contextmanager
+    def average_parameters(self, module: "torch.nn.Module"):
+        """Temporarily swap EMA weights into ``module`` for the block body."""
+        self.store(module)
+        self.copy_to(module)
+        try:
+            yield
+        finally:
+            self.restore(module)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(
+        self, state: Dict[str, Any], device: Optional[torch.device] = None
+    ) -> None:
+        """Restore shadow weights from a checkpoint, tolerating missing keys."""
+        if not state:
+            return
+        self.decay = float(state.get("decay", self.decay))
+        shadow = state.get("shadow", {}) or {}
+        loaded = skipped = 0
+        for name, tensor in shadow.items():
+            target = self.shadow.get(name)
+            if target is not None and isinstance(tensor, torch.Tensor):
+                src = tensor if device is None else tensor.to(device)
+                target.copy_(src.to(target.device))
+                loaded += 1
+            else:
+                skipped += 1
+        logger.info("Restored EMA shadow: %d params loaded, %d skipped", loaded, skipped)
+
+
 def resume_training_state(
     checkpoint_path: str,
     model: "torch.nn.Module",
@@ -256,6 +359,7 @@ def resume_training_state(
     schedulers: Dict[str, Any],
     scalers: Dict[str, Any],
     device: torch.device,
+    ema: Optional["GeneratorEMA"] = None,
 ) -> Dict[str, Any]:
     """Restore full training state from a checkpoint saved by either trainer.
 
@@ -304,6 +408,15 @@ def resume_training_state(
         if sc is not None and name in ck:
             sc.load_state_dict(ck[name])
 
+    # EMA shadow weights — optional. Missing on pre-EMA checkpoints, in which
+    # case the freshly-initialized shadow (a clone of the loaded model weights)
+    # is the correct starting point, so silently skip.
+    if ema is not None and ck.get("ema"):
+        try:
+            ema.load_state_dict(ck["ema"], device=device)
+        except (RuntimeError, TypeError, ValueError) as e:
+            logger.warning("Could not restore EMA state: %s", e)
+
     # RNG state — best-effort. Mismatched CUDA device counts at resume can
     # raise; log and continue rather than die because RNG drift across
     # resumes is acceptable for GAN training.
@@ -346,4 +459,5 @@ __all__ = [
     "cleanup",
     "pick_amp_dtype",
     "resume_training_state",
+    "GeneratorEMA",
 ]

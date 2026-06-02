@@ -1,6 +1,6 @@
 # HSI Reconstruction Visualization Suite
 
-Self-contained utilities for turning hyperspectral reconstruction results into publication-ready plots. The suite consumes `.npy` tensors and optional `metrics.json` files (ARAD-1K style) and produces PNG/PDF outputs for qualitative inspection, error analysis, and spectral curve comparisons.
+Self-contained utilities for turning hyperspectral reconstruction results into publication-ready plots. The suite consumes `.npy` tensors and optional `metrics.json` files (ARAD-1K style) and produces PNG/PDF outputs for qualitative inspection, error analysis, and spectral curve comparisons. Sample selection is data-driven: if real test prediction/target pairs are present, those samples are used directly.
 
 ## Features
 
@@ -50,7 +50,7 @@ python scripts/generate_all_visualizations.py \
   --output figs
 ```
 
-Provide explicit `--method-names` to control legend labels; otherwise directory names are used. Each method folder should mirror the ARAD-1K MST++ layout (`hsi/*.npy`, `rgb/*.png`, optional `metrics.json`).
+Provide explicit `--method-names` to control legend labels; otherwise directory names are used. Each method folder should include per-sample prediction/target pairs (`hsi/<sample>.npy` or `hsi/<sample>_pred.npy`, plus `hsi/<sample>_target.npy`) and optional `metrics/<sample>_metrics.json`.
 
 ### Customising samples and styling
 

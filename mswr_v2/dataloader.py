@@ -53,6 +53,20 @@ _VALID_HSI_DIRS = (
     "Test_Spec",
     "Train_Spec",
 )
+_TEST_RGB_DIRS = (
+    "Test_RGB",
+    "Valid_RGB",
+    "Validation_RGB",
+    "Val_RGB",
+    "Train_RGB",
+)
+_TEST_HSI_DIRS = (
+    "Test_Spec",
+    "Valid_Spec",
+    "Validation_Spec",
+    "Val_Spec",
+    "Train_Spec",
+)
 _RGB_SUFFIXES = (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
@@ -295,12 +309,13 @@ class TrainDataset(Dataset):
 
 
 class ValidDataset(Dataset):
-    """Full-image ARAD-1K validation dataset."""
+    """Full-image ARAD-1K validation/test dataset."""
 
     def __init__(
         self,
         data_root: str,
         *,
+        split: str = "valid",
         bgr2rgb: bool = True,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -314,41 +329,77 @@ class ValidDataset(Dataset):
             bgr2rgb=bgr2rgb,
         )
 
-        split_file = _first_existing_split(data_root_path, ("valid_list.txt", "val_list.txt"))
-        stems = _read_split_file(split_file)
-        if not stems:
-            raise RuntimeError(f"No entries found in {split_file}")
+        split_key = split.lower()
+        if split_key == "valid":
+            split_options = [
+                ("validation", ("valid_list.txt", "val_list.txt"), _VALID_RGB_DIRS, _VALID_HSI_DIRS)
+            ]
+        elif split_key == "test":
+            split_options = [
+                ("test", ("test_list.txt",), _TEST_RGB_DIRS, _TEST_HSI_DIRS)
+            ]
+        elif split_key == "auto":
+            split_options = [
+                ("test", ("test_list.txt",), _TEST_RGB_DIRS, _TEST_HSI_DIRS),
+                ("validation", ("valid_list.txt", "val_list.txt"), _VALID_RGB_DIRS, _VALID_HSI_DIRS),
+            ]
+        else:
+            raise ValueError("split must be one of: valid, test, auto")
 
         self.rgb_images: List[torch.Tensor] = []
         self.hsi_cubes: List[torch.Tensor] = []
         self.stems: List[str] = []
+        load_errors: List[str] = []
 
-        self.config.logger.info("Loading %d validation scenes from %s", len(stems), data_root_path)
-
-        for stem in stems:
-            rgb_path = self.config.rgb_path(stem, _VALID_RGB_DIRS)
-            hsi_path = self.config.hsi_path(stem, _VALID_HSI_DIRS)
-            if rgb_path is None or hsi_path is None:
-                continue
+        for split_label, split_names, rgb_dirs, hsi_dirs in split_options:
             try:
-                rgb = _load_rgb_image(rgb_path, bgr2rgb=self.config.bgr2rgb)
-                hsi = _load_hsi_cube(hsi_path)
-            except Exception as exc:  # pragma: no cover - defensive
-                self.config.logger.warning("Skipping %s due to load failure: %s", stem, exc)
+                split_file = _first_existing_split(data_root_path, split_names)
+            except FileNotFoundError as exc:
+                load_errors.append(str(exc))
                 continue
 
-            self.rgb_images.append(torch.from_numpy(np.ascontiguousarray(rgb)))
-            self.hsi_cubes.append(torch.from_numpy(np.ascontiguousarray(hsi)))
-            self.stems.append(stem)
+            stems = _read_split_file(split_file)
+            if not stems:
+                load_errors.append(f"No entries found in {split_file}")
+                continue
 
-        if not self.rgb_images:
+            self.config.logger.info(
+                "Loading %d %s scenes from %s via %s",
+                len(stems),
+                split_label,
+                data_root_path,
+                split_file.name,
+            )
+
+            for stem in stems:
+                rgb_path = self.config.rgb_path(stem, rgb_dirs)
+                hsi_path = self.config.hsi_path(stem, hsi_dirs)
+                if rgb_path is None or hsi_path is None:
+                    continue
+                try:
+                    rgb = _load_rgb_image(rgb_path, bgr2rgb=self.config.bgr2rgb)
+                    hsi = _load_hsi_cube(hsi_path)
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.config.logger.warning("Skipping %s due to load failure: %s", stem, exc)
+                    continue
+
+                self.rgb_images.append(torch.from_numpy(np.ascontiguousarray(rgb)))
+                self.hsi_cubes.append(torch.from_numpy(np.ascontiguousarray(hsi)))
+                self.stems.append(stem)
+
+            if self.rgb_images:
+                break
+
             preview = ", ".join(stems[:5])
-            raise RuntimeError(
-                f"No validation samples were loaded from {split_file}. "
-                f"Checked RGB dirs={list(_VALID_RGB_DIRS)} and HSI dirs={list(_VALID_HSI_DIRS)} "
+            load_errors.append(
+                f"No {split_label} samples were loaded from {split_file}. "
+                f"Checked RGB dirs={list(rgb_dirs)} and HSI dirs={list(hsi_dirs)} "
                 f"for {len(stems)} split entries"
                 f"{f' (first entries: {preview})' if preview else ''}."
             )
+
+        if not self.rgb_images:
+            raise RuntimeError(" ".join(load_errors))
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.rgb_images)

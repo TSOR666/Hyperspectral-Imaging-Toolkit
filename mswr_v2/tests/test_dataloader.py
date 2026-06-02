@@ -213,6 +213,70 @@ class TestValidDatasetLayout:
 
         assert len(dataset) == 1
 
+    def test_valid_dataset_auto_prefers_test_split_when_available(self, workspace_tmp_dir):
+        from dataloader import ValidDataset
+
+        test_scene = "ARAD_1K_0950"
+        valid_scene = "ARAD_1K_0901"
+        split_dir = workspace_tmp_dir / "split_txt"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "test_list.txt").write_text(f"{test_scene}\n", encoding="utf-8")
+        (split_dir / "valid_list.txt").write_text(f"{valid_scene}\n", encoding="utf-8")
+        self._write_scene(workspace_tmp_dir, test_scene)
+        self._write_scene(
+            workspace_tmp_dir,
+            valid_scene,
+            rgb_dir_name="Valid_RGB",
+            hsi_dir_name="Valid_Spec",
+        )
+
+        dataset = ValidDataset(data_root=str(workspace_tmp_dir), split="auto", bgr2rgb=True)
+
+        assert len(dataset) == 1
+        assert dataset.stems == [test_scene]
+
+    def test_valid_dataset_explicit_test_split_requires_test_list(self, workspace_tmp_dir):
+        from dataloader import ValidDataset
+
+        scene = "ARAD_1K_0951"
+        split_dir = workspace_tmp_dir / "split_txt"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "test_list.txt").write_text(f"{scene}\n", encoding="utf-8")
+        self._write_scene(workspace_tmp_dir, scene)
+
+        dataset = ValidDataset(data_root=str(workspace_tmp_dir), split="test", bgr2rgb=True)
+
+        assert len(dataset) == 1
+        assert dataset.stems == [scene]
+
+    def test_valid_dataset_auto_falls_back_when_test_targets_missing(self, workspace_tmp_dir):
+        from dataloader import ValidDataset
+
+        test_scene = "ARAD_1K_0952"
+        valid_scene = "ARAD_1K_0902"
+        split_dir = workspace_tmp_dir / "split_txt"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "test_list.txt").write_text(f"{test_scene}\n", encoding="utf-8")
+        (split_dir / "valid_list.txt").write_text(f"{valid_scene}\n", encoding="utf-8")
+
+        test_rgb_dir = workspace_tmp_dir / "Test_RGB"
+        test_rgb_dir.mkdir(parents=True, exist_ok=True)
+        cv2 = pytest.importorskip("cv2")
+        rgb = np.random.randint(0, 255, (4, 5, 3), dtype=np.uint8)
+        assert cv2.imwrite(str(test_rgb_dir / f"{test_scene}.jpg"), rgb)
+
+        self._write_scene(
+            workspace_tmp_dir,
+            valid_scene,
+            rgb_dir_name="Valid_RGB",
+            hsi_dir_name="Valid_Spec",
+        )
+
+        dataset = ValidDataset(data_root=str(workspace_tmp_dir), split="auto", bgr2rgb=True)
+
+        assert len(dataset) == 1
+        assert dataset.stems == [valid_scene]
+
 
 # ============================================================================
 # EDGE CASE TESTS (FINDING 4.2)

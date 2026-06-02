@@ -79,8 +79,9 @@ class TestConfig:
     model_size: str = 'base'
     device: str = 'cuda'
     
-    # Data settings — ARAD-1K root holding Valid_RGB / Valid_Spec / split_txt.
+    # Data settings — ARAD-1K root holding Valid/Test RGB+Spec folders and split_txt.
     data_root: str = None
+    split: str = 'auto'  # 'auto' prefers test_list when present, then validation splits.
     bgr2rgb: bool = True  # cv2 reads BGR; convert to RGB to match training.
 
     # Testing settings
@@ -106,6 +107,7 @@ class TestConfig:
     save_visualizations: bool = True
     save_error_maps: bool = True
     save_spectral_plots: bool = True
+    save_hsi_viz_inputs: bool = True
     n_visualization_samples: int = 10
     
     # Output
@@ -201,6 +203,11 @@ class MetricsCalculator:
         mrae = self.mrae_fn(pred, target)
         rmse = self.rmse_fn(pred, target)
         psnr = self.psnr_fn(pred, target, data_range=1.0)
+        sample_metrics = {
+            'mrae': mrae.item(),
+            'rmse': rmse.item(),
+            'psnr': psnr.item(),
+        }
         
         self.metrics['mrae'].update(mrae.item())
         self.metrics['rmse'].update(rmse.item())
@@ -210,11 +217,13 @@ class MetricsCalculator:
         if self.calculate_sam and self.sam_fn is not None:
             sam = self.sam_fn(pred, target)
             sam_deg = sam.item() * 180.0 / np.pi  # Convert to degrees
+            sample_metrics['sam'] = sam_deg
             self.metrics['sam'].update(sam_deg)
         
         # SSIM
         if self.calculate_ssim:
             ssim = self.calculate_ssim_metric(pred, target)
+            sample_metrics['ssim'] = ssim.item()
             self.metrics['ssim'].update(ssim.item())
         
         # Per-band metrics
@@ -233,6 +242,8 @@ class MetricsCalculator:
         if len(self.raw_errors) < 32:
             error = torch.abs(pred - target).cpu().numpy()
             self.raw_errors.append(error)
+
+        return sample_metrics
     
     def _calculate_per_band_metrics(self, pred: torch.Tensor, target: torch.Tensor):
         """Calculate metrics for each spectral band"""
@@ -640,7 +651,12 @@ class NTIRETestEngine:
         
         # Initialize components
         self.model = self._load_model()
-        self.dataset = ValidDataset(config.data_root, bgr2rgb=config.bgr2rgb, logger=logger)
+        self.dataset = ValidDataset(
+            config.data_root,
+            split=config.split,
+            bgr2rgb=config.bgr2rgb,
+            logger=logger,
+        )
         self.metrics_calculator = MetricsCalculator(
             calculate_sam=config.calculate_sam,
             calculate_ssim=config.calculate_ssim
@@ -766,7 +782,7 @@ class NTIRETestEngine:
             pred_for_metrics = pred_for_metrics.clamp(0.0, 1.0)
 
             # Update metrics
-            self.metrics_calculator.update(
+            result['metrics'] = self.metrics_calculator.update(
                 pred_for_metrics, gt_for_metrics,
                 calculate_per_band=self.config.per_band_metrics,
                 calculate_per_pixel=self.config.per_pixel_metrics
@@ -886,9 +902,22 @@ class NTIRETestEngine:
             if self.config.save_predictions:
                 self._save_prediction(result['prediction'], name)
             
+            selected_for_figures = idx < self.config.n_visualization_samples
+            if (
+                self.config.save_hsi_viz_inputs
+                and selected_for_figures
+                and 'ground_truth' in result
+            ):
+                self._save_hsi_viz_input(
+                    result['prediction'],
+                    result['ground_truth'],
+                    name,
+                    result.get('metrics', {}),
+                )
+
             # Visualize selected samples
             if (self.config.save_visualizations and 
-                idx < self.config.n_visualization_samples and
+                selected_for_figures and
                 'ground_truth' in result):
                 
                 pred_np = result['prediction'].squeeze(0).cpu().numpy().transpose(1, 2, 0)
@@ -949,6 +978,41 @@ class NTIRETestEngine:
             save_path = save_dir / f'{name}_pred.h5'
             with h5py.File(str(save_path), 'w') as f:
                 f.create_dataset('prediction', data=pred_np, compression='gzip')
+
+    def _save_hsi_viz_input(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        name: str,
+        metrics: Dict[str, float],
+    ) -> None:
+        """Export selected samples in the layout consumed by hsi_viz_suite."""
+        hsi_dir = self.output_dir / 'hsi'
+        metrics_dir = self.output_dir / 'metrics'
+        hsi_dir.mkdir(exist_ok=True)
+        metrics_dir.mkdir(exist_ok=True)
+
+        pred_np = (
+            pred.squeeze(0)
+            .clamp(0.0, 1.0)
+            .float()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        target_np = (
+            target.squeeze(0)
+            .float()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+
+        np.save(hsi_dir / f'{name}.npy', pred_np)
+        np.save(hsi_dir / f'{name}_target.npy', target_np)
+        if metrics:
+            with open(metrics_dir / f'{name}_metrics.json', 'w') as f:
+                json.dump(metrics, f, indent=2)
     
     def _statistical_analysis(self) -> Dict[str, Any]:
         """Perform statistical analysis on results"""
@@ -1071,7 +1135,7 @@ def main():
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--data_root', type=str, required=True,
-                       help='ARAD-1K dataset root (holds Valid_RGB/Valid_Spec/split_txt)')
+                       help='ARAD-1K dataset root (holds RGB/Spec folders and split_txt)')
 
     # Model settings
     parser.add_argument('--model_size', type=str, default='base',
@@ -1079,6 +1143,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
 
     # Data settings
+    parser.add_argument('--split', type=str, default='auto',
+                       choices=['auto', 'valid', 'test'],
+                       help='Evaluation split. auto prefers test_list.txt when available.')
     parser.add_argument('--bgr2rgb', action='store_true', default=True,
                        help='Convert OpenCV BGR to RGB (matches training preprocessing).')
     parser.add_argument('--crop_border', type=int, default=128,
@@ -1099,6 +1166,11 @@ def main():
     parser.add_argument('--save_visualizations', action='store_true', default=True)
     parser.add_argument('--save_error_maps', action='store_true', default=True)
     parser.add_argument('--save_spectral_plots', action='store_true', default=True)
+    parser.add_argument('--save_hsi_viz_inputs', dest='save_hsi_viz_inputs',
+                       action='store_true', default=True,
+                       help='Export selected pred/target .npy pairs for hsi_viz_suite.')
+    parser.add_argument('--no_save_hsi_viz_inputs', dest='save_hsi_viz_inputs',
+                       action='store_false')
     parser.add_argument('--n_visualization_samples', type=int, default=10)
     
     # Output

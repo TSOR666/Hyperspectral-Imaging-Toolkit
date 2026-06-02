@@ -11,6 +11,14 @@ import numpy as np
 import torch
 
 from hsi_model.utils import get_cached_cmf, hsi_to_rgb
+from result_layout import (
+    HsiResultLayoutError,
+    filter_sample_pairs,
+    no_sample_pairs_message,
+    prediction_path,
+    target_path,
+)
+from visualization_utils import to_chw
 
 class ComparisonGridGenerator:
     def __init__(self, results_dir: str, output_dir: str, dpi: int = 300) -> None:
@@ -22,10 +30,10 @@ class ComparisonGridGenerator:
 
     def _load_hsi(self, dir_path: Path, sample: str) -> Optional[torch.Tensor]:
         """Load an HSI prediction as (B,C,H,W) tensor."""
-        p = dir_path / "hsi" / f"{sample}.npy"
-        if not p.exists():
+        p = prediction_path(dir_path, sample)
+        if p is None:
             return None
-        x = torch.from_numpy(np.load(p)).float()
+        x = torch.from_numpy(to_chw(np.load(p))).float()
         if x.dim() == 3:
             x = x.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
         return x
@@ -34,16 +42,20 @@ class ComparisonGridGenerator:
         self, sample_names: List[str], methods: Optional[Dict[str, str]] = None
     ) -> None:
         methods = methods or {"Ours": str(self.results_dir)}
+        sample_names = filter_sample_pairs(self.results_dir, sample_names)
+        if not sample_names:
+            raise HsiResultLayoutError(no_sample_pairs_message(self.results_dir))
+
         n_samples = min(4, len(sample_names))
         n_methods = len(methods)
         fig = plt.figure(figsize=(2.6 * (n_methods + 1), 2.6 * n_samples))
         gs = gridspec.GridSpec(n_samples, n_methods + 1, wspace=0.02, hspace=0.02)
         headers = ['Ground Truth'] + list(methods.keys())
         for r, s in enumerate(sample_names[:n_samples]):
-            tgt_path = self.results_dir / "hsi" / f"{s}_target.npy"
-            if not tgt_path.exists():
+            tgt_path = target_path(self.results_dir, s)
+            if tgt_path is None:
                 continue
-            tgt = torch.from_numpy(np.load(tgt_path)).float()
+            tgt = torch.from_numpy(to_chw(np.load(tgt_path))).float()
             if tgt.dim() == 3:
                 tgt = tgt.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
             tgt_rgb = hsi_to_rgb(tgt, self.cmf).squeeze(0).permute(1, 2, 0).numpy()
@@ -83,7 +95,10 @@ def main() -> None:
         names = args.method_names or [Path(d).name for d in args.methods]
         methods = {n:d for n,d in zip(names, args.methods)}
     gen = ComparisonGridGenerator(args.results, args.output)
-    gen.create_main_comparison_figure(args.samples, methods=methods)
+    try:
+        gen.create_main_comparison_figure(args.samples, methods=methods)
+    except HsiResultLayoutError as exc:
+        raise SystemExit(str(exc)) from None
 
 if __name__ == "__main__":
     main()

@@ -4,6 +4,7 @@ hsi_viz_suite/
   README.md
   requirements.txt
   scripts/
+    result_layout.py
     visualization_utils.py
     visualize_results.py
     generate_error_maps.py
