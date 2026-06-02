@@ -12,7 +12,15 @@ import numpy as np
 import torch
 
 from hsi_model.utils import crop_center_arad1k, get_cached_cmf, hsi_to_rgb
-from visualization_utils import compute_mrae_map
+from result_layout import (
+    HsiResultLayoutError,
+    filter_sample_pairs,
+    find_sample_pairs,
+    no_sample_pairs_message,
+    prediction_path,
+    target_path,
+)
+from visualization_utils import compute_mrae_map, to_chw
 
 class ResultsVisualizer:
     def __init__(
@@ -38,11 +46,11 @@ class ResultsVisualizer:
         if sample_name in self._cache:
             return self._cache[sample_name]
         data: Dict[str, Any] = {}
-        hsi_path = self.results_dir / "hsi" / f"{sample_name}.npy"
-        if hsi_path.exists():
+        hsi_path = prediction_path(self.results_dir, sample_name)
+        if hsi_path is not None:
             data['pred_hsi'] = np.load(hsi_path)
-        tgt_path = self.results_dir / "hsi" / f"{sample_name}_target.npy"
-        if tgt_path.exists():
+        tgt_path = target_path(self.results_dir, sample_name)
+        if tgt_path is not None:
             data['target_hsi'] = np.load(tgt_path)
         metrics_path = self.results_dir / "metrics" / f"{sample_name}_metrics.json"
         if metrics_path.exists():
@@ -58,6 +66,10 @@ class ResultsVisualizer:
         show_metrics: bool = True,
         crop_arad1k_flag: bool = False,
     ) -> None:
+        sample_names = filter_sample_pairs(self.results_dir, sample_names)
+        if not sample_names:
+            raise HsiResultLayoutError(no_sample_pairs_message(self.results_dir))
+
         n = min(len(sample_names), 4)
         fig = plt.figure(figsize=(12, 3 * n))
         gs = gridspec.GridSpec(n, 4, hspace=0.3, wspace=0.1)
@@ -66,11 +78,11 @@ class ResultsVisualizer:
             d = self.load_sample_data(name)
             if not all(k in d for k in ['pred_hsi', 'target_hsi']):
                 continue
-            pred = torch.from_numpy(d['pred_hsi']).float()
-            if d['pred_hsi'].ndim == 3:
+            pred = torch.from_numpy(to_chw(d['pred_hsi'])).float()
+            if pred.dim() == 3:
                 pred = pred.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
-            targ = torch.from_numpy(d['target_hsi']).float()
-            if d['target_hsi'].ndim == 3:
+            targ = torch.from_numpy(to_chw(d['target_hsi'])).float()
+            if targ.dim() == 3:
                 targ = targ.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
             if crop_arad1k_flag:
                 pred = crop_center_arad1k(pred)
@@ -132,9 +144,11 @@ def main() -> None:
     if args.samples:
         sample_names = args.samples
     else:
-        from pathlib import Path
-        sample_names = sorted([p.stem for p in (Path(args.results)/"hsi").glob("*.npy") if not p.stem.endswith("_target")])[:10]
-    vis.create_comparison_figure(sample_names, "comparison_figure", True, args.crop_arad1k)
+        sample_names = find_sample_pairs(Path(args.results), max_samples=10)
+    try:
+        vis.create_comparison_figure(sample_names, "comparison_figure", True, args.crop_arad1k)
+    except HsiResultLayoutError as exc:
+        raise SystemExit(str(exc)) from None
     print(f"Saved to {args.output}")
 
 if __name__ == "__main__":

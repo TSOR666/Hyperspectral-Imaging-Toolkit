@@ -49,7 +49,7 @@ from hsi_model.utils.data import (
 )
 from hsi_model.utils.training_setup import (
     setup_paths, setup_distributed_training, setup_seed,
-    pick_amp_dtype, resume_training_state,
+    pick_amp_dtype, resume_training_state, GeneratorEMA,
 )
 from hsi_model.constants import (
     DEFAULT_BATCH_SIZE,
@@ -443,7 +443,8 @@ def train_sinkhorn_gan(
     distributed: bool,
     seed: int,
     rank: int,
-    resume_info: Optional[Dict[str, Any]] = None
+    resume_info: Optional[Dict[str, Any]] = None,
+    ema: Optional[GeneratorEMA] = None,
 ) -> None:
     """
     Main Sinkhorn GAN training loop.
@@ -723,7 +724,12 @@ def train_sinkhorn_gan(
                 scaler_g.update()
                 optimizer_g.zero_grad(set_to_none=True)
                 scheduler_g.step()
-            
+
+                # Update the generator EMA once per real optimizer step (i.e.
+                # at accumulation step boundaries, not every micro-batch).
+                if ema is not None:
+                    ema.update(generator)
+
             # ========== Train Discriminator ==========
             if run_disc_step:
                 fake_hsi_detached = fake_hsi.detach()
@@ -818,10 +824,20 @@ def train_sinkhorn_gan(
             
             # Validation
             if iteration % per_epoch_iteration == 0:
-                val_metrics = validate_gan_safe(
-                    model, val_dataset, criterion, device, iteration, config, seed, rank,
-                    val_loader=val_loader_persistent,
-                )
+                # Validate with EMA generator weights when enabled, so the
+                # reported metrics and the best_model selection below reflect
+                # the smoothed weights that get saved for inference.
+                if ema is not None:
+                    with ema.average_parameters(generator):
+                        val_metrics = validate_gan_safe(
+                            model, val_dataset, criterion, device, iteration, config, seed, rank,
+                            val_loader=val_loader_persistent,
+                        )
+                else:
+                    val_metrics = validate_gan_safe(
+                        model, val_dataset, criterion, device, iteration, config, seed, rank,
+                        val_loader=val_loader_persistent,
+                    )
                 
                 current_mrae = val_metrics.get('mrae', float('inf'))
                 epoch_num = iteration // per_epoch_iteration
@@ -876,22 +892,37 @@ def train_sinkhorn_gan(
                             if torch.cuda.is_available() else None
                         ),
                         'numpy_rng_state': np.random.get_state(),
+                        # EMA shadow weights for resume (None when EMA disabled).
+                        'ema': ema.state_dict() if ema is not None else None,
                     }
 
-                    # (1) latest — always overwritten
+                    # (1) latest — always overwritten (raw weights for resume)
                     _atomic_torch_save(
                         checkpoint_dict,
                         os.path.join(checkpoint_dir, CHECKPOINT_LATEST_NAME),
                     )
 
-                    # (2) best — only on MRAE improvement
+                    # (2) best — only on MRAE improvement. With EMA on, store
+                    # the EMA weights (the ones that produced this metric) so
+                    # inference loads them directly.
                     if is_best:
                         previous_best = record_mrae_loss
                         record_mrae_loss = current_mrae
-                        _atomic_torch_save(
-                            checkpoint_dict,
-                            os.path.join(checkpoint_dir, CHECKPOINT_BEST_NAME),
-                        )
+                        if ema is not None:
+                            base_model = model.module if hasattr(model, 'module') else model
+                            with ema.average_parameters(generator):
+                                best_dict = dict(checkpoint_dict)
+                                best_dict['state_dict'] = base_model.state_dict()
+                                best_dict['ema_applied'] = True
+                                _atomic_torch_save(
+                                    best_dict,
+                                    os.path.join(checkpoint_dir, CHECKPOINT_BEST_NAME),
+                                )
+                        else:
+                            _atomic_torch_save(
+                                checkpoint_dict,
+                                os.path.join(checkpoint_dir, CHECKPOINT_BEST_NAME),
+                            )
                         logger.info(
                             "NEW BEST: MRAE %.6f -> %.6f at iter %d (epoch %d); "
                             "saved %s",
@@ -1073,6 +1104,15 @@ def main(config: DictConfig) -> None:
     if is_distributed:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
+    # Generator weight EMA (optional). Built AFTER the DDP wrap so it tracks the
+    # underlying generator parameters; created before resume so its shadow can
+    # be restored from the checkpoint.
+    ema: Optional[GeneratorEMA] = None
+    if cfg.get("use_ema", True):
+        gen_for_ema = model.module.generator if hasattr(model, "module") else model.generator
+        ema = GeneratorEMA(gen_for_ema, decay=float(cfg.get("ema_decay", 0.999)))
+        logger.info("Generator EMA enabled (decay=%.4f)", ema.decay)
+
     # Resume from a previous checkpoint if requested. Hydra syntax:
     #   python training_script_fixed.py resume_checkpoint=/path/to/best_model.pth
     # Restores model + both optimizers + both schedulers + both scalers +
@@ -1088,6 +1128,7 @@ def main(config: DictConfig) -> None:
             schedulers=schedulers,
             scalers=scalers,
             device=device,
+            ema=ema,
         )
 
     # Set up metrics logger
@@ -1111,6 +1152,7 @@ def main(config: DictConfig) -> None:
             cfg.get("seed", 42),
             rank,
             resume_info=resume_info,
+            ema=ema,
         )
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)

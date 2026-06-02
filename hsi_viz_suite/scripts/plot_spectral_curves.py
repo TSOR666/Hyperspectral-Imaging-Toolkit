@@ -9,6 +9,7 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 
+from result_layout import prediction_path, target_path
 from visualization_utils import to_chw
 
 if TYPE_CHECKING:
@@ -31,9 +32,9 @@ class SpectralAnalyzer:
 
     def _load_pair(self, sample: str) -> Tuple[np.ndarray | None, np.ndarray | None]:
         """Load (C,H,W) numpy arrays for prediction and target."""
-        pred_path = self.results_dir / "hsi" / f"{sample}.npy"
-        tgt_path = self.results_dir / "hsi" / f"{sample}_target.npy"
-        if not pred_path.exists() or not tgt_path.exists():
+        pred_path = prediction_path(self.results_dir, sample)
+        tgt_path = target_path(self.results_dir, sample)
+        if pred_path is None or tgt_path is None:
             return None, None
         pred = to_chw(np.load(pred_path))
         tgt = to_chw(np.load(tgt_path))

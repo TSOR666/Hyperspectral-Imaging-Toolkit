@@ -55,6 +55,14 @@ sinkhorn_loss_clip: 5.0
 use_r1_regularization: true
 r1_gamma: 10.0
 
+# Generator weight EMA: validate and save best_model.pth from an exponential
+# moving average of the generator weights instead of the raw training iterate.
+# Smooths the late-epoch metric noise typical of GAN training and makes the
+# final weights match best-epoch quality. best_model.pth stores the EMA
+# weights; latest_checkpoint.pth keeps the raw weights for exact resume.
+use_ema: true
+ema_decay: 0.999
+
 # Loss = true L1 (main) + small MRAE (keeps the ARAD-1K leaderboard metric in
 # the objective) + small Sinkhorn-OT adversarial term. SAM and perceptual are
 # dropped. Weights are FIXED (use_adaptive_weights: false) so the reconstruction

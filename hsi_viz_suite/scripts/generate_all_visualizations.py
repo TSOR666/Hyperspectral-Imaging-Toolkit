@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import List
 
+from result_layout import find_sample_pairs, no_sample_pairs_message
+
 
 def run_script(script: str, args: List[str]) -> None:
     cmd = [sys.executable, str(Path(__file__).parent / script)] + args
@@ -26,10 +28,9 @@ def main() -> None:
     args = ap.parse_args()
 
     rdir = Path(args.results)
-    samples = sorted([
-        p.stem for p in (rdir / 'hsi').glob('*.npy')
-        if not p.stem.endswith('_target')
-    ])[:args.max_samples]
+    samples = find_sample_pairs(rdir, max_samples=args.max_samples)
+    if not samples:
+        raise SystemExit(no_sample_pairs_message(rdir))
 
     out_main = Path(args.output) / "main_figures"
     out_main.mkdir(parents=True, exist_ok=True)

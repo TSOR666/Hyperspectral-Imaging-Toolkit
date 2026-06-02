@@ -10,10 +10,12 @@ import numpy as np
 import torch
 
 from hsi_model.utils import get_cached_cmf
+from result_layout import prediction_path, target_path
 from visualization_utils import (
     apply_gaussian_smoothing,
     compute_mrae_map,
     create_error_colormap,
+    to_chw,
 )
 
 class ErrorMapGenerator:
@@ -26,12 +28,12 @@ class ErrorMapGenerator:
 
     def _load_pair(self, sample: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Load prediction/target pair as (B,C,H,W) tensors."""
-        pred_path = self.results_dir / "hsi" / f"{sample}.npy"
-        tgt_path = self.results_dir / "hsi" / f"{sample}_target.npy"
-        if not pred_path.exists() or not tgt_path.exists():
+        pred_path = prediction_path(self.results_dir, sample)
+        tgt_path = target_path(self.results_dir, sample)
+        if pred_path is None or tgt_path is None:
             return None, None
-        pred = torch.from_numpy(np.load(pred_path)).float()
-        tgt = torch.from_numpy(np.load(tgt_path)).float()
+        pred = torch.from_numpy(to_chw(np.load(pred_path))).float()
+        tgt = torch.from_numpy(to_chw(np.load(tgt_path))).float()
         if pred.dim() == 3:
             pred = pred.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
         if tgt.dim() == 3:
