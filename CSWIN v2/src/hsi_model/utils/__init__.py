@@ -6,8 +6,14 @@ Exposes checkpointing, logging, metrics, patch inference, and data utilities.
 """
 
 # Core utilities
+import sys as _sys
+
 from .checkpoint import save_checkpoint, load_checkpoint
-from .logging import setup_logging, MetricsLogger
+from . import log_utils as logging
+from .log_utils import setup_logging, MetricsLogger
+
+# Backwards compatibility for callers using `hsi_model.utils.logging`.
+_sys.modules.setdefault(__name__ + ".logging", logging)
 from .metrics import (
     hsi_to_rgb,
     create_cmf_tensor,
