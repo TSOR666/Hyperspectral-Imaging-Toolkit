@@ -160,6 +160,29 @@ class RelativeMRAELoss(nn.Module):
         return loss.mean()
 
 
+class MRAELoss(nn.Module):
+    """
+    Mean Relative Absolute Error — the exact objective the ARAD-1K leaderboard
+    scores, and MST++'s training loss (``Loss_MRAE``).
+
+        MRAE = mean( |pred - target| / max(|target|, epsilon) )
+
+    Unlike :class:`RelativeMRAELoss` (a Charbonnier-smoothed surrogate that
+    floors the denominator at 1e-2 and so underweights dark pixels), this
+    matches ``utils.metrics.compute_mrae`` term-for-term, so training on it
+    directly optimizes the reported metric. ``epsilon`` defaults to 1e-8 to
+    match the metric; raise it if near-zero targets cause gradient spikes under
+    mixed precision.
+    """
+    def __init__(self, epsilon: float = 1e-8):
+        super().__init__()
+        self.epsilon = max(float(epsilon), 1e-12)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        denominator = target.abs().clamp_min(self.epsilon)
+        return torch.mean(torch.abs(pred - target) / denominator)
+
+
 # ============================================
 # Spectral Losses
 # ============================================
@@ -1050,6 +1073,7 @@ class ComputeSinkhornDiscriminatorLoss(nn.Module):
 __all__ = [
     'CharbonnierLoss',
     'RelativeMRAELoss',
+    'MRAELoss',
     'SAMLoss',
     'SinkhornDivergence',
     'SinkhornLoss',

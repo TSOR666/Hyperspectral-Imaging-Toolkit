@@ -268,10 +268,9 @@ class MetricsCalculator:
         pred_flat = pred.permute(0, 2, 3, 1).reshape(-1, pred.shape[1])
         target_flat = target.permute(0, 2, 3, 1).reshape(-1, target.shape[1])
 
-        # Calculate per-pixel relative error with proper handling of near-zero values
-        # Use max(target, epsilon) to avoid division by very small values
-        # A typical threshold is based on the data range
-        eps = 1e-3  # Use a more reasonable epsilon for relative error
+        # Match the strict aggregate MRAE denominator so per-pixel diagnostics
+        # explain the reported leaderboard-style score.
+        eps = getattr(self.mrae_fn, "epsilon", 1e-6)
         abs_error = torch.abs(pred_flat - target_flat)
         denominator = torch.maximum(torch.abs(target_flat), torch.tensor(eps, device=target.device))
         pixel_mrae = (abs_error / denominator).mean(dim=1)

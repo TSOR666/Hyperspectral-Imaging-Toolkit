@@ -42,8 +42,34 @@ mixed_precision: true
 memory_mode: standard
 validation_max_batches: null
 
+# ===========================================================================
+# ACTIVE DIRECTION: generator-only MRAE training (train_generator.py)
+# The GAN was dropped (no discriminator / Sinkhorn / R1). Objective is MRAE-only
+# (MST++'s training loss and the ARAD-1K leaderboard metric), so results are
+# directly comparable to MST++. The sinkhorn_* / lambda_* / discriminator_* /
+# r1 / n_critic / gradient_accumulation_steps keys below are LEGACY and only
+# read by the deprecated GAN trainers (train_optimized.py, training_script_fixed.py).
+# ===========================================================================
+objective: mrae          # mrae | relative_mrae
+mrae_epsilon: 1.0e-8     # matches utils.metrics.compute_mrae; raise if unstable
+optimizer: adam          # adam (MST++) | adamw
+weight_decay: 0.0
+
+# Generator architecture (aggressive bundle). Defaults in code preserve the old
+# architecture, so these flags select the new one:
+base_channels: 96                # was 64
+num_heads: 4
+blocks_per_stage: 3              # DualTransformerBlocks per U-Net stage (was 2)
+spectral_attention_type: s_msa   # full-res-token channel self-attn (was 'efficient' global gate)
+sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (was bilinear)
+use_noise_block: false           # drop denoising blocks (clean ARAD data)
+thick_output_head: true          # 3x3 -> GELU -> 1x1 spectral head
+
 warmup_steps: 2000
-generator_lr: 0.0001
+# MST++ init_lr is 4e-4 (was 1e-4 for the GAN generator). Cosine-annealed over
+# epochs * iterations_per_epoch with linear warmup.
+generator_lr: 0.0004
+# --- legacy GAN trainer keys below (ignored by train_generator.py) ---
 discriminator_lr: 0.00002
 sinkhorn_epsilon: 0.1
 sinkhorn_iters: 25   # was 50; halves Sinkhorn cost (adversarial weight is small)

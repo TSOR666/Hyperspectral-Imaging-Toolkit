@@ -768,6 +768,126 @@ class EfficientSpectralAttention(nn.Module):
         return out
 
 
+class SpectralMSA(nn.Module):
+    """
+    Spectral multi-head self-attention (Restormer-MDTA / MST++ S-MSA style).
+
+    Unlike :class:`EfficientSpectralAttention`, which mean-pools Q,K to a single
+    ``(B, C)`` descriptor *before* computing the channel affinity (discarding all
+    spatial structure, ``attention.py`` audit), this computes the per-head
+    ``(C/h) x (C/h)`` channel-affinity from FULL-RESOLUTION tokens and applies it
+    to the full-resolution V. The affinity is shared across spatial positions
+    (global-per-image, which is what keeps it cheap), but it is computed from
+    spatially-resolved statistics — a much richer cross-band mixing than the
+    pre-pooled gate.
+
+    Cost is ``O(B * num_heads * (C/h)^2 * H*W)`` — linear in H*W, cheap because
+    the affinity matrix is channel-sized, not token-sized.
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        bias: bool = False,
+        config: Optional[ConfigDict] = None,
+    ) -> None:
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(
+                f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+            )
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        self.force_fp32 = (
+            bool(config.get("spectral_attention_force_fp32", True)) if config else True
+        )
+        self.finite_clamp = (
+            float(config.get("spectral_attention_finite_clamp", 1e4)) if config else 1e4
+        )
+        norm_groups = config.get("norm_groups", 8) if config else 8
+
+        # Depthwise-conv-enhanced QKV (Restormer): a 1x1 mixes channels, a 3x3
+        # depthwise injects local spatial context into each token.
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(
+            channels * 3, channels * 3, kernel_size=3, padding=1,
+            groups=channels * 3, bias=bias,
+        )
+        self.project_out = nn.Conv2d(channels, channels, kernel_size=1, bias=bias)
+        self.norm = _adaptive_group_norm(channels, norm_groups)
+
+        # Local positional context (depthwise), matching EfficientSpectralAttention.
+        self.pos_embed = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        output_dtype = x.dtype
+        param_dtype = self.qkv.weight.dtype
+        run_fp32 = self.force_fp32 and param_dtype == torch.float32
+
+        ctx = _autocast_disabled(x.device.type) if run_fp32 else nullcontext()
+        with ctx:
+            x_work = x.float() if run_fp32 else x
+            x_work = _replace_nonfinite(
+                x_work,
+                "Non-finite values entering spectral MSA; replacing with bounded values",
+                self.finite_clamp,
+            )
+
+            qkv = self.qkv_dwconv(self.qkv(x_work))
+            q, k, v = qkv.chunk(3, dim=1)
+
+            q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+            # Normalize along the token axis -> cosine channel affinity (MDTA).
+            norm_eps = 1e-6 if q.dtype in (torch.float16, torch.bfloat16) else EPS
+            q = F.normalize(q, dim=-1, eps=norm_eps)
+            k = F.normalize(k, dim=-1, eps=norm_eps)
+
+            attn = (q @ k.transpose(-2, -1)) * self.temperature  # (B, head, c, c)
+            attn = attn - attn.amax(dim=-1, keepdim=True)
+            attn_dtype = attn.dtype
+            if attn_dtype in (torch.float16, torch.bfloat16):
+                attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
+            else:
+                attn = F.softmax(attn, dim=-1)
+            attn = _replace_nonfinite(
+                attn, "Non-finite spectral MSA weights; replacing with zeros"
+            )
+
+            out = attn @ v  # (B, head, c, (h w))
+            out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=H, w=W)
+
+            out = out + self.pos_embed(x_work)
+            out = self.project_out(out)
+            out = self.norm(out)
+            out = _replace_nonfinite(
+                out,
+                "Non-finite spectral MSA output; replacing with bounded values",
+                self.finite_clamp,
+            )
+
+        if out.dtype != output_dtype:
+            if output_dtype in (torch.float16, torch.bfloat16):
+                dtype_limit = torch.finfo(output_dtype).max
+                clamp_value = (
+                    min(self.finite_clamp, dtype_limit) if self.finite_clamp > 0 else dtype_limit
+                )
+                out = out.clamp(-clamp_value, clamp_value)
+            out = out.to(output_dtype)
+
+        return out
+
+
 # Optional: Alternative lightweight spectral attention for extreme memory constraints
 class ChannelAttention(nn.Module):
     """

@@ -17,6 +17,7 @@ try:
         calculate_metrics,
         count_parameters,
         get_model_size,
+        mrae_diagnostics,
         my_summary,
         save_matv73,
     )
@@ -108,6 +109,37 @@ class TestLossFunctions:
         # Should not raise
         loss = loss_fn(pred, target)
         assert not torch.isnan(loss)
+
+    def test_mrae_promotes_low_precision_outputs(self):
+        """MRAE should not downcast fp32 labels when predictions are bf16."""
+        pred = torch.tensor([[[[0.001001]]]], dtype=torch.bfloat16)
+        target = torch.tensor([[[[0.001003]]]], dtype=torch.float32)
+        expected = (pred.float() - target).abs().div(target.abs().clamp_min(1e-6)).mean()
+
+        loss = Loss_MRAE()(pred, target)
+
+        assert loss.dtype == torch.float32
+        assert torch.allclose(loss, expected, rtol=1e-6, atol=1e-8)
+
+    def test_mrae_diagnostics_bucket_accounting(self):
+        """Diagnostic bucket fractions and contributions should account for strict MRAE."""
+        pred = torch.tensor([[[[0.0, 0.002, 0.02, 0.2]]]], dtype=torch.float32)
+        target = torch.tensor([[[[0.0005, 0.002, 0.04, 0.1]]]], dtype=torch.float32)
+
+        diagnostics = mrae_diagnostics(pred, target)
+
+        assert diagnostics["mrae_strict"] == pytest.approx(Loss_MRAE()(pred, target).item())
+        assert diagnostics["target_lt_1e-2_frac"] == pytest.approx(0.5)
+        bucket_frac_sum = sum(
+            value for key, value in diagnostics.items()
+            if key.startswith("bucket_") and key.endswith("_frac")
+        )
+        contrib_sum = sum(
+            value for key, value in diagnostics.items()
+            if key.startswith("bucket_") and key.endswith("_contrib_frac")
+        )
+        assert bucket_frac_sum == pytest.approx(1.0)
+        assert contrib_sum == pytest.approx(1.0)
 
     def test_rmse_loss_shape(self, sample_tensors):
         """Test RMSE loss returns scalar."""

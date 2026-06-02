@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Union, Mapping
 
-from .attention import CSWinAttentionBlock, EfficientSpectralAttention
+from .attention import CSWinAttentionBlock, EfficientSpectralAttention, SpectralMSA
 
 ConfigDict = Mapping[str, object]
 
@@ -189,31 +189,45 @@ class DualTransformerBlock(nn.Module):
         self.norm2 = adaptive_group_norm(channels, base_groups)
         self.norm3 = adaptive_group_norm(channels, base_groups)
         
-        # Wrap attention modules with NaN protection
-        spectral_attn = EfficientSpectralAttention(channels, num_heads=num_heads, config=config)
+        # Spectral attention: 's_msa' uses full-resolution-token channel
+        # self-attention (Restormer/MST++ MDTA) which keeps spatial structure
+        # when computing the cross-band affinity; 'efficient' is the legacy
+        # pre-pooled global gate. Default 'efficient' for backward compatibility.
+        spectral_type = str(config.get("spectral_attention_type", "efficient")).lower()
+        if spectral_type in ("s_msa", "smsa", "spectral_msa", "mdta"):
+            spectral_attn = SpectralMSA(channels, num_heads=num_heads, config=config)
+        else:
+            spectral_attn = EfficientSpectralAttention(channels, num_heads=num_heads, config=config)
         self.spectral_attn = NaNSafeAttention(spectral_attn)
-        
+
         spatial_attn = CSWinAttentionBlock(
             channels, num_heads=num_heads, split_size=split_size, config=config
         )
         self.spatial_attn = NaNSafeAttention(spatial_attn)
-        
+
         self.ffn = FeedForwardNetwork(channels, config=config)
-        self.noise_block = NoiseAwareBlock(channels, config=config)
-        
+        # NoiseAwareBlock models sensor noise that clean ARAD RGB->HSI does not
+        # contain; it can be disabled to reallocate capacity. Default on for
+        # backward compatibility.
+        self.use_noise_block = bool(config.get("use_noise_block", True))
+        self.noise_block = (
+            NoiseAwareBlock(channels, config=config) if self.use_noise_block else None
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Spectral attention branch
         x = x + self.spectral_attn(self.norm1(x))
-        
+
         # Spatial attention branch with CSWin
         x = x + self.spatial_attn(self.norm2(x))
-        
+
         # Feed-forward
         x = x + self.ffn(self.norm3(x))
-        
-        # Noise-aware processing
-        x = self.noise_block(x)
-        
+
+        # Noise-aware processing (optional)
+        if self.noise_block is not None:
+            x = self.noise_block(x)
+
         return x
 
 
@@ -281,6 +295,49 @@ class DynamicUpsampleBlock(nn.Module):
         return x
 
 
+class PixelUnshuffleDownsample(nn.Module):
+    """Learned, near-lossless 2x downsample: PixelUnshuffle rearranges spatial
+    detail into channels (no information thrown away, unlike bilinear), then a
+    3x3 conv mixes it. Requires even H,W (the generator pads to a multiple of
+    the total downsample factor before the encoder)."""
+    def __init__(self, in_channels: int, out_channels: int, config: Optional[ConfigDict] = None) -> None:
+        super().__init__()
+        base_groups = config.get("norm_groups", 8) if config else 8
+        self.unshuffle = nn.PixelUnshuffle(2)
+        self.conv = nn.Conv2d(in_channels * 4, out_channels, kernel_size=3, padding=1)
+        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.unshuffle(x)
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+
+class PixelShuffleUpsample(nn.Module):
+    """Learned 2x upsample: 3x3 conv expands channels 4x, PixelShuffle folds
+    them back into space, then a 3x3 conv smooths PixelShuffle's characteristic
+    checkerboard pattern. Recovers high-frequency detail bilinear interpolation
+    cannot."""
+    def __init__(self, in_channels: int, out_channels: int, config: Optional[ConfigDict] = None) -> None:
+        super().__init__()
+        base_groups = config.get("norm_groups", 8) if config else 8
+        self.expand = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=1)
+        self.shuffle = nn.PixelShuffle(2)
+        self.smooth = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.shuffle(self.expand(x))
+        x = self.smooth(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+
 class NoiseRobustCSWinGenerator(nn.Module):
     """
     Noise-Robust U-Net Generator with CSWin transformer blocks.
@@ -343,42 +400,57 @@ class NoiseRobustCSWinGenerator(nn.Module):
             nn.GELU()
         )
         
-        # Encoder blocks
-        self.encoder1 = nn.Sequential(
-            DualTransformerBlock(base_channels, split_size=split_sizes[0], num_heads=num_heads, config=config),
-            DualTransformerBlock(base_channels, split_size=split_sizes[0], num_heads=num_heads, config=config)
-        )
-        self.down1 = DynamicDownsampleBlock(base_channels, base_channels*2, config=config)
-        
-        self.encoder2 = nn.Sequential(
-            DualTransformerBlock(base_channels*2, split_size=split_sizes[1], num_heads=num_heads, config=config),
-            DualTransformerBlock(base_channels*2, split_size=split_sizes[1], num_heads=num_heads, config=config)
-        )
-        self.down2 = DynamicDownsampleBlock(base_channels*2, base_channels*4, config=config)
-        
+        # Depth: number of DualTransformerBlocks per stage (default 2).
+        blocks_per_stage = max(1, int(config.get("blocks_per_stage", 2)))
+
+        def make_stage(ch: int, split: int) -> nn.Sequential:
+            return nn.Sequential(*[
+                DualTransformerBlock(ch, split_size=split, num_heads=num_heads, config=config)
+                for _ in range(blocks_per_stage)
+            ])
+
+        # Sampling: 'pixelshuffle' = learned PixelUnshuffle down / PixelShuffle
+        # up (recovers high-frequency detail bilinear interpolation discards);
+        # 'bilinear' = legacy F.interpolate. Default 'bilinear' for back-compat.
+        sampling = str(config.get("sampling", "bilinear")).lower()
+        if sampling in ("pixelshuffle", "pixel_shuffle", "ps"):
+            DownBlock, UpBlock = PixelUnshuffleDownsample, PixelShuffleUpsample
+            # Two stride-2 stages: pad H,W to a multiple of 4 in forward so
+            # PixelUnshuffle always sees even dims.
+            self._size_multiple = 4
+        else:
+            DownBlock, UpBlock = DynamicDownsampleBlock, DynamicUpsampleBlock
+            self._size_multiple = 1
+
+        # Encoder
+        self.encoder1 = make_stage(base_channels, split_sizes[0])
+        self.down1 = DownBlock(base_channels, base_channels*2, config=config)
+
+        self.encoder2 = make_stage(base_channels*2, split_sizes[1])
+        self.down2 = DownBlock(base_channels*2, base_channels*4, config=config)
+
         # Bottleneck
-        self.bottleneck = nn.Sequential(
-            DualTransformerBlock(base_channels*4, split_size=split_sizes[2], num_heads=num_heads, config=config),
-            DualTransformerBlock(base_channels*4, split_size=split_sizes[2], num_heads=num_heads, config=config)
-        )
-        
-        # Decoder blocks
-        self.up1 = DynamicUpsampleBlock(base_channels*4, base_channels*2, config=config)
-        self.decoder1 = nn.Sequential(
-            DualTransformerBlock(base_channels*4, split_size=split_sizes[1], num_heads=num_heads, config=config),
-            DualTransformerBlock(base_channels*4, split_size=split_sizes[1], num_heads=num_heads, config=config)
-        )
+        self.bottleneck = make_stage(base_channels*4, split_sizes[2])
+
+        # Decoder
+        self.up1 = UpBlock(base_channels*4, base_channels*2, config=config)
+        self.decoder1 = make_stage(base_channels*4, split_sizes[1])
         self.compressor1 = nn.Conv2d(base_channels*4, base_channels*2, kernel_size=1)
-        
-        self.up2 = DynamicUpsampleBlock(base_channels*2, base_channels, config=config)
+
+        self.up2 = UpBlock(base_channels*2, base_channels, config=config)
         self.compressor2 = nn.Conv2d(base_channels*2, base_channels, kernel_size=1)
-        self.decoder2 = nn.Sequential(
-            DualTransformerBlock(base_channels, split_size=split_sizes[0], num_heads=num_heads, config=config),
-            DualTransformerBlock(base_channels, split_size=split_sizes[0], num_heads=num_heads, config=config)
-        )
-        
-        # Output layer
-        self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+        self.decoder2 = make_stage(base_channels, split_sizes[0])
+
+        # Output head. Optional nonlinear lift (3x3 -> GELU -> 1x1) for a
+        # richer spectral mapping than a single linear conv.
+        if bool(config.get("thick_output_head", False)):
+            self.to_spectral = nn.Sequential(
+                nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(base_channels, out_channels, kernel_size=1),
+            )
+        else:
+            self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
         result = super().load_state_dict(state_dict, strict)
@@ -420,7 +492,21 @@ class NoiseRobustCSWinGenerator(nn.Module):
                 with torch.no_grad():
                     self.iteration_count.add_(1)
         iter_idx = self._iteration_count
-        
+
+        # Pad to a multiple of the total downsample factor so learned
+        # (PixelUnshuffle) downsampling sees even dims at every stage. No-op for
+        # bilinear sampling (_size_multiple == 1), which handles arbitrary sizes
+        # via the skip-connection interpolation fallbacks below.
+        in_h, in_w = x.shape[-2], x.shape[-1]
+        size_multiple = getattr(self, "_size_multiple", 1)
+        pad_h = (size_multiple - in_h % size_multiple) % size_multiple
+        pad_w = (size_multiple - in_w % size_multiple) % size_multiple
+        if pad_h or pad_w:
+            pad_mode = "reflect"
+            if (pad_h and in_h <= pad_h) or (pad_w and in_w <= pad_w):
+                pad_mode = "replicate"
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
+
         # Initial denoising with residual connection
         x_denoised = self.denoising(x)
         x = x + x_denoised
@@ -501,5 +587,9 @@ class NoiseRobustCSWinGenerator(nn.Module):
         if self.training and in_linear_phase:
             if self.clamp_after_iters == 0 or iter_idx < self.clamp_after_iters:
                 x = torch.clamp(x, -self.clamp_range, self.clamp_range)
+
+        # Remove the symmetric padding added for learned downsampling.
+        if pad_h or pad_w:
+            x = x[..., :in_h, :in_w]
 
         return x
