@@ -13,6 +13,31 @@ import logging
 import os
 from typing import Optional, Dict, Any, Tuple, Union
 
+
+MRAE_EPSILON = 1e-6
+MRAE_DIAGNOSTIC_BUCKETS = (
+    ("lt_1e-3", 0.0, 1e-3),
+    ("1e-3_1e-2", 1e-3, 1e-2),
+    ("1e-2_5e-2", 1e-2, 5e-2),
+    ("5e-2_1e-1", 5e-2, 1e-1),
+    ("gte_1e-1", 1e-1, float("inf")),
+)
+
+
+def _metric_work_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    """Use at least fp32 for metric arithmetic; keep fp64 inputs in fp64."""
+    if any(t.dtype == torch.float64 for t in tensors):
+        return torch.float64
+    return torch.float32
+
+
+def _metric_tensors(outputs: torch.Tensor, label: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
+    assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
+    work_dtype = _metric_work_dtype(outputs, label)
+    return outputs.to(work_dtype), label.to(work_dtype)
+
+
 def save_matv73(mat_name: str, var_name: str, var: np.ndarray) -> None:
     """Save variable to MATLAB v7.3 format.
 
@@ -100,20 +125,17 @@ class Loss_MRAE(nn.Module):
     """
     Mean Relative Absolute Error Loss
     FIXED: Use reshape instead of view for non-contiguous tensors
-    FIXED: Use torch.maximum for numerically stable denominator (avoids div-by-zero when label ~ -1e-8)
+    FIXED: Promote metric arithmetic to fp32 and clamp the denominator.
     """
-    def __init__(self):
+    def __init__(self, epsilon: float = MRAE_EPSILON):
         super(Loss_MRAE, self).__init__()
+        self.epsilon = float(epsilon)
 
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-        assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
-        assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        if outputs.dtype != label.dtype:
-            label = label.to(outputs.dtype)
+        outputs, label = _metric_tensors(outputs, label)
 
-        # Use torch.maximum to ensure minimum denominator (handles all-zero or near-zero labels)
-        # This avoids division by zero when label values are exactly -1e-8 or very small
-        denominator = torch.maximum(torch.abs(label), torch.tensor(1e-6, device=label.device, dtype=label.dtype))
+        # Clamp to ensure a minimum denominator for all-zero or near-zero labels.
+        denominator = torch.clamp_min(torch.abs(label), self.epsilon)
         error = torch.abs(outputs - label) / denominator
         # FIXED: Use reshape instead of view to handle non-contiguous tensors
         mrae = torch.mean(error.reshape(-1))
@@ -128,10 +150,7 @@ class Loss_RMSE(nn.Module):
         super(Loss_RMSE, self).__init__()
 
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-        assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
-        assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        if outputs.dtype != label.dtype:
-            label = label.to(outputs.dtype)
+        outputs, label = _metric_tensors(outputs, label)
 
         error = outputs - label
         sqrt_error = torch.pow(error, 2)
@@ -178,17 +197,12 @@ class Loss_SAM(nn.Module):
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         assert outputs.shape == label.shape, f"Shape mismatch: {outputs.shape} != {label.shape}"
         assert outputs.device == label.device, f"Device mismatch: {outputs.device} != {label.device}"
-        if outputs.dtype != label.dtype:
-            label = label.to(outputs.dtype)
 
         # Reshape to (batch*height*width, channels)
         B, C, H, W = outputs.shape
-        outputs_flat = outputs.permute(0, 2, 3, 1).reshape(-1, C)
-        label_flat = label.permute(0, 2, 3, 1).reshape(-1, C)
-
         work_dtype = torch.float64 if outputs.device.type == 'cpu' else torch.float32
-        outputs_flat = outputs_flat.to(work_dtype)
-        label_flat = label_flat.to(work_dtype)
+        outputs_flat = outputs.to(work_dtype).permute(0, 2, 3, 1).reshape(-1, C)
+        label_flat = label.to(work_dtype).permute(0, 2, 3, 1).reshape(-1, C)
 
         dot_product = torch.sum(outputs_flat * label_flat, dim=1)
         output_norm = torch.linalg.vector_norm(outputs_flat, dim=1)
@@ -205,6 +219,44 @@ class Loss_SAM(nn.Module):
         # Return mean angle (you can convert to degrees if needed)
         sam = torch.mean(angles)
         return sam
+
+
+def mrae_diagnostics(
+    outputs: torch.Tensor,
+    label: torch.Tensor,
+    epsilon: float = MRAE_EPSILON,
+) -> Dict[str, float]:
+    """Break strict MRAE into target-intensity buckets for debugging."""
+    outputs, label = _metric_tensors(outputs, label)
+    abs_error = torch.abs(outputs - label)
+    target_abs = torch.abs(label)
+    rel_error = abs_error / torch.clamp_min(target_abs, float(epsilon))
+    flat_rel = rel_error.reshape(-1)
+    flat_target = target_abs.reshape(-1)
+
+    total_error = flat_rel.sum().clamp_min(torch.finfo(flat_rel.dtype).eps)
+    diagnostics: Dict[str, float] = {
+        "mrae_strict": float(flat_rel.mean().item()),
+        "target_mean": float(flat_target.mean().item()),
+        "target_lt_1e-3_frac": float((flat_target < 1e-3).to(torch.float32).mean().item()),
+        "target_lt_1e-2_frac": float((flat_target < 1e-2).to(torch.float32).mean().item()),
+    }
+
+    for name, low, high in MRAE_DIAGNOSTIC_BUCKETS:
+        if np.isinf(high):
+            mask = flat_target >= low
+        else:
+            mask = (flat_target >= low) & (flat_target < high)
+        diagnostics[f"bucket_{name}_frac"] = float(mask.to(torch.float32).mean().item())
+        if mask.any():
+            bucket_errors = flat_rel[mask]
+            diagnostics[f"bucket_{name}_mrae"] = float(bucket_errors.mean().item())
+            diagnostics[f"bucket_{name}_contrib_frac"] = float((bucket_errors.sum() / total_error).item())
+        else:
+            diagnostics[f"bucket_{name}_mrae"] = 0.0
+            diagnostics[f"bucket_{name}_contrib_frac"] = 0.0
+
+    return diagnostics
 
 def my_summary(test_model: nn.Module, H: int = 256, W: int = 256,
                C: int = 31, N: int = 1) -> None:

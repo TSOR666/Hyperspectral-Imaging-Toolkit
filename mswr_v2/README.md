@@ -174,6 +174,7 @@ Runtime, precision, EMA, and stopping options:
 | `--channels_last` / `--no_channels_last` | flag pair | on | CUDA memory format. |
 | `--memory_monitoring` | flag | on | Enables memory/performance monitoring; set false in YAML to disable. |
 | `--profile_model` | flag | off | Emits model profiling diagnostics. |
+| `--mrae_diagnostics` | flag | off | Logs strict MRAE contribution by target-intensity bucket during validation. |
 | `--use_ema` / `--no_ema` | flag pair | on | EMA tracking for model weights. |
 | `--ema_decay` | float | 0.999 | EMA decay factor. |
 | `--ema_start_epoch` | int | 5 | Delays EMA updates until this epoch. |

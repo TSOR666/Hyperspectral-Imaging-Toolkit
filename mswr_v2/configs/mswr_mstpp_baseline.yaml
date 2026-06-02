@@ -29,6 +29,7 @@ num_workers: 4
 pin_memory: true
 save_frequency: 5000
 validate_frequency: 1000
+mrae_diagnostics: true        # log strict MRAE contribution by target-intensity bucket
 seed: 42
 
 # ---- architecture (preset) ----

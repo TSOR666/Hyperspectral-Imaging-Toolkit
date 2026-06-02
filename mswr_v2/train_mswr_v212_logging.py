@@ -127,7 +127,8 @@ try:
         Loss_MRAE, 
         Loss_RMSE, 
         Loss_PSNR,
-        Loss_SAM  # Added SAM import
+        Loss_SAM,  # Added SAM import
+        mrae_diagnostics,
     )
 except ImportError as e:
     early_logger = logging.getLogger('mswr_train_early')
@@ -418,6 +419,7 @@ class TrainingConfig:
         self.gradient_accumulation_steps = args.gradient_accumulation_steps
         self.save_frequency = args.save_frequency
         self.validate_frequency = args.validate_frequency
+        self.mrae_diagnostics = getattr(args, 'mrae_diagnostics', False)
         self.num_workers = args.num_workers
         self.pin_memory = args.pin_memory
         self.seed = args.seed
@@ -550,6 +552,8 @@ def parse_arguments():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--save_frequency", type=int, default=5000)
     parser.add_argument("--validate_frequency", type=int, default=1000)
+    parser.add_argument("--mrae_diagnostics", action='store_true', default=False,
+                       help="Log strict MRAE contribution by target-intensity bucket during validation")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", action='store_true', default=True)
     parser.add_argument("--distributed", action='store_true',
@@ -1360,6 +1364,25 @@ class EnhancedTrainer:
             if count > 0:
                 results[key] = total / count
         return results
+
+    def _log_mrae_diagnostics(self, diagnostics: Dict[str, float], desc: str) -> None:
+        """Emit a compact strict-MRAE denominator breakdown."""
+        low_1e3_contrib = diagnostics.get('mrae_diag_bucket_lt_1e-3_contrib_frac', 0.0)
+        low_1e2_contrib = low_1e3_contrib + diagnostics.get('mrae_diag_bucket_1e-3_1e-2_contrib_frac', 0.0)
+        self.logger.info(
+            "%s MRAE diagnostics | strict=%.6f | target<1e-3: %.2f%% pixels, %.2f%% MRAE | "
+            "target<1e-2: %.2f%% pixels, %.2f%% MRAE | bucket MRAE: <1e-3=%.4f, "
+            "1e-3..1e-2=%.4f, >=1e-1=%.4f",
+            desc,
+            diagnostics.get('mrae_diag_mrae_strict', 0.0),
+            diagnostics.get('mrae_diag_target_lt_1e-3_frac', 0.0) * 100.0,
+            low_1e3_contrib * 100.0,
+            diagnostics.get('mrae_diag_target_lt_1e-2_frac', 0.0) * 100.0,
+            low_1e2_contrib * 100.0,
+            diagnostics.get('mrae_diag_bucket_lt_1e-3_mrae', 0.0),
+            diagnostics.get('mrae_diag_bucket_1e-3_1e-2_mrae', 0.0),
+            diagnostics.get('mrae_diag_bucket_gte_1e-1_mrae', 0.0),
+        )
     
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint with enhanced error handling"""
@@ -1776,6 +1799,7 @@ class EnhancedTrainer:
             'psnr': AverageMeter(),
             'sam': AverageMeter()
         }
+        diag_meters: Dict[str, AverageMeter] = {}
         
         pbar = tqdm(self.val_loader, desc=desc, leave=False, disable=self.rank != 0)
         
@@ -1815,6 +1839,13 @@ class EnhancedTrainer:
             if output_crop.shape[1] > 3:
                 sam = self.criterion_sam(output_crop, labels_crop)
                 metrics['sam'].update(sam.item() * 180.0 / np.pi)
+
+            if self.config.mrae_diagnostics:
+                for key, value in mrae_diagnostics(output_crop, labels_crop).items():
+                    meter_key = f'mrae_diag_{key}'
+                    if meter_key not in diag_meters:
+                        diag_meters[meter_key] = AverageMeter()
+                    diag_meters[meter_key].update(value)
             
             postfix = {
                 'MRAE': f'{metrics["mrae"].avg:.6f}',
@@ -1826,7 +1857,13 @@ class EnhancedTrainer:
             
             pbar.set_postfix(postfix)
         
-        return self._sync_metric_meters(metrics)
+        results = self._sync_metric_meters(metrics)
+        if diag_meters:
+            diagnostics = self._sync_metric_meters(diag_meters)
+            results.update(diagnostics)
+            if self.rank == 0:
+                self._log_mrae_diagnostics(diagnostics, desc)
+        return results
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -1860,6 +1897,9 @@ class EnhancedTrainer:
             }
             if 'sam' in results:
                 log_dict['val/sam_deg'] = results['sam']
+            for key, value in results.items():
+                if key.startswith('mrae_diag_'):
+                    log_dict[f'val/{key}'] = value
             for prefix in ('ema', 'model'):
                 key_mrae = f'{prefix}_mrae'
                 if key_mrae in results:
