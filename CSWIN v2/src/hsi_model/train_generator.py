@@ -56,6 +56,7 @@ from hsi_model.utils.training_setup import (
     GeneratorEMA,
     pick_amp_dtype,
     resume_training_state,
+    resolve_resume_stage_position,
     setup_distributed_training,
     setup_paths,
     setup_seed,
@@ -464,8 +465,14 @@ def train_generator_only(
     stages = _resolve_stages(config)
     global_iter = int(resume_info.get("iteration", 0)) if resume_info else 0
     record_mrae_loss = float(resume_info.get("best_mrae", float("inf"))) if resume_info else float("inf")
-    resume_stage_idx = int(resume_info.get("stage_idx", 0)) if resume_info else 0
-    resume_stage_iter = int(resume_info.get("stage_iter", 0)) if resume_info else 0
+    resume_stage_idx, resume_stage_iter = resolve_resume_stage_position(stages, resume_info)
+
+    if resume_info and not ({"stage_idx", "stage_iter"} <= set(resume_info)):
+        train_logger.info(
+            "Resume checkpoint has no explicit stage position; derived stage %d "
+            "iteration %d from global_iter %d",
+            resume_stage_idx, resume_stage_iter, global_iter,
+        )
 
     train_logger.info(
         "Progressive training: %d stage(s); resuming at stage %d (global_iter %d)",

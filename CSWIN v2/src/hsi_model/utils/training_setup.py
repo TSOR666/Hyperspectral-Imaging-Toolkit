@@ -352,6 +352,50 @@ class GeneratorEMA:
         logger.info("Restored EMA shadow: %d params loaded, %d skipped", loaded, skipped)
 
 
+def resolve_resume_stage_position(
+    stages: list,
+    resume_info: Optional[Dict[str, Any]],
+) -> tuple[int, int]:
+    """Return the progressive stage index/local iteration to resume from.
+
+    New progressive checkpoints store explicit ``stage_idx`` and ``stage_iter``
+    values, but older checkpoints only store the cumulative ``iteration``. In
+    that legacy case, map the global iteration back onto the configured stage
+    boundaries so resume continues from the remaining work instead of replaying
+    the whole current stage.
+    """
+    if not resume_info:
+        return 0, 0
+
+    has_stage_idx = "stage_idx" in resume_info
+    has_stage_iter = "stage_iter" in resume_info
+    if has_stage_idx and has_stage_iter:
+        stage_idx = max(0, int(resume_info.get("stage_idx", 0)))
+        if stages:
+            stage_idx = min(stage_idx, len(stages) - 1)
+            stage_iterations = max(0, int(stages[stage_idx].get("iterations", 0)))
+        else:
+            stage_iterations = 0
+        stage_iter = max(0, int(resume_info.get("stage_iter", 0)))
+        if stage_iterations > 0:
+            stage_iter = min(stage_iter, stage_iterations)
+        return stage_idx, stage_iter
+
+    remaining_iter = max(0, int(resume_info.get("iteration", 0)))
+    if not stages:
+        return 0, 0
+
+    for stage_idx, stage in enumerate(stages):
+        stage_iterations = max(0, int(stage.get("iterations", 0)))
+        if remaining_iter < stage_iterations:
+            return stage_idx, remaining_iter
+        remaining_iter -= stage_iterations
+
+    final_stage_idx = len(stages) - 1
+    final_stage_iter = max(0, int(stages[final_stage_idx].get("iterations", 0)))
+    return final_stage_idx, final_stage_iter
+
+
 def resume_training_state(
     checkpoint_path: str,
     model: "torch.nn.Module",
@@ -441,10 +485,15 @@ def resume_training_state(
         "iteration": int(ck.get("iter", ck.get("iteration", 0))),
         "epoch": int(ck.get("epoch", 0)),
         "best_mrae": float(ck.get("best_mrae", float("inf"))),
-        # Progressive-training position (0 when absent / non-progressive run).
-        "stage_idx": int(ck.get("stage_idx", 0)),
-        "stage_iter": int(ck.get("stage_iter", 0)),
     }
+    # Preserve explicit progressive-training position when present, but do not
+    # synthesize stage defaults for older checkpoints.  The progressive trainer
+    # can then detect legacy checkpoints and derive the stage-local position
+    # from the cumulative iteration count.
+    if "stage_idx" in ck:
+        info["stage_idx"] = int(ck["stage_idx"])
+    if "stage_iter" in ck:
+        info["stage_iter"] = int(ck["stage_iter"])
     logger.info(
         "Resumed from %s | iter=%d, epoch=%d, best_mrae=%.6f",
         checkpoint_path,
@@ -462,5 +511,6 @@ __all__ = [
     "cleanup",
     "pick_amp_dtype",
     "resume_training_state",
+    "resolve_resume_stage_position",
     "GeneratorEMA",
 ]

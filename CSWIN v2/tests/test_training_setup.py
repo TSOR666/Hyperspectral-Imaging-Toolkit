@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from hsi_model.utils.training_setup import resume_training_state, setup_paths
+from hsi_model.utils.training_setup import (
+    resolve_resume_stage_position,
+    resume_training_state,
+    setup_paths,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1] / ".tmp_manual_dataset"
@@ -121,3 +125,98 @@ def test_resume_training_state_normalizes_cuda_rng_state_all(monkeypatch):
             assert torch.allclose(value, source.state_dict()[key])
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_resume_training_state_does_not_synthesize_missing_stage_position():
+    case_dir = _case_dir("resume_legacy_stage")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    ckpt_path = case_dir / "legacy_checkpoint.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "iter": 50_000,
+                "epoch": 50,
+                "best_mrae": 0.5,
+            },
+            ckpt_path,
+        )
+
+        info = resume_training_state(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            optimizers={},
+            schedulers={},
+            scalers={},
+            device=torch.device("cpu"),
+        )
+
+        assert info["iteration"] == 50_000
+        assert "stage_idx" not in info
+        assert "stage_iter" not in info
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_resume_training_state_preserves_explicit_stage_position():
+    case_dir = _case_dir("resume_progressive_stage")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    ckpt_path = case_dir / "progressive_checkpoint.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "iter": 125,
+                "stage_idx": 1,
+                "stage_iter": 25,
+            },
+            ckpt_path,
+        )
+
+        info = resume_training_state(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            optimizers={},
+            schedulers={},
+            scalers={},
+            device=torch.device("cpu"),
+        )
+
+        assert info["iteration"] == 125
+        assert info["stage_idx"] == 1
+        assert info["stage_iter"] == 25
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_resolve_resume_stage_position_derives_single_stage_legacy_iteration():
+    stages = [{"iterations": 100_000}]
+
+    assert resolve_resume_stage_position(stages, {"iteration": 50_000}) == (
+        0,
+        50_000,
+    )
+
+
+def test_resolve_resume_stage_position_maps_legacy_iteration_to_progressive_stage():
+    stages = [
+        {"iterations": 100},
+        {"iterations": 200},
+        {"iterations": 300},
+    ]
+
+    assert resolve_resume_stage_position(stages, {"iteration": 150}) == (1, 50)
+    assert resolve_resume_stage_position(stages, {"iteration": 300}) == (2, 0)
+    assert resolve_resume_stage_position(stages, {"iteration": 999}) == (2, 300)
+
+
+def test_resolve_resume_stage_position_prefers_explicit_stage_position():
+    stages = [{"iterations": 100}, {"iterations": 200}]
+
+    assert resolve_resume_stage_position(
+        stages, {"iteration": 150, "stage_idx": 0, "stage_iter": 75}
+    ) == (0, 75)
