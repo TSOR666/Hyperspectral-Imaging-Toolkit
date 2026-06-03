@@ -441,6 +441,9 @@ def resume_training_state(
         "iteration": int(ck.get("iter", ck.get("iteration", 0))),
         "epoch": int(ck.get("epoch", 0)),
         "best_mrae": float(ck.get("best_mrae", float("inf"))),
+        # Progressive-training position (0 when absent / non-progressive run).
+        "stage_idx": int(ck.get("stage_idx", 0)),
+        "stage_iter": int(ck.get("stage_iter", 0)),
     }
     logger.info(
         "Resumed from %s | iter=%d, epoch=%d, best_mrae=%.6f",

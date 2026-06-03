@@ -24,7 +24,7 @@ hf_max_train_samples: null
 hf_max_val_samples: null
 hf_allow_pseudo_hsi: false
 
-batch_size: 20
+batch_size: 32   # paper batch size (HSIFormer Sec 4.2)
 val_batch_size: 1
 patch_size: 128
 stride: 8
@@ -43,27 +43,37 @@ memory_mode: standard
 validation_max_batches: null
 
 # ===========================================================================
-# ACTIVE DIRECTION: generator-only MRAE training (train_generator.py)
-# The GAN was dropped (no discriminator / Sinkhorn / R1). Objective is MRAE-only
-# (MST++'s training loss and the ARAD-1K leaderboard metric), so results are
-# directly comparable to MST++. The sinkhorn_* / lambda_* / discriminator_* /
-# r1 / n_critic / gradient_accumulation_steps keys below are LEGACY and only
-# read by the deprecated GAN trainers (train_optimized.py, training_script_fixed.py).
+# ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
+# Aligned to the author's paper (HSIFormer, which beats MST++ at MRAE 0.1497):
+# L1 loss on [0,1] targets, an efficient SSTB generator (CBAM channel gate ->
+# S-MSA + GDFN -> CSwin + SGFN), AdamW lr 4e-4 cosine. The sinkhorn_* /
+# lambda_* / discriminator_* / r1 / n_critic / gradient_accumulation_steps keys
+# below are LEGACY (read only by the deprecated GAN trainers).
 # ===========================================================================
-objective: mrae          # mrae | relative_mrae
-mrae_epsilon: 1.0e-8     # matches utils.metrics.compute_mrae; raise if unstable
-optimizer: adam          # adam (MST++) | adamw
-weight_decay: 0.0
+objective: l1            # l1 (paper) | mrae | mrae_l1 | relative_mrae
+optimizer: adamw         # adamw regularizes the small dataset | adam
+weight_decay: 1.0e-2     # was 0.0; the regularization the 44.8M overfit run lacked
+mrae_epsilon: 1.0e-2     # only used if objective involves MRAE
 
-# Generator architecture (aggressive bundle). Defaults in code preserve the old
-# architecture, so these flags select the new one:
-base_channels: 96                # was 64
+# Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
+base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
 num_heads: 4
-blocks_per_stage: 3              # DualTransformerBlocks per U-Net stage (was 2)
-spectral_attention_type: s_msa   # full-res-token channel self-attn (was 'efficient' global gate)
-sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (was bilinear)
-use_noise_block: false           # drop denoising blocks (clean ARAD data)
-thick_output_head: true          # 3x3 -> GELU -> 1x1 spectral head
+stage_depths: [2, 2, 2, 2, 4]    # [enc1, enc2, bottleneck, dec1, dec2] (paper: deeper final stage)
+spectral_attention_type: s_msa   # full-res-token channel self-attn (the ablation workhorse)
+sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (paper uses pixel shuffle)
+use_noise_block: false           # NoiseAwareBlock is not in the paper
+thick_output_head: false         # paper ToOut is a single conv
+ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
+
+# Progressive training (HSIFormer Sec 4.2): fine-tune at growing patch sizes
+# 128 -> 256 -> 512. UNCOMMENT for the final SOTA-recipe run; leave commented
+# for single-resolution ablations (then training uses patch_size + epochs *
+# iterations_per_epoch above). Reduce batch_size at larger patches to fit
+# memory; tune iteration counts to your wall-clock budget.
+# progressive_stages:
+#   - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 32}
+#   - {patch_size: 256, iterations: 50000,  init_lr: 4.0e-5, batch_size: 8}
+#   - {patch_size: 512, iterations: 50000,  init_lr: 4.0e-5, batch_size: 2}
 
 warmup_steps: 2000
 # MST++ init_lr is 4e-4 (was 1e-4 for the GAN generator). Cosine-annealed over
@@ -103,13 +113,12 @@ use_sinkhorn_adversarial: true   # keep optimal-transport adversarial loss
 lambda_adversarial: 0.01
 lambda_sam: 0.0           # was 0.10; dropped for the L1 + adversarial objective
 
-# Sigmoid head for the whole run (ARAD reflectance targets are in [0,1]).
-# Previously 'delayed_sigmoid' switched on at activation_delay_iters=60000
-# (~epoch 60), an abrupt linear->sigmoid output shock that matched "stops
-# learning past 60 epochs". A fixed sigmoid removes that discontinuity.
-# NOTE: changing the output head means you must train a FRESH run - do not
-# resume a checkpoint trained with the old linear/delayed-sigmoid head.
-output_activation: sigmoid
+# Linear output head (no activation), matching the paper: L1 is trained on
+# [0,1] targets with no output squashing (the RGB INPUT is rescaled, not the
+# output). 'none' keeps a training-time soft-clamp (+/-clamp_range) for
+# stability; the eval output is unbounded reflectance. NOTE: changing the
+# output head requires a FRESH run.
+output_activation: none
 activation_delay_iters: 0
 
 checkpoint_keep: 5

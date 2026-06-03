@@ -163,72 +163,128 @@ class FeedForwardNetwork(nn.Module):
         return self.net(x)
 
 
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm over the channel dimension for (B, C, H, W) tensors
+    (Restormer-style pre-norm used inside the SSTB)."""
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)          # (B, H, W, C)
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+
+class CBAMChannelGate(nn.Module):
+    """CBAM-style channel attention gate (HSIFormer Eq. 3): concat of avg- and
+    max-pooled channel descriptors -> shared 1x1 MLP -> sigmoid -> scales X."""
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(2 * channels, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = x.mean(dim=(2, 3), keepdim=True)
+        mx = x.amax(dim=(2, 3), keepdim=True)
+        gate = torch.sigmoid(self.mlp(torch.cat([avg, mx], dim=1)))
+        return x * gate
+
+
+class GDFN(nn.Module):
+    """Gated-Dconv feed-forward network (Restormer / HSIFormer GDFN, Fig 3c):
+    1x1 expand -> 3x3 depthwise -> GELU(half) * (other half) -> 1x1 project."""
+    def __init__(self, channels: int, expansion: float = 2.66) -> None:
+        super().__init__()
+        hidden = max(1, int(channels * expansion))
+        self.project_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1)
+        self.dwconv = nn.Conv2d(2 * hidden, 2 * hidden, kernel_size=3, padding=1, groups=2 * hidden)
+        self.project_out = nn.Conv2d(hidden, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = self.dwconv(self.project_in(x)).chunk(2, dim=1)
+        return self.project_out(F.gelu(x1) * x2)
+
+
+class SGFN(nn.Module):
+    """Spatial-gate feed-forward network (HSIFormer SGFN, Fig 3b):
+    1x1 expand -> GELU -> split -> a * DWConv3x3(b) -> 1x1 project."""
+    def __init__(self, channels: int, expansion: float = 2.66) -> None:
+        super().__init__()
+        hidden = max(1, int(channels * expansion))
+        self.project_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1)
+        self.dwconv = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden)
+        self.project_out = nn.Conv2d(hidden, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.gelu(self.project_in(x))
+        a, b = x.chunk(2, dim=1)
+        return self.project_out(a * self.dwconv(b))
+
+
 class DualTransformerBlock(nn.Module):
-    """
-    Dual Transformer Block with NaN-safe attention.
+    """HSIFormer Spectral-Spatial Transformer Block (SSTB).
+
+    ``Xout = SST(ChannelGate(Xin)) + Xin`` where SST is two pre-norm residual
+    pairs (paper Eqs. 2, 4, 5):
+        spectral:  h = g + S-MSA(LN(g));  h = h + GDFN(LN(h))
+        spatial:   h = h + CSwin(LN(h));  h = h + SGFN(LN(h))
+    A CBAM channel gate refines the input before the dual transformer, and the
+    outer residual adds the original (ungated) input. The spectral S-MSA is the
+    workhorse (paper ablation: removing it collapses MRAE 0.1497 -> 0.2204).
+
+    The class name is kept (not renamed to SSTB) for checkpoint/test/inference
+    compatibility.
     """
     def __init__(
-        self, 
-        channels: int, 
-        split_size: int = 7, 
-        num_heads: int = 4, 
-        config: Optional[ConfigDict] = None
+        self,
+        channels: int,
+        split_size: int = 7,
+        num_heads: int = 4,
+        config: Optional[ConfigDict] = None,
     ) -> None:
         super(DualTransformerBlock, self).__init__()
-        
+
         if config is None:
             raise ValueError("config cannot be None for DualTransformerBlock")
-            
-        base_groups = config.get("norm_groups", 8)
-        
         if num_heads is None:
             num_heads = config.get("num_heads", 4)
-            
-        # Use adaptive GroupNorm
-        self.norm1 = adaptive_group_norm(channels, base_groups)
-        self.norm2 = adaptive_group_norm(channels, base_groups)
-        self.norm3 = adaptive_group_norm(channels, base_groups)
-        
-        # Spectral attention: 's_msa' uses full-resolution-token channel
-        # self-attention (Restormer/MST++ MDTA) which keeps spatial structure
-        # when computing the cross-band affinity; 'efficient' is the legacy
-        # pre-pooled global gate. Default 'efficient' for backward compatibility.
-        spectral_type = str(config.get("spectral_attention_type", "efficient")).lower()
+        ffn_expansion = float(config.get("ffn_expansion", 2.66))
+
+        self.gate = CBAMChannelGate(channels, reduction=int(config.get("cbam_reduction", 4)))
+        self.norm1 = ChannelLayerNorm(channels)
+        self.norm2 = ChannelLayerNorm(channels)
+        self.norm3 = ChannelLayerNorm(channels)
+        self.norm4 = ChannelLayerNorm(channels)
+
+        # Spectral sub-block (workhorse): S-MSA + GDFN. 'efficient' keeps the
+        # legacy pre-pooled gate for back-compat, but 's_msa' is the default.
+        spectral_type = str(config.get("spectral_attention_type", "s_msa")).lower()
         if spectral_type in ("s_msa", "smsa", "spectral_msa", "mdta"):
             spectral_attn = SpectralMSA(channels, num_heads=num_heads, config=config)
         else:
             spectral_attn = EfficientSpectralAttention(channels, num_heads=num_heads, config=config)
         self.spectral_attn = NaNSafeAttention(spectral_attn)
+        self.gdfn = GDFN(channels, expansion=ffn_expansion)
 
+        # Spatial sub-block: CSwin + SGFN.
         spatial_attn = CSWinAttentionBlock(
             channels, num_heads=num_heads, split_size=split_size, config=config
         )
         self.spatial_attn = NaNSafeAttention(spatial_attn)
-
-        self.ffn = FeedForwardNetwork(channels, config=config)
-        # NoiseAwareBlock models sensor noise that clean ARAD RGB->HSI does not
-        # contain; it can be disabled to reallocate capacity. Default on for
-        # backward compatibility.
-        self.use_noise_block = bool(config.get("use_noise_block", True))
-        self.noise_block = (
-            NoiseAwareBlock(channels, config=config) if self.use_noise_block else None
-        )
+        self.sgfn = SGFN(channels, expansion=ffn_expansion)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Spectral attention branch
-        x = x + self.spectral_attn(self.norm1(x))
-
-        # Spatial attention branch with CSWin
-        x = x + self.spatial_attn(self.norm2(x))
-
-        # Feed-forward
-        x = x + self.ffn(self.norm3(x))
-
-        # Noise-aware processing (optional)
-        if self.noise_block is not None:
-            x = self.noise_block(x)
-
-        return x
+        g = self.gate(x)
+        h = g + self.spectral_attn(self.norm1(g))   # Eq. 4 spectral pair
+        h = h + self.gdfn(self.norm2(h))
+        h = h + self.spatial_attn(self.norm3(h))     # Eq. 5 spatial pair
+        h = h + self.sgfn(self.norm4(h))
+        return h + x                                  # Eq. 2 outer residual
 
 
 class DynamicDownsampleBlock(nn.Module):
@@ -400,13 +456,24 @@ class NoiseRobustCSWinGenerator(nn.Module):
             nn.GELU()
         )
         
-        # Depth: number of DualTransformerBlocks per stage (default 2).
-        blocks_per_stage = max(1, int(config.get("blocks_per_stage", 2)))
+        # Depth per stage in order [encoder1, encoder2, bottleneck, decoder1,
+        # decoder2]. HSIFormer uses [2, 2, 2, 2, 4] — extra blocks at the final
+        # high-resolution decoder stage (cheap, where detail is recovered).
+        # ``stage_depths`` overrides; otherwise fall back to a scalar
+        # ``blocks_per_stage`` replicated across all five stages.
+        default_depth = max(1, int(config.get("blocks_per_stage", 2)))
+        stage_depths = config.get("stage_depths", None)
+        if stage_depths is None:
+            stage_depths = [default_depth] * 5
+        stage_depths = [max(1, int(d)) for d in stage_depths]
+        if len(stage_depths) != 5:
+            stage_depths = (list(stage_depths) + [default_depth] * 5)[:5]
+        self._stage_depths = stage_depths
 
-        def make_stage(ch: int, split: int) -> nn.Sequential:
+        def make_stage(ch: int, split: int, n_blocks: int) -> nn.Sequential:
             return nn.Sequential(*[
                 DualTransformerBlock(ch, split_size=split, num_heads=num_heads, config=config)
-                for _ in range(blocks_per_stage)
+                for _ in range(n_blocks)
             ])
 
         # Sampling: 'pixelshuffle' = learned PixelUnshuffle down / PixelShuffle
@@ -423,23 +490,23 @@ class NoiseRobustCSWinGenerator(nn.Module):
             self._size_multiple = 1
 
         # Encoder
-        self.encoder1 = make_stage(base_channels, split_sizes[0])
+        self.encoder1 = make_stage(base_channels, split_sizes[0], stage_depths[0])
         self.down1 = DownBlock(base_channels, base_channels*2, config=config)
 
-        self.encoder2 = make_stage(base_channels*2, split_sizes[1])
+        self.encoder2 = make_stage(base_channels*2, split_sizes[1], stage_depths[1])
         self.down2 = DownBlock(base_channels*2, base_channels*4, config=config)
 
         # Bottleneck
-        self.bottleneck = make_stage(base_channels*4, split_sizes[2])
+        self.bottleneck = make_stage(base_channels*4, split_sizes[2], stage_depths[2])
 
         # Decoder
         self.up1 = UpBlock(base_channels*4, base_channels*2, config=config)
-        self.decoder1 = make_stage(base_channels*4, split_sizes[1])
+        self.decoder1 = make_stage(base_channels*4, split_sizes[1], stage_depths[3])
         self.compressor1 = nn.Conv2d(base_channels*4, base_channels*2, kernel_size=1)
 
         self.up2 = UpBlock(base_channels*2, base_channels, config=config)
         self.compressor2 = nn.Conv2d(base_channels*2, base_channels, kernel_size=1)
-        self.decoder2 = make_stage(base_channels, split_sizes[0])
+        self.decoder2 = make_stage(base_channels, split_sizes[0], stage_depths[4])
 
         # Output head. Optional nonlinear lift (3x3 -> GELU -> 1x1) for a
         # richer spectral mapping than a single linear conv.
