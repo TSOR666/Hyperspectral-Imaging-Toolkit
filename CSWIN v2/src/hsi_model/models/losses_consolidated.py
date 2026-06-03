@@ -183,6 +183,27 @@ class MRAELoss(nn.Module):
         return torch.mean(torch.abs(pred - target) / denominator)
 
 
+class MRAEPlusL1Loss(nn.Module):
+    """MRAE with a smooth L1 backbone: ``MRAE + l1_weight * L1``.
+
+    Pure MRAE divides by the target, so dark pixels (target ~1e-3) get gradients
+    scaled by ~1/target — spiky and hard to optimize, which tends to plateau and
+    drift, and it under-weights bright pixels (hurting PSNR/SSIM). Adding a small
+    L1 term restores a well-conditioned gradient everywhere and protects the
+    bright-pixel / structural accuracy L1 directly optimizes, while MRAE stays
+    the primary (leaderboard-aligned) objective. ``mrae_epsilon`` is also raised
+    (default 1e-2) to tame the dark-pixel gradient explosion.
+    """
+    def __init__(self, mrae_epsilon: float = 1e-2, l1_weight: float = 0.3):
+        super().__init__()
+        self.mrae = MRAELoss(epsilon=mrae_epsilon)
+        self.l1 = nn.L1Loss()
+        self.l1_weight = float(l1_weight)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self.mrae(pred, target) + self.l1_weight * self.l1(pred, target)
+
+
 # ============================================
 # Spectral Losses
 # ============================================
@@ -1074,6 +1095,7 @@ __all__ = [
     'CharbonnierLoss',
     'RelativeMRAELoss',
     'MRAELoss',
+    'MRAEPlusL1Loss',
     'SAMLoss',
     'SinkhornDivergence',
     'SinkhornLoss',
