@@ -702,23 +702,62 @@ class NTIRETestEngine:
         # Prefer EMA weights when present (the trainer evaluates and reports
         # against EMA by default, so testing the base state_dict trails the
         # headline numbers).
-        ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
+        def _load_checked(state: Dict[str, Any], label: str) -> None:
+            """Load weights and FAIL LOUDLY on a large key mismatch.
+
+            strict=False is kept (EMA/base dicts may legitimately omit a handful
+            of buffers), but a *silent* partial load of a mismatched checkpoint
+            yields a half- or fully-random model that still produces a
+            plausible-looking dashboard (observed: MRAE ~2.7 from an unloaded
+            model). Report the mismatch and refuse to score garbage.
+            """
+            incompat = model.load_state_dict(state, strict=False)
+            missing, unexpected = list(incompat.missing_keys), list(incompat.unexpected_keys)
+            n_model = len(model.state_dict())
+            if missing or unexpected:
+                logger.warning(
+                    "%s: %d/%d model keys missing, %d unexpected keys",
+                    label, len(missing), n_model, len(unexpected),
+                )
+                if missing:
+                    logger.warning("  missing sample: %s", missing[:8])
+                if unexpected:
+                    logger.warning("  unexpected sample: %s", unexpected[:8])
+            if len(missing) > 0.25 * max(1, n_model):
+                raise RuntimeError(
+                    f"{label}: {len(missing)}/{n_model} model parameters were NOT loaded "
+                    f"-- checkpoint/architecture mismatch. Refusing to report metrics from a "
+                    f"half-random model. Verify the checkpoint's model_config matches the model "
+                    f"(e.g. use_spectral_attn) and that the EMA dict format is unwrapped."
+                )
+
+        # The trainer's full checkpoints wrap EMA weights as ModelEMA.state_dict()
+        # = {'decay':..., 'ema_state': <weights>}; the lightweight checkpoint
+        # stores the raw weights under 'ema_state_dict'. Normalize both to an
+        # actual state_dict. The previous code passed the {'decay','ema_state'}
+        # wrapper straight to load_state_dict, which with strict=False silently
+        # loaded NOTHING and left the model fully random.
+        ema_container = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
+        ema_weights = None
+        if isinstance(ema_container, dict) and ema_container:
+            if isinstance(ema_container.get('ema_state'), dict):
+                ema_weights = ema_container['ema_state']          # full checkpoint wrapper
+            elif isinstance(ema_container.get('shadow'), dict):
+                ema_weights = ema_container['shadow']             # legacy 'shadow' format
+            elif 'decay' not in ema_container:
+                ema_weights = ema_container                       # already a raw state_dict
+
         ema_used = False
-        if ema_state and isinstance(ema_state, dict):
-            shadow = ema_state.get('shadow', ema_state) if isinstance(ema_state, dict) else ema_state
-            if isinstance(shadow, dict) and shadow:
-                try:
-                    model.load_state_dict(shadow, strict=False)
-                    ema_used = True
-                    logger.info("Loaded EMA shadow weights for testing (preferred over base state_dict).")
-                except Exception as ema_exc:
-                    logger.warning("Failed to load EMA weights (%s); falling back to base state_dict.", ema_exc)
+        if ema_weights:
+            _load_checked(ema_weights, "EMA weights")
+            ema_used = True
+            logger.info("Loaded EMA weights for testing (preferred over base state_dict).")
 
         if not ema_used:
             if 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'], strict=False)
+                _load_checked(checkpoint['state_dict'], "base state_dict")
             else:
-                model.load_state_dict(checkpoint, strict=False)
+                _load_checked(checkpoint, "raw checkpoint")
         
         model = model.to(self.device)
         model.eval()

@@ -400,6 +400,13 @@ class MSWRDualConfig:
     num_landmarks: int = 64
     landmark_pooling: Literal['learned', 'uniform', 'adaptive'] = 'learned'
     local_global_fusion: Literal['adaptive', 'concat', 'add', 'gated'] = 'adaptive'
+    # MST++-style spectral (band-to-band) self-attention, added as a parallel
+    # branch inside the dual-attention block. The original architecture attends
+    # only spatially (window + landmark + SE channel gating) and has no
+    # band-to-band attention, which is MST++'s defining inductive bias for
+    # RGB->HSI. Default off preserves the original architecture and lets existing
+    # checkpoints load unchanged.
+    use_spectral_attn: bool = False
     
     # CNN Wavelet Configuration
     use_wavelet: bool = True
@@ -834,6 +841,91 @@ class OptimizedLandmarkAttention2D(nn.Module):
         out = rearrange(out, 'b h (h_dim w_dim) d -> b (h d) h_dim w_dim', h_dim=H, w_dim=W)  # (B, Heads, H*W, D) -> (B, C, H, W)
         return self.proj(out)  # (B, C, H, W) -> (B, C, H, W)
 
+class SpectralMSA2D(nn.Module):
+    """
+    Spectral-wise multi-head self-attention (MST++ S-MSA), NCHW in/out.
+
+    Unlike the spatial window/landmark attention, this attends across the
+    SPECTRAL (channel) dimension: tokens are pixels and the per-head C x C
+    correlation between feature channels is what is modeled. This is the
+    dominant inductive bias for RGB->HSI spectral reconstruction and the
+    mechanism the original MSWR architecture lacked. A depthwise-conv
+    positional embedding on V reinjects local spatial structure, as in MST++.
+    """
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"dim ({dim}) must be divisible by num_heads ({num_heads}) for spectral attention"
+            )
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # 1x1 conv == per-pixel Linear over channels (NCHW-friendly).
+        self.to_q = nn.Conv2d(dim, dim, 1, bias=False)
+        self.to_k = nn.Conv2d(dim, dim, 1, bias=False)
+        self.to_v = nn.Conv2d(dim, dim, 1, bias=False)
+
+        # Per-head learnable temperature (MST++ 'rescale').
+        self.rescale = nn.Parameter(torch.ones(num_heads, 1, 1))  # (Heads, 1, 1)
+
+        # Depthwise-conv positional embedding on V (local spatial cue), MST++-style.
+        self.pos_emb = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+        )
+
+        self.proj = nn.Conv2d(dim, dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Spectral self-attention over NCHW input.
+
+        Args:
+            x: Input tensor in NCHW format (B, C, H, W).
+
+        Returns:
+            Output tensor in NCHW format (B, C, H, W).
+        """
+        B, C, H, W = x.shape  # (B, C, H, W)
+
+        q = self.to_q(x)  # (B, C, H, W)
+        k = self.to_k(x)  # (B, C, H, W)
+        v = self.to_v(x)  # (B, C, H, W)
+
+        # (B, C, H, W) -> (B, Heads, D, N) with N = H*W, D = C/Heads
+        q = rearrange(q, 'b (h d) ph pw -> b h d (ph pw)', h=self.num_heads)  # (B, Heads, D, N)
+        k = rearrange(k, 'b (h d) ph pw -> b h d (ph pw)', h=self.num_heads)  # (B, Heads, D, N)
+        v_t = rearrange(v, 'b (h d) ph pw -> b h d (ph pw)', h=self.num_heads)  # (B, Heads, D, N)
+
+        # NUMERICAL STABILITY: compute attention in float32 (matches the spatial
+        # attention modules). Normalize along the spatial-token dim so the
+        # attention is a cosine-similarity over channels (MST++ formulation).
+        q_fp32 = F.normalize(q.float(), dim=-1)  # (B, Heads, D, N)
+        k_fp32 = F.normalize(k.float(), dim=-1)  # (B, Heads, D, N)
+        v_fp32 = v_t.float()  # (B, Heads, D, N)
+
+        # (B, Heads, D, N) @ (B, Heads, N, D) -> (B, Heads, D, D): channel-channel attention
+        attn = (q_fp32 @ k_fp32.transpose(-2, -1)) * self.rescale.float()  # (B, Heads, D, D)
+        attn = torch.clamp(attn, min=-65504.0, max=65504.0)
+        attn = F.softmax(attn, dim=-1)  # (B, Heads, D, D)
+        attn = self.dropout(attn)
+
+        out = attn @ v_fp32  # (B, Heads, D, D) @ (B, Heads, D, N) -> (B, Heads, D, N)
+        out = out.to(dtype=x.dtype)
+
+        # (B, Heads, D, N) -> (B, C, H, W)
+        out = rearrange(out, 'b h d (ph pw) -> b (h d) ph pw', ph=H, pw=W)  # (B, C, H, W)
+
+        # Reinject local spatial structure via depthwise positional embedding on V.
+        out = out + self.pos_emb(v)  # (B, C, H, W)
+        return self.proj(out)  # (B, C, H, W) -> (B, C, H, W)
+
+
 class EnhancedDualAttention2D(nn.Module):
     """
     Enhanced dual attention with FIXED normalization handling
@@ -860,7 +952,13 @@ class EnhancedDualAttention2D(nn.Module):
             config.landmark_pooling, config.use_flash_attn,
             config.attention_dropout
         )
-        
+
+        # Optional MST++-style spectral (band-to-band) attention branch. getattr
+        # keeps older configs/checkpoints (without the field) working.
+        self.use_spectral_attn = getattr(config, 'use_spectral_attn', False)
+        if self.use_spectral_attn:
+            self.spectral_attn = SpectralMSA2D(dim, config.num_heads, config.attention_dropout)
+
         # Enhanced fusion mechanisms
         if config.local_global_fusion == 'adaptive':
             self.fusion_gate = nn.Sequential(
@@ -922,7 +1020,14 @@ class EnhancedDualAttention2D(nn.Module):
             fused = self.fusion_proj(torch.cat([local_out, global_out], dim=1))  # (B, 2*C, H, W) -> (B, C, H, W)
         else:  # 'add'
             fused = local_out + global_out  # (B, C, H, W)
-        
+
+        # Add the spectral (band-to-band) attention branch in parallel with the
+        # spatial fusion. The shared proj + tiny layer-scale gamma below keep the
+        # whole sub-layer near-identity at init, so enabling this does not
+        # destabilize from-scratch training.
+        if self.use_spectral_attn:
+            fused = fused + self.spectral_attn(x_norm)  # (B, C, H, W)
+
         out = self.proj(fused)  # (B, C, H, W) -> (B, C, H, W)
         out = self.gamma * out  # (1, C, 1, 1) broadcast over (B, C, H, W)
         
@@ -1691,6 +1796,7 @@ class IntegratedMSWRNet(nn.Module):
                 'num_stages': self.config.num_stages,
                 'base_channels': self.config.base_channels,
                 'attention_type': self.config.attention_type,
+                'use_spectral_attn': getattr(self.config, 'use_spectral_attn', False),
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
                 'use_flash_attn': self.config.use_flash_attn,
