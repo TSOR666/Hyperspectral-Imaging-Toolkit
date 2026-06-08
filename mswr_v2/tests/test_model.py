@@ -161,6 +161,57 @@ class TestModelForward:
         assert output.shape == (1, 31, 34, 32)
 
 
+class TestSpectralAttention:
+    """Tests for the optional MST++-style spectral self-attention branch."""
+
+    def test_spectral_off_by_default(self):
+        """Spectral attention must be opt-in so existing behavior is preserved."""
+        config = MSWRDualConfig(base_channels=32, num_heads=4)
+        assert config.use_spectral_attn is False
+        model = create_mswr_tiny()
+        has_spectral = any("spectral_attn" in n for n, _ in model.named_parameters())
+        assert not has_spectral
+
+    def test_spectral_adds_parameters(self):
+        """Enabling spectral attention should add parameters."""
+        base = create_mswr_tiny()
+        spec = create_mswr_tiny(use_spectral_attn=True)
+        base_count = sum(p.numel() for p in base.parameters())
+        spec_count = sum(p.numel() for p in spec.parameters())
+        assert spec_count > base_count
+        assert any("spectral_attn" in n for n, _ in spec.named_parameters())
+        assert spec.get_model_info()["architecture"]["use_spectral_attn"] is True
+
+    def test_spectral_forward_shape_and_no_nan(self):
+        """Forward with spectral attention preserves shape and is finite."""
+        model = create_mswr_tiny(use_spectral_attn=True)
+        model.eval()
+        for h, w in [(64, 64), (128, 128)]:
+            x = torch.randn(1, 3, h, w)
+            with torch.no_grad():
+                output = model(x)
+            assert output.shape == (1, 31, h, w), f"Failed for size {h}x{w}"
+            assert not torch.isnan(output).any()
+            assert not torch.isinf(output).any()
+
+    def test_spectral_backward(self):
+        """Spectral attention parameters must receive finite gradients."""
+        model = create_mswr_tiny(use_spectral_attn=True, use_checkpoint=False)
+        model.train()
+        x = torch.randn(1, 3, 64, 64)
+        target = torch.randn(1, 31, 64, 64)
+        output = model(x)
+        loss = torch.nn.functional.l1_loss(output, target)
+        loss.backward()
+        spectral_grads = [
+            p.grad for n, p in model.named_parameters()
+            if "spectral_attn" in n and p.requires_grad
+        ]
+        assert len(spectral_grads) > 0
+        assert all(g is not None for g in spectral_grads)
+        assert all(not torch.isnan(g).any() for g in spectral_grads)
+
+
 class TestModelGradients:
     """Tests for model gradient computation."""
 

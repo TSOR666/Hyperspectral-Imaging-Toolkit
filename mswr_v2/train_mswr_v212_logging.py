@@ -396,6 +396,7 @@ class TrainingConfig:
         self.window_size = args.window_size
         self.num_landmarks = args.num_landmarks
         self.landmark_pooling = args.landmark_pooling
+        self.use_spectral_attn = getattr(args, 'use_spectral_attn', False)
         
         # CNN Wavelet parameters (no external dependencies)
         self.use_wavelet = args.use_wavelet
@@ -519,6 +520,8 @@ def parse_arguments():
     parser.add_argument("--use_flash_attn", action='store_true', default=True)
     
     # CNN Wavelet parameters (always available, no dependencies)
+    parser.add_argument("--use_spectral_attn", action='store_true', default=False,
+                       help="Add MST++-style spectral (band-to-band) self-attention branch to each dual-attention block")
     parser.add_argument("--use_wavelet", action='store_true', default=True)
     parser.add_argument("--wavelet_type", type=str, default='db2',
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
@@ -1065,6 +1068,7 @@ class EnhancedTrainer:
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
                 'landmark_pooling': self.config.landmark_pooling,
+                'use_spectral_attn': self.config.use_spectral_attn,
                 'performance_monitoring': self.config.memory_monitoring
             }
             
@@ -1089,6 +1093,7 @@ class EnhancedTrainer:
                 use_wavelet=self.config.use_wavelet,
                 wavelet_type=self.config.wavelet_type,
                 wavelet_levels=self.config.wavelet_levels,
+                use_spectral_attn=self.config.use_spectral_attn,
                 performance_monitoring=self.config.memory_monitoring
             )
             self.model = IntegratedMSWRNet(model_config)
