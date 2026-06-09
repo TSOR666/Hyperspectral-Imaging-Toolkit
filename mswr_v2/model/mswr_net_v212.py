@@ -1799,6 +1799,7 @@ class IntegratedMSWRNet(nn.Module):
                 'use_spectral_attn': getattr(self.config, 'use_spectral_attn', False),
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
+                'wavelet_levels': list(self.config.wavelet_levels or []),
                 'use_flash_attn': self.config.use_flash_attn,
                 'norm_type': self.config.norm_type
             },

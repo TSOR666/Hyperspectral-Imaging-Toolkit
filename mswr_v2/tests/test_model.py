@@ -212,6 +212,21 @@ class TestSpectralAttention:
         assert all(not torch.isnan(g).any() for g in spectral_grads)
 
 
+class TestWaveletLevelConfiguration:
+    """Wavelet-depth ablations must reach the encoder blocks unchanged."""
+
+    def test_uniform_single_level_wavelets(self):
+        model = create_mswr_tiny(
+            wavelet_levels=[1, 1],
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+
+        assert [stage.wavelet_level for stage in model.encoder_stages] == [1, 1]
+        assert all(stage.wavelet_level == 0 for stage in model.decoder_stages)
+        assert model.get_model_info()["architecture"]["wavelet_levels"] == [1, 1]
+
+
 class TestModelGradients:
     """Tests for model gradient computation."""
 

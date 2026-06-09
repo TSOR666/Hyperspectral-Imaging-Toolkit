@@ -9,6 +9,7 @@ Covers all BLOCKER and HIGH issues identified in the deep-learning systems audit
   HIGH-4     GradScaler checkpoint restore
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -516,6 +517,66 @@ class TestResumeStateRestoration:
                 "self.ema must be initialised BEFORE _setup_optimization() so "
                 "checkpoint EMA state is restored on resume."
             )
+
+
+# ---------------------------------------------------------------------------
+# Config enum parsing and independent raw/EMA checkpoint tracking
+# ---------------------------------------------------------------------------
+class TestValidationWeightSourceTracking:
+    """Raw-model improvements must not be hidden by EMA-only selection."""
+
+    def test_yaml_false_normalizes_to_early_stopping_off(self):
+        from train_mswr_v212_logging import _normalize_early_stopping_mode
+
+        assert _normalize_early_stopping_mode(False) == "off"
+        assert _normalize_early_stopping_mode("off") == "off"
+        assert _normalize_early_stopping_mode("min") == "min"
+        assert _normalize_early_stopping_mode("MAX") == "max"
+
+    def test_invalid_early_stopping_mode_fails_loudly(self):
+        from train_mswr_v212_logging import EarlyStoppingMonitor, _normalize_early_stopping_mode
+
+        with pytest.raises(ValueError):
+            _normalize_early_stopping_mode(True)
+        with pytest.raises(ValueError):
+            EarlyStoppingMonitor(mode=False)
+
+    def test_raw_and_ema_best_weights_are_saved_independently(self, workspace_tmp_dir):
+        from train_mswr_v212_logging import EnhancedTrainer, ModelEMA
+
+        trainer = EnhancedTrainer.__new__(EnhancedTrainer)
+        trainer.rank = 0
+        trainer.model = create_mswr_tiny(use_checkpoint=False)
+        trainer.ema = ModelEMA(trainer.model, decay=0.999)
+        trainer.checkpoint_dir = str(workspace_tmp_dir)
+        trainer.epoch = 12
+        trainer.iteration = 13000
+        trainer.best_model_mrae = float("inf")
+        trainer.best_ema_mrae = float("inf")
+        trainer.best_model_epoch = -1
+        trainer.best_ema_epoch = -1
+        trainer.logger = logging.getLogger("test_source_checkpoint_tracking")
+
+        trainer._track_source_bests({
+            "evaluation_model": "ema",
+            "mrae": 0.24,
+            "ema_mrae": 0.24,
+            "model_mrae": 0.22,
+        })
+
+        raw_path = workspace_tmp_dir / "best_raw_model.pth"
+        ema_path = workspace_tmp_dir / "best_ema_model.pth"
+        assert raw_path.exists()
+        assert ema_path.exists()
+
+        raw_checkpoint = torch.load(raw_path, map_location="cpu", weights_only=True)
+        ema_checkpoint = torch.load(ema_path, map_location="cpu", weights_only=True)
+        assert raw_checkpoint["weights_source"] == "model"
+        assert raw_checkpoint["best_mrae"] == pytest.approx(0.22)
+        assert ema_checkpoint["weights_source"] == "ema"
+        assert ema_checkpoint["best_mrae"] == pytest.approx(0.24)
+        assert trainer.best_model_epoch == 12
+        assert trainer.best_ema_epoch == 12
 
 
 # ---------------------------------------------------------------------------

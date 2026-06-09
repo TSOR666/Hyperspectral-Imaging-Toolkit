@@ -40,6 +40,10 @@ mswr_v2/
 
 By default, logs and checkpoints are stored under `./experiments/{logs,checkpoints}` relative to this directory and the dataset path resolves to `./data/ARAD_1K`. Override them via the CLI flags `--data_root`, `--log_base`, and `--checkpoint_base` or by exporting the environment variables above.
 
+When `ema_eval_mode: both`, training saves independent lightweight minima as
+`best_raw_model.pth` and `best_ema_model.pth`. This prevents an improved raw
+model checkpoint from being hidden by EMA-only ranking.
+
 ## Training
 
 ```bash
