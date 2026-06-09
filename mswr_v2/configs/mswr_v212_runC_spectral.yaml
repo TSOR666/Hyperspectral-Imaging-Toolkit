@@ -74,4 +74,4 @@ ema_start_epoch: 5
 ema_eval_mode: both
 
 # ---- early stopping: OFF ----
-early_stopping_mode: off
+early_stopping_mode: "off"

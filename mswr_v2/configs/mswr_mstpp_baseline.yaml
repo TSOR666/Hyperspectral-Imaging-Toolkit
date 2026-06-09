@@ -63,4 +63,4 @@ memory_monitoring: true
 use_ema: false
 
 # ---- early stopping: OFF (matches MST++ — train full schedule) ----
-early_stopping_mode: off
+early_stopping_mode: "off"

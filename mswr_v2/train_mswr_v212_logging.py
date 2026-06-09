@@ -172,6 +172,24 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _normalize_early_stopping_mode(value: Any) -> str:
+    """Normalize YAML/CLI early-stopping values to an explicit string enum."""
+    if value is False or value is None:
+        return 'off'
+    if value is True:
+        raise ValueError(
+            "early_stopping_mode must be one of: off, min, max. "
+            "Quote YAML strings such as \"off\" to avoid YAML 1.1 boolean coercion."
+        )
+
+    mode = str(value).strip().lower()
+    if mode not in {'off', 'min', 'max'}:
+        raise ValueError(
+            f"Invalid early_stopping_mode={value!r}; expected one of: off, min, max"
+        )
+    return mode
+
+
 def _cuda_bf16_supported() -> bool:
     return bool(
         torch.cuda.is_available()
@@ -434,7 +452,9 @@ class TrainingConfig:
         
         # Enhanced features
         self.early_stopping_patience = getattr(args, 'early_stopping_patience', 50)
-        self.early_stopping_mode = getattr(args, 'early_stopping_mode', 'off')
+        self.early_stopping_mode = _normalize_early_stopping_mode(
+            getattr(args, 'early_stopping_mode', 'off')
+        )
         self.early_stopping_warmup = getattr(args, 'early_stopping_warmup', 0)
         self.memory_monitoring = getattr(args, 'memory_monitoring', True)
         self.profile_model = getattr(args, 'profile_model', False)
@@ -925,6 +945,8 @@ class ModelEMA:
 class EarlyStoppingMonitor:
     """Enhanced early stopping with best model tracking"""
     def __init__(self, patience: int = 50, min_delta: float = 1e-6, mode: str = 'min'):
+        if mode not in {'min', 'max'}:
+            raise ValueError(f"EarlyStoppingMonitor mode must be 'min' or 'max', got {mode!r}")
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -978,6 +1000,10 @@ class EnhancedTrainer:
         self.iteration = 0
         self.epoch = 0
         self.best_mrae = float('inf')
+        self.best_model_mrae = float('inf')
+        self.best_ema_mrae = float('inf')
+        self.best_model_epoch = -1
+        self.best_ema_epoch = -1
         self.train_losses = []
         self.val_losses = []
         self.early_stopping = None
@@ -1136,6 +1162,22 @@ class EnhancedTrainer:
         self.logger.info(f"Trainable parameters: {model_info['trainable_parameters']:,}")
         self.logger.info(f"Model memory: {model_info['total_memory_mb']:.2f} MB")
         self.logger.info(f"Architecture: {model_info['architecture']}")
+        model_config = unwrap_model(self.model).config
+        stage_size = int(self.config.patch_size)
+        attention_resolutions = []
+        for stage_idx, level in enumerate(model_config.wavelet_levels or []):
+            if stage_idx >= model_config.num_stages:
+                break
+            lowpass_size = max(1, math.ceil(stage_size / (2 ** max(0, int(level)))))
+            attention_resolutions.append(f"stage{stage_idx}:{lowpass_size}x{lowpass_size}")
+            stage_size = max(1, math.ceil(stage_size / 2))
+        if attention_resolutions:
+            self.logger.info(
+                "Encoder low-pass attention resolutions for %dx%d patches: %s",
+                self.config.patch_size,
+                self.config.patch_size,
+                ", ".join(attention_resolutions),
+            )
         self.logger.info("="*60)
     
     def _profile_model(self):
@@ -1456,6 +1498,10 @@ class EnhancedTrainer:
                     self.epoch = logical_epoch
                     logical_epoch_adjusted = True
             self.best_mrae = checkpoint.get('best_mrae', float('inf'))
+            self.best_model_mrae = checkpoint.get('best_model_mrae', float('inf'))
+            self.best_ema_mrae = checkpoint.get('best_ema_mrae', float('inf'))
+            self.best_model_epoch = checkpoint.get('best_model_epoch', -1)
+            self.best_ema_epoch = checkpoint.get('best_ema_epoch', -1)
             legacy_ema_state_invalid = (
                 logical_epoch_adjusted
                 and checkpoint_epoch < self.config.ema_start_epoch <= self.epoch
@@ -1727,6 +1773,7 @@ class EnhancedTrainer:
             ):
                 val_metrics = self.validate()
                 evaluation_source = val_metrics.get('evaluation_model', 'model')
+                self._track_source_bests(val_metrics)
                 
                 # Track best checkpoint using validation MRAE
                 new_best = val_metrics.get('mrae', float('inf')) < self.best_mrae
@@ -1923,6 +1970,64 @@ class EnhancedTrainer:
         self.model.train()
         return results
 
+    @staticmethod
+    def _source_mrae(val_metrics: Dict[str, float], source: str) -> float:
+        source_key = f'{source}_mrae'
+        if source_key in val_metrics:
+            return float(val_metrics[source_key])
+        if val_metrics.get('evaluation_model') == source and 'mrae' in val_metrics:
+            return float(val_metrics['mrae'])
+        return float('inf')
+
+    def _save_source_weights(self, source: str, mrae: float) -> None:
+        """Save a lightweight checkpoint containing exactly the evaluated weights."""
+        if self.rank != 0:
+            return
+        if source == 'ema':
+            if self.ema is None:
+                return
+            source_model = self.ema.ema_model
+            filename = 'best_ema_model.pth'
+        elif source == 'model':
+            source_model = unwrap_model(self.model)
+            filename = 'best_raw_model.pth'
+        else:
+            raise ValueError(f"Unknown validation weight source: {source!r}")
+
+        model_config = source_model.config.to_dict() if hasattr(source_model, 'config') else {}
+        checkpoint = {
+            'state_dict': source_model.state_dict(),
+            'model_config': model_config,
+            'best_mrae': float(mrae),
+            'epoch': self.epoch,
+            'iter': self.iteration,
+            'weights_source': source,
+            'timestamp': datetime.now().isoformat(),
+        }
+        filepath = os.path.join(self.checkpoint_dir, filename)
+        torch.save(checkpoint, filepath)
+        self.logger.info(
+            "Best %s weights saved: %s (MRAE=%.6f, epoch=%d)",
+            source,
+            filepath,
+            mrae,
+            self.epoch,
+        )
+
+    def _track_source_bests(self, val_metrics: Dict[str, float]) -> None:
+        """Track raw and EMA validation minima independently."""
+        model_mrae = self._source_mrae(val_metrics, 'model')
+        if model_mrae < self.best_model_mrae:
+            self.best_model_mrae = model_mrae
+            self.best_model_epoch = self.epoch
+            self._save_source_weights('model', model_mrae)
+
+        ema_mrae = self._source_mrae(val_metrics, 'ema')
+        if ema_mrae < self.best_ema_mrae:
+            self.best_ema_mrae = ema_mrae
+            self.best_ema_epoch = self.epoch
+            self._save_source_weights('ema', ema_mrae)
+
     def save_checkpoint(self, filename: str, is_best: bool = False):
         """Enhanced checkpoint saving with metadata"""
         if self.rank != 0:
@@ -1954,6 +2059,10 @@ class EnhancedTrainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict() if hasattr(self.scheduler, 'state_dict') else None,
             'best_mrae': self.best_mrae,
+            'best_model_mrae': self.best_model_mrae,
+            'best_ema_mrae': self.best_ema_mrae,
+            'best_model_epoch': self.best_model_epoch,
+            'best_ema_epoch': self.best_ema_epoch,
             'config': self.config.to_dict(),
             'model_config': model_config,
             'torch_version': torch.__version__,
@@ -2034,6 +2143,7 @@ class EnhancedTrainer:
                 
                 # End-of-epoch validation
                 val_metrics = self.validate()
+                self._track_source_bests(val_metrics)
                 
                 # Track best performance
                 if val_metrics['mrae'] < self.best_mrae:
@@ -2150,6 +2260,16 @@ class EnhancedTrainer:
             self.logger.info(f"Total training time: {total_time/3600:.2f} hours")
             self.logger.info(f"Best MRAE: {self.best_mrae:.6f} (epoch {best_epoch})")
             self.logger.info(f"Best checkpoint weights source: {best_eval_source}")
+            if math.isfinite(self.best_model_mrae):
+                self.logger.info(
+                    f"Best raw-model MRAE: {self.best_model_mrae:.6f} "
+                    f"(epoch {self.best_model_epoch})"
+                )
+            if math.isfinite(self.best_ema_mrae):
+                self.logger.info(
+                    f"Best EMA MRAE: {self.best_ema_mrae:.6f} "
+                    f"(epoch {self.best_ema_epoch})"
+                )
             self.logger.info(f"Final epoch: {self.epoch}")
             self.logger.info(f"Checkpoints saved to: {self.checkpoint_dir}")
             self.logger.info("="*80)
