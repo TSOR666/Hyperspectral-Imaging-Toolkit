@@ -24,6 +24,7 @@ import os
 import sys
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -42,7 +43,12 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from hsi_model.models.generator_v3 import NoiseRobustCSWinGenerator
-from hsi_model.models.losses_consolidated import MRAELoss, RelativeMRAELoss, MRAEPlusL1Loss
+from hsi_model.models.losses_consolidated import (
+    L1PlusMRAELoss,
+    MRAELoss,
+    MRAEPlusL1Loss,
+    RelativeMRAELoss,
+)
 from hsi_model.constants import (
     DEFAULT_GRADIENT_CLIP_NORM,
     DEFAULT_WARMUP_STEPS,
@@ -154,6 +160,12 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
         return MRAEPlusL1Loss(
             mrae_epsilon=float(config.get("mrae_epsilon", 1e-2)),
             l1_weight=float(config.get("l1_weight", 0.3)),
+        )
+    if objective in ("l1_with_mrae", "l1+mrae_small", "balanced_l1_mrae"):
+        return L1PlusMRAELoss(
+            mrae_epsilon=float(config.get("mrae_epsilon", 1e-2)),
+            mrae_weight=float(config.get("mrae_weight", 0.1)),
+            l1_weight=float(config.get("l1_weight", 1.0)),
         )
     if objective in ("relative_mrae", "smooth_mrae"):
         return RelativeMRAELoss(
@@ -314,6 +326,8 @@ def _run_stage(
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
     max_consecutive_nonfinite = int(config.get("max_consecutive_nonfinite_generator_outputs", 3))
+    finite_check_interval = max(1, int(config.get("finite_check_interval", 100)))
+    ema_update_every = max(1, int(config.get("ema_update_every", 1)))
     early_stopping_patience = max(0, int(config.get("early_stopping_patience", 0)))
     early_stopping_min_delta = max(0.0, float(config.get("early_stopping_min_delta", 0.0)))
     early_stopping_warmup_epochs = max(0, int(config.get("early_stopping_warmup_epochs", 0)))
@@ -325,6 +339,8 @@ def _run_stage(
     consecutive_nonfinite = 0
     stage_iter = start_stage_iter
     iteration = global_iter
+    log_window_start = time.perf_counter()
+    log_window_iteration = iteration
 
     while stage_iter < stage_iterations:
         net.train()
@@ -341,7 +357,11 @@ def _run_stage(
             rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
             rgb_tensor = rgb_tensor.to(device, non_blocking=True)
             hsi_tensor = hsi_tensor.to(device, non_blocking=True)
-            if not torch.isfinite(rgb_tensor).all() or not torch.isfinite(hsi_tensor).all():
+            check_finite = iteration % finite_check_interval == 0
+            if check_finite and (
+                not torch.isfinite(rgb_tensor).all()
+                or not torch.isfinite(hsi_tensor).all()
+            ):
                 train_logger.warning("Skipping non-finite batch at iteration %s", iteration)
                 continue
 
@@ -353,7 +373,7 @@ def _run_stage(
             with autocast(enabled=use_amp, dtype=autocast_dtype):
                 pred = net(rgb_tensor)
 
-            if not torch.isfinite(pred).all():
+            if check_finite and not torch.isfinite(pred).all():
                 consecutive_nonfinite += 1
                 train_logger.warning(
                     "Non-finite generator output at iter %s; retry %s/%s",
@@ -394,7 +414,7 @@ def _run_stage(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            if ema is not None:
+            if ema is not None and (iteration + 1) % ema_update_every == 0:
                 ema.update(generator)
 
             epoch_losses.append(loss.item())
@@ -403,10 +423,22 @@ def _run_stage(
 
             if iteration % 20 == 0:
                 avg_loss = np.mean(epoch_losses[-20:]) if epoch_losses else 0.0
+                elapsed = max(time.perf_counter() - log_window_start, 1e-9)
+                completed = max(iteration - log_window_iteration, 1)
                 train_logger.info(
-                    "[iter:%d | stage %d %d/%d] lr=%.9f train_loss=%.6f",
-                    iteration, stage_idx, stage_iter, stage_iterations, lr, avg_loss,
+                    "[iter:%d | stage %d %d/%d] lr=%.9f train_loss=%.6f "
+                    "time=%.3fs/iter throughput=%.2f samples/s",
+                    iteration,
+                    stage_idx,
+                    stage_iter,
+                    stage_iterations,
+                    lr,
+                    avg_loss,
+                    elapsed / completed,
+                    completed * int(rgb_tensor.shape[0]) / elapsed,
                 )
+                log_window_start = time.perf_counter()
+                log_window_iteration = iteration
 
             if iteration % per_epoch_iteration == 0:
                 if ema is not None:
@@ -530,6 +562,8 @@ def _run_stage(
 
                 epoch_losses = []
                 memory_cleanup()
+                log_window_start = time.perf_counter()
+                log_window_iteration = iteration
                 if should_stop:
                     if rank == 0:
                         train_logger.info(
@@ -715,11 +749,24 @@ def main(config: DictConfig) -> None:
                              cfg.get("blocks_per_stage"))
             main_logger.info("=" * 60)
 
-        setup_seed(cfg.get("seed", 42), rank)
+        setup_seed(
+            cfg.get("seed", 42),
+            rank,
+            deterministic=cfg.get("deterministic", True),
+            allow_tf32=cfg.get("allow_tf32", False),
+        )
         memory_cleanup()
 
         train_dataset, val_dataset = create_training_datasets(cfg, seed=int(cfg.get("seed", 42)))
         report_memory("After loading datasets")
+
+        _amp_dtype = pick_amp_dtype(cfg) if device.type == "cuda" else None
+        if rank == 0:
+            main_logger.info(
+                "AMP dtype=%s, spectral_attention_force_fp32=%s",
+                str(_amp_dtype).replace("torch.", "") if _amp_dtype else "fp32",
+                cfg.get("spectral_attention_force_fp32", True),
+            )
 
         net = NoiseRobustCSWinGenerator(cfg).to(device)
         report_memory("After creating generator")
@@ -733,7 +780,6 @@ def main(config: DictConfig) -> None:
             optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=weight_decay)
 
         # Schedulers are built PER progressive stage inside train_generator_only.
-        _amp_dtype = pick_amp_dtype(cfg) if device.type == "cuda" else None
         scaler = GradScaler(enabled=(_amp_dtype == torch.float16))
 
         criterion = build_criterion(cfg)
@@ -744,8 +790,17 @@ def main(config: DictConfig) -> None:
         ema: Optional[GeneratorEMA] = None
         if cfg.get("use_ema", True):
             gen_for_ema = net.module if hasattr(net, "module") else net
-            ema = GeneratorEMA(gen_for_ema, decay=float(cfg.get("ema_decay", 0.999)))
-            main_logger.info("Generator EMA enabled (decay=%.4f)", ema.decay)
+            ema_update_every = max(1, int(cfg.get("ema_update_every", 1)))
+            per_step_decay = float(cfg.get("ema_decay", 0.999))
+            ema = GeneratorEMA(
+                gen_for_ema,
+                decay=per_step_decay ** ema_update_every,
+            )
+            main_logger.info(
+                "Generator EMA enabled (per-step decay=%.4f, update every %d steps)",
+                per_step_decay,
+                ema_update_every,
+            )
 
         resume_info: Optional[Dict[str, Any]] = None
         resume_path = cfg.get("resume_checkpoint")

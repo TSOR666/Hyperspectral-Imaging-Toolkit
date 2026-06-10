@@ -9,7 +9,7 @@ cross-importing one script from the other.
 Public API:
     setup_paths(config)                 -> dict
     setup_distributed_training(config)  -> (device, rank, world_size, is_distributed)
-    setup_seed(seed, rank=0)            -> None
+    setup_seed(seed, rank=0, ...)       -> None
     cleanup()                           -> None   # destroys the NCCL process group
 """
 
@@ -137,13 +137,13 @@ def setup_distributed_training(
     return torch.device(f"cuda:{local_rank}"), rank, world_size, True
 
 
-def setup_seed(seed: int, rank: int = 0) -> None:
-    """Seed all RNGs deterministically for a given rank.
-
-    cuDNN benchmark is disabled and deterministic mode enabled. This may
-    reduce throughput 5-15%; set `cudnn.benchmark = True` after calling
-    this helper if reproducibility is not required.
-    """
+def setup_seed(
+    seed: int,
+    rank: int = 0,
+    deterministic: bool = True,
+    allow_tf32: bool = False,
+) -> None:
+    """Seed all RNGs and configure CUDA performance/reproducibility."""
     seed = seed + rank
     random.seed(seed)
     np.random.seed(seed)
@@ -151,12 +151,22 @@ def setup_seed(seed: int, rank: int = 0) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    deterministic = bool(deterministic)
+    allow_tf32 = bool(allow_tf32)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    if allow_tf32 and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
-    logger.info("Deterministic mode enabled: cudnn.deterministic=True, benchmark=False")
-    logger.warning(
-        "Performance may be reduced. To disable: set cudnn.benchmark=True (loses determinism)"
+    logger.info(
+        "CUDA runtime: deterministic=%s, cudnn.benchmark=%s, TF32=%s",
+        deterministic,
+        torch.backends.cudnn.benchmark,
+        allow_tf32,
     )
 
 

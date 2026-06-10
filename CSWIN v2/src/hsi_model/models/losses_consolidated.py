@@ -204,6 +204,28 @@ class MRAEPlusL1Loss(nn.Module):
         return self.mrae(pred, target) + self.l1_weight * self.l1(pred, target)
 
 
+class L1PlusMRAELoss(nn.Module):
+    """L1-primary hybrid loss with a stabilized MRAE correction."""
+
+    def __init__(
+        self,
+        mrae_epsilon: float = 1e-2,
+        mrae_weight: float = 0.1,
+        l1_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.mrae = MRAELoss(epsilon=mrae_epsilon)
+        self.l1 = nn.L1Loss()
+        self.mrae_weight = float(mrae_weight)
+        self.l1_weight = float(l1_weight)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (
+            self.l1_weight * self.l1(pred, target)
+            + self.mrae_weight * self.mrae(pred, target)
+        )
+
+
 # ============================================
 # Spectral Losses
 # ============================================
@@ -1096,6 +1118,7 @@ __all__ = [
     'RelativeMRAELoss',
     'MRAELoss',
     'MRAEPlusL1Loss',
+    'L1PlusMRAELoss',
     'SAMLoss',
     'SinkhornDivergence',
     'SinkhornLoss',

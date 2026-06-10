@@ -1,7 +1,18 @@
 import pytest
 import torch
 
-from hsi_model.models.attention import CSWinAttentionBlock, EfficientSpectralAttention
+from hsi_model.models.attention import (
+    CSWinAttentionBlock,
+    EfficientSpectralAttention,
+    _resolve_spectral_fp32_policy,
+)
+
+
+def test_spectral_attention_auto_precision_policy():
+    assert _resolve_spectral_fp32_policy("auto", True, torch.float16)
+    assert not _resolve_spectral_fp32_policy("auto", True, torch.bfloat16)
+    assert not _resolve_spectral_fp32_policy("auto", False, None)
+    assert _resolve_spectral_fp32_policy(True, True, torch.bfloat16)
 
 
 def test_cswin_attention_padding_shape():

@@ -5,6 +5,7 @@ import torch
 
 from hsi_model.models.losses_consolidated import (
     CharbonnierLoss,
+    L1PlusMRAELoss,
     RelativeMRAELoss,
     SAMLoss,
     SinkhornDivergence,
@@ -49,6 +50,25 @@ def test_relative_mrae_loss_uses_denominator_floor():
     assert torch.isfinite(value)
     assert value.item() == pytest.approx((2.0 + 1.0) / 2.0, rel=1e-5)
 
+    value.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+
+
+def test_l1_plus_mrae_loss_uses_configured_weights():
+    loss = L1PlusMRAELoss(
+        mrae_epsilon=0.01,
+        mrae_weight=0.1,
+        l1_weight=1.0,
+    )
+    pred = torch.tensor([[[[0.02, 0.5]]]], requires_grad=True)
+    target = torch.tensor([[[[0.0, 0.25]]]])
+
+    value = loss(pred, target)
+
+    expected_l1 = (0.02 + 0.25) / 2.0
+    expected_mrae = (2.0 + 1.0) / 2.0
+    assert value.item() == pytest.approx(expected_l1 + 0.1 * expected_mrae)
     value.backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
