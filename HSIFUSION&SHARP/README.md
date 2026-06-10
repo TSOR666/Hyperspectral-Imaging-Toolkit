@@ -45,19 +45,14 @@ Set the following environment variables to keep outputs consistent with the rest
 
 ## Dataset preparation
 
-Use the bundled `dataset_setup.py` helper to stage ARAD-1K data with MST++ style crops, statistics, and channel metadata. Example:
+Use the bundled `dataset_setup.py` helper to verify an existing ARAD-1K layout and create `split_txt/train_list.txt` plus `valid_list.txt`. Example:
 
 ```bash
 cd "HSIFUSION&SHARP"
-python dataset_setup.py \
-  --arad-root /path/to/ARAD_1K_raw \
-  --output-root ./data/ARAD_1K \
-  --patch-size 128 \
-  --stride 8 \
-  --workers 8
+python dataset_setup.py /path/to/ARAD_1K --train-ratio 0.95 --samples 5
 ```
 
-The script populates `train/` and `val/` directories with `.npy` spectral tensors and generates lookup tables consumed by both trainers. Skip this step if you already have a curated dataset prepared for MSWR/CSWIN in the repository root.
+The dataset root must already contain `Train_RGB/` images and matching `Train_Spec/*.mat` cubes. Skip split creation with `--verify-only`.
 
 ## Training HSIFusionNet v2.5.3
 
@@ -67,8 +62,7 @@ python hsifusion_training.py \
   --data_root ${HSI_DATA_DIR:-./data/ARAD_1K} \
   --batch_size 12 \
   --model_size base \
-  --use_amp \
-  --compile_model
+  --cross_attention_max_tokens 1024
 ```
 
 Key CLI flags exposed by the dataclass configuration:
@@ -79,9 +73,10 @@ Key CLI flags exposed by the dataclass configuration:
 | `--memory_mode {standard,float16,lazy}` | Controls dataloader caching and precision. | `float16` |
 | `--accumulate_steps` | Gradient accumulation steps to emulate larger batches. | `1` |
 | `--warmup_epochs` | Number of cosine warm-up epochs. | `5` |
-| `--compile_model/--no-compile_model` | Toggle `torch.compile` for the forward pass. | Enabled |
+| `--no_compile` | Disable `torch.compile` for the forward pass. | Compilation enabled |
+| `--cross_attention_max_tokens` | Caps decoder cross-attention key/value tokens; `0` restores full attention. | `1024` |
 
-Checkpoints and TensorBoard logs are stored under `./experiments/hsifusion_*` by default. Resume training with `--resume_from path/to/checkpoint.pt`.
+Checkpoints and TensorBoard logs are stored under `./experiments/hsifusion_*` by default. Resume training with `--resume path/to/checkpoint.pt`.
 
 ## Training SHARP v3.2.2 Hardened
 
@@ -92,16 +87,18 @@ python sharp_training_script_fixed.py \
   --batch_size 20 \
   --model_size base \
   --sparse_sparsity_ratio 0.9 \
-  --use_amp
+  --max_global_tokens 1024
 ```
 
 Important parameters:
 
 - `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, and `--sparse_window_size` tune the streaming attention kernels and must respect GPU memory limits.
+- `--max_global_tokens` bounds dense global and decoder cross-attention context without changing checkpoint parameter shapes.
+- `--key_rbf_mode linear` preserves query-dependent sparse rankings and is the training default; `mean` remains available for legacy experiments.
 - `--ema_decay` together with `--ema_update_every` mirrors the production EMA scheme – keep these defaults unless you benchmark alternatives.
-- Set `--memory_mode lazy` if you need to stream tiles from slower storage without blowing host RAM.
+- Set `--memory_mode lazy --cache_size 4` to stream tiles with a bounded per-worker float16 cache.
 
-Distributed training works by wrapping the invocation with `torch.distributed.run` in the same fashion as the CSWIN trainer.
+These trainers are single-process. Do not wrap them with `torch.distributed.run` until DDP samplers, rank-aware checkpointing, and metric reduction are implemented.
 
 ## SHARP inference
 
@@ -109,18 +106,18 @@ The standalone inference utility loads checkpoints (with or without embedded con
 
 ```bash
 python sharp_inference.py \
-  --checkpoint experiments/sharp/best.ckpt \
-  --input tests/rgb/frame.png \
+  experiments/sharp/best_model.pth \
+  tests/rgb/frame.png \
   --output outputs/hsis/frame.npy \
-  --patch-size 256 \
+  --patch_size 256 \
   --device cuda
 ```
 
-When `--patch-size` is provided the script applies overlap-and-blend tiling to avoid seams. Outputs are compatible with the [`hsi_viz_suite`](../hsi_viz_suite/README.md) plotting scripts.
+When `--patch_size` is provided the script applies overlap-and-blend tiling to avoid seams. Outputs are compatible with the [`hsi_viz_suite`](../hsi_viz_suite/README.md) plotting scripts.
 
 ## Batch jobs
 
-Two SLURM-ready job templates (`train_job_HSI.sh`, `train_job_SHARP.sh`) demonstrate how we schedule multi-GPU experiments with pre-configured environment variables. Adapt them to your cluster (account names, partitions, `srun` args) before use.
+Two LSF job templates (`train_job_HSI.sh`, `train_job_SHARP.sh`) demonstrate single-GPU A100 runs. Adapt queue, account, module, and environment paths before use.
 
 ## Interoperability tips
 

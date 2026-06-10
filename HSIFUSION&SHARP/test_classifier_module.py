@@ -77,7 +77,6 @@ def test_inheritance():
     print("[PASS] Encoder architecture preserved")
 
     print("\n[OK] TEST 1 PASSED: Inheritance and architecture verified")
-    return True
 
 
 def test_forward_pass():
@@ -118,7 +117,6 @@ def test_forward_pass():
     print("[PASS] Output values are valid (no NaN/Inf)")
 
     print("\n[OK] TEST 2 PASSED: Forward pass produces correct output")
-    return True
 
 
 def test_decoder_error():
@@ -147,7 +145,6 @@ def test_decoder_error():
         print(f"[PASS] forward_decoder correctly raises error: {e}")
 
     print("\n[OK] TEST 3 PASSED: Decoder properly disabled")
-    return True
 
 
 def test_pooling_modes():
@@ -186,7 +183,6 @@ def test_pooling_modes():
         print(f"[PASS] Pooling mode '{pooling}' works correctly")
 
     print("\n[OK] TEST 4 PASSED: All pooling modes functional")
-    return True
 
 
 def test_multi_scale_features():
@@ -249,7 +245,6 @@ def test_multi_scale_features():
     print(f"[PASS] Single-scale embedding dim: {classifier_single.embedding_dim}")
 
     print("\n[OK] TEST 5 PASSED: Multi-scale aggregation working")
-    return True
 
 
 def test_embedding_extraction():
@@ -304,7 +299,6 @@ def test_embedding_extraction():
     print(f"[PASS] Feature extraction returns {len(features)} feature maps")
 
     print("\n[OK] TEST 6 PASSED: Embedding extraction functional")
-    return True
 
 
 def test_hidden_layer():
@@ -364,7 +358,6 @@ def test_hidden_layer():
     print(f"[PASS] Classifier without hidden layer works")
 
     print("\n[OK] TEST 7 PASSED: Hidden layer configuration working")
-    return True
 
 
 def test_model_sizes():
@@ -396,10 +389,9 @@ def test_model_sizes():
 
         except Exception as e:
             print(f"[FAIL] Model size '{size}' failed: {e}")
-            return False
+            raise AssertionError(f"Model size {size} failed: {e}") from e
 
     print("\n[OK] TEST 8 PASSED: All model sizes functional")
-    return True
 
 
 def test_selected_scales():
@@ -438,7 +430,6 @@ def test_selected_scales():
     print(f"[PASS] Custom scale selection works: {classifier.selected_scales}")
 
     print("\n[OK] TEST 9 PASSED: Custom scale selection working")
-    return True
 
 
 def test_classification_workflow():
@@ -509,7 +500,6 @@ def test_classification_workflow():
     print(f"[PASS] Embedding extraction deterministic")
 
     print("\n[OK] TEST 10 PASSED: Complete workflow functional")
-    return True
 
 
 def run_all_tests():
@@ -534,8 +524,8 @@ def run_all_tests():
     results = []
     for name, test_func in tests:
         try:
-            result = test_func()
-            results.append((name, result))
+            test_func()
+            results.append((name, True))
         except Exception as e:
             print(f"\n[FAIL] TEST FAILED: {name}")
             print(f"Error: {e}")

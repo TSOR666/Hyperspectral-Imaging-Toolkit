@@ -31,6 +31,7 @@ def _run_hsifusion(device: torch.device, size: int) -> Dict[str, float]:
         compile_mode=None,
         compile_model=False,
         force_compile=False,
+        cross_attention_max_tokens=256,
     ).to(device)
     model.eval()
 
@@ -66,6 +67,7 @@ def _run_sharp(device: torch.device, size: int) -> Dict[str, float]:
         sparse_window_size=7,
         sparse_sparsity_ratio=0.5,
         sparse_k_cap=64,
+        max_global_tokens=256,
     )
     ckpt_path = work_dir / "smoke_ckpt.pth"
     cfg = SimpleNamespace(
@@ -79,6 +81,7 @@ def _run_sharp(device: torch.device, size: int) -> Dict[str, float]:
         sparse_q_block_size=128,
         sparse_window_size=7,
         sparse_max_tokens=2048,
+        max_global_tokens=256,
         key_rbf_mode="mean",
         sparsemax_pad_value=None,
         ema_update_every=1,

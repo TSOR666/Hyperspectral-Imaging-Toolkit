@@ -50,10 +50,10 @@ module load cudnn/v8.6.0.163-prod-cuda-11.X
 source /zhome/25/d/221980/miniconda3/etc/profile.d/conda.sh
 conda activate hsifusion
 # Set environment variables for optimal A100 performance
-export CUDA_LAUNCH_BLOCKING=1
+export CUDA_LAUNCH_BLOCKING=0
 export TORCH_CUDNN_V8_API_ENABLED=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
-export TORCH_USE_CUDA_DSA=1
+unset TORCH_USE_CUDA_DSA
 
 # Enable tensor core optimizations
 export NVIDIA_TF32_OVERRIDE=1

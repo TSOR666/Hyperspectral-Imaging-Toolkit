@@ -4,6 +4,7 @@ Simplified version with performance optimizations
 """
 
 import os
+import math
 import torch
 import numpy as np
 import h5py
@@ -39,13 +40,17 @@ class OptimizedTrainDataset(Dataset):
                  stride: int = 8,
                  memory_mode: str = 'float16',
                  augment: bool = True,
-                 cache_size: int = 100):
+                 cache_size: int = 4):
         
         self.data_root = data_root
         self.crop_size = crop_size
         self.stride = stride
         self.memory_mode = memory_mode
         self.augment = augment
+        if memory_mode not in {"standard", "float16", "lazy"}:
+            raise ValueError(
+                f"memory_mode must be one of standard/float16/lazy, got {memory_mode!r}"
+            )
         
         # Load file lists
         self.rgb_files = []
@@ -74,7 +79,7 @@ class OptimizedTrainDataset(Dataset):
         
         rgb_dir = os.path.join(self.data_root, 'Train_RGB')
         hsi_dir = os.path.join(self.data_root, 'Train_Spec')
-        
+
         for name in file_names:
             rgb_path = _resolve_rgb_path(rgb_dir, name)
             hsi_path = os.path.join(hsi_dir, f"{name}.mat")
@@ -115,8 +120,8 @@ class OptimizedTrainDataset(Dataset):
         for i in range(len(self.rgb_files)):
             h, w = self._infer_image_shape(i)
             # Fix: ensure we don't go beyond image boundaries
-            n_patches_h = max(1, (h - self.crop_size) // self.stride + 1)
-            n_patches_w = max(1, (w - self.crop_size) // self.stride + 1)
+            n_patches_h = max(1, math.ceil((h - self.crop_size) / self.stride) + 1)
+            n_patches_w = max(1, math.ceil((w - self.crop_size) / self.stride) + 1)
             n_patches = n_patches_h * n_patches_w
             
             self.image_shapes.append((h, w))
@@ -147,9 +152,16 @@ class OptimizedTrainDataset(Dataset):
         with h5py.File(self.hsi_files[idx], 'r') as f:
             hsi = np.array(f['cube'], dtype=np.float32)
         hsi = np.transpose(hsi, [0, 2, 1])  # [31, H, W]
-        
+
+        if rgb.shape[:2] != hsi.shape[1:]:
+            raise ValueError(
+                "RGB/HSI spatial mismatch for "
+                f"{self.rgb_files[idx]} and {self.hsi_files[idx]}: "
+                f"RGB={rgb.shape[:2]}, HSI={hsi.shape[1:]}"
+            )
+
         # Apply memory mode
-        if self.memory_mode == 'float16':
+        if self.memory_mode in {'float16', 'lazy'}:
             rgb = rgb.astype(np.float16)
             hsi = hsi.astype(np.float16)
         
@@ -178,7 +190,7 @@ class OptimizedTrainDataset(Dataset):
         
         # Get patch coordinates
         h, w = self.image_shapes[img_idx]
-        patches_per_row = max(1, (w - self.crop_size) // self.stride + 1)
+        patches_per_row = max(1, math.ceil((w - self.crop_size) / self.stride) + 1)
         
         patch_row = patch_idx // patches_per_row
         patch_col = patch_idx % patches_per_row
@@ -328,7 +340,7 @@ class OptimizedValDataset(Dataset):
         
         rgb_dir = os.path.join(self.data_root, 'Train_RGB')
         hsi_dir = os.path.join(self.data_root, 'Train_Spec')
-        
+
         for name in file_names:
             rgb_path = _resolve_rgb_path(rgb_dir, name)
             hsi_path = os.path.join(hsi_dir, f"{name}.mat")
@@ -408,7 +420,7 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
     num_workers = config.num_workers
     memory_mode = memory_mode or config.memory_mode
     augment = getattr(config, "augment", True)
-    cache_size = int(getattr(config, "cache_size", 100 if memory_mode == 'lazy' else 0))
+    cache_size = int(getattr(config, "cache_size", 4 if memory_mode == 'lazy' else 0))
     base_seed = int(getattr(config, "seed", 42))
     
     # Create datasets

@@ -6,7 +6,7 @@ Loads a trained model checkpoint and performs inference on RGB images.
 
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,12 @@ import numpy as np
 from PIL import Image
 
 from sharp_v322_hardened import create_sharp_v32, SHARPv32Config
+
+
+def _config_get(config: Any, name: str, default: Any) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    return getattr(config, name, default)
 
 
 def _torch_load_compat(path: str, map_location: torch.device):
@@ -41,22 +47,23 @@ class SHARPInference:
         # Get configuration
         if 'config' in checkpoint:
             config = checkpoint['config']
-            self.model_size = config.model_size
-            self.in_channels = config.in_channels
-            self.out_channels = config.out_channels
+            self.model_size = _config_get(config, 'model_size', 'base')
+            self.in_channels = _config_get(config, 'in_channels', 3)
+            self.out_channels = _config_get(config, 'out_channels', 31)
             
             # Extract SHARP-specific parameters
             sharp_kwargs = {
-                'sparse_sparsity_ratio': getattr(config, 'sparse_sparsity_ratio', 0.9),
-                'rbf_centers_per_head': getattr(config, 'rbf_centers_per_head', 32),
-                'sparse_k_cap': getattr(config, 'sparse_k_cap', 1024),
-                'sparse_block_size': getattr(config, 'sparse_block_size', 2048),
-                'sparse_q_block_size': getattr(config, 'sparse_q_block_size', 1024),
-                'sparse_window_size': getattr(config, 'sparse_window_size', 49),
-                'sparse_max_tokens': getattr(config, 'sparse_max_tokens', 8192),
-                'key_rbf_mode': getattr(config, 'key_rbf_mode', 'mean'),
-                'sparsemax_pad_value': getattr(config, 'sparsemax_pad_value', None),
-                'ema_update_every': getattr(config, 'ema_update_every', 1),
+                'sparse_sparsity_ratio': _config_get(config, 'sparse_sparsity_ratio', 0.9),
+                'rbf_centers_per_head': _config_get(config, 'rbf_centers_per_head', 32),
+                'sparse_k_cap': _config_get(config, 'sparse_k_cap', 1024),
+                'sparse_block_size': _config_get(config, 'sparse_block_size', 2048),
+                'sparse_q_block_size': _config_get(config, 'sparse_q_block_size', 1024),
+                'sparse_window_size': _config_get(config, 'sparse_window_size', 49),
+                'sparse_max_tokens': _config_get(config, 'sparse_max_tokens', 8192),
+                'max_global_tokens': _config_get(config, 'max_global_tokens', None),
+                'key_rbf_mode': _config_get(config, 'key_rbf_mode', 'mean'),
+                'sparsemax_pad_value': _config_get(config, 'sparsemax_pad_value', None),
+                'ema_update_every': _config_get(config, 'ema_update_every', 1),
             }
         else:
             # Default configuration
@@ -72,6 +79,7 @@ class SHARPInference:
                 'sparse_q_block_size': 1024,
                 'sparse_window_size': 49,
                 'sparse_max_tokens': 8192,
+                'max_global_tokens': None,
                 'key_rbf_mode': 'mean',
                 'sparsemax_pad_value': None,
                 'ema_update_every': 1,
@@ -89,7 +97,9 @@ class SHARPInference:
         )
         
         # Load weights
-        model_state = checkpoint['model_state_dict']
+        model_state = checkpoint.get('ema_model_state_dict', checkpoint['model_state_dict'])
+        if 'ema_model_state_dict' in checkpoint:
+            print("Using EMA weights from checkpoint")
         self.model.load_state_dict(model_state)
         
         # Move to device and set eval mode
@@ -106,7 +116,7 @@ class SHARPInference:
         
         print("Model loaded successfully!")
     
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, rgb_image: torch.Tensor, 
                 patch_size: Optional[int] = None,
                 overlap: int = 16) -> torch.Tensor:
@@ -161,11 +171,14 @@ class SHARPInference:
         B, C, H, W = rgb_image.shape
         
         # Initialize output
-        output = torch.zeros(B, self.out_channels, H, W, device=self.device)
-        weight_map = torch.zeros(B, 1, H, W, device=self.device)
+        output = torch.zeros(
+            B, self.out_channels, H, W, device=self.device, dtype=rgb_image.dtype
+        )
+        weight_map = torch.zeros(B, 1, H, W, device=self.device, dtype=rgb_image.dtype)
         
         # Create overlapping windows
         stride = patch_size - overlap
+        blend_weights = {}
         
         for y in range(0, H - overlap, stride):
             for x in range(0, W - overlap, stride):
@@ -180,9 +193,14 @@ class SHARPInference:
                 
                 # Predict
                 pred_patch = self.model(patch)
-                
+
                 # Add to output with blending weights
-                weight = self._create_blend_weight(patch_size, patch_size).to(self.device)
+                patch_hw = pred_patch.shape[-2:]
+                if patch_hw not in blend_weights:
+                    blend_weights[patch_hw] = self._create_blend_weight(*patch_hw).to(
+                        device=self.device, dtype=pred_patch.dtype
+                    )
+                weight = blend_weights[patch_hw]
                 output[:, :, y_start:y_end, x_start:x_end] += pred_patch * weight
                 weight_map[:, :, y_start:y_end, x_start:x_end] += weight
         
@@ -237,6 +255,7 @@ class SHARPInference:
         if output_path:
             # Save as .npy or .mat based on extension
             output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             if output_path.suffix == '.npy':
                 np.save(output_path, hsi_np)
             elif output_path.suffix == '.mat':

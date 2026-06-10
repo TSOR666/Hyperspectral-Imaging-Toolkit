@@ -45,7 +45,7 @@ See the [CSWIN v2 README](CSWIN%20v2/README.md) for distributed training tips an
 
 ```bash
 cd "HSIFUSION&SHARP"
-python dataset_setup.py --arad-root /path/to/raw/ARAD_1K --output-root ./data/ARAD_1K
+python dataset_setup.py /path/to/ARAD_1K --train-ratio 0.95
 python hsifusion_training.py --data_root ./data/ARAD_1K --model_size base
 python sharp_training_script_fixed.py --data_root ./data/ARAD_1K --model_size base
 ```

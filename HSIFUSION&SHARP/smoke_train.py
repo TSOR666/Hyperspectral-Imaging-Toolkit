@@ -43,6 +43,7 @@ def _run_hsifusion(device: torch.device, steps: int, batch_size: int, size: int)
         compile_mode=None,
         compile_model=False,
         force_compile=False,
+        cross_attention_max_tokens=256,
     ).to(device)
     model.train()
 
@@ -95,6 +96,7 @@ def _run_sharp(device: torch.device, steps: int, batch_size: int, size: int) -> 
         sparse_window_size=7,
         sparse_sparsity_ratio=0.5,
         sparse_k_cap=64,
+        max_global_tokens=256,
     ).to(device)
     model.train()
 
