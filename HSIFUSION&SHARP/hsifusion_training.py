@@ -88,6 +88,7 @@ class HSIFusionTrainingConfig:
     patch_size: int = 128
     stride: int = 8
     augment: bool = True
+    cache_size: int = 4
 
     # Optimisation
     epochs: int = 300
@@ -101,6 +102,8 @@ class HSIFusionTrainingConfig:
     use_amp: bool = True
     compile_model: bool = True
     use_channels_last: bool = True
+    cross_attention_max_tokens: Optional[int] = 1024
+    estimate_uncertainty: bool = False
 
     # Validation & logging
     val_interval: int = 10
@@ -120,6 +123,14 @@ class HSIFusionTrainingConfig:
     min_mrae_denom: float = 1e-6
     max_consecutive_nonfinite: int = 8
     skip_oom_batches: bool = True
+
+    def __post_init__(self) -> None:
+        if self.accumulate_steps <= 0:
+            raise ValueError("accumulate_steps must be > 0")
+        if self.cache_size < 0:
+            raise ValueError("cache_size must be >= 0")
+        if self.cross_attention_max_tokens is not None and self.cross_attention_max_tokens <= 0:
+            raise ValueError("cross_attention_max_tokens must be positive or None")
 
     def experiment_path(self) -> Path:
         root = Path(self.output_dir)
@@ -141,7 +152,8 @@ class HSIFusionTrainer:
 
         self.writer = SummaryWriter(log_dir=self.exp_dir / "tensorboard")
         self.criterion = MSTPlusPlusLoss()
-        self.scaler = GradScaler(enabled=config.use_amp)
+        self.use_amp = config.use_amp and self.device.type == "cuda"
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         self.model = self._build_model()
         self.train_loader, self.val_loader = self._build_dataloaders()
@@ -181,6 +193,8 @@ class HSIFusionTrainer:
             expected_min_size=self.config.patch_size,
             lazy_compile=False,
             force_compile=self.config.compile_model,
+            cross_attention_max_tokens=self.config.cross_attention_max_tokens,
+            estimate_uncertainty=self.config.estimate_uncertainty,
         )
         model = model.to(self.device)
         if self.config.use_channels_last and self.device.type == "cuda":
@@ -191,10 +205,25 @@ class HSIFusionTrainer:
         self, steps_per_epoch: int
     ) -> Tuple[optim.Optimizer, optim.lr_scheduler._LRScheduler]:
         """Create optimiser and scheduler."""
+        model_ref = getattr(self.model, "_orig_mod", self.model)
+        norm_types = (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)
+        decay_params = []
+        no_decay_params = []
+        for module in model_ref.modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
+                if isinstance(module, norm_types) or param_name.endswith("bias") or param.ndim == 1:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+
         optimizer = optim.AdamW(
-            self.model.parameters(),
+            [
+                {"params": decay_params, "weight_decay": self.config.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
             betas=(0.9, 0.999),
         )
 
@@ -272,13 +301,14 @@ class HSIFusionTrainer:
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             running_loss = 0.0
+            successful_batches = 0
 
             for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
                 rgb = rgb.to(self.device, non_blocking=True)
                 hsi = hsi.to(self.device, non_blocking=True)
 
                 try:
-                    with autocast(enabled=self.config.use_amp):
+                    with autocast(enabled=self.use_amp):
                         outputs = self.model(rgb)
                         if isinstance(outputs, tuple):
                             outputs, _ = outputs
@@ -341,6 +371,7 @@ class HSIFusionTrainer:
                     self._step_scheduler()
 
                 running_loss += loss.item()
+                successful_batches += 1
                 self.iteration += 1
 
                 if self.iteration % self.config.log_interval == 0:
@@ -348,7 +379,7 @@ class HSIFusionTrainer:
                     self.writer.add_scalar("train/loss", loss.item(), self.iteration)
                     self.writer.add_scalar("train/lr", current_lr, self.iteration)
 
-            avg_loss = running_loss / total_steps
+            avg_loss = running_loss / max(1, successful_batches)
             print(f"Epoch {epoch+1}/{self.config.epochs} - train loss: {avg_loss:.6f}")
 
             if (epoch + 1) % self.config.val_interval == 0:
@@ -391,7 +422,7 @@ class HSIFusionTrainer:
                 rgb = rgb.to(self.device, non_blocking=True)
                 hsi = hsi.to(self.device, non_blocking=True)
 
-                with autocast(enabled=self.config.use_amp):
+                with autocast(enabled=self.use_amp):
                     outputs = self.model(rgb)
                     if isinstance(outputs, tuple):
                         outputs, _ = outputs
@@ -415,6 +446,9 @@ def parse_args() -> HSIFusionTrainingConfig:
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--gradient_clip", type=float, default=1.0)
+    parser.add_argument("--accumulate_steps", type=int, default=1)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--memory_mode", type=str, default="float16",
@@ -422,10 +456,19 @@ def parse_args() -> HSIFusionTrainingConfig:
     parser.add_argument("--patch_size", type=int, default=128)
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--no_augment", action="store_true")
+    parser.add_argument("--cache_size", type=int, default=4)
+    parser.add_argument("--cross_attention_max_tokens", type=int, default=1024,
+                        help="Maximum encoder tokens used by decoder cross-attention (0 disables cap)")
+    parser.add_argument("--estimate_uncertainty", action="store_true",
+                        help="Enable the uncertainty head (requires a custom uncertainty loss to train it)")
     parser.add_argument("--min_mrae_denom", type=float, default=1e-6)
     parser.add_argument("--max_consecutive_nonfinite", type=int, default=8)
     parser.add_argument("--early_stopping_patience", type=int, default=40)
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-5)
+    parser.add_argument("--val_interval", type=int, default=10)
+    parser.add_argument("--save_interval", type=int, default=50)
+    parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--disable_oom_skip", action="store_true")
     parser.add_argument("--output_dir", type=str, default="./experiments/hsifusion")
     parser.add_argument("--experiment_name", type=str, default=None)
@@ -441,16 +484,28 @@ def parse_args() -> HSIFusionTrainingConfig:
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        gradient_clip=args.gradient_clip,
+        accumulate_steps=args.accumulate_steps,
+        warmup_epochs=args.warmup_epochs,
         use_amp=not args.no_amp,
         compile_model=not args.no_compile,
         memory_mode=args.memory_mode,
         patch_size=args.patch_size,
         stride=args.stride,
         num_workers=args.num_workers,
+        augment=not args.no_augment,
+        cache_size=args.cache_size,
+        cross_attention_max_tokens=(
+            args.cross_attention_max_tokens if args.cross_attention_max_tokens > 0 else None
+        ),
+        estimate_uncertainty=args.estimate_uncertainty,
         min_mrae_denom=args.min_mrae_denom,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        val_interval=args.val_interval,
+        save_interval=args.save_interval,
+        log_interval=args.log_interval,
         skip_oom_batches=not args.disable_oom_skip,
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,

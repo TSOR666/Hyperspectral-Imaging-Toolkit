@@ -102,8 +102,9 @@ class SHARPTrainingConfig:
     sparse_window_size: int = 49            # Window size for fallback (odd)
     sparse_k_cap: int = 1024                # Maximum k_keep to prevent memory spikes
     sparse_q_block_size: int = 1024         # Query block size for tiling
+    max_global_tokens: Optional[int] = 1024 # Bound dense global/cross-attention context
     rbf_centers_per_head: int = 32          # RBF centers per attention head
-    key_rbf_mode: str = 'mean'              # RBF key projection mode: mean/linear/none
+    key_rbf_mode: str = 'linear'            # Preserve query-dependent key rankings
     sparsemax_pad_value: Optional[float] = None  # Custom pad value for sparsemax
     ema_update_every: int = 1               # EMA update frequency (v3.2.2 throttling)
     
@@ -115,6 +116,7 @@ class SHARPTrainingConfig:
     stride: int = 8
     augment: bool = True
     memory_mode: str = 'float16'  # standard, float16, or lazy
+    cache_size: int = 4
     
     # Training configuration
     epochs: int = 300
@@ -178,6 +180,14 @@ class SHARPTrainingConfig:
             raise ValueError("accumulate_steps must be > 0")
         if self.psnr_data_range <= 0:
             raise ValueError("psnr_data_range must be > 0")
+        if self.max_global_tokens is not None and self.max_global_tokens <= 0:
+            self.max_global_tokens = None
+        if self.cache_size < 0:
+            raise ValueError("cache_size must be >= 0")
+        if self.ema_update_every <= 0:
+            raise ValueError("ema_update_every must be > 0")
+        if self.key_rbf_mode not in {'mean', 'linear', 'none'}:
+            raise ValueError("key_rbf_mode must be one of mean/linear/none")
 
 
 class SHARPLoss(nn.Module):
@@ -337,6 +347,7 @@ class DedicatedSHARPTrainer:
                 sparse_k_cap=self.config.sparse_k_cap,
                 sparse_block_size=self.config.sparse_block_size,
                 sparse_q_block_size=self.config.sparse_q_block_size,
+                max_global_tokens=self.config.max_global_tokens,
                 sparse_window_size=self.config.sparse_window_size,
                 sparse_max_tokens=self.config.sparse_max_tokens,
                 key_rbf_mode=self.config.key_rbf_mode,
@@ -453,6 +464,7 @@ class DedicatedSHARPTrainer:
                 memory_mode=self.config.memory_mode,
                 patch_size=self.config.patch_size,
                 stride=self.config.stride,
+                cache_size=self.config.cache_size,
                 seed=self.config.seed,
                 val_num_workers=min(2, self.config.num_workers),
             )
@@ -479,6 +491,7 @@ class DedicatedSHARPTrainer:
         print(f"  Block size: {self.config.sparse_block_size}")
         print(f"  Query block size: {self.config.sparse_q_block_size}")
         print(f"  Max tokens: {self.config.sparse_max_tokens}")
+        print(f"  Global context cap: {self.config.max_global_tokens or 'disabled'}")
         print(f"  Window size: {self.config.sparse_window_size}")
         print(f"  K-cap: {self.config.sparse_k_cap if self.config.sparse_k_cap else 'disabled'}")
         print(f"  RBF centers/head: {self.config.rbf_centers_per_head}")
@@ -698,7 +711,13 @@ class DedicatedSHARPTrainer:
         self.model.eval()
         
         if self.use_sharp_trainer:
-            metrics = self.sharp_trainer.evaluate(self.val_loader, psnr_max=self.config.psnr_data_range)
+            crop_size = self.config.val_crop_size if self.config.val_crop else None
+            metrics = self.sharp_trainer.evaluate(
+                self.val_loader,
+                psnr_max=self.config.psnr_data_range,
+                crop_size=crop_size,
+                use_ema=self.config.ema_decay > 0,
+            )
         else:
             metrics = self._manual_validate()
         
@@ -790,12 +809,20 @@ class DedicatedSHARPTrainer:
             'iteration': self.iteration,
             'model_state_dict': model_state,
             'best_mrae': self.best_mrae,
+            'bad_val_epochs': self.bad_val_epochs,
+            'skipped_oom_batches': self.skipped_oom_batches,
+            'skipped_nonfinite_batches': self.skipped_nonfinite_batches,
             'config': self.config,
             'sharp_version': '3.2.2'
         }
         
-        # Add training state if not using SHARPv32Trainer
-        if not self.use_sharp_trainer:
+        if self.use_sharp_trainer:
+            checkpoint['trainer_state_dict'] = self.sharp_trainer.state_dict()
+            if self.sharp_trainer.ema_state is not None:
+                checkpoint['ema_model_state_dict'] = self.sharp_trainer.get_ema_model(
+                    device='cpu', eval_mode=True
+                ).state_dict()
+        else:
             checkpoint.update({
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
@@ -824,8 +851,20 @@ class DedicatedSHARPTrainer:
         self.start_epoch = checkpoint['epoch']
         self.iteration = checkpoint.get('iteration', 0)
         self.best_mrae = checkpoint.get('best_mrae', float('inf'))
+        self.bad_val_epochs = checkpoint.get('bad_val_epochs', 0)
+        self.skipped_oom_batches = checkpoint.get('skipped_oom_batches', 0)
+        self.skipped_nonfinite_batches = checkpoint.get('skipped_nonfinite_batches', 0)
         
-        if not self.use_sharp_trainer:
+        if self.use_sharp_trainer:
+            trainer_state = checkpoint.get('trainer_state_dict')
+            if trainer_state is not None:
+                self.sharp_trainer.load_state_dict(trainer_state)
+            else:
+                warnings.warn(
+                    "Legacy checkpoint has no built-in trainer state; optimizer, "
+                    "scheduler, scaler, and EMA will restart."
+                )
+        else:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -850,11 +889,17 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--patch_size', type=int, default=128,
                         help='Patch size for training')
+    parser.add_argument('--stride', type=int, default=8,
+                        help='Training patch stride')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
     parser.add_argument('--memory_mode', type=str, default='float16',
                         choices=['standard', 'float16', 'lazy'],
                         help='Memory mode for dataloader')
+    parser.add_argument('--cache_size', type=int, default=4,
+                        help='Per-worker full-image cache size in lazy mode')
+    parser.add_argument('--no_augment', action='store_true',
+                        help='Disable paired spatial augmentation')
     
     # Training configuration
     parser.add_argument('--epochs', type=int, default=300,
@@ -863,26 +908,45 @@ def main():
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay')
+    parser.add_argument('--warmup_ratio', type=float, default=0.1,
+                        help='Fraction of optimizer steps used for warmup')
+    parser.add_argument('--gradient_clip', type=float, default=1.0,
+                        help='Gradient norm clipping threshold')
+    parser.add_argument('--accumulate_steps', type=int, default=1,
+                        help='Gradient accumulation steps')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='Exponential moving average decay')
     
     # SHARP v3.2.2 specific
-    parser.add_argument('--sparsity', type=float, default=0.9,
+    parser.add_argument('--sparsity', '--sparse_sparsity_ratio', dest='sparsity',
+                        type=float, default=0.9,
                         help='Sparse attention sparsity ratio (0.0-1.0)')
     parser.add_argument('--rbf_centers', type=int, default=32,
                         help='RBF centers per attention head')
-    parser.add_argument('--k_cap', type=int, default=1024,
+    parser.add_argument('--k_cap', '--sparse_k_cap', dest='k_cap', type=int, default=1024,
                         help='Memory cap for top-k (0 = no cap)')
-    parser.add_argument('--block_size', type=int, default=2048,
+    parser.add_argument('--block_size', '--sparse_block_size', dest='block_size',
+                        type=int, default=2048,
                         help='Block size for streaming attention')
-    parser.add_argument('--q_block_size', type=int, default=1024,
+    parser.add_argument('--q_block_size', '--sparse_q_block_size', dest='q_block_size',
+                        type=int, default=1024,
                         help='Query block size for tiling')
-    parser.add_argument('--key_rbf_mode', type=str, default='mean',
+    parser.add_argument('--max_tokens', '--sparse_max_tokens', dest='max_tokens',
+                        type=int, default=8192,
+                        help='Token count above which sparse attention uses its local fallback')
+    parser.add_argument('--window_size', '--sparse_window_size', dest='window_size',
+                        type=int, default=49,
+                        help='Local fallback window size')
+    parser.add_argument('--max_global_tokens', type=int, default=1024,
+                        help='Maximum key/value tokens in dense global and cross attention (0 disables cap)')
+    parser.add_argument('--key_rbf_mode', type=str, default='linear',
                         choices=['mean', 'linear', 'none'],
                         help='RBF key projection mode')
     parser.add_argument('--ema_update_every', type=int, default=1,
                         help='EMA update frequency (v3.2.2 throttling)')
     
     # Optimization
-    parser.add_argument('--compile', action='store_true',
+    parser.add_argument('--compile', '--compile_model', dest='compile', action='store_true',
                         help='Compile model with torch.compile')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable automatic mixed precision')
@@ -892,6 +956,12 @@ def main():
                         help='Stop training after this many validations without improvement')
     parser.add_argument('--early_stopping_min_delta', type=float, default=1e-5,
                         help='Minimum MRAE improvement to reset early stopping counter')
+    parser.add_argument('--val_interval', type=int, default=10,
+                        help='Validation interval in epochs')
+    parser.add_argument('--save_interval', type=int, default=50,
+                        help='Periodic checkpoint interval in epochs')
+    parser.add_argument('--log_interval', type=int, default=100,
+                        help='Training log interval in batches')
     parser.add_argument('--psnr_data_range', type=float, default=1.0,
                         help='Reference intensity range used when reporting PSNR')
     parser.add_argument('--min_mrae_denom', type=float, default=1e-6,
@@ -921,16 +991,26 @@ def main():
         data_root=args.data_root,
         batch_size=args.batch_size,
         patch_size=args.patch_size,
+        stride=args.stride,
         num_workers=args.num_workers,
         memory_mode=args.memory_mode,
+        cache_size=args.cache_size,
+        augment=not args.no_augment,
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        gradient_clip=args.gradient_clip,
+        accumulate_steps=args.accumulate_steps,
+        ema_decay=args.ema_decay,
         sparse_sparsity_ratio=args.sparsity,
         rbf_centers_per_head=args.rbf_centers,
         sparse_k_cap=args.k_cap,
         sparse_block_size=args.block_size,
         sparse_q_block_size=args.q_block_size,
+        sparse_max_tokens=args.max_tokens,
+        sparse_window_size=args.window_size,
+        max_global_tokens=args.max_global_tokens,
         key_rbf_mode=args.key_rbf_mode,
         ema_update_every=args.ema_update_every,
         compile_model=args.compile,
@@ -938,6 +1018,9 @@ def main():
         use_checkpoint=args.checkpoint,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        val_interval=args.val_interval,
+        save_interval=args.save_interval,
+        log_interval=args.log_interval,
         psnr_data_range=args.psnr_data_range,
         min_mrae_denom=args.min_mrae_denom,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,

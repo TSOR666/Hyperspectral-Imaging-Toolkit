@@ -104,6 +104,27 @@ def has_cuda_11_8_or_newer():
 
 HAS_CUDA_11_8 = has_cuda_11_8_or_newer()
 
+
+def _pooled_spatial_size(height: int, width: int, max_tokens: Optional[int]) -> Tuple[int, int]:
+    """Choose an aspect-ratio-preserving pooled size bounded by max_tokens."""
+    if max_tokens is None or height * width <= max_tokens:
+        return height, width
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be positive or None, got {max_tokens}")
+
+    scale = math.sqrt(max_tokens / float(height * width))
+    pooled_h = max(1, int(height * scale))
+    pooled_w = max(1, int(width * scale))
+    while pooled_h * pooled_w > max_tokens:
+        if pooled_w >= pooled_h and pooled_w > 1:
+            pooled_w -= 1
+        elif pooled_h > 1:
+            pooled_h -= 1
+        else:
+            break
+    return pooled_h, pooled_w
+
+
 # ============================================================================
 # Enums for configuration
 # ============================================================================
@@ -123,7 +144,8 @@ def sparse_attention_topk_streaming(
     sparsity_ratio: float = 0.9, scale: Optional[float] = None, 
     block_size: int = 2048, max_tokens: int = 8192,
     window_size: int = 49, k_cap: Optional[int] = 1024,
-    q_block_size: int = 1024
+    q_block_size: int = 1024,
+    spatial_shape: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """
     Streaming top-k attention that avoids allocating the full (N x N) scores.
@@ -191,7 +213,15 @@ def sparse_attention_topk_streaming(
         if adjusted_window_size != window_size:
             logger.debug(f"Adjusted window_size from {window_size} to {adjusted_window_size} (must be odd)")
 
-        return local_window_attention(q, k, v, adjusted_window_size, scale)
+        return local_window_attention(
+            q,
+            k,
+            v,
+            adjusted_window_size,
+            scale,
+            spatial_shape=spatial_shape,
+            q_block_size=q_block_size,
+        )
     
     # Initialize output tensor with v's dimension
     out = q.new_zeros(BH, N, D_v)
@@ -255,11 +285,10 @@ def sparse_attention_topk_streaming(
 
 
 def local_window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                          window_size: int, scale: float) -> torch.Tensor:
-    """Vectorized local window attention for very large sequences.
-    
-    Fixed to handle different q/k/v dimensions that can occur with RBF transforms.
-    """
+                          window_size: int, scale: float,
+                          spatial_shape: Optional[Tuple[int, int]] = None,
+                          q_block_size: int = 1024) -> torch.Tensor:
+    """Chunked 2D local attention for very large spatial sequences."""
     BH, N, D_q = q.shape
     D_k = k.shape[-1]  # k dimension (may differ from q due to RBF)
     D_v = v.shape[-1]  # v dimension (original head_dim)
@@ -268,35 +297,63 @@ def local_window_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if window_size <= 1:
         return v
     
-    # Ensure window_size is odd for symmetric window
-    if window_size % 2 == 0:
-        window_size -= 1
-    half = window_size // 2
-    
-    # Build (N, W) neighbor indices
-    base = torch.arange(N, device=q.device).unsqueeze(1)
-    offsets = torch.arange(-half, half + 1, device=q.device).unsqueeze(0)
-    idx = (base + offsets).clamp_(0, N - 1)
-    
-    # Gather k and v windows
-    W = idx.size(1)
-    
-    # Create separate index tensors for k and v with their respective dimensions
-    idx_b_k = idx.unsqueeze(0).unsqueeze(-1).expand(BH, -1, -1, D_k)
-    idx_b_v = idx.unsqueeze(0).unsqueeze(-1).expand(BH, -1, -1, D_v)
-    
-    k_src = k.unsqueeze(2).expand(-1, -1, W, -1)
-    v_src = v.unsqueeze(2).expand(-1, -1, W, -1)
-    
-    k_win = torch.gather(k_src, 1, idx_b_k)
-    v_win = torch.gather(v_src, 1, idx_b_v)
-    
-    # Compute scores using q's dimension
-    scores = torch.einsum('bnd,bnwd->bnw', q, k_win) * scale
-    attn = F.softmax(scores.to(torch.float32), dim=-1).to(scores.dtype)
-    
-    # Apply attention to values
-    out = torch.einsum('bnw,bnwd->bnd', attn, v_win)
+    if spatial_shape is None:
+        height = int(math.sqrt(N))
+        width = N // height if height > 0 and N % height == 0 else N
+        height = N // width
+    else:
+        height, width = spatial_shape
+    if height * width != N:
+        raise ValueError(
+            f"spatial_shape={(height, width)} does not match sequence length N={N}"
+        )
+
+    window_side = max(1, int(math.ceil(math.sqrt(window_size))))
+    if window_side % 2 == 0:
+        window_side += 1
+    half = window_side // 2
+    offsets_y, offsets_x = torch.meshgrid(
+        torch.arange(-half, half + 1, device=q.device),
+        torch.arange(-half, half + 1, device=q.device),
+        indexing="ij",
+    )
+    offsets_y = offsets_y.reshape(1, -1)
+    offsets_x = offsets_x.reshape(1, -1)
+
+    out = q.new_zeros(BH, N, D_v)
+    batch_offsets = torch.arange(BH, device=q.device).view(BH, 1, 1) * N
+    k_flat = k.reshape(BH * N, D_k)
+    v_flat = v.reshape(BH * N, D_v)
+
+    for q_start in range(0, N, q_block_size):
+        q_end = min(q_start + q_block_size, N)
+        positions = torch.arange(q_start, q_end, device=q.device).unsqueeze(1)
+        center_y = positions // width
+        center_x = positions % width
+        neighbor_y = center_y + offsets_y
+        neighbor_x = center_x + offsets_x
+        valid = (
+            (neighbor_y >= 0)
+            & (neighbor_y < height)
+            & (neighbor_x >= 0)
+            & (neighbor_x < width)
+        )
+        neighbor_idx = (
+            neighbor_y.clamp(0, height - 1) * width
+            + neighbor_x.clamp(0, width - 1)
+        ).long()
+        gather_idx = (neighbor_idx.unsqueeze(0) + batch_offsets).reshape(-1)
+        q_len, neighbors = neighbor_idx.shape
+        k_win = k_flat.index_select(0, gather_idx).view(BH, q_len, neighbors, D_k)
+        v_win = v_flat.index_select(0, gather_idx).view(BH, q_len, neighbors, D_v)
+        scores = torch.einsum(
+            'bnd,bnwd->bnw', q[:, q_start:q_end], k_win
+        ) * scale
+        scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+        attn = F.softmax(scores.to(torch.float32), dim=-1).to(scores.dtype)
+        out[:, q_start:q_end] = torch.einsum(
+            'bnw,bnwd->bnd', attn, v_win
+        )
     return out
 
 # ============================================================================
@@ -453,12 +510,14 @@ class VectorizedWindowedSparsemax(nn.Module):
 class MultiScaleAttention(nn.Module):
     """Multi-scale attention with local and global branches."""
     def __init__(self, dim: int, num_heads: int = 8, 
-                 local_window: int = 7, use_conv_proj: bool = True):
+                 local_window: int = 7, use_conv_proj: bool = True,
+                 max_global_tokens: Optional[int] = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.local_window = local_window
+        self.max_global_tokens = max_global_tokens
         
         groups = get_optimal_groups(dim, dim * 3)
         if use_conv_proj:
@@ -485,7 +544,16 @@ class MultiScaleAttention(nn.Module):
         
         qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H*W)
         q, k, v = qkv.unbind(1)
-        q, k, v = [t.permute(0, 1, 3, 2) for t in (q, k, v)]
+        q = q.permute(0, 1, 3, 2)
+        pooled_h, pooled_w = _pooled_spatial_size(H, W, self.max_global_tokens)
+        if (pooled_h, pooled_w) != (H, W):
+            k = F.adaptive_avg_pool2d(
+                k.reshape(B, C, H, W), (pooled_h, pooled_w)
+            ).reshape(B, self.num_heads, self.head_dim, -1)
+            v = F.adaptive_avg_pool2d(
+                v.reshape(B, C, H, W), (pooled_h, pooled_w)
+            ).reshape(B, self.num_heads, self.head_dim, -1)
+        k, v = [t.permute(0, 1, 3, 2) for t in (k, v)]
         
         global_out = sdpa_unified(q, k, v, scale=self.scale)
         global_out = global_out.permute(0, 1, 3, 2).reshape(B, C, H, W)
@@ -618,7 +686,8 @@ class OptimizedSparseAttention(nn.Module):
                 max_tokens=self.max_tokens,
                 window_size=self.window_size,
                 k_cap=self.k_cap,
-                q_block_size=self.q_block_size
+                q_block_size=self.q_block_size,
+                spatial_shape=(H, W),
             )
             out = out_flat.reshape(B, self.num_heads, N, -1)
         else:
@@ -661,13 +730,16 @@ class EnhancedDualAttentionBlock(nn.Module):
     """Dual attention with optimized memory usage."""
     def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.,
                  drop_path: float = 0., use_checkpoint: bool = False,
-                 sparse_config: Optional[dict] = None):
+                 sparse_config: Optional[dict] = None,
+                 max_global_tokens: Optional[int] = None):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         
         self.norm = ChannelRMSNorm(dim)
         
-        self.attn1 = MultiScaleAttention(dim, num_heads)
+        self.attn1 = MultiScaleAttention(
+            dim, num_heads, max_global_tokens=max_global_tokens
+        )
         
         # Use sparse config if provided
         sparse_kwargs = sparse_config or {}
@@ -712,11 +784,17 @@ class EnhancedDualAttentionBlock(nn.Module):
 
 class ImprovedCrossAttentionFusion(nn.Module):
     """Cross-attention with gated residual."""
-    def __init__(self, dim: int, num_heads: int = 8):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        max_global_tokens: Optional[int] = None,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.max_global_tokens = max_global_tokens
         
         self.norm1 = ChannelRMSNorm(dim)
         self.norm2 = ChannelRMSNorm(dim)
@@ -740,6 +818,14 @@ class ImprovedCrossAttentionFusion(nn.Module):
         q = self.q(x_norm).reshape(B, self.num_heads, self.head_dim, H*W).permute(0, 1, 3, 2)
         kv = self.kv(skip_norm).reshape(B, 2, self.num_heads, self.head_dim, H*W)
         k, v = kv.unbind(1)
+        pooled_h, pooled_w = _pooled_spatial_size(H, W, self.max_global_tokens)
+        if (pooled_h, pooled_w) != (H, W):
+            k = F.adaptive_avg_pool2d(
+                k.reshape(B, C, H, W), (pooled_h, pooled_w)
+            ).reshape(B, self.num_heads, self.head_dim, -1)
+            v = F.adaptive_avg_pool2d(
+                v.reshape(B, C, H, W), (pooled_h, pooled_w)
+            ).reshape(B, self.num_heads, self.head_dim, -1)
         k, v = [t.permute(0, 1, 3, 2) for t in (k, v)]
         
         out = sdpa_unified(q, k, v, scale=self.scale)
@@ -771,6 +857,7 @@ class SHARPv32Config:
     sparse_k_cap: int = 1024
     sparse_q_block_size: int = 1024
     sparse_sparsity_ratio: float = 0.9
+    max_global_tokens: Optional[int] = None
     # RBF kernel parameters
     rbf_centers_per_head: int = 32
     # v3.2.2 additions
@@ -791,6 +878,10 @@ class SHARPv32Config:
             logger.info("Auto-disabled sparse_k_cap for sparsity_ratio=0 (dense attention)")
         elif self.sparse_k_cap is not None and self.sparse_k_cap <= 0:
             self.sparse_k_cap = None
+        if self.max_global_tokens is not None and self.max_global_tokens <= 0:
+            raise ValueError("max_global_tokens must be positive or None")
+        if self.ema_update_every <= 0:
+            raise ValueError("ema_update_every must be > 0")
 
 # ============================================================================
 # Improved SHARP Model with v3.2.2 enhancements
@@ -846,7 +937,8 @@ class SHARPv32(nn.Module):
                     mlp_ratio=config.mlp_ratios[i],
                     drop_path=dpr[cur_depth + j],
                     use_checkpoint=config.use_checkpoint,
-                    sparse_config=sparse_config
+                    sparse_config=sparse_config,
+                    max_global_tokens=config.max_global_tokens,
                 )
                 for j in range(config.depths[i])
             ])
@@ -873,7 +965,13 @@ class SHARPv32(nn.Module):
                 nn.GELU()
             ))
             
-            self.fusion.append(ImprovedCrossAttentionFusion(up_dim, config.heads[i-1]))
+            self.fusion.append(
+                ImprovedCrossAttentionFusion(
+                    up_dim,
+                    config.heads[i-1],
+                    max_global_tokens=config.max_global_tokens,
+                )
+            )
         
         self.head = nn.Sequential(
             nn.Conv2d(config.base_dim, config.base_dim, 3, padding=1),
@@ -973,21 +1071,14 @@ class SHARPv32(nn.Module):
         return torch.tanh(out)
     
     def compute_loss(self, pred, target, alpha: float = 0.1):
-        """Memory-efficient loss with spectral regularization using cached basis."""
+        """Reconstruction loss with target-aligned spectral curvature matching."""
         rec_loss = F.l1_loss(pred, target)
         
-        if alpha > 0:
-            # v3.2.2: Use cached spectral basis
-            basis = self._get_spectral_basis(pred.device, pred.dtype)
-            
-            # Memory-efficient computation using einsum
-            proj = torch.einsum('bchw,dc->bdhw', pred, basis)
-            smooth_loss = F.mse_loss(
-                torch.einsum('bdhw,dc->bchw', proj, basis), 
-                pred
-            )
-            
-            return rec_loss + alpha * smooth_loss
+        if alpha > 0 and pred.shape[1] >= 3:
+            pred_curvature = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
+            target_curvature = target[:, 2:] - 2 * target[:, 1:-1] + target[:, :-2]
+            spectral_loss = F.l1_loss(pred_curvature, target_curvature)
+            return rec_loss + alpha * spectral_loss
         
         return rec_loss
     
@@ -1185,7 +1276,7 @@ class SHARPv32Trainer:
         )
         decay, no_decay = [], []
         
-        for mod_name, mod in self.model.named_modules():
+        for mod_name, mod in self._orig_model.named_modules():
             for p_name, p in mod.named_parameters(recurse=False):
                 if not p.requires_grad:
                     continue
@@ -1211,18 +1302,36 @@ class SHARPv32Trainer:
             return 0.5 * (1.0 + math.cos(math.pi * progress))
             
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+    def state_dict(self) -> Dict[str, object]:
+        """Return all state required for an exact training resume."""
+        return {
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "ema_state": self.ema_state,
+            "step": self._step,
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        """Restore optimizer, scheduler, scaler, EMA, and step counters."""
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.scheduler.load_state_dict(state["scheduler_state_dict"])
+        self.scaler.load_state_dict(state["scaler_state_dict"])
+        self.ema_state = state.get("ema_state")
+        self._step = int(state.get("step", 0))
         
     def _create_ema_state(self):
         """Create EMA state on CPU to save VRAM."""
         state = {}
         
         # Parameters
-        for k, p in self.model.named_parameters():
+        for k, p in self._orig_model.named_parameters():
             if p.requires_grad:
                 state[k] = p.detach().to('cpu', non_blocking=True).float()
         
         # Buffers
-        for mod_name, mod in self.model.named_modules():
+        for mod_name, mod in self._orig_model.named_modules():
             non_persist = getattr(mod, "_non_persistent_buffers_set", set())
             for buf_name, b in mod.named_buffers(recurse=False):
                 if b is None or buf_name.startswith('_') or 'num_batches_tracked' in buf_name:
@@ -1245,7 +1354,7 @@ class SHARPv32Trainer:
             return
             
         # Update EMA parameters
-        for name, param in self.model.named_parameters():
+        for name, param in self._orig_model.named_parameters():
             if name in self.ema_state:
                 param_cpu = param.detach().to('cpu', non_blocking=True).float()
                 self.ema_state[name].mul_(self.ema_decay).add_(
@@ -1253,7 +1362,7 @@ class SHARPv32Trainer:
                 )
         
         # Update buffers
-        for mod_name, mod in self.model.named_modules():
+        for mod_name, mod in self._orig_model.named_modules():
             non_persist = getattr(mod, "_non_persistent_buffers_set", set())
             for buf_name, buffer in mod.named_buffers(recurse=False):
                 if buffer is None or buf_name in non_persist:
@@ -1279,7 +1388,7 @@ class SHARPv32Trainer:
         
         with _autocast(enabled=self.use_amp):
             outputs = self.model(inputs)
-            loss = self.model.compute_loss(outputs, targets)
+            loss = self._orig_model.compute_loss(outputs, targets)
 
         if not torch.isfinite(loss):
             self.optimizer.zero_grad(set_to_none=True)
@@ -1334,12 +1443,23 @@ class SHARPv32Trainer:
         }
         
     @torch.no_grad()
-    def evaluate(self, dataloader, psnr_max: float = 1.0) -> Dict[str, float]:
+    def evaluate(
+        self,
+        dataloader,
+        psnr_max: float = 1.0,
+        crop_size: Optional[Tuple[int, int]] = None,
+        use_ema: bool = False,
+    ) -> Dict[str, float]:
         """Evaluate model."""
         if psnr_max <= 0:
             raise ValueError("psnr_max must be positive")
         
-        self.model.eval()
+        eval_model = (
+            self.get_ema_model(device=self.device, eval_mode=True)
+            if use_ema and self.ema_state is not None
+            else self.model
+        )
+        eval_model.eval()
         
         total_loss = 0.0
         total_mrae = 0.0
@@ -1352,8 +1472,20 @@ class SHARPv32Trainer:
             targets = targets.to(self.device)
             
             with _autocast(enabled=self.use_amp):
-                outputs = self.model(inputs)
-                loss = self.model.compute_loss(outputs, targets)
+                outputs = eval_model(inputs)
+                if crop_size is not None:
+                    crop_h, crop_w = crop_size
+                    height, width = outputs.shape[-2:]
+                    if height >= crop_h and width >= crop_w:
+                        start_h = (height - crop_h) // 2
+                        start_w = (width - crop_w) // 2
+                        outputs = outputs[
+                            ..., start_h:start_h + crop_h, start_w:start_w + crop_w
+                        ]
+                        targets = targets[
+                            ..., start_h:start_h + crop_h, start_w:start_w + crop_w
+                        ]
+                loss = self._orig_model.compute_loss(outputs, targets)
             
             abs_err = torch.abs(outputs - targets)
             mrae = torch.mean(abs_err / torch.clamp_min(torch.abs(targets), 1e-6))

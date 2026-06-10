@@ -149,6 +149,27 @@ def _factor_pair(n: int) -> Tuple[int, int]:
     )
     return h, w
 
+
+def _pooled_spatial_size(height: int, width: int, max_tokens: Optional[int]) -> Tuple[int, int]:
+    """Choose an aspect-ratio-preserving pooled size bounded by max_tokens."""
+    if max_tokens is None or height * width <= max_tokens:
+        return height, width
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be positive or None, got {max_tokens}")
+
+    scale = math.sqrt(max_tokens / float(height * width))
+    pooled_h = max(1, int(height * scale))
+    pooled_w = max(1, int(width * scale))
+    while pooled_h * pooled_w > max_tokens:
+        if pooled_w >= pooled_h and pooled_w > 1:
+            pooled_w -= 1
+        elif pooled_h > 1:
+            pooled_h -= 1
+        else:
+            break
+    return pooled_h, pooled_w
+
+
 # ============================================================================
 # Fixed merge_sliding_windows using F.fold
 # ============================================================================
@@ -920,6 +941,7 @@ class LightningProConfig:
     num_experts: int = 4
     use_rope: bool = True
     use_cross_attention: bool = True
+    cross_attention_max_tokens: Optional[int] = None
     enable_spectral: bool = True
     spectral_basis_rank: Optional[int] = None
     
@@ -1031,7 +1053,8 @@ class HSIFusionNetV25LightningPro(nn.Module):
             if config.use_cross_attention:
                 cross_attn = CrossAttention(
                     dim=self.dims[i-1],
-                    num_heads=config.num_heads * (2 ** min(i-1, 2))
+                    num_heads=config.num_heads * (2 ** min(i-1, 2)),
+                    max_context_tokens=config.cross_attention_max_tokens,
                 )
                 self.cross_attns.append(cross_attn)
             
@@ -1150,7 +1173,9 @@ class HSIFusionNetV25LightningPro(nn.Module):
                 B, C, H, W = x.shape
                 x_flat = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
                 skip_flat = skip.flatten(2).transpose(1, 2)  # (B, C, Hs, Ws) -> (B, Hs*Ws, C)
-                x_flat = self.cross_attns[i](x_flat, skip_flat)  # (B, H*W, C)
+                x_flat = self.cross_attns[i](
+                    x_flat, skip_flat, context_hw=skip.shape[-2:]
+                )  # (B, H*W, C)
                 x = x_flat.transpose(1, 2).reshape(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
             
             # Ensure spatial dimensions match
@@ -1328,6 +1353,7 @@ class CrossAttention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        max_context_tokens: Optional[int] = None,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
@@ -1336,6 +1362,7 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.max_context_tokens = max_context_tokens
         
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
@@ -1343,7 +1370,12 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
         
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        context_hw: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
         """Apply cross-attention.
 
         Args:
@@ -1354,6 +1386,26 @@ class CrossAttention(nn.Module):
             (B, N, C) attended tokens
         """
         B, N, C = x.shape
+        _, M, context_channels = context.shape
+        if context_channels != C:
+            raise ValueError(
+                f"Context channels ({context_channels}) must match query channels ({C})"
+            )
+        if self.max_context_tokens is not None and M > self.max_context_tokens:
+            if context_hw is None:
+                context_hw = _factor_pair(M)
+            context_h, context_w = context_hw
+            if context_h * context_w != M:
+                raise ValueError(
+                    f"context_hw={context_hw} does not match token count M={M}"
+                )
+            pooled_h, pooled_w = _pooled_spatial_size(
+                context_h, context_w, self.max_context_tokens
+            )
+            context = F.adaptive_avg_pool2d(
+                context.transpose(1, 2).reshape(B, C, context_h, context_w),
+                (pooled_h, pooled_w),
+            ).flatten(2).transpose(1, 2)
         
         q = self.q(x).reshape(
             B, N, self.num_heads, C // self.num_heads
