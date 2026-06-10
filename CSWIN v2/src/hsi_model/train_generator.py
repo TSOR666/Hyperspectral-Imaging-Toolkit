@@ -3,9 +3,8 @@
 Generator-only (no-GAN) training for CSWin RGB->HSI reconstruction.
 
 This is the post-GAN trainer: the discriminator, Sinkhorn-OT adversarial loss,
-and R1 regularization are gone. The objective is pure reconstruction (MRAE by
-default — the ARAD-1K leaderboard metric and MST++'s training loss), so the
-reported metric is optimized directly and results are comparable to MST++.
+and R1 regularization are gone. The objective is configurable reconstruction
+loss (L1 in the active HSIFormer recipe, with MRAE variants also available).
 
 Dropping the GAN removes 4 discriminator forwards + a discriminator backward +
 the per-batch Sinkhorn loop per iteration, which frees most of the compute
@@ -24,6 +23,7 @@ inference:
 import os
 import sys
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -80,8 +80,69 @@ from hsi_model.train_optimized import (
 logger = logging.getLogger(__name__)
 
 
+def _update_early_stopping(
+    current_mrae: float,
+    best_mrae: float,
+    bad_epochs: int,
+    patience: int,
+    min_delta: float,
+    epoch: int,
+    warmup_epochs: int,
+) -> tuple[float, int, bool]:
+    """Update validation-MRAE early-stopping state."""
+    improved = math.isfinite(current_mrae) and current_mrae < best_mrae - min_delta
+    if improved:
+        best_mrae = current_mrae
+        bad_epochs = 0
+    elif epoch >= warmup_epochs:
+        bad_epochs += 1
+
+    should_stop = (
+        patience > 0
+        and epoch >= warmup_epochs
+        and bad_epochs >= patience
+    )
+    return best_mrae, bad_epochs, should_stop
+
+
+def _sync_early_stopping_state(
+    record_mrae_loss: float,
+    early_stopping_best_mrae: float,
+    early_stopping_bad_epochs: int,
+    should_stop: bool,
+    device: torch.device,
+    distributed: bool,
+) -> tuple[float, float, int, bool]:
+    """Broadcast rank-zero stopping state so every DDP worker exits together."""
+    if not distributed:
+        return (
+            record_mrae_loss,
+            early_stopping_best_mrae,
+            early_stopping_bad_epochs,
+            should_stop,
+        )
+
+    state = torch.tensor(
+        [
+            record_mrae_loss,
+            early_stopping_best_mrae,
+            float(early_stopping_bad_epochs),
+            float(should_stop),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    torch.distributed.broadcast(state, src=0)
+    return (
+        float(state[0].item()),
+        float(state[1].item()),
+        int(state[2].item()),
+        bool(state[3].item()),
+    )
+
+
 def build_criterion(config: Dict[str, Any]) -> nn.Module:
-    """Reconstruction criterion. Default 'mrae' = the MST++ / leaderboard MRAE."""
+    """Build the configured reconstruction criterion (L1 by default)."""
     objective = str(config.get("objective", "l1")).lower()
     if objective in ("l1", "mae"):
         # HSIFormer/SS-Transformer (paper Sec 4.2) trains with L1 on [0,1]
@@ -237,9 +298,11 @@ def _run_stage(
     net, generator, optimizer, scheduler, scaler, criterion, ema,
     train_loader, val_dataset, config, device, metrics_logger,
     distributed, seed, rank, stage_idx, stage_iterations,
-    global_iter, record_mrae_loss, start_stage_iter=0,
+    global_iter, record_mrae_loss, early_stopping_best_mrae,
+    early_stopping_bad_epochs, early_stopping_enabled,
+    start_stage_iter=0,
 ):
-    """Run one progressive-training stage; returns (global_iter, record_mrae_loss).
+    """Run one progressive-training stage and return training/stopping state.
 
     ``global_iter`` is the cumulative iteration across all stages (used for epoch
     numbering, logging and checkpoints); ``stage_iter`` is local to this stage
@@ -251,6 +314,9 @@ def _run_stage(
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
     max_consecutive_nonfinite = int(config.get("max_consecutive_nonfinite_generator_outputs", 3))
+    early_stopping_patience = max(0, int(config.get("early_stopping_patience", 0)))
+    early_stopping_min_delta = max(0.0, float(config.get("early_stopping_min_delta", 0.0)))
+    early_stopping_warmup_epochs = max(0, int(config.get("early_stopping_warmup_epochs", 0)))
 
     data_iter = iter(train_loader)
     is_distributed = isinstance(train_loader.sampler, DistributedSampler)
@@ -357,18 +423,55 @@ def _run_stage(
 
                 current_mrae = val_metrics.get("mrae", float("inf"))
                 epoch_num = iteration // per_epoch_iteration
+                stage_epoch_num = stage_iter // per_epoch_iteration
                 avg_train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+                objective_name = str(config.get("objective", "l1")).upper()
                 train_logger.info(
-                    "Iter[%06d] Epoch[%06d] TrainMRAE: %.6f TestMRAE: %.6f",
-                    iteration, epoch_num, avg_train_loss, current_mrae,
+                    "Iter[%06d] Epoch[%06d] TrainLoss[%s]: %.6f ValMRAE: %.6f",
+                    iteration, epoch_num, objective_name, avg_train_loss, current_mrae,
                 )
                 metrics_logger.log_scalars(
                     {"train_loss": avg_train_loss, "lr": lr}, epoch_num, "train"
                 )
                 metrics_logger.log_scalars(val_metrics, epoch_num, "val")
 
-                if config.get("local_rank", 0) == 0:
+                should_stop = False
+                if rank == 0:
                     is_best = current_mrae < record_mrae_loss
+                    previous_best = record_mrae_loss
+                    if is_best:
+                        record_mrae_loss = current_mrae
+
+                    if early_stopping_enabled:
+                        (
+                            early_stopping_best_mrae,
+                            early_stopping_bad_epochs,
+                            should_stop,
+                        ) = _update_early_stopping(
+                            current_mrae=current_mrae,
+                            best_mrae=early_stopping_best_mrae,
+                            bad_epochs=early_stopping_bad_epochs,
+                            patience=early_stopping_patience,
+                            min_delta=early_stopping_min_delta,
+                            epoch=stage_epoch_num,
+                            warmup_epochs=early_stopping_warmup_epochs,
+                        )
+
+                (
+                    record_mrae_loss,
+                    early_stopping_best_mrae,
+                    early_stopping_bad_epochs,
+                    should_stop,
+                ) = _sync_early_stopping_state(
+                    record_mrae_loss=record_mrae_loss,
+                    early_stopping_best_mrae=early_stopping_best_mrae,
+                    early_stopping_bad_epochs=early_stopping_bad_epochs,
+                    should_stop=should_stop,
+                    device=device,
+                    distributed=distributed,
+                )
+
+                if rank == 0:
                     checkpoint_dir = config["checkpoint_dir"]
                     checkpoint_dict = {
                         "epoch": epoch_num,
@@ -379,7 +482,9 @@ def _run_stage(
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
-                        "best_mrae": min(current_mrae, record_mrae_loss),
+                        "best_mrae": record_mrae_loss,
+                        "early_stopping_best_mrae": early_stopping_best_mrae,
+                        "early_stopping_bad_epochs": early_stopping_bad_epochs,
                         "val_metrics": val_metrics,
                         "config": config,
                         "torch_rng_state": torch.get_rng_state(),
@@ -393,8 +498,6 @@ def _run_stage(
                         checkpoint_dict, os.path.join(checkpoint_dir, CHECKPOINT_LATEST_NAME)
                     )
                     if is_best:
-                        previous_best = record_mrae_loss
-                        record_mrae_loss = current_mrae
                         if ema is not None:
                             with ema.average_parameters(generator):
                                 best_dict = dict(checkpoint_dict)
@@ -411,6 +514,13 @@ def _run_stage(
                             "NEW BEST: MRAE %.6f -> %.6f at iter %d (epoch %d)",
                             previous_best, current_mrae, iteration, epoch_num,
                         )
+                    if early_stopping_enabled:
+                        train_logger.info(
+                            "Early stopping: best MRAE %.6f, no improvement %d/%d",
+                            early_stopping_best_mrae,
+                            early_stopping_bad_epochs,
+                            early_stopping_patience,
+                        )
                     if iteration % 5000 == 0:
                         _atomic_torch_save(
                             checkpoint_dict,
@@ -420,6 +530,23 @@ def _run_stage(
 
                 epoch_losses = []
                 memory_cleanup()
+                if should_stop:
+                    if rank == 0:
+                        train_logger.info(
+                            "EARLY STOP at iter %d (stage epoch %d): validation MRAE "
+                            "did not improve by %.6f for %d checks.",
+                            iteration,
+                            stage_epoch_num,
+                            early_stopping_min_delta,
+                            early_stopping_patience,
+                        )
+                    return (
+                        iteration,
+                        record_mrae_loss,
+                        early_stopping_best_mrae,
+                        early_stopping_bad_epochs,
+                        True,
+                    )
 
             if stage_iter >= stage_iterations:
                 break
@@ -432,7 +559,13 @@ def _run_stage(
                 continue
             raise
 
-    return iteration, record_mrae_loss
+    return (
+        iteration,
+        record_mrae_loss,
+        early_stopping_best_mrae,
+        early_stopping_bad_epochs,
+        False,
+    )
 
 
 def train_generator_only(
@@ -465,7 +598,18 @@ def train_generator_only(
     stages = _resolve_stages(config)
     global_iter = int(resume_info.get("iteration", 0)) if resume_info else 0
     record_mrae_loss = float(resume_info.get("best_mrae", float("inf"))) if resume_info else float("inf")
+    early_stopping_best_mrae = (
+        float(resume_info.get("early_stopping_best_mrae", float("inf")))
+        if resume_info else float("inf")
+    )
+    early_stopping_bad_epochs = (
+        int(resume_info.get("early_stopping_bad_epochs", 0)) if resume_info else 0
+    )
     resume_stage_idx, resume_stage_iter = resolve_resume_stage_position(stages, resume_info)
+    early_stopping_patience = max(0, int(config.get("early_stopping_patience", 0)))
+    early_stopping_final_stage_only = bool(
+        config.get("early_stopping_final_stage_only", True)
+    )
 
     if resume_info and not ({"stage_idx", "stage_iter"} <= set(resume_info)):
         train_logger.info(
@@ -512,14 +656,31 @@ def train_generator_only(
             stage["init_lr"], stage["batch_size"], start_stage_iter,
         )
         report_memory(f"Before stage {stage_idx}")
-        global_iter, record_mrae_loss = _run_stage(
+        early_stopping_enabled = (
+            early_stopping_patience > 0
+            and (
+                not early_stopping_final_stage_only
+                or stage_idx == len(stages) - 1
+            )
+        )
+        (
+            global_iter,
+            record_mrae_loss,
+            early_stopping_best_mrae,
+            early_stopping_bad_epochs,
+            should_stop,
+        ) = _run_stage(
             net, generator, optimizer, scheduler, scaler, criterion, ema,
             train_loader, val_dataset, config, device, metrics_logger,
             distributed, seed, rank, stage_idx, stage["iterations"],
-            global_iter, record_mrae_loss, start_stage_iter=start_stage_iter,
+            global_iter, record_mrae_loss, early_stopping_best_mrae,
+            early_stopping_bad_epochs, early_stopping_enabled,
+            start_stage_iter=start_stage_iter,
         )
         del train_loader
         memory_cleanup()
+        if should_stop:
+            break
 
     train_logger.info("Progressive training complete. Best MRAE: %.6f", record_mrae_loss)
 
@@ -547,7 +708,7 @@ def main(config: DictConfig) -> None:
         main_logger = setup_logging(cfg["log_dir"], log_level, rank)
         if rank == 0:
             main_logger.info("=" * 60)
-            main_logger.info("GENERATOR-ONLY (NO-GAN) MRAE TRAINING")
+            main_logger.info("GENERATOR-ONLY (NO-GAN) RECONSTRUCTION TRAINING")
             main_logger.info("objective=%s, sampling=%s, spectral=%s, base_channels=%s, blocks/stage=%s",
                              cfg.get("objective", "mrae"), cfg.get("sampling"),
                              cfg.get("spectral_attention_type"), cfg.get("base_channels"),

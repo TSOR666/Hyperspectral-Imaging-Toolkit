@@ -193,6 +193,39 @@ def test_resume_training_state_preserves_explicit_stage_position():
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
+def test_resume_training_state_preserves_early_stopping_state():
+    case_dir = _case_dir("resume_early_stopping")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    ckpt_path = case_dir / "early_stopping_checkpoint.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "iter": 26_000,
+                "best_mrae": 0.2786,
+                "early_stopping_best_mrae": 0.2786,
+                "early_stopping_bad_epochs": 10,
+            },
+            ckpt_path,
+        )
+
+        info = resume_training_state(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            optimizers={},
+            schedulers={},
+            scalers={},
+            device=torch.device("cpu"),
+        )
+
+        assert info["early_stopping_best_mrae"] == pytest.approx(0.2786)
+        assert info["early_stopping_bad_epochs"] == 10
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
 def test_resolve_resume_stage_position_derives_single_stage_legacy_iteration():
     stages = [{"iterations": 100_000}]
 

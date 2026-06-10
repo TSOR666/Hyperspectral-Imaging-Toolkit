@@ -42,6 +42,14 @@ mixed_precision: true
 memory_mode: standard
 validation_max_batches: null
 
+# Stop a single-resolution run after validation MRAE has genuinely plateaued.
+# For progressive training this is applied only to the final patch-size stage,
+# so an intermediate stage cannot prevent the higher-resolution fine-tuning.
+early_stopping_patience: 10
+early_stopping_min_delta: 1.0e-4
+early_stopping_warmup_epochs: 10
+early_stopping_final_stage_only: true
+
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
 # Aligned to the author's paper (HSIFormer, which beats MST++ at MRAE 0.1497):

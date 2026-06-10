@@ -415,8 +415,8 @@ def resume_training_state(
       * ``torch_rng_state`` / ``cuda_rng_state_all`` / ``numpy_rng_state``
         -> RNG states (deterministic resume)
 
-    Returns ``resume_info`` shaped for the trainer loop:
-        {"iteration": int, "best_mrae": float, "epoch": int}
+    Returns ``resume_info`` shaped for the trainer loop. Optional progressive
+    stage and early-stopping fields are preserved when present.
 
     Uses ``weights_only=False`` because the checkpoint contains non-tensor
     state (config dict, numpy RNG, etc.) that PyTorch's safe-pickle does
@@ -494,6 +494,10 @@ def resume_training_state(
         info["stage_idx"] = int(ck["stage_idx"])
     if "stage_iter" in ck:
         info["stage_iter"] = int(ck["stage_iter"])
+    if "early_stopping_best_mrae" in ck:
+        info["early_stopping_best_mrae"] = float(ck["early_stopping_best_mrae"])
+    if "early_stopping_bad_epochs" in ck:
+        info["early_stopping_bad_epochs"] = int(ck["early_stopping_bad_epochs"])
     logger.info(
         "Resumed from %s | iter=%d, epoch=%d, best_mrae=%.6f",
         checkpoint_path,
