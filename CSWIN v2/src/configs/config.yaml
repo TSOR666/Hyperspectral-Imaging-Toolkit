@@ -32,15 +32,21 @@ stride: 8
 # number of epochs you ACTUALLY train. It was 300 while real runs stopped near
 # 64, so the LR had only annealed ~10% (still ~90% of initial) at epoch 64 -
 # the model never settled, which is the noisy plateau you saw. Set this to your
-# real wall-clock budget.
-epochs: 100
+# real wall-clock budget. The previous 100k-step run still had LR=2.9e-4 at
+# epoch 36, so it never entered a low-LR settling phase. A 40k horizon reaches
+# eta_min within the observed useful window.
+epochs: 40
 iterations_per_epoch: 1000
 gradient_accumulation_steps: 2
 num_workers: 8   # was 2; raise toward (CPU cores - 2) to speed up patch loading
 n_critic: 1
 mixed_precision: true
+mixed_precision_dtype: auto
+deterministic: false
+allow_tf32: true
 memory_mode: standard
 validation_max_batches: null
+finite_check_interval: 100
 
 # Stop a single-resolution run after validation MRAE has genuinely plateaued.
 # For progressive training this is applied only to the final patch-size stage,
@@ -52,22 +58,32 @@ early_stopping_final_stage_only: true
 
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
-# Aligned to the author's paper (HSIFormer, which beats MST++ at MRAE 0.1497):
-# L1 loss on [0,1] targets, an efficient SSTB generator (CBAM channel gate ->
+# Architecture aligned to HSIFormer; the loss is adapted to the observed
+# validation behavior by adding a small leaderboard-aligned MRAE term:
+# L1-primary hybrid loss on [0,1] targets, an efficient SSTB generator (CBAM channel gate ->
 # S-MSA + GDFN -> CSwin + SGFN), AdamW lr 4e-4 cosine. The sinkhorn_* /
 # lambda_* / discriminator_* / r1 / n_critic / gradient_accumulation_steps keys
 # below are LEGACY (read only by the deprecated GAN trainers).
 # ===========================================================================
-objective: l1            # l1 (paper) | mrae | mrae_l1 | relative_mrae
+# Start a fresh run for this objective/schedule combination. Resuming the old
+# 100k pure-L1 optimizer state would immediately place the new run near its end.
+objective: l1_with_mrae  # L1 + small stabilized MRAE; keeps the target metric moving
 optimizer: adamw         # adamw regularizes the small dataset | adam
 weight_decay: 1.0e-2     # was 0.0; the regularization the 44.8M overfit run lacked
 mrae_epsilon: 1.0e-2     # only used if objective involves MRAE
+mrae_weight: 0.1
+l1_weight: 1.0
 
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
 num_heads: 4
 stage_depths: [2, 2, 2, 2, 4]    # [enc1, enc2, bottleneck, dec1, dec2] (paper: deeper final stage)
 spectral_attention_type: s_msa   # full-res-token channel self-attn (the ablation workhorse)
+# auto keeps FP16 attention in FP32, but lets BF16 use Tensor Cores.
+spectral_attention_force_fp32: auto
+# Trainer-level finite checks remain enabled every 100 steps; disabling the
+# per-block scans removes dozens of GPU synchronization points per iteration.
+spectral_attention_sanitize_nonfinite: false
 sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (paper uses pixel shuffle)
 use_noise_block: false           # NoiseAwareBlock is not in the paper
 thick_output_head: false         # paper ToOut is a single conv
@@ -83,7 +99,7 @@ ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
 #   - {patch_size: 256, iterations: 50000,  init_lr: 4.0e-5, batch_size: 8}
 #   - {patch_size: 512, iterations: 50000,  init_lr: 4.0e-5, batch_size: 2}
 
-warmup_steps: 2000
+warmup_steps: 1000
 # MST++ init_lr is 4e-4 (was 1e-4 for the GAN generator). Cosine-annealed over
 # epochs * iterations_per_epoch with linear warmup.
 generator_lr: 0.0004
@@ -106,6 +122,7 @@ r1_gamma: 10.0
 # weights; latest_checkpoint.pth keeps the raw weights for exact resume.
 use_ema: true
 ema_decay: 0.999
+ema_update_every: 10
 
 # Loss = true L1 (main) + small MRAE (keeps the ARAD-1K leaderboard metric in
 # the objective) + small Sinkhorn-OT adversarial term. SAM and perceptual are

@@ -847,7 +847,12 @@ def main(config: DictConfig) -> None:
                 logger.info("  - Lazy loading with LRU cache (~5GB)")
             logger.info("="*60)
         
-        setup_seed(cfg.get("seed", 42), rank)
+        setup_seed(
+            cfg.get("seed", 42),
+            rank,
+            deterministic=cfg.get("deterministic", True),
+            allow_tf32=cfg.get("allow_tf32", False),
+        )
         memory_cleanup()
         
         # Create only datasets (no DataLoaders yet)

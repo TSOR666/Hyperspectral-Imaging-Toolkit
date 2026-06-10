@@ -49,7 +49,7 @@ import torch.nn.functional as F
 import math
 import logging
 from contextlib import nullcontext
-from typing import Optional, Mapping
+from typing import Optional, Mapping, Tuple
 from einops import rearrange, repeat
 from torch.utils.checkpoint import checkpoint
 from packaging import version
@@ -81,6 +81,42 @@ def _autocast_disabled(device_type: str):
     return nullcontext()
 
 
+def _resolve_spectral_fp32_policy(
+    policy: object,
+    autocast_enabled: bool,
+    autocast_dtype: Optional[torch.dtype],
+) -> bool:
+    """Keep FP16 attention in FP32 while allowing BF16 Tensor Core execution."""
+    if isinstance(policy, str):
+        key = policy.strip().lower()
+        if key == "auto":
+            return autocast_enabled and autocast_dtype == torch.float16
+        if key in ("true", "1", "yes", "on"):
+            return True
+        if key in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(
+            "spectral_attention_force_fp32 must be true, false, or 'auto'"
+        )
+    return bool(policy)
+
+
+def _current_autocast_state(device_type: str) -> Tuple[bool, Optional[torch.dtype]]:
+    """Return autocast state across supported PyTorch API generations."""
+    try:
+        enabled = torch.is_autocast_enabled(device_type)
+    except TypeError:
+        enabled = torch.is_autocast_enabled() if device_type == "cuda" else False
+    if not enabled:
+        return False, None
+
+    try:
+        dtype = torch.get_autocast_dtype(device_type)
+    except (AttributeError, TypeError):
+        dtype = torch.get_autocast_gpu_dtype() if device_type == "cuda" else None
+    return True, dtype
+
+
 def _replace_nonfinite(
     tensor: torch.Tensor,
     message: str,
@@ -99,6 +135,17 @@ def _replace_nonfinite(
             neginf=-clamp_value,
         ).clamp(-clamp_value, clamp_value)
     return torch.nan_to_num(tensor)
+
+
+def _maybe_replace_nonfinite(
+    enabled: bool,
+    tensor: torch.Tensor,
+    message: str,
+    clamp_value: Optional[float] = None,
+) -> torch.Tensor:
+    if not enabled:
+        return tensor
+    return _replace_nonfinite(tensor, message, clamp_value)
 
 
 class LePEAttention(nn.Module):
@@ -616,8 +663,8 @@ class EfficientSpectralAttention(nn.Module):
             raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
-        self.force_fp32 = (
-            bool(config.get("spectral_attention_force_fp32", True))
+        self.force_fp32_policy = (
+            config.get("spectral_attention_force_fp32", True)
             if config
             else True
         )
@@ -625,6 +672,11 @@ class EfficientSpectralAttention(nn.Module):
             float(config.get("spectral_attention_finite_clamp", 1e4))
             if config
             else 1e4
+        )
+        self.sanitize_nonfinite = (
+            bool(config.get("spectral_attention_sanitize_nonfinite", True))
+            if config
+            else True
         )
         
         # Handle None config
@@ -667,7 +719,15 @@ class EfficientSpectralAttention(nn.Module):
         B, C, H, W = x.shape
         output_dtype = x.dtype
         param_dtype = self.to_v.weight.dtype
-        run_fp32 = self.force_fp32 and param_dtype == torch.float32
+        autocast_enabled, autocast_dtype = _current_autocast_state(x.device.type)
+        run_fp32 = (
+            param_dtype == torch.float32
+            and _resolve_spectral_fp32_policy(
+                self.force_fp32_policy,
+                autocast_enabled,
+                autocast_dtype,
+            )
+        )
 
         # Spectral attention is especially sensitive under fp16 autocast:
         # a 1x1 projection can overflow before GroupNorm/F.normalize has a
@@ -677,7 +737,8 @@ class EfficientSpectralAttention(nn.Module):
         ctx = _autocast_disabled(x.device.type) if run_fp32 else nullcontext()
         with ctx:
             x_work = x.float() if run_fp32 else x
-            x_work = _replace_nonfinite(
+            x_work = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 x_work,
                 "Non-finite values entering spectral attention; replacing with bounded values",
                 self.finite_clamp,
@@ -688,17 +749,20 @@ class EfficientSpectralAttention(nn.Module):
             k = self.to_k(x_work)  # (B, C, H, W)
             v = self.to_v(x_work)  # (B, C, H, W)
 
-            q = _replace_nonfinite(
+            q = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 q,
                 "Non-finite values in Q projection; replacing with bounded values",
                 self.finite_clamp,
             )
-            k = _replace_nonfinite(
+            k = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 k,
                 "Non-finite values in K projection; replacing with bounded values",
                 self.finite_clamp,
             )
-            v = _replace_nonfinite(
+            v = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 v,
                 "Non-finite values in V projection; replacing with bounded values",
                 self.finite_clamp,
@@ -716,7 +780,10 @@ class EfficientSpectralAttention(nn.Module):
             norm_eps = 1e-6 if q_global.dtype in (torch.float16, torch.bfloat16) else EPS
             q_norm = F.normalize(q_global, dim=-1, eps=norm_eps)
             k_norm = F.normalize(k_global, dim=-1, eps=norm_eps)
-            if not torch.isfinite(q_norm).all() or not torch.isfinite(k_norm).all():
+            if self.sanitize_nonfinite and (
+                not torch.isfinite(q_norm).all()
+                or not torch.isfinite(k_norm).all()
+            ):
                 logger.warning("Non-finite values in normalized Q/K; replacing with zeros")
                 q_norm = torch.nan_to_num(q_norm)
                 k_norm = torch.nan_to_num(k_norm)
@@ -730,7 +797,8 @@ class EfficientSpectralAttention(nn.Module):
                 attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
             else:
                 attn = F.softmax(attn, dim=-1)
-            attn = _replace_nonfinite(
+            attn = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 attn,
                 "Non-finite spectral attention weights; replacing with zeros",
             )
@@ -748,7 +816,8 @@ class EfficientSpectralAttention(nn.Module):
             pos = self.pos_embed(x_work)
             out = out + pos
             out = self.proj(out)
-            out = _replace_nonfinite(
+            out = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 out,
                 "Non-finite spectral attention output; replacing with bounded values",
                 self.finite_clamp,
@@ -801,11 +870,16 @@ class SpectralMSA(nn.Module):
         self.head_dim = channels // num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
-        self.force_fp32 = (
-            bool(config.get("spectral_attention_force_fp32", True)) if config else True
+        self.force_fp32_policy = (
+            config.get("spectral_attention_force_fp32", True) if config else True
         )
         self.finite_clamp = (
             float(config.get("spectral_attention_finite_clamp", 1e4)) if config else 1e4
+        )
+        self.sanitize_nonfinite = (
+            bool(config.get("spectral_attention_sanitize_nonfinite", True))
+            if config
+            else True
         )
         norm_groups = config.get("norm_groups", 8) if config else 8
 
@@ -830,12 +904,21 @@ class SpectralMSA(nn.Module):
         B, C, H, W = x.shape
         output_dtype = x.dtype
         param_dtype = self.qkv.weight.dtype
-        run_fp32 = self.force_fp32 and param_dtype == torch.float32
+        autocast_enabled, autocast_dtype = _current_autocast_state(x.device.type)
+        run_fp32 = (
+            param_dtype == torch.float32
+            and _resolve_spectral_fp32_policy(
+                self.force_fp32_policy,
+                autocast_enabled,
+                autocast_dtype,
+            )
+        )
 
         ctx = _autocast_disabled(x.device.type) if run_fp32 else nullcontext()
         with ctx:
             x_work = x.float() if run_fp32 else x
-            x_work = _replace_nonfinite(
+            x_work = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 x_work,
                 "Non-finite values entering spectral MSA; replacing with bounded values",
                 self.finite_clamp,
@@ -860,8 +943,10 @@ class SpectralMSA(nn.Module):
                 attn = F.softmax(attn.float(), dim=-1).to(attn_dtype)
             else:
                 attn = F.softmax(attn, dim=-1)
-            attn = _replace_nonfinite(
-                attn, "Non-finite spectral MSA weights; replacing with zeros"
+            attn = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
+                attn,
+                "Non-finite spectral MSA weights; replacing with zeros",
             )
 
             out = attn @ v  # (B, head, c, (h w))
@@ -870,7 +955,8 @@ class SpectralMSA(nn.Module):
             out = out + self.pos_embed(x_work)
             out = self.project_out(out)
             out = self.norm(out)
-            out = _replace_nonfinite(
+            out = _maybe_replace_nonfinite(
+                self.sanitize_nonfinite,
                 out,
                 "Non-finite spectral MSA output; replacing with bounded values",
                 self.finite_clamp,
