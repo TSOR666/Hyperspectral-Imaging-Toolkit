@@ -330,8 +330,8 @@ class ModelAdapter:
     def _forward(self, rgb: torch.Tensor) -> torch.Tensor:
         return _first_tensor(self.model(rgb))
 
-    def predict_batch(self, rgb: torch.Tensor) -> torch.Tensor:
-        rgb = self.preprocess(rgb.to(self.device, non_blocking=True))
+    def predict_preprocessed_batch(self, rgb: torch.Tensor) -> torch.Tensor:
+        rgb = rgb.to(self.device, non_blocking=True)
         with torch.inference_mode(), torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16,
@@ -339,6 +339,10 @@ class ModelAdapter:
         ):
             prediction = self._forward(rgb)
         return prediction.float().clamp(0.0, 1.0)
+
+    def predict_batch(self, rgb: torch.Tensor) -> torch.Tensor:
+        rgb = self.preprocess(rgb.to(self.device, non_blocking=True))
+        return self.predict_preprocessed_batch(rgb)
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -708,6 +712,11 @@ def predict_tiled(
     if overlap < 0 or overlap >= tile_size:
         raise ValueError("overlap must satisfy 0 <= overlap < tile_size")
 
+    # Normalize the complete image once so spatial tiles share the same input
+    # transform. In particular, MST preprocessing uses image-level min/max
+    # statistics and must not recompute them independently for every tile.
+    rgb = adapter.preprocess(rgb.unsqueeze(0)).squeeze(0)
+
     def predict_once(image: torch.Tensor) -> torch.Tensor:
         height, width = image.shape[-2:]
         effective_tile = max(tile_size, adapter.min_size)
@@ -734,7 +743,7 @@ def predict_tiled(
                 batches = [chunk]
             for group in batches:
                 batch = torch.stack([entry[4] for entry in group])
-                predictions = adapter.predict_batch(batch).cpu()
+                predictions = adapter.predict_preprocessed_batch(batch).cpu()
                 for prediction, (y, x, tile_h, tile_w, _) in zip(predictions, group):
                     prediction = prediction[:, :tile_h, :tile_w]
                     if prediction.shape[-2:] != (tile_h, tile_w):
