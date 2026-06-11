@@ -1,0 +1,11 @@
+# Install the PyTorch build matching your CUDA runtime before this file.
+torch>=1.13
+torchvision>=0.14
+numpy>=1.21
+scipy>=1.7
+h5py>=3.7
+pillow>=8.2
+matplotlib>=3.4
+tqdm>=4.64
+einops>=0.6
+PyWavelets>=1.3

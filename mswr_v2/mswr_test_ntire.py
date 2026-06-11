@@ -23,14 +23,23 @@ import json
 import yaml
 from tqdm import tqdm
 import h5py
-import scipy.io as sio
 from scipy import stats
 from collections import defaultdict
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import seaborn as sns
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    import seaborn as sns
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    plt = None
+    gridspec = None
+    sns = None
+    go = None
+    make_subplots = None
+    PLOTTING_AVAILABLE = False
 
 # Import model and utilities
 from model.mswr_net_v212 import (
@@ -47,7 +56,8 @@ from utils import (
     Loss_RMSE,
     Loss_PSNR,
     Loss_SAM,
-    AverageMeter
+    AverageMeter,
+    save_matv73,
 )
 
 # Reuse the same validation reader the model was trained/validated against so
@@ -56,12 +66,13 @@ from utils import (
 # through split_txt/valid_list.txt.
 from dataloader import ValidDataset
 
-# Configure plotting style
-sns.set_style("whitegrid")
-sns.set_palette("husl")
-plt.rcParams['figure.dpi'] = 100
-plt.rcParams['savefig.dpi'] = 150
-plt.rcParams['font.size'] = 10
+# Configure plotting style when the optional visualization stack is installed.
+if PLOTTING_AVAILABLE:
+    sns.set_style("whitegrid")
+    sns.set_palette("husl")
+    plt.rcParams['figure.dpi'] = 100
+    plt.rcParams['savefig.dpi'] = 150
+    plt.rcParams['font.size'] = 10
 
 # Setup logging
 logging.basicConfig(
@@ -124,6 +135,9 @@ class TestConfig:
 
 class MetricsCalculator:
     """Comprehensive metrics calculation following NTIRE 2022"""
+
+    MAX_RAW_ERROR_VALUES = 500_000
+    RAW_ERROR_VALUES_PER_SAMPLE = 10_000
     
     def __init__(self, calculate_sam: bool = True, calculate_ssim: bool = True):
         self.calculate_sam = calculate_sam
@@ -151,6 +165,7 @@ class MetricsCalculator:
         self.per_band_metrics = defaultdict(lambda: defaultdict(list))
         self.per_pixel_metrics = defaultdict(list)
         self.raw_errors = []
+        self.raw_error_values = 0
     
     def calculate_ssim_metric(self, pred: torch.Tensor, target: torch.Tensor, 
                               data_range: float = 1.0) -> torch.Tensor:
@@ -234,14 +249,20 @@ class MetricsCalculator:
         if calculate_per_pixel:
             self._calculate_per_pixel_metrics(pred, target)
         
-        # Store raw errors for statistical analysis. CAP the buffer: for a
-        # 1000-image test set at 482x512x31 fp32, the original unbounded list
-        # would consume ~28 GB. Keep at most 32 full-resolution error volumes
-        # (~900 MB) — large enough for normality tests, small enough to avoid
-        # OOM. Downstream `_statistical_analysis` already checks `size < 1e6`.
-        if len(self.raw_errors) < 32:
-            error = torch.abs(pred - target).cpu().numpy()
-            self.raw_errors.append(error)
+        # Keep a bounded, deterministic sample for statistical analysis.
+        # Sampling tensor elements before subtraction avoids materializing a
+        # full error volume solely for diagnostics.
+        remaining = self.MAX_RAW_ERROR_VALUES - self.raw_error_values
+        if remaining > 0:
+            pred_flat = pred.detach().reshape(-1)
+            target_flat = target.detach().reshape(-1)
+            take = min(remaining, self.RAW_ERROR_VALUES_PER_SAMPLE, pred_flat.numel())
+            step = max(1, (pred_flat.numel() + take - 1) // take)
+            error_sample = (
+                pred_flat[::step][:take] - target_flat[::step][:take]
+            ).abs().float().cpu().numpy()
+            self.raw_errors.append(error_sample)
+            self.raw_error_values += int(error_sample.size)
 
         return sample_metrics
     
@@ -339,9 +360,18 @@ class Visualizer:
         
         for dir_path in [self.plots_dir, self.error_maps_dir, self.spectral_plots_dir]:
             dir_path.mkdir(exist_ok=True)
+
+    @staticmethod
+    def _require_plotting() -> None:
+        if not PLOTTING_AVAILABLE:
+            raise ImportError(
+                "Visualization requires matplotlib, seaborn, and plotly. "
+                "Install mswr_v2 requirements or disable visualization output."
+            )
     
     def plot_metrics_summary(self, results: Dict[str, Any]):
         """Create comprehensive metrics summary plot"""
+        self._require_plotting()
         fig = plt.figure(figsize=(16, 10))
         gs = gridspec.GridSpec(3, 3, figure=fig)
         
@@ -445,6 +475,7 @@ class Visualizer:
     def plot_error_maps(self, pred: np.ndarray, target: np.ndarray, 
                        name: str, n_bands: int = 6):
         """Plot error maps for visualization"""
+        self._require_plotting()
         fig, axes = plt.subplots(3, n_bands, figsize=(n_bands*3, 9))
         
         # Select bands to visualize
@@ -487,6 +518,7 @@ class Visualizer:
     def plot_spectral_comparison(self, pred: np.ndarray, target: np.ndarray, 
                                 name: str, n_pixels: int = 5):
         """Plot spectral signatures comparison"""
+        self._require_plotting()
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
         wavelengths = np.linspace(400, 700, pred.shape[2])
@@ -565,6 +597,7 @@ class Visualizer:
     
     def create_interactive_plot(self, results: Dict[str, Any]):
         """Create interactive Plotly visualization"""
+        self._require_plotting()
         # Create subplots
         fig = make_subplots(
             rows=2, cols=2,
@@ -664,7 +697,6 @@ class NTIRETestEngine:
         
         # Results storage
         self.all_results = []
-        self.predictions_cache = []
         
         logger.info(f"Test engine initialized on {self.device}")
     
@@ -843,7 +875,7 @@ class NTIRETestEngine:
     
     def _ensemble_inference(self, rgb: torch.Tensor) -> torch.Tensor:
         """Test-time augmentation ensemble"""
-        predictions = []
+        prediction_sum = None
         
         # Define augmentations
         if self.config.ensemble_mode == 'flip':
@@ -865,6 +897,10 @@ class NTIRETestEngine:
                 lambda x: torch.flip(x, dims=[2]),
                 lambda x: torch.flip(x, dims=[3]),
                 lambda x: torch.flip(x, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=1, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=2, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=3, dims=[2, 3]),
+                lambda x: torch.rot90(torch.flip(x, dims=[2]), k=1, dims=[2, 3]),
             ]
         
         # Inverse transforms must mirror the forward augmentation EXACTLY,
@@ -889,6 +925,10 @@ class NTIRETestEngine:
                 lambda y: torch.flip(y, dims=[2]),
                 lambda y: torch.flip(y, dims=[3]),
                 lambda y: torch.flip(y, dims=[2, 3]),
+                lambda y: torch.rot90(y, k=-1, dims=[2, 3]),
+                lambda y: torch.rot90(y, k=-2, dims=[2, 3]),
+                lambda y: torch.rot90(y, k=-3, dims=[2, 3]),
+                lambda y: torch.flip(torch.rot90(y, k=-1, dims=[2, 3]), dims=[2]),
             ]
 
         # Apply augmentations and get predictions
@@ -896,10 +936,21 @@ class NTIRETestEngine:
             aug_input = aug(rgb)
             pred = self.model(aug_input)
             pred = inv(pred)
-            predictions.append(pred)
+            pred_fp32 = pred.float()
+            if prediction_sum is None:
+                prediction_sum = pred_fp32
+            else:
+                prediction_sum.add_(pred_fp32)
 
-        # Average predictions
-        return torch.stack(predictions).mean(dim=0)
+        return prediction_sum.div_(len(augs))
+
+    @staticmethod
+    def _result_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Return only scalar metadata safe to retain for the full test run."""
+        summary = {'name': result['name']}
+        if 'metrics' in result:
+            summary['metrics'] = dict(result['metrics'])
+        return summary
     
     def _mc_dropout_inference(self, rgb: torch.Tensor) -> torch.Tensor:
         """Monte Carlo dropout inference for uncertainty"""
@@ -934,7 +985,6 @@ class NTIRETestEngine:
             name = self.dataset.stems[idx]
 
             result = self.test_single_image(rgb, gt, name)
-            self.all_results.append(result)
             
             # Save predictions if requested
             if self.config.save_predictions:
@@ -966,6 +1016,11 @@ class NTIRETestEngine:
                 
                 if self.config.save_spectral_plots:
                     self.visualizer.plot_spectral_comparison(pred_np, gt_np, name)
+
+            # MetricsCalculator owns aggregate state. Retaining full prediction
+            # and target tensors here kept every evaluated scene resident,
+            # including on CUDA, until the entire test run completed.
+            self.all_results.append(self._result_summary(result))
         
         # Get final metrics
         final_results = self.metrics_calculator.get_results()
@@ -981,9 +1036,11 @@ class NTIRETestEngine:
         # Save results
         self._save_results(final_results)
         
-        # Create visualizations
-        self.visualizer.plot_metrics_summary(final_results)
-        self.visualizer.create_interactive_plot(final_results)
+        # Aggregate plots are optional so metric-only/headless evaluation does
+        # not require the plotting dependency stack.
+        if self.config.save_visualizations:
+            self.visualizer.plot_metrics_summary(final_results)
+            self.visualizer.create_interactive_plot(final_results)
         
         # Print summary
         self._print_summary(final_results)
@@ -1008,7 +1065,7 @@ class NTIRETestEngine:
 
         if self.config.save_format == 'mat':
             save_path = save_dir / f'{name}_pred.mat'
-            sio.savemat(str(save_path), {'cube': pred_np})
+            save_matv73(str(save_path), 'cube', pred_np)
         elif self.config.save_format == 'npy':
             save_path = save_dir / f'{name}_pred.npy'
             np.save(str(save_path), pred_np)
@@ -1201,7 +1258,11 @@ def main():
     parser.add_argument('--baseline_results_path', type=str)
     
     # Visualization
-    parser.add_argument('--save_visualizations', action='store_true', default=True)
+    parser.add_argument('--save_visualizations', dest='save_visualizations',
+                       action='store_true', default=True)
+    parser.add_argument('--no_save_visualizations', dest='save_visualizations',
+                       action='store_false',
+                       help='Run metric/submission evaluation without plotting dependencies.')
     parser.add_argument('--save_error_maps', action='store_true', default=True)
     parser.add_argument('--save_spectral_plots', action='store_true', default=True)
     parser.add_argument('--save_hsi_viz_inputs', dest='save_hsi_viz_inputs',

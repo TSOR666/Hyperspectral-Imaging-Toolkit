@@ -1,0 +1,58 @@
+# Canonical MSWR-Net v2.1.2 training recipe.
+#
+# This is the default config for new training runs. Historical baselines and
+# ablations live under configs/experiments/ and should only be used when
+# reproducing those comparisons.
+
+experiment_name: mswr_v212
+model_size: base
+gpu_id: "0"
+
+# Data / iteration
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 150
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# Architecture
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+
+# MRAE-only benchmark objective
+use_enhanced_loss: false
+
+# Optimizer / schedule: unchanged from Run C
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# Precision / memory
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# Evaluate both sources; the trainer saves each source's best weights separately.
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+
+# Quote YAML 1.1 boolean-like strings explicitly.
+early_stopping_mode: "off"

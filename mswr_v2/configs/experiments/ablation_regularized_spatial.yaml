@@ -1,0 +1,87 @@
+# Historical experiment: regularized spatial-attention ablation.
+#
+# This is not the recommended training config. Use ../train.yaml for new runs.
+#
+# Derived from baseline_mstpp.yaml. The baseline run overfit early:
+# validation MRAE bottomed at ~0.268 around epoch 70 (a noise-minimum of an
+# already-plateaued ~0.30 process), then oscillated 0.30-0.35 while train loss
+# kept falling to epoch ~200. Diagnosis: overfitting + missing regularization,
+# NOT a capacity ceiling (train loss kept dropping below the val floor).
+#
+# This config keeps the MRAE-only loss (so the *metric* stays MST++-comparable)
+# but adds three deviations from the literal MST++ recipe to break the plateau:
+#   1. EMA on, validate/select on EMA weights (damps the val oscillation; the
+#      raw single-epoch "best" was partly luck — val noise was 20-60x the
+#      per-epoch signal at the plateau).
+#   2. AdamW with decoupled weight decay (baseline had wd=0 — nothing pushed
+#      back on weight growth/memorization). Norm/bias stay exempt (handled in
+#      create_optimizer's param-group split).
+#   3. Shorter cosine horizon (end_epoch 300 -> 200) so the low-LR anneal lands
+#      near where the regularized model converges instead of ~ep300. EMA still
+#      captures the best weights along the way, so a slightly-early cutoff is safe.
+#
+# DELIBERATELY NOT CHANGED (to preserve comparability with MST++):
+#   - Loss stays MRAE-only (use_enhanced_loss: false).
+#   - NO photometric/spectral augmentation. That would alter the RGB inputs the
+#     model sees and break the apples-to-apples data comparison with MST++.
+#     Geometric augmentation (rot90 + flips) is unchanged and MST++-faithful.
+#
+# Pair this with the baseline (baseline_mstpp.yaml) as the strict MST++
+# control. ema_eval_mode: both logs both the EMA and the raw-model MRAE each
+# validation, so a strictly-fair raw number is always recorded.
+#
+# Train from scratch — do NOT pass --pretrained_model_path.
+
+# ---- run / paths ----
+experiment_name: mswr_v212_runA_ema_wd
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 200               # was 300 — re-time cosine anneal to the convergence point
+steps_per_epoch: 1000        # logical epochs (unchanged; validation cadence comparable to baseline)
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (preset) ----
+attention_type: dual
+use_flash_attn: true
+
+# ---- wavelets (MSWR's contribution; kept on) ----
+use_wavelet: true
+wavelet_type: db2
+
+# ---- LOSS: MRAE only (unchanged — keeps the metric MST++-comparable) ----
+use_enhanced_loss: false     # criterion = Loss_MRAE()
+
+# ---- optimizer / schedule ----
+optimizer: adamw             # was adam — enables decoupled weight decay
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2         # was 0.0 — decoupled L2 on transformer+conv params (norm/bias auto-exempt). Sweep {1e-4, 1e-3, 1e-2} if tuning.
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- precision / mem ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA: ON (averages out the high-LR val jitter; best is selected on EMA) ----
+use_ema: true                # was false
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both          # log + select on EMA, also log raw-model MRAE for a strictly-fair number
+
+# ---- early stopping: OFF (train the full schedule; EMA captures best) ----
+early_stopping_mode: "off"

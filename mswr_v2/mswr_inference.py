@@ -27,11 +27,18 @@ import cv2
 import h5py
 import scipy.io as sio
 from collections import defaultdict
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-import seaborn as sns
 import math
-sns.set_style("whitegrid")
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import seaborn as sns
+    sns.set_style("whitegrid")
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    plt = None
+    GridSpec = None
+    PLOTTING_AVAILABLE = False
 
 # Import model and utilities
 from model.mswr_net_v212 import (
@@ -348,7 +355,7 @@ class EnsembleProcessor:
     
     def process(self, model: nn.Module, input_tensor: torch.Tensor) -> torch.Tensor:
         """Apply ensemble processing"""
-        predictions = []
+        prediction_sum = None
         
         for i, transform in enumerate(self.transforms):
             # Apply transform
@@ -360,10 +367,13 @@ class EnsembleProcessor:
             
             # Apply inverse transform
             pred = self._inverse_transform(pred, i)
-            predictions.append(pred)
-        
-        # Average predictions
-        return torch.stack(predictions).mean(dim=0)
+            pred_fp32 = pred.float()
+            if prediction_sum is None:
+                prediction_sum = pred_fp32
+            else:
+                prediction_sum.add_(pred_fp32)
+
+        return prediction_sum.div_(len(self.transforms))
     
     def _inverse_transform(self, tensor: torch.Tensor, transform_idx: int) -> torch.Tensor:
         """Apply inverse transform to prediction"""
@@ -806,6 +816,12 @@ class MSWRInference:
     def _save_visualization(self, output: np.ndarray, input_path: str, 
                            input_name: str, timestamp: str):
         """Create and save visualization of results"""
+        if not PLOTTING_AVAILABLE:
+            raise ImportError(
+                "Visualization requires matplotlib and seaborn. "
+                "Install mswr_v2 requirements or omit --save_visualization."
+            )
+
         # Load original for comparison
         original, _ = self.load_image(input_path)
         

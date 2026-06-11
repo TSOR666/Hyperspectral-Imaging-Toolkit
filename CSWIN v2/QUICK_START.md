@@ -211,7 +211,8 @@ print('✅ Installation verified!')
 - Use `train_optimized.py` instead of `training_script_fixed.py`
 - Reduce `batch_size=8`
 - Increase `gradient_accumulation_steps=4`
-- Set `memory_mode=lazy` in config
+- Set `memory_mode=lazy` in config for file-backed MST data with bounded per-worker caches.
+- Tune `lazy_cache_size` to trade RAM for random-access speed. Keep `memory_mode=standard` when throughput matters more than resident memory.
 
 ### For Better Quality:
 - Increase `epochs=500`

@@ -208,7 +208,7 @@ class PatchInference:
         _, _, H, W = img.shape
         if H <= self.patch_size and W <= self.patch_size:
             logger.info(f"Image size {H}x{W} is smaller than patch size, processing directly")
-            with torch.no_grad():
+            with torch.inference_mode():
                 with torch.cuda.amp.autocast(enabled=self.use_fp16):
                     if hasattr(self.model, 'generator'):
                         output = self.model.generator(img.to(self.device))
@@ -238,7 +238,7 @@ class PatchInference:
         else:
             pbar = range(0, n_patches, self.batch_size)
         
-        with torch.no_grad():
+        with torch.inference_mode():
             for i in pbar:
                 batch = patches[i:i+self.batch_size].to(self.device)
                 
@@ -254,10 +254,6 @@ class PatchInference:
                         output = torch.sigmoid(output)
                 
                 outputs.append(output.cpu())
-                
-                # Clear cache after each batch to prevent OOM
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         
         # Concatenate outputs
         all_outputs = torch.cat(outputs, dim=0)

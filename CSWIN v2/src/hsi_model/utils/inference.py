@@ -87,17 +87,20 @@ def load_generator(
     raw_state = ck.get("state_dict") or ck.get("model_state_dict") or ck
     state = _normalize_generator_state(raw_state)
 
-    try:
-        generator.load_state_dict(state, strict=strict)
-    except RuntimeError as e:
-        if not strict:
-            raise
-        logger.warning("Strict generator load failed (%s); retrying strict=False.", e)
+    if strict:
+        generator.load_state_dict(state, strict=True)
+    else:
         result = generator.load_state_dict(state, strict=False)
         if getattr(result, "missing_keys", None):
             logger.warning("Missing keys (first 8): %s", list(result.missing_keys)[:8])
         if getattr(result, "unexpected_keys", None):
             logger.warning("Unexpected keys (first 8): %s", list(result.unexpected_keys)[:8])
+        model_keys = set(generator.state_dict())
+        matched_keys = model_keys.intersection(state)
+        if not matched_keys:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} matched no generator state keys."
+            )
 
     # Apply EMA shadow for raw checkpoints that carry one (best_model already has
     # EMA baked into state_dict and is flagged ema_applied=True).

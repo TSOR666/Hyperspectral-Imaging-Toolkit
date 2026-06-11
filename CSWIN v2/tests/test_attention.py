@@ -150,3 +150,55 @@ def test_cswin_attention_window_size_one():
     out = block(x)
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+def test_cswin_local_global_uses_bounded_window_sequences(monkeypatch):
+    block = CSWinAttentionBlock(
+        dim=8,
+        num_heads=2,
+        split_size=4,
+        config={
+            "cswin_attention_mode": "local_global",
+            "cswin_global_tokens": 0,
+            "ckpt_min_tokens": 10**9,
+        },
+    ).eval()
+    sequence_lengths = []
+    original = block._scaled_attention
+
+    def capture(q, k, v, bias=None):
+        sequence_lengths.append(q.shape[-2])
+        return original(q, k, v, bias)
+
+    monkeypatch.setattr(block, "_scaled_attention", capture)
+    with torch.inference_mode():
+        out = block(torch.randn(1, 8, 8, 12))
+
+    assert out.shape == (1, 8, 8, 12)
+    assert sequence_lengths == [16, 16]
+
+
+def test_cswin_local_global_switches_to_global_below_threshold(monkeypatch):
+    block = CSWinAttentionBlock(
+        dim=8,
+        num_heads=2,
+        split_size=4,
+        config={
+            "cswin_attention_mode": "local_global",
+            "cswin_global_tokens": 96,
+            "ckpt_min_tokens": 10**9,
+        },
+    ).eval()
+    sequence_lengths = []
+    original = block._scaled_attention
+
+    def capture(q, k, v, bias=None):
+        sequence_lengths.append(q.shape[-2])
+        return original(q, k, v, bias)
+
+    monkeypatch.setattr(block, "_scaled_attention", capture)
+    with torch.inference_mode():
+        out = block(torch.randn(1, 8, 8, 12))
+
+    assert out.shape == (1, 8, 8, 12)
+    assert sequence_lengths == [96, 96]

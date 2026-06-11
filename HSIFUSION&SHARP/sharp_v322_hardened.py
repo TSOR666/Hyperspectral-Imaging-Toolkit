@@ -19,7 +19,7 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -467,16 +467,20 @@ class VectorizedWindowedSparsemax(nn.Module):
         self.pad_value = pad_value
         
     def forward(self, scores):
+        # linear_sparsemax upcasts to float32 internally; preserve the caller's dtype so
+        # downstream matmul(attn, v) does not silently upcast v (and its activations) to fp32
+        # under AMP, which would inflate attention memory ~2-4x.
+        in_dtype = scores.dtype
         if self.dim != -1:
             scores = scores.transpose(self.dim, -1)
-    
+
         *batch_dims, seq_len = scores.shape
-    
+
         if seq_len <= self.window_size:
             output = linear_sparsemax(scores, dim=-1)
             if self.dim != -1:
                 output = output.transpose(self.dim, -1)
-            return output
+            return output.to(in_dtype)
     
         pad_len = (self.window_size - seq_len % self.window_size) % self.window_size
         if pad_len > 0:
@@ -501,11 +505,11 @@ class VectorizedWindowedSparsemax(nn.Module):
         row_sums = output.sum(dim=-1, keepdim=True)
         mask = row_sums > 1e-12
         output = torch.where(mask, output / row_sums.clamp_min(1e-12), output)
-        
+
         if self.dim != -1:
             output = output.transpose(self.dim, -1)
-        
-        return output
+
+        return output.to(in_dtype)
 
 class MultiScaleAttention(nn.Module):
     """Multi-scale attention with local and global branches."""
@@ -863,10 +867,21 @@ class SHARPv32Config:
     # v3.2.2 additions
     key_rbf_mode: str = KeyRBFMode.MEAN
     sparsemax_pad_value: Optional[float] = None
+    # Output parameterization. ARAD-1K / MST++ HSI targets are normalized to [0, 1],
+    # so 'sigmoid' (codomain [0,1], nonnegative) is the correct default. 'tanh' (legacy,
+    # codomain [-1,1]) wastes the negative half and saturates near full reflectance; it is
+    # retained for backward compatibility with checkpoints trained before this option.
+    # 'relu'/'softplus' give nonnegative unbounded outputs; 'none' is raw linear.
+    output_activation: str = "sigmoid"
     # EMA parameters
     ema_update_every: int = 1
 
     def __post_init__(self):
+        valid_acts = {"sigmoid", "tanh", "relu", "softplus", "none"}
+        if self.output_activation not in valid_acts:
+            raise ValueError(
+                f"output_activation must be one of {sorted(valid_acts)}, got {self.output_activation!r}"
+            )
         self.base_dim = (self.base_dim + 7) // 8 * 8
         for i, (d, h) in enumerate(zip([self.base_dim * (2**i) for i in range(len(self.depths))], self.heads)):
             if d % h != 0:
@@ -1067,8 +1082,18 @@ class SHARPv32(nn.Module):
         out = self.head(x)
         out, gate = out.chunk(2, dim=1)
         out = out * torch.sigmoid(gate)
-        
-        return torch.tanh(out)
+
+        act = getattr(self.config, "output_activation", "tanh")
+        if act == "sigmoid":
+            return torch.sigmoid(out)
+        elif act == "tanh":
+            return torch.tanh(out)
+        elif act == "relu":
+            return F.relu(out)
+        elif act == "softplus":
+            return F.softplus(out)
+        else:  # "none" -> raw linear output
+            return out
     
     def compute_loss(self, pred, target, alpha: float = 0.1):
         """Reconstruction loss with target-aligned spectral curvature matching."""
@@ -1241,11 +1266,17 @@ class SHARPv32Trainer:
         ema_decay: float = 0.999,
         use_amp: bool = True,
         ema_update_every: Optional[int] = None,
+        criterion: Optional[Callable] = None,
     ):
         self.model = model
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        
+
+        # Optional loss override. When None, falls back to model.compute_loss (L1+curvature).
+        # The training entrypoint injects MSTPlusPlusLoss() here so the optimization objective
+        # matches the MRAE selection/eval metric (MST++/ARAD-1K protocol).
+        self.criterion = criterion
+
         # Store original model reference for compiled models
         self._orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
         
@@ -1378,6 +1409,12 @@ class SHARPv32Trainer:
                     else:
                         self.ema_state[full_name] = buffer.detach().to('cpu', non_blocking=True)
             
+    def _loss(self, outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Use the injected criterion (e.g. MRAE) if provided, else model.compute_loss."""
+        if self.criterion is not None:
+            return self.criterion(outputs, targets)
+        return self._orig_model.compute_loss(outputs, targets)
+
     def train_step(self, inputs: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
         """Single training step."""
         self.model.train()
@@ -1388,7 +1425,7 @@ class SHARPv32Trainer:
         
         with _autocast(enabled=self.use_amp):
             outputs = self.model(inputs)
-            loss = self._orig_model.compute_loss(outputs, targets)
+            loss = self._loss(outputs, targets)
 
         if not torch.isfinite(loss):
             self.optimizer.zero_grad(set_to_none=True)
@@ -1485,7 +1522,7 @@ class SHARPv32Trainer:
                         targets = targets[
                             ..., start_h:start_h + crop_h, start_w:start_w + crop_w
                         ]
-                loss = self._orig_model.compute_loss(outputs, targets)
+                loss = self._loss(outputs, targets)
             
             abs_err = torch.abs(outputs - targets)
             mrae = torch.mean(abs_err / torch.clamp_min(torch.abs(targets), 1e-6))

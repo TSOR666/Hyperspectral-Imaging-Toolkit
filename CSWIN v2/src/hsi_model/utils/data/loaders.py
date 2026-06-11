@@ -6,6 +6,7 @@ DataLoader creation utilities with MST++-style memory optimisations.
 import os
 import logging
 import random
+from functools import partial
 from typing import Dict, Tuple, Any
 
 import h5py
@@ -56,6 +57,12 @@ def create_training_datasets(
         )
 
     memory_mode = config.get("memory_mode", "standard")
+    lazy_cache_size = int(
+        config.get(
+            "lazy_cache_size",
+            os.environ.get("MST_LAZY_CACHE_SIZE", 3),
+        )
+    )
     data_root = config.get("data_dir", DEFAULT_DATA_DIR)
     crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
     stride = config.get("stride", DEFAULT_STRIDE)
@@ -67,12 +74,14 @@ def create_training_datasets(
         bgr2rgb=True,
         stride=stride,
         memory_mode=memory_mode,
+        lazy_cache_size=lazy_cache_size,
     )
 
     val_dataset = MST_ValidDataset(
         data_root=data_root,
         bgr2rgb=True,
         memory_mode=memory_mode,
+        lazy_cache_size=max(1, int(config.get("lazy_val_cache_size", 1))),
     )
 
     return train_dataset, val_dataset
@@ -114,6 +123,16 @@ def worker_init_fn_mst(worker_id: int, base_seed: int = 42, rank: int = 0) -> No
     )
 
 
+def make_worker_init_fn(base_seed: int = 42, rank: int = 0):
+    """Return a spawn-safe DataLoader worker initializer.
+
+    ``lambda`` and nested functions cannot be pickled by Windows/macOS spawn
+    workers. ``functools.partial`` around this module-level function preserves
+    the configured seed/rank while remaining serializable.
+    """
+    return partial(worker_init_fn_mst, base_seed=int(base_seed), rank=int(rank))
+
+
 def create_mst_dataloaders(
     config: Dict[str, Any],
     distributed: bool = False,
@@ -152,8 +171,7 @@ def create_mst_dataloaders(
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed)
         logger.info("  - Using DistributedSampler")
 
-    def worker_init_wrapper(worker_id: int) -> None:
-        worker_init_fn_mst(worker_id, seed, rank)
+    worker_init = make_worker_init_fn(seed, rank)
 
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -163,7 +181,7 @@ def create_mst_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=worker_init_wrapper,
+        worker_init_fn=worker_init,
         persistent_workers=(num_workers > 0),
     )
 
@@ -174,7 +192,7 @@ def create_mst_dataloaders(
         sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        worker_init_fn=worker_init_wrapper,
+        worker_init_fn=worker_init,
         persistent_workers=False,
     )
 

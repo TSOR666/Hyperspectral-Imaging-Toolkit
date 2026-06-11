@@ -124,7 +124,10 @@ def _factor_pair(n: int) -> Tuple[int, int]:
                 # For extreme aspect ratios, prefer near-square
                 h_alt = sqrt_n
                 w_alt = (n + h_alt - 1) // h_alt  # Ceiling division
-                if h_alt * w_alt >= n and min(h_alt, w_alt) >= 4:
+                # Only accept the near-square alternative if it is an EXACT factorization
+                # (h_alt*w_alt == n). Accepting >= n returns a pair whose product exceeds n,
+                # which breaks the downstream (B, C, h, w) reshape of an L=n token sequence.
+                if h_alt * w_alt == n and min(h_alt, w_alt) >= 4:
                     warnings.warn(
                         f"Extreme aspect ratio {h}x{w} for length {n}. "
                         f"Consider using {h_alt}x{w_alt} or providing explicit H,W.",
@@ -139,15 +142,14 @@ def _factor_pair(n: int) -> Tuple[int, int]:
                     )
             return h, w
     
-    # Fallback for primes - use near-square
-    h = sqrt_n
-    w = (n + h - 1) // h
+    # Fallback for primes - return the only exact factorization (1, n) so the product
+    # always equals n (a ceiling-division near-square would overshoot and break reshape).
     warnings.warn(
-        f"No good factorization for length {n} (using {h}x{w}). "
+        f"No good factorization for length {n} (using 1x{n}). "
         f"Consider providing explicit H,W dimensions.",
         UserWarning
     )
-    return h, w
+    return 1, n
 
 
 def _pooled_spatial_size(height: int, width: int, max_tokens: Optional[int]) -> Tuple[int, int]:
@@ -941,14 +943,20 @@ class LightningProConfig:
     num_experts: int = 4
     use_rope: bool = True
     use_cross_attention: bool = True
-    cross_attention_max_tokens: Optional[int] = None
+    # Bound decoder cross-attention K/V tokens (queries stay full-resolution). None = full
+    # quadratic attention; 1024 matches the training CLI/audit default and pools only the
+    # highest-resolution decoder stage(s). Keep aligned with hsifusion_training defaults.
+    cross_attention_max_tokens: Optional[int] = 1024
     enable_spectral: bool = True
     spectral_basis_rank: Optional[int] = None
     
     # Training
     dropout: float = 0.0
     drop_path: float = 0.1
-    estimate_uncertainty: bool = True
+    # The uncertainty head is untrained unless a matching loss is wired in, so it must default
+    # off (aligns with the training script and the prior audit) to avoid emitting an unused,
+    # arbitrary second output during direct create_hsifusion_lightning_pro()/inference use.
+    estimate_uncertainty: bool = False
     auxiliary_loss_weight: float = 0.01
     spectral_failure_weight: float = 0.1  # Weight for spectral attention failures
     gradient_clip_val: float = 1.0

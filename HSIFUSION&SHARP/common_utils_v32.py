@@ -663,9 +663,12 @@ def sparse_attention_topk(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     *batch_dims, seq_len, head_dim = v.shape
     batch_size = math.prod(batch_dims)
     
-    v_flat = v_float.view(batch_size, seq_len, head_dim)  # (B*, L, D)
-    topk_indices_flat = topk_indices.view(batch_size, -1, k_keep)  # (B*, L, K)
-    topk_attn_flat = topk_attn.view(batch_size, -1, k_keep)  # (B*, L, K)
+    # reshape (not view): q/k/v may be non-contiguous after upstream permute, so
+    # v_float.view(...) raises "view size is not compatible". reshape is a safe no-copy
+    # when contiguous and copies only when required.
+    v_flat = v_float.reshape(batch_size, seq_len, head_dim)  # (B*, L, D)
+    topk_indices_flat = topk_indices.reshape(batch_size, -1, k_keep)  # (B*, L, K)
+    topk_attn_flat = topk_attn.reshape(batch_size, -1, k_keep)  # (B*, L, K)
     
     # Efficient gathering using advanced indexing (removed unused seq_indices)
     batch_indices = torch.arange(batch_size, device=v.device)[:, None, None]  # (B*, 1, 1)
