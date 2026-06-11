@@ -1,0 +1,1 @@
+"""WaveDiff benchmark entry points."""

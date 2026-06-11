@@ -3,8 +3,10 @@
 Generator-only (no-GAN) training for CSWin RGB->HSI reconstruction.
 
 This is the post-GAN trainer: the discriminator, Sinkhorn-OT adversarial loss,
-and R1 regularization are gone. The objective is configurable reconstruction
-loss (L1 in the active HSIFormer recipe, with MRAE variants also available).
+and R1 regularization are gone. The objective is a configurable reconstruction
+loss (see ``objective`` in config.yaml; the active recipe uses L1 plus a small
+MRAE term — note that any compound objective is NOT loss-comparable with
+MRAE-only MST++ benchmark training, only the evaluation metric is).
 
 Dropping the GAN removes 4 discriminator forwards + a discriminator backward +
 the per-batch Sinkhorn loop per iteration, which frees most of the compute
@@ -171,8 +173,11 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
         return RelativeMRAELoss(
             denominator_epsilon=float(config.get("relative_mrae_epsilon", 1e-2))
         )
-    logger.warning("Unknown objective=%r; defaulting to MRAE.", objective)
-    return MRAELoss(epsilon=float(config.get("mrae_epsilon", 1e-8)))
+    raise ValueError(
+        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_l1, "
+        "l1_with_mrae, relative_mrae (a typo here silently changed the training "
+        "objective in earlier versions; failing loudly instead)."
+    )
 
 
 def _resolve_stages(config: Dict[str, Any]) -> list:
@@ -214,7 +219,11 @@ def _resolve_stages(config: Dict[str, Any]) -> list:
 def _build_train_loader(dataset, batch_size, config, distributed, seed, rank):
     """Build a training DataLoader for a given dataset/batch_size."""
     seed_base = seed + rank * 1000
-    sampler = DistributedSampler(dataset, shuffle=True, seed=seed_base) if distributed else None
+    # DistributedSampler requires the SAME seed on every rank: each rank takes
+    # its rank-th stride of one shared permutation. Per-rank seeds would make
+    # the rank shards overlap (~35% duplicated samples per epoch at world=4).
+    # Rank-dependent augmentation randomness comes from worker_init_fn_mst.
+    sampler = DistributedSampler(dataset, shuffle=True, seed=seed) if distributed else None
     num_workers = int(config.get("num_workers", 8))
     return DataLoader(
         dataset=dataset,
@@ -296,6 +305,18 @@ def validate_generator(
                 continue
 
     del val_loader
+
+    # Each rank evaluated a disjoint shard under DistributedSampler; aggregate
+    # before averaging so best-model selection and early stopping use the FULL
+    # validation set rather than rank 0's shard.
+    if distributed and torch.distributed.is_initialized():
+        batches_t = torch.tensor(float(num_batches), device=device)
+        torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(batches_t, op=torch.distributed.ReduceOp.SUM)
+        for value in total_metrics.values():
+            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+        num_batches = int(batches_t.item())
+
     denom = max(num_batches, 1)
     avg = {"gen_loss": total_loss.item() / denom}
     avg.update({k: v.item() / denom for k, v in total_metrics.items()})
@@ -392,37 +413,63 @@ def _run_stage(
                         f"consecutive batches at iteration {iteration}."
                     )
                 continue
-            consecutive_nonfinite = 0
+            # (consecutive_nonfinite is reset only after a successful optimizer
+            # step below, so repeated NaN losses/grads cannot loop forever.)
 
             with autocast(enabled=use_amp, dtype=autocast_dtype):
                 loss = criterion(pred.float(), hsi_tensor.float())
 
-            if not torch.isfinite(loss):
-                train_logger.warning("Non-finite loss at iter %s; skipping batch", iteration)
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
+            # A non-finite loss is caught below via the grad-norm check (NaN
+            # loss -> NaN grads -> NaN grad norm), which avoids a dedicated
+            # per-step host-device sync on the loss here.
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 net.parameters(), max_norm=DEFAULT_GRADIENT_CLIP_NORM
             )
             if not torch.isfinite(grad_norm):
-                train_logger.warning("Non-finite grad norm at iter %s; skipping step", iteration)
+                consecutive_nonfinite += 1
+                train_logger.warning(
+                    "Non-finite loss/grad norm at iter %s; skipping step (%s/%s)",
+                    iteration, consecutive_nonfinite, max_consecutive_nonfinite,
+                )
                 optimizer.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    # unscale_() was already called for this optimizer; update()
+                    # consumes that state (otherwise the next unscale_() raises)
+                    # and shrinks the loss scale since non-finite grads were
+                    # found.
+                    scaler.update()
+                bad = first_nonfinite_parameter_name(generator)
+                if bad is not None:
+                    raise FloatingPointError(
+                        f"Generator parameter contains NaN/Inf: {bad}. Resume from "
+                        "the last finite checkpoint with a lower LR."
+                    )
+                if max_consecutive_nonfinite > 0 and consecutive_nonfinite >= max_consecutive_nonfinite:
+                    raise FloatingPointError(
+                        f"Non-finite loss/gradients on {consecutive_nonfinite} "
+                        f"consecutive batches at iteration {iteration}."
+                    )
                 continue
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            consecutive_nonfinite = 0
             if ema is not None and (iteration + 1) % ema_update_every == 0:
                 ema.update(generator)
 
-            epoch_losses.append(loss.item())
+            # Keep the running loss on-device; it is materialised to Python
+            # floats only at logging/validation cadence (saves one host-device
+            # sync per step).
+            epoch_losses.append(loss.detach())
             iteration += 1
             stage_iter += 1
 
             if iteration % 20 == 0:
-                avg_loss = np.mean(epoch_losses[-20:]) if epoch_losses else 0.0
+                avg_loss = (
+                    torch.stack(epoch_losses[-20:]).mean().item() if epoch_losses else 0.0
+                )
                 elapsed = max(time.perf_counter() - log_window_start, 1e-9)
                 completed = max(iteration - log_window_iteration, 1)
                 train_logger.info(
@@ -456,7 +503,9 @@ def _run_stage(
                 current_mrae = val_metrics.get("mrae", float("inf"))
                 epoch_num = iteration // per_epoch_iteration
                 stage_epoch_num = stage_iter // per_epoch_iteration
-                avg_train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+                avg_train_loss = (
+                    torch.stack(epoch_losses).mean().item() if epoch_losses else 0.0
+                )
                 objective_name = str(config.get("objective", "l1")).upper()
                 train_logger.info(
                     "Iter[%06d] Epoch[%06d] TrainLoss[%s]: %.6f ValMRAE: %.6f",
@@ -558,7 +607,10 @@ def _run_stage(
                             checkpoint_dict,
                             os.path.join(checkpoint_dir, f"net_{epoch_num}epoch.pth"),
                         )
-                        _prune_epoch_checkpoints(checkpoint_dir, CHECKPOINT_KEEP_COUNT)
+                        _prune_epoch_checkpoints(
+                            checkpoint_dir,
+                            int(config.get("checkpoint_keep", CHECKPOINT_KEEP_COUNT)),
+                        )
 
                 epoch_losses = []
                 memory_cleanup()
@@ -676,10 +728,23 @@ def train_generator_only(
         # otherwise rebuild at the new patch size.
         if stage_idx == 0 and train_dataset is not None and stage["patch_size"] == int(config.get("patch_size", 128)):
             stage_dataset = train_dataset
+        elif train_dataset is not None and hasattr(train_dataset, "set_patch_geometry"):
+            # The in-RAM dataset stores full-resolution scenes; only the patch
+            # indexing depends on crop size. Mutating it avoids re-loading the
+            # ~30 GB scene set (and a discarded val-set copy) at every stage
+            # boundary, which previously doubled host RAM from stage 1 onward.
+            train_dataset.set_patch_geometry(stage["patch_size"])
+            stage_dataset = train_dataset
         else:
+            # Fallback for dataset classes without set_patch_geometry (e.g. the
+            # HF wrapper). Note: the caller's reference keeps the previous copy
+            # alive for the duration of the run; only MST datasets avoid the
+            # double-residency via the mutation path above.
             stage_cfg = dict(config)
             stage_cfg["patch_size"] = stage["patch_size"]
-            stage_dataset, _ = create_training_datasets(stage_cfg, seed=int(config.get("seed", 42)))
+            stage_dataset, stage_val = create_training_datasets(stage_cfg, seed=int(config.get("seed", 42)))
+            del stage_val  # only the train split is needed; free the val copy
+            train_dataset = stage_dataset
         train_loader = _build_train_loader(
             stage_dataset, stage["batch_size"], config, distributed, seed, rank
         )
@@ -744,7 +809,7 @@ def main(config: DictConfig) -> None:
             main_logger.info("=" * 60)
             main_logger.info("GENERATOR-ONLY (NO-GAN) RECONSTRUCTION TRAINING")
             main_logger.info("objective=%s, sampling=%s, spectral=%s, base_channels=%s, blocks/stage=%s",
-                             cfg.get("objective", "mrae"), cfg.get("sampling"),
+                             cfg.get("objective", "l1"), cfg.get("sampling"),
                              cfg.get("spectral_attention_type"), cfg.get("base_channels"),
                              cfg.get("blocks_per_stage"))
             main_logger.info("=" * 60)
@@ -785,7 +850,16 @@ def main(config: DictConfig) -> None:
         criterion = build_criterion(cfg)
 
         if is_distributed:
-            net = DDP(net, device_ids=[rank], find_unused_parameters=True)
+            # device_ids must be the node-LOCAL device index (the global rank
+            # would index nonexistent GPUs on multi-node runs). The generator
+            # objective touches every parameter, so the per-iteration
+            # unused-parameter graph walk is pure overhead by default.
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            net = DDP(
+                net,
+                device_ids=[local_rank],
+                find_unused_parameters=bool(cfg.get("ddp_find_unused_parameters", False)),
+            )
 
         ema: Optional[GeneratorEMA] = None
         if cfg.get("use_ema", True):

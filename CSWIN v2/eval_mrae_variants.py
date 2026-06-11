@@ -84,7 +84,23 @@ def load_model(checkpoint_path: str, device: torch.device) -> NoiseRobustCSWinMo
         state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
 
     model = NoiseRobustCSWinModel(config).to(device)
+    # Generator-only checkpoints (train_generator.py) store BARE generator
+    # keys; this wrapper expects 'generator.*'. Adapt instead of letting
+    # strict=False silently load nothing and score random weights.
+    model_keys = set(model.state_dict().keys())
+    if not (set(state_dict) & model_keys):
+        prefixed = {f"generator.{k}": v for k, v in state_dict.items()}
+        if set(prefixed) & model_keys:
+            print("[info] bare generator checkpoint detected; prefixing keys with 'generator.'")
+            state_dict = prefixed
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if len(missing) >= len(model_keys):
+        raise RuntimeError(
+            f"Checkpoint matched 0/{len(model_keys)} model keys - refusing to "
+            "evaluate randomly initialized weights. Use a checkpoint produced "
+            "by the GAN trainer, or load generator-only checkpoints through "
+            "hsi_model.utils.inference.load_generator."
+        )
     if missing:
         print(f"[warn] {len(missing)} missing keys (e.g. {missing[:3]})")
     if unexpected:

@@ -48,9 +48,10 @@ class SpectralAngleLoss(nn.Module):
     Spectral Angle Mapper (SAM) loss
     Measures similarity between spectral signatures independent of magnitude
     """
-    def __init__(self, eps=1e-8):
+    def __init__(self, eps=1e-8, normalized_to_neg_one_to_one=True):
         super().__init__()
         self.eps = eps
+        self.normalized_to_neg_one_to_one = normalized_to_neg_one_to_one
 
     def forward(self, pred_hsi, target_hsi):
         """
@@ -63,6 +64,10 @@ class SpectralAngleLoss(nn.Module):
         Returns:
             Mean spectral angle in radians
         """
+        if self.normalized_to_neg_one_to_one:
+            pred_hsi = (pred_hsi + 1.0) * 0.5
+            target_hsi = (target_hsi + 1.0) * 0.5
+
         # Flatten spatial dimensions
         pred_flat = pred_hsi.reshape(pred_hsi.shape[0], pred_hsi.shape[1], -1)  # B, C, H*W
         target_flat = target_hsi.reshape(target_hsi.shape[0], target_hsi.shape[1], -1)  # B, C, H*W
@@ -146,7 +151,9 @@ class FrequencyDomainLoss(nn.Module):
 
         pred_phase = torch.angle(pred_freq_low)
         target_phase = torch.angle(target_freq_low)
-        phase_loss = F.l1_loss(pred_phase, target_phase)
+        # Circular distance avoids a false 2*pi discontinuity at the phase
+        # wrap boundary.
+        phase_loss = (1.0 - torch.cos(pred_phase - target_phase)).mean()
 
         return mag_loss + 0.5 * phase_loss
 
@@ -207,10 +214,16 @@ class PhysicalConstraintLoss(nn.Module):
     - Spectral smoothness
     - Valid intensity ranges
     """
-    def __init__(self, lambda_neg=1.0, lambda_range=1.0):
+    def __init__(
+        self,
+        lambda_neg=1.0,
+        lambda_range=1.0,
+        normalized_to_neg_one_to_one=True,
+    ):
         super().__init__()
         self.lambda_neg = lambda_neg
         self.lambda_range = lambda_range
+        self.normalized_to_neg_one_to_one = normalized_to_neg_one_to_one
 
     def forward(self, pred_hsi):
         """
@@ -224,8 +237,10 @@ class PhysicalConstraintLoss(nn.Module):
         """
         loss = 0.0
 
-        # Convert from [-1, 1] to [0, 1] for physical interpretation
-        pred_physical = (pred_hsi + 1.0) / 2.0
+        if self.normalized_to_neg_one_to_one:
+            pred_physical = (pred_hsi + 1.0) / 2.0
+        else:
+            pred_physical = pred_hsi
 
         # Penalize negative values (after denormalization)
         neg_values = torch.relu(-pred_physical)
@@ -251,6 +266,7 @@ class CombinedSpectralLoss(nn.Module):
         use_frequency=True,
         use_perceptual=True,
         use_physical=True,
+        normalized_to_neg_one_to_one=True,
         sam_weight=0.1,
         spectral_grad_weight=0.5,
         frequency_weight=0.3,
@@ -273,7 +289,9 @@ class CombinedSpectralLoss(nn.Module):
 
         # Initialize loss modules
         if use_sam:
-            self.sam_loss = SpectralAngleLoss()
+            self.sam_loss = SpectralAngleLoss(
+                normalized_to_neg_one_to_one=normalized_to_neg_one_to_one
+            )
 
         if use_spectral_grad:
             self.spectral_grad_loss = SpectralGradientLoss()
@@ -285,7 +303,9 @@ class CombinedSpectralLoss(nn.Module):
             self.perceptual_loss = PerceptualSpectralLoss(num_bands=num_bands)
 
         if use_physical:
-            self.physical_loss = PhysicalConstraintLoss()
+            self.physical_loss = PhysicalConstraintLoss(
+                normalized_to_neg_one_to_one=normalized_to_neg_one_to_one
+            )
 
     def forward(self, pred_hsi, target_hsi=None, return_components=False):
         """

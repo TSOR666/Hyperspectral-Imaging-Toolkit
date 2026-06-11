@@ -71,7 +71,9 @@ class SpectralNoiseSchedule(BaseNoiseSchedule):
         super().__init__(timesteps, beta_start, beta_end)
         self.num_freq_bands = num_freq_bands
 
-        self.spectral_weights = nn.Parameter(torch.ones(num_freq_bands))
+        # Diagnostic content-adaptation weights. The valid diffusion path uses
+        # the fixed cached schedule, so these are not trainable parameters.
+        self.register_buffer('spectral_weights', torch.ones(num_freq_bands))
 
     def compute_band_energy(self, x: torch.Tensor) -> torch.Tensor:
         """Compute the energy contained in logarithmically spaced frequency bands."""
@@ -147,8 +149,8 @@ class WaveletSpectralNoiseSchedule(BaseNoiseSchedule):
 
         self.wavelet = HaarWaveletTransform(latent_dim)
 
-        self.ll_weight = nn.Parameter(torch.ones(1))
-        self.detail_weights = nn.Parameter(torch.ones(3))
+        self.register_buffer('ll_weight', torch.ones(1))
+        self.register_buffer('detail_weights', torch.ones(3))
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         base_beta = self.betas[t]

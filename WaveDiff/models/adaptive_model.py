@@ -17,14 +17,23 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
     """
     def __init__(self, latent_dim=64, out_channels=31, timesteps=1000,
                  use_batchnorm=True, masking_config=None, threshold_method='soft',
-                 init_threshold=0.1, trainable_threshold=True, refinement_config=None):
+                 init_threshold=0.1, trainable_threshold=True, refinement_config=None,
+                 return_noise_estimate=False, norm_type=None, norm_groups=8,
+                 cross_attention_mode="channel", attention_window_size=8,
+                 conditional_residual_diffusion=False, residual_scale=1.0):
         super().__init__(
             latent_dim=latent_dim,
             out_channels=out_channels,
             timesteps=timesteps,
             use_batchnorm=use_batchnorm,
             masking_config=masking_config,
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
+            conditional_residual_diffusion=conditional_residual_diffusion,
+            residual_scale=residual_scale,
         )
 
         # Replace standard denoiser with thresholding wavelet UNet denoiser
@@ -34,18 +43,25 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
             use_batchnorm=use_batchnorm,
             threshold_method=threshold_method,
             init_threshold=init_threshold,
-            trainable_threshold=trainable_threshold
+            trainable_threshold=trainable_threshold,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
+            conditional=conditional_residual_diffusion,
         )
 
         # Update DPM-OT to use the new denoiser
         self.dpm_ot = DPMOT(
             denoiser=self.denoiser,
             spectral_schedule=self.spectral_schedule,
-            timesteps=timesteps
+            timesteps=timesteps,
+            conditional=conditional_residual_diffusion,
         )
 
         # Add noise estimator for adaptive processing
         self.noise_estimator = WaveletNoiseEstimator()
+        self.return_noise_estimate = return_noise_estimate
 
         # Add adaptive thresholding module for inference refinement
         # CRITICAL FIX: Initialize with correct number of channels (out_channels for HSI output)
@@ -62,15 +78,28 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         from transforms.haar_wavelet import InverseHaarWaveletTransform
         self.inverse_wavelet_transform = InverseHaarWaveletTransform()
     
-    def forward(self, rgb, t=None, mask=None, use_masking=False):
+    def forward(
+        self,
+        rgb,
+        t=None,
+        mask=None,
+        use_masking=False,
+        hsi_target=None,
+    ):
         """
         Enhanced forward pass with adaptive thresholding
         """
         # Get basic forward pass results using parent implementation
-        outputs = super().forward(rgb, t, mask, use_masking)
+        outputs = super().forward(
+            rgb,
+            t,
+            mask,
+            use_masking,
+            hsi_target=hsi_target,
+        )
         
         # Add noise estimation if available from denoiser
-        if hasattr(self.denoiser, 'noise_estimator'):
+        if self.return_noise_estimate and hasattr(self.denoiser, 'noise_estimator'):
             latent = outputs['latent']
             # Get estimated noise level using wavelet-based estimator
             noise_level = self.denoiser.noise_estimator(
@@ -92,9 +121,9 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
            hasattr(self.denoiser.input_thresholding, 'll_threshold'):
             # Add small regularization to prevent threshold values from growing too large
             threshold_reg = (
-                torch.norm(self.denoiser.input_thresholding.ll_threshold) + 
+                torch.norm(self.denoiser.input_thresholding.ll_threshold) +
                 torch.norm(self.denoiser.input_thresholding.detail_thresholds)
-            ) * 1e-4
+            )
             
             losses['threshold_reg'] = threshold_reg
         
@@ -107,6 +136,7 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         return_stages=False,
         *,
         apply_adaptive_threshold: bool = True,
+        latent_mode: str = "direct",
     ):
         """
         Convert RGB to HSI with enhanced adaptive thresholding
@@ -121,24 +151,30 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
             HSI image tensor [B, C, H, W] or tuple of (HSI, stages dict)
         """
         # Encode RGB to latent space
-        latent = self.encode(rgb)
-
-        # Sample latent using DPM Solver v3 for efficient inference
-        sampled_latent = self.dpm_ot.sample(
-            latent.shape,
-            latent.device,
-            conditioning=latent,
-            use_dpm_solver=True,
-            steps=sampling_steps or 20
-        )
-
-        # Decode to HSI
-        hsi_initial = self.decode(sampled_latent)
-        hsi_after_spectral = self.refinement_head(hsi_initial)
-        if getattr(self, 'pixel_refinement_head', None) is not None:
-            hsi_after_pixel = self.pixel_refinement_head(hsi_after_spectral)
+        latent = self._encode_condition(rgb)
+        if latent_mode == "direct":
+            reconstruction_latent = latent
+        elif latent_mode == "diffusion":
+            sampled = self.dpm_ot.sample(
+                latent.shape,
+                latent.device,
+                conditioning=latent,
+                use_dpm_solver=True,
+                steps=sampling_steps or 20,
+            )
+            reconstruction_latent = (
+                latent + self.residual_scale * sampled
+                if self.conditional_residual_diffusion
+                else sampled
+            )
         else:
-            hsi_after_pixel = hsi_after_spectral
+            raise ValueError(
+                f"latent_mode must be 'direct' or 'diffusion', got {latent_mode!r}"
+            )
+
+        hsi_after_pixel, hsi_initial, hsi_after_spectral = self._decode_and_refine(
+            reconstruction_latent
+        )
 
         stages = {
             'initial': hsi_initial,
@@ -148,10 +184,6 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
 
         # Apply adaptive thresholding as a final refinement step
         if apply_adaptive_threshold:
-            # CRITICAL FIX: Ensure transforms are on the correct device
-            self.wavelet_transform_output = self.wavelet_transform_output.to(hsi_after_pixel.device)
-            self.inverse_wavelet_transform = self.inverse_wavelet_transform.to(hsi_after_pixel.device)
-
             # Apply wavelet transform to HSI output
             hsi_coeffs = self.wavelet_transform_output(hsi_after_pixel)
 

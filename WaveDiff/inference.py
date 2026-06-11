@@ -5,6 +5,7 @@ import argparse
 from tqdm import tqdm
 from PIL import Image
 from pathlib import Path
+from torch.utils.data import DataLoader, Dataset
 
 # Import model implementations
 from models.base_model import HSILatentDiffusionModel
@@ -36,7 +37,12 @@ def _torch_load_checkpoint(path, map_location):
         return torch.load(path, map_location=map_location)
 
 
-def load_model(checkpoint_path, device, model_type=None):
+def load_model(
+    checkpoint_path,
+    device,
+    model_type=None,
+    use_ema_weights=True,
+):
     """
     Load a model from checkpoint
     
@@ -70,6 +76,18 @@ def load_model(checkpoint_path, device, model_type=None):
     latent_dim = config.get('latent_dim', 64)
     timesteps = config.get('timesteps', 1000)
     use_batchnorm = config.get('use_batchnorm', True)
+    common_kwargs = {
+        'norm_type': config.get('norm_type'),
+        'norm_groups': config.get('norm_groups', 8),
+        'cross_attention_mode': config.get(
+            'cross_attention_mode', 'spatial'
+        ),
+        'attention_window_size': config.get('attention_window_size', 8),
+        'conditional_residual_diffusion': config.get(
+            'conditional_residual_diffusion', False
+        ),
+        'residual_scale': config.get('residual_scale', 1.0),
+    }
     
     refinement_config = config.get('refinement_config')
 
@@ -80,7 +98,14 @@ def load_model(checkpoint_path, device, model_type=None):
             out_channels=31,  # 31 HSI bands output for ARAD-1K
             timesteps=timesteps,
             use_batchnorm=use_batchnorm,
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            use_enhanced_attention=config.get('use_enhanced_attention', False),
+            use_domain_adaptation=config.get('use_domain_adaptation', False),
+            dropout=config.get('dropout', 0.1),
+            enhanced_attention_mode=config.get(
+                'enhanced_attention_mode', 'spatial'
+            ),
+            **common_kwargs,
         ).to(device)
     elif config['model_type'] == 'wavelet':
         print("Loading Wavelet-enhanced HSI Latent Diffusion Model")
@@ -89,7 +114,8 @@ def load_model(checkpoint_path, device, model_type=None):
             out_channels=31,
             timesteps=timesteps,
             use_batchnorm=use_batchnorm,
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            **common_kwargs,
         ).to(device)
     elif config['model_type'] == 'adaptive_wavelet':
         print("Loading Adaptive Wavelet HSI Latent Diffusion Model")
@@ -105,18 +131,35 @@ def load_model(checkpoint_path, device, model_type=None):
             threshold_method=threshold_method,
             init_threshold=init_threshold,
             trainable_threshold=trainable_threshold,
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            **common_kwargs,
         ).to(device)
     else:
         raise ValueError(f"Unknown model type: {config['model_type']}")
     
     # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = checkpoint['model_state_dict']
+    if use_ema_weights and 'ema_state_dict' in checkpoint:
+        ema_state = checkpoint['ema_state_dict']
+        state_dict = ema_state.get('model', ema_state)
+        print("Loading EMA weights")
+    model.load_state_dict(state_dict)
     
     # Set to evaluation mode
     model.eval()
     
     return model, config
+
+
+def build_rgb_transform(image_size=256):
+    """Build the RGB preprocessing used by both single and batched inference."""
+    from torchvision import transforms
+
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
 
 
 def preprocess_image(image_path, image_size=256):
@@ -130,14 +173,7 @@ def preprocess_image(image_path, image_size=256):
     Returns:
         Preprocessed image tensor
     """
-    from torchvision import transforms
-
-    # Define transforms
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
+    transform = build_rgb_transform(image_size)
 
     # Load and transform image
     image = Image.open(image_path).convert('RGB')
@@ -146,6 +182,53 @@ def preprocess_image(image_path, image_size=256):
     image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
 
     return image_tensor
+
+
+class InferenceImageDataset(Dataset):
+    """Decode and preprocess directory images for true batched inference."""
+
+    def __init__(self, image_files, image_size=256):
+        self.image_files = list(image_files)
+        self.transform = build_rgb_transform(image_size)
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, index):
+        path = self.image_files[index]
+        with Image.open(path) as image:
+            tensor = self.transform(image.convert('RGB'))
+        return {
+            'rgb': tensor,
+            'path': str(path),
+            'filename': path.stem,
+        }
+
+
+def compile_model_for_inference(model, mode="default"):
+    """Compile compute-heavy model submodules while preserving custom methods."""
+    if not hasattr(torch, 'compile'):
+        print("torch.compile is unavailable; using eager inference")
+        return model
+
+    module_names = [
+        'encoder',
+        'hsi_encoder',
+        'denoiser',
+        'decoder',
+        'refinement_head',
+        'pixel_refinement_head',
+    ]
+    for name in module_names:
+        module = getattr(model, name, None)
+        if module is None:
+            continue
+        try:
+            setattr(model, name, torch.compile(module, mode=mode))
+        except Exception as exc:
+            print(f"Could not compile {name}; using eager module: {exc}")
+    model.dpm_ot.denoiser = model.denoiser
+    return model
 
 
 def load_hsi_ground_truth(path):
@@ -244,7 +327,31 @@ def postprocess_hsi_output(hsi_tensor, config=None, clamp=True):
     return output
 
 
-def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_threshold=True):
+def align_hsi_ground_truth(hsi_gt, reference):
+    """Align ground-truth spatial size with the model output."""
+    if hsi_gt.shape[1] != reference.shape[1]:
+        raise ValueError(
+            f"HSI channel mismatch: ground truth has {hsi_gt.shape[1]} bands, "
+            f"prediction has {reference.shape[1]}"
+        )
+    if hsi_gt.shape[-2:] != reference.shape[-2:]:
+        hsi_gt = torch.nn.functional.interpolate(
+            hsi_gt,
+            size=reference.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+    return hsi_gt
+
+
+def run_inference(
+    model,
+    rgb_tensor,
+    device,
+    sampling_steps=20,
+    apply_adaptive_threshold=True,
+    latent_mode="direct",
+):
     """
     Run inference on an RGB image
     
@@ -272,13 +379,15 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
                     rgb_tensor,
                     sampling_steps=sampling_steps,
                     apply_adaptive_threshold=apply_adaptive_threshold,
-                    return_stages=True
+                    return_stages=True,
+                    latent_mode=latent_mode,
                 )
             else:
                 result = model.rgb_to_hsi(
                     rgb_tensor,
                     sampling_steps=sampling_steps,
-                    return_stages=True
+                    return_stages=True,
+                    latent_mode=latent_mode,
                 )
 
             if isinstance(result, tuple) and len(result) == 2:
@@ -289,14 +398,20 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
             # Manual inference for other models
             latent = model.encode(rgb_tensor)
 
-            # Sample latent using DPM Solver
-            sampled_latent = model.dpm_ot.sample(
-                latent.shape,
-                latent.device,
-                conditioning=latent,
-                use_dpm_solver=True,
-                steps=sampling_steps
-            )
+            if latent_mode == "direct":
+                sampled_latent = latent
+            elif latent_mode == "diffusion":
+                sampled_latent = model.dpm_ot.sample(
+                    latent.shape,
+                    latent.device,
+                    conditioning=latent,
+                    use_dpm_solver=True,
+                    steps=sampling_steps,
+                )
+            else:
+                raise ValueError(
+                    f"latent_mode must be 'direct' or 'diffusion', got {latent_mode!r}"
+                )
 
             # Decode to HSI
             hsi_output = model.decode(sampled_latent)
@@ -306,6 +421,146 @@ def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_t
         stage_outputs['final'] = hsi_output
 
     return hsi_output, stage_outputs
+
+
+def _tile_starts(length, tile_size, stride):
+    if length <= tile_size:
+        return [0]
+    starts = list(range(0, length - tile_size + 1, stride))
+    if starts[-1] != length - tile_size:
+        starts.append(length - tile_size)
+    return starts
+
+
+def _blend_window(tile_size, device, dtype):
+    if tile_size == 1:
+        return torch.ones(1, 1, 1, 1, device=device, dtype=dtype)
+    axis = torch.hann_window(
+        tile_size,
+        periodic=False,
+        device=device,
+        dtype=dtype,
+    ).clamp_min(0.05)
+    return (axis[:, None] * axis[None, :]).view(1, 1, tile_size, tile_size)
+
+
+def run_tiled_inference(
+    model,
+    rgb_tensor,
+    device,
+    tile_size,
+    overlap=32,
+    tile_batch_size=1,
+    sampling_steps=20,
+    apply_adaptive_threshold=True,
+    latent_mode="direct",
+):
+    """Run overlapping tiled inference with weighted stitching."""
+    if tile_size < 4 or tile_size % 4 != 0:
+        raise ValueError("tile_size must be a positive multiple of 4")
+    if overlap < 0 or overlap >= tile_size:
+        raise ValueError("overlap must satisfy 0 <= overlap < tile_size")
+    tile_batch_size = max(int(tile_batch_size), 1)
+
+    original_h, original_w = rgb_tensor.shape[-2:]
+    pad_h = max(tile_size - original_h, 0)
+    pad_w = max(tile_size - original_w, 0)
+    if pad_h or pad_w:
+        rgb_tensor = torch.nn.functional.pad(
+            rgb_tensor,
+            (0, pad_w, 0, pad_h),
+            mode='replicate',
+        )
+    height, width = rgb_tensor.shape[-2:]
+    stride = tile_size - overlap
+    coordinates = [
+        (top, left)
+        for top in _tile_starts(height, tile_size, stride)
+        for left in _tile_starts(width, tile_size, stride)
+    ]
+
+    batch_size = rgb_tensor.shape[0]
+    accumulators = {}
+    weights = {}
+    blend = None
+
+    for start in range(0, len(coordinates), tile_batch_size):
+        chunk = coordinates[start:start + tile_batch_size]
+        tiles = torch.cat(
+            [
+                rgb_tensor[
+                    :,
+                    :,
+                    top:top + tile_size,
+                    left:left + tile_size,
+                ]
+                for top, left in chunk
+            ],
+            dim=0,
+        )
+        output, stages = run_inference(
+            model,
+            tiles,
+            device,
+            sampling_steps=sampling_steps,
+            apply_adaptive_threshold=apply_adaptive_threshold,
+            latent_mode=latent_mode,
+        )
+        stages = dict(stages)
+        stages['final'] = output
+
+        for stage_name, stage_tensor in stages.items():
+            stage_tensor = stage_tensor.view(
+                len(chunk),
+                batch_size,
+                stage_tensor.shape[1],
+                tile_size,
+                tile_size,
+            )
+            if stage_name not in accumulators:
+                accumulators[stage_name] = torch.zeros(
+                    batch_size,
+                    stage_tensor.shape[2],
+                    height,
+                    width,
+                    device=stage_tensor.device,
+                    dtype=stage_tensor.dtype,
+                )
+                weights[stage_name] = torch.zeros(
+                    batch_size,
+                    1,
+                    height,
+                    width,
+                    device=stage_tensor.device,
+                    dtype=stage_tensor.dtype,
+                )
+            if blend is None or blend.dtype != stage_tensor.dtype:
+                blend = _blend_window(
+                    tile_size,
+                    stage_tensor.device,
+                    stage_tensor.dtype,
+                )
+            for tile_index, (top, left) in enumerate(chunk):
+                accumulators[stage_name][
+                    :,
+                    :,
+                    top:top + tile_size,
+                    left:left + tile_size,
+                ] += stage_tensor[tile_index] * blend
+                weights[stage_name][
+                    :,
+                    :,
+                    top:top + tile_size,
+                    left:left + tile_size,
+                ] += blend
+
+    stitched = {
+        name: (
+            tensor / weights[name].clamp_min(1e-6)
+        )[:, :, :original_h, :original_w]
+        for name, tensor in accumulators.items()
+    }
+    return stitched['final'], stitched
 
 
 def save_results(
@@ -367,6 +622,7 @@ def save_results(
     
     # If ground truth is available, create comparison
     if hsi_gt is not None:
+        hsi_gt = align_hsi_ground_truth(hsi_gt, hsi_output)
         hsi_gt_np = hsi_gt.squeeze(0).cpu().numpy()
         
         # Save comparison visualization
@@ -407,6 +663,7 @@ def evaluate_metrics(hsi_output, hsi_gt, config=None):
     device = hsi_output.device
     hsi_output = postprocess_hsi_output(hsi_output, config)
     hsi_gt = hsi_gt.to(device)
+    hsi_gt = align_hsi_ground_truth(hsi_gt, hsi_output)
     
     # Calculate metrics
     metrics = {}
@@ -426,8 +683,10 @@ def evaluate_metrics(hsi_output, hsi_gt, config=None):
     return metrics
 
 
-def process_directory(input_dir, model, device, output_dir, sampling_steps=20, 
-                      apply_adaptive_threshold=True, batch_size=1, config=None):
+def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
+                      apply_adaptive_threshold=True, batch_size=1, config=None,
+                      latent_mode="direct", tile_size=None, tile_overlap=32,
+                      tile_batch_size=1, num_workers=0):
     """
     Process all RGB images in a directory
     
@@ -438,7 +697,7 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
         output_dir: Directory to save results
         sampling_steps: Number of sampling steps for DPM Solver
         apply_adaptive_threshold: Whether to apply adaptive thresholding (for adaptive models)
-        batch_size: Batch size for processing (currently only supports batch_size=1)
+        batch_size: Number of full images evaluated per model call
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -461,65 +720,84 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
     results_file = os.path.join(output_dir, "metrics.txt")
     results_summary = {}
     
-    # Process each image
-    for img_path in tqdm(image_files, desc="Processing images"):
-        # Get base filename (without extension)
-        filename = img_path.stem
-        
-        # Load and preprocess image
-        try:
-            rgb_tensor = preprocess_image(img_path)
-        except Exception as e:
-            print(f"Error processing {img_path}: {e}")
-            continue
-        
-        # Try to load ground truth HSI data if available
-        gt_dir = Path(input_dir).parent / "HSI"
-        if gt_dir.exists():
-            hsi_gt = load_hsi_ground_truth(gt_dir / filename)
+    image_files = sorted(image_files)
+    dataset = InferenceImageDataset(
+        image_files,
+        image_size=config.get('image_size', 256) if config else 256,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=max(int(batch_size), 1),
+        shuffle=False,
+        num_workers=max(int(num_workers), 0),
+        pin_memory=device.type == 'cuda',
+    )
+    gt_dir = Path(input_dir).parent / "HSI"
+
+    for batch in tqdm(loader, desc="Processing image batches"):
+        rgb_batch = batch['rgb']
+        if tile_size:
+            hsi_batch, stage_batches = run_tiled_inference(
+                model,
+                rgb_batch,
+                device,
+                tile_size=tile_size,
+                overlap=tile_overlap,
+                tile_batch_size=tile_batch_size,
+                sampling_steps=sampling_steps,
+                apply_adaptive_threshold=apply_adaptive_threshold,
+                latent_mode=latent_mode,
+            )
         else:
-            hsi_gt = None
-        
-        # Run inference
-        hsi_output, stage_outputs = run_inference(
-            model, rgb_tensor, device,
-            sampling_steps=sampling_steps,
-            apply_adaptive_threshold=apply_adaptive_threshold
-        )
+            hsi_batch, stage_batches = run_inference(
+                model,
+                rgb_batch,
+                device,
+                sampling_steps=sampling_steps,
+                apply_adaptive_threshold=apply_adaptive_threshold,
+                latent_mode=latent_mode,
+            )
 
-        # Calculate metrics if ground truth is available
-        metrics = None
-        stage_metrics = None
-        if hsi_gt is not None:
-            metrics = evaluate_metrics(hsi_output, hsi_gt, config=config)
-            stage_metrics = {}
-            for stage_name, stage_tensor in stage_outputs.items():
-                if stage_name == 'final':
-                    continue
-                stage_metrics[stage_name] = evaluate_metrics(stage_tensor, hsi_gt, config=config)
-
-            # Save metrics to results dictionary
-            results_summary[filename] = {
-                'final': metrics,
-                'stages': stage_metrics
+        for index, filename in enumerate(batch['filename']):
+            rgb_tensor = rgb_batch[index:index + 1]
+            hsi_output = hsi_batch[index:index + 1]
+            stage_outputs = {
+                name: tensor[index:index + 1]
+                for name, tensor in stage_batches.items()
             }
+            hsi_gt = (
+                load_hsi_ground_truth(gt_dir / filename)
+                if gt_dir.exists()
+                else None
+            )
 
-            # Print metrics
-            print(f"Metrics for {filename}:")
-            for k, v in metrics.items():
-                print(f"  final_{k}: {v:.6f}")
-            for stage_name, stage_vals in stage_metrics.items():
-                for k, v in stage_vals.items():
-                    print(f"  {stage_name}_{k}: {v:.6f}")
-            print()
+            metrics = None
+            stage_metrics = {}
+            if hsi_gt is not None:
+                metrics = evaluate_metrics(hsi_output, hsi_gt, config=config)
+                for stage_name, stage_tensor in stage_outputs.items():
+                    if stage_name == 'final':
+                        continue
+                    stage_metrics[stage_name] = evaluate_metrics(
+                        stage_tensor,
+                        hsi_gt,
+                        config=config,
+                    )
+                results_summary[filename] = {
+                    'final': metrics,
+                    'stages': stage_metrics,
+                }
 
-        # Save results
-        save_results(
-            rgb_tensor, hsi_output, hsi_gt,
-            output_dir, filename, metrics,
-            stage_outputs=stage_outputs,
-            config=config,
-        )
+            save_results(
+                rgb_tensor,
+                hsi_output,
+                hsi_gt,
+                output_dir,
+                filename,
+                metrics,
+                stage_outputs=stage_outputs,
+                config=config,
+            )
     
     # Calculate and save average metrics
     if results_summary:
@@ -567,6 +845,13 @@ def main():
                         help='Model type (overrides checkpoint)')
     parser.add_argument('--sampling_steps', type=int, default=20,
                         help='Number of sampling steps for DPM Solver')
+    parser.add_argument(
+        '--latent_mode',
+        type=str,
+        default='direct',
+        choices=['direct', 'diffusion'],
+        help='Decode the supervised latent directly or use experimental diffusion sampling',
+    )
     parser.add_argument('--adaptive_threshold', dest='adaptive_threshold', action='store_true',
                         help='Apply adaptive thresholding (for adaptive models)')
     parser.add_argument('--no_adaptive_threshold', dest='adaptive_threshold', action='store_false',
@@ -588,6 +873,30 @@ def main():
     # Processing parameters
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for processing (only for directory mode)')
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument(
+        '--tile_size',
+        type=int,
+        default=None,
+        help='Optional overlapping inference tile size (multiple of 4)',
+    )
+    parser.add_argument('--tile_overlap', type=int, default=32)
+    parser.add_argument('--tile_batch_size', type=int, default=1)
+    parser.add_argument(
+        '--torch_compile',
+        action='store_true',
+        help='Compile inference submodules with torch.compile',
+    )
+    parser.add_argument(
+        '--compile_mode',
+        choices=['default', 'reduce-overhead', 'max-autotune'],
+        default='default',
+    )
+    parser.add_argument(
+        '--no_ema',
+        action='store_true',
+        help='Use raw training weights even when EMA weights are available',
+    )
     
     # Parse arguments
     parser.set_defaults(adaptive_threshold=True)
@@ -598,7 +907,14 @@ def main():
     print(f"Using device: {device}")
     
     # Load model
-    model, config = load_model(args.checkpoint, device, args.model_type)
+    model, config = load_model(
+        args.checkpoint,
+        device,
+        args.model_type,
+        use_ema_weights=not args.no_ema,
+    )
+    if args.torch_compile:
+        model = compile_model_for_inference(model, mode=args.compile_mode)
     print(f"Model loaded from {args.checkpoint}")
     
     # Process single image or directory
@@ -607,7 +923,10 @@ def main():
         print(f"Processing image: {args.image}")
         
         # Load and preprocess image
-        rgb_tensor = preprocess_image(args.image)
+        rgb_tensor = preprocess_image(
+            args.image,
+            image_size=config.get('image_size', 256),
+        )
         
         # Get base filename
         filename = Path(args.image).stem
@@ -618,11 +937,25 @@ def main():
             hsi_gt = load_hsi_ground_truth(args.gt_path)
         
         # Run inference
-        hsi_output, stage_outputs = run_inference(
-            model, rgb_tensor, device,
-            sampling_steps=args.sampling_steps,
-            apply_adaptive_threshold=args.adaptive_threshold
-        )
+        if args.tile_size:
+            hsi_output, stage_outputs = run_tiled_inference(
+                model,
+                rgb_tensor,
+                device,
+                tile_size=args.tile_size,
+                overlap=args.tile_overlap,
+                tile_batch_size=args.tile_batch_size,
+                sampling_steps=args.sampling_steps,
+                apply_adaptive_threshold=args.adaptive_threshold,
+                latent_mode=args.latent_mode,
+            )
+        else:
+            hsi_output, stage_outputs = run_inference(
+                model, rgb_tensor, device,
+                sampling_steps=args.sampling_steps,
+                apply_adaptive_threshold=args.adaptive_threshold,
+                latent_mode=args.latent_mode,
+            )
 
         # Calculate metrics if ground truth is available
         metrics = None
@@ -664,6 +997,11 @@ def main():
             apply_adaptive_threshold=args.adaptive_threshold,
             batch_size=args.batch_size,
             config=config,
+            latent_mode=args.latent_mode,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+            tile_batch_size=args.tile_batch_size,
+            num_workers=args.num_workers,
         )
         
         print(f"Results saved to {args.output_dir}")

@@ -420,6 +420,13 @@ class TrainingConfig:
         self.use_wavelet = args.use_wavelet
         self.wavelet_type = args.wavelet_type
         self.wavelet_levels = getattr(args, 'wavelet_levels', None)
+
+        # Regularization knobs (None = keep the model's defaults). These are
+        # the comparability-safe anti-overfitting levers (architecture-internal
+        # stochastic depth/dropout, no data or loss changes).
+        self.drop_path = getattr(args, 'drop_path', None)
+        self.dropout = getattr(args, 'dropout', None)
+        self.attention_dropout = getattr(args, 'attention_dropout', None)
         
         # Loss parameters (including MRAE weight)
         self.use_enhanced_loss = args.use_enhanced_loss
@@ -547,6 +554,14 @@ def parse_arguments():
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
     parser.add_argument("--wavelet_levels", type=int, nargs='+', default=None,
                        help='Wavelet levels for each stage')
+    # Regularization (None keeps the model defaults: drop_path 0.1, dropout 0)
+    parser.add_argument("--drop_path", type=float, default=None,
+                       help='Stochastic-depth rate (model default 0.1); the main '
+                            'comparability-safe anti-overfitting lever')
+    parser.add_argument("--dropout", type=float, default=None,
+                       help='FFN/projection dropout (model default 0.0)')
+    parser.add_argument("--attention_dropout", type=float, default=None,
+                       help='Attention dropout (model default 0.0)')
     
     # Enhanced loss parameters (ADDED mrae_weight)
     parser.add_argument("--use_enhanced_loss", action='store_true', 
@@ -658,8 +673,10 @@ def load_config(args):
         explicit_cli = getattr(args, '_explicit_cli_args', set())
         
         # Update args with yaml config (preserving command line precedence)
+        ignored_keys = []
         for key, value in yaml_cfg.items():
             if not hasattr(args, key):
+                ignored_keys.append(key)
                 continue
             if key in explicit_cli:
                 continue
@@ -667,7 +684,15 @@ def load_config(args):
             default_value = parser_defaults.get(key, current_value)
             if current_value == default_value:
                 setattr(args, key, value)
-    
+        if ignored_keys:
+            # Loud, not fatal: a typo here used to be a silent no-op (the user
+            # believes they tuned something that never reached the trainer).
+            logging.getLogger('mswr_train').warning(
+                "Config file %s contains %d key(s) the trainer does not "
+                "recognize (IGNORED): %s",
+                args.config, len(ignored_keys), ", ".join(sorted(ignored_keys)),
+            )
+
     return args
 
 def setup_environment(config: TrainingConfig):
@@ -1037,6 +1062,11 @@ class EnhancedTrainer:
 
         if self.config.use_ema:
             self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
+            # The snapshot above holds epoch-0 weights, but updates only begin
+            # at ema_start_epoch; re-snapshot at the first update so early EMA
+            # validations are not contaminated by ~37% epoch-0 weights
+            # (0.999^1000 residual after the first EMA epoch).
+            self._ema_refreshed = False
             self.logger.info(
                 f"EMA enabled (decay={self.config.ema_decay}, "
                 f"start_epoch={self.config.ema_start_epoch}, eval_mode={self.config.ema_eval_mode})"
@@ -1100,7 +1130,12 @@ class EnhancedTrainer:
             
             if self.config.wavelet_levels:
                 model_kwargs['wavelet_levels'] = self.config.wavelet_levels
-                
+
+            for reg_key in ('drop_path', 'dropout', 'attention_dropout'):
+                reg_val = getattr(self.config, reg_key, None)
+                if reg_val is not None:
+                    model_kwargs[reg_key] = float(reg_val)
+
             self.model = MODEL_SIZES[self.config.model_size](**model_kwargs)
         else:
             # Custom configuration
@@ -1120,7 +1155,12 @@ class EnhancedTrainer:
                 wavelet_type=self.config.wavelet_type,
                 wavelet_levels=self.config.wavelet_levels,
                 use_spectral_attn=self.config.use_spectral_attn,
-                performance_monitoring=self.config.memory_monitoring
+                performance_monitoring=self.config.memory_monitoring,
+                **{
+                    reg_key: float(getattr(self.config, reg_key))
+                    for reg_key in ('drop_path', 'dropout', 'attention_dropout')
+                    if getattr(self.config, reg_key, None) is not None
+                },
             )
             self.model = IntegratedMSWRNet(model_config)
         
@@ -1528,10 +1568,12 @@ class EnhancedTrainer:
                         self.ema.load_state_dict(checkpoint['ema'])
                         self.ema.to(self.device)
                         self.logger.info("Loaded EMA state from checkpoint.")
+                    self._ema_refreshed = True
                 except Exception as e:
                     self.logger.warning(f"Failed to load EMA state: {e}")
             elif self.ema is not None and not checkpoint.get('ema'):
                 self.ema = ModelEMA(self.model, decay=self.config.ema_decay).to(self.device)
+                self._ema_refreshed = True
                 self.logger.info("Checkpoint has no EMA state; initialized EMA from loaded model weights.")
             elif checkpoint.get('ema') and self.ema is None:
                 self.logger.info("Checkpoint contains EMA weights but EMA is disabled in the current run.")
@@ -1555,6 +1597,11 @@ class EnhancedTrainer:
         self.model.train()
         if self.train_sampler is not None:
             self.train_sampler.set_epoch(self.epoch)
+        # Drop any partially-accumulated gradients left over from the previous
+        # epoch (possible when batches-per-epoch is not divisible by
+        # gradient_accumulation_steps) so they cannot merge into this epoch's
+        # first accumulation group with stale weights and wrong normalization.
+        self.optimizer.zero_grad(set_to_none=True)
         losses = AverageMeter()
         loss_components = defaultdict(AverageMeter)
         grad_norms = AverageMeter()
@@ -1594,13 +1641,18 @@ class EnhancedTrainer:
                 # silently freezing learning on those elements. The L1/SSIM/SAM
                 # losses against [0, 1] targets pull predictions into range
                 # naturally; only NaN/Inf must be guarded here.
+                # The full-tensor output isfinite scan is gated (it reads the
+                # whole B x 31 x H x W tensor and forces a host sync every
+                # step); the per-step loss guard below catches non-finite
+                # outputs anyway because the loss reduces over the output.
+                check_output_finite = (self.iteration % 100) == 0
                 if self.amp_enabled:
                     with cuda_autocast(self.amp_dtype):
                         output = self.model(images)
                     # Compute loss in fp32 outside autocast for numerical stability
                     output_fp32 = output.float()
                     labels_fp32 = labels.float()
-                    if not torch.isfinite(output_fp32).all():
+                    if check_output_finite and not torch.isfinite(output_fp32).all():
                         self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
                         self.optimizer.zero_grad()
                         self.iteration += 1
@@ -1612,7 +1664,7 @@ class EnhancedTrainer:
                         loss = self.criterion(output_fp32, labels_fp32) / self.config.gradient_accumulation_steps
                 else:
                     output = self.model(images)
-                    if not torch.isfinite(output).all():
+                    if check_output_finite and not torch.isfinite(output).all():
                         self.logger.warning(f"[Iter {self.iteration}] Non-finite model output, skipping batch")
                         self.optimizer.zero_grad()
                         self.iteration += 1
@@ -1650,9 +1702,11 @@ class EnhancedTrainer:
                         f"[Iter {self.iteration}] CUDA OOM, skipping batch. "
                         f"Allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB"
                     )
-                    for v in ('output', 'output_fp32', 'loss'):
-                        if v in locals():
-                            del locals()[v]
+                    # NOTE: `del locals()[name]` is a no-op in CPython (locals()
+                    # returns a snapshot) — the previous version never actually
+                    # freed these, so empty_cache() could not reclaim the
+                    # forward graph and OOM "recovery" tended to cascade.
+                    output = output_fp32 = loss = None  # noqa: F841 - drop graph refs
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
                     self.iteration += 1
@@ -1673,6 +1727,18 @@ class EnhancedTrainer:
                     self.optimizer.step()
                 
                 if self.ema is not None and self.epoch >= self.config.ema_start_epoch:
+                    if not self._ema_refreshed:
+                        # First update after ema_start_epoch: replace the
+                        # epoch-0 construction snapshot with the current
+                        # (trained) weights before decaying.
+                        self.ema.ema_model.load_state_dict(
+                            unwrap_model(self.model).state_dict()
+                        )
+                        self._ema_refreshed = True
+                        self.logger.info(
+                            f"EMA snapshot refreshed from model weights at "
+                            f"epoch {self.epoch} (start of EMA updates)."
+                        )
                     self.ema.update(self.model)
                 
                 self.optimizer.zero_grad()
@@ -1847,6 +1913,7 @@ class EnhancedTrainer:
         model.eval()
         metrics = {
             'mrae': AverageMeter(),
+            'mrae_unclamped': AverageMeter(),
             'rmse': AverageMeter(),
             'psnr': AverageMeter(),
             'sam': AverageMeter()
@@ -1878,12 +1945,17 @@ class EnhancedTrainer:
             # early in training or under AMP) inflate the reported errors
             # versus the published ARAD‑1K protocol. Targets are already in
             # [0, 1] for ARAD‑1K so the clamp on labels is a no-op there.
+            # MST++'s validation computes MRAE on the RAW model output (no
+            # clamp), so the clamped value below is NOT MST++-comparable —
+            # track the unclamped variant alongside for benchmark reporting.
+            mrae_unclamped = self.criterion_mrae(output_crop, labels_crop)
             output_crop = output_crop.clamp(0.0, 1.0)
 
             mrae = self.criterion_mrae(output_crop, labels_crop)
             rmse = self.criterion_rmse(output_crop, labels_crop)
             psnr = self.criterion_psnr(output_crop, labels_crop, data_range=1.0)
-            
+
+            metrics['mrae_unclamped'].update(mrae_unclamped.item())
             metrics['mrae'].update(mrae.item())
             metrics['rmse'].update(rmse.item())
             metrics['psnr'].update(psnr.item())

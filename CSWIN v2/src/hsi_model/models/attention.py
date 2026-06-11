@@ -314,8 +314,11 @@ class CSWinAttentionBlock(nn.Module):
             self.relative_position_bias_table_v_long = nn.Parameter(
                 torch.zeros(long_table_shape, dtype=bias_dtype)
             )
-            nn.init.trunc_normal_(self.relative_position_bias_table_h_long, std=0.02)
-            nn.init.trunc_normal_(self.relative_position_bias_table_v_long, std=0.02)
+            # Deliberately ZERO-initialized (no trunc_normal_): at patch-128
+            # training only offsets up to ~±132 ever receive gradient, but
+            # full-frame inference indexes offsets up to ~±517. Random-init
+            # rows would inject untrained head-specific logit noise at eval;
+            # zero rows contribute exactly nothing (standard ViT bias init).
 
         idx = torch.arange(split_size, dtype=torch.long)
         relative_index = idx[:, None] - idx[None, :] + split_size - 1  # (s, s)
