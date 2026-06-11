@@ -25,10 +25,17 @@ class DPMOT(nn.Module):
     for improved sampling efficiency.
     """
 
-    def __init__(self, denoiser, spectral_schedule=None, timesteps=1000):
+    def __init__(
+        self,
+        denoiser,
+        spectral_schedule=None,
+        timesteps=1000,
+        conditional=False,
+    ):
         super().__init__()
         self.denoiser = denoiser
         self.timesteps = timesteps
+        self.conditional = bool(conditional)
 
         # Base schedule is always available as a fallback
         self.base_schedule = BaseNoiseSchedule(timesteps=timesteps)
@@ -52,7 +59,7 @@ class DPMOT(nn.Module):
 
         return x_t, noise
 
-    def p_losses(self, x_0, t=None):
+    def p_losses(self, x_0, t=None, conditioning=None):
         """
         Training losses for DPM-OT
 
@@ -73,7 +80,7 @@ class DPMOT(nn.Module):
         x_t, noise = self.q_sample(x_0, t)
 
         # Predict noise
-        noise_pred = self.denoiser(x_t, t)
+        noise_pred = self._predict_noise(x_t, t, conditioning)
 
         # Compute loss
         loss = F.mse_loss(noise_pred, noise)
@@ -92,12 +99,9 @@ class DPMOT(nn.Module):
         """
         Sample from the model.
 
-        NOTE: ``use_dpm_solver`` defaults to False pending math review. The
-        update equations in ``sample_dpm_solver`` do not match the published
-        DPM-Solver-1/2/3 formulae for the epsilon-prediction parameterization
-        (the sigma_bar coefficients are missing), so the DDPM reference path
-        is used by default. Set ``use_dpm_solver=True`` explicitly only if
-        you have validated the solver against a known baseline.
+        ``use_dpm_solver=True`` selects a deterministic, reduced-step DDIM
+        sampler for the epsilon-prediction parameterization. The legacy method
+        name is retained for checkpoint and caller compatibility.
 
         Args:
             shape: Shape of sample to generate [B, C, H, W]
@@ -139,7 +143,9 @@ class DPMOT(nn.Module):
         for i in tqdm(reversed(range(0, self.timesteps)), desc='Sampling time step', total=self.timesteps):
             t = torch.full((b,), i, device=device, dtype=torch.long)
 
-            beta_t = self.spectral_schedule(x, t)
+            # Forward noising uses the cached schedule statistics. Reverse
+            # sampling must use the same beta sequence.
+            beta_t = self.spectral_schedule.extract('betas', t, x.shape)
 
             sqrt_one_minus_alpha_bar_t = self.spectral_schedule.extract(
                 'sqrt_one_minus_alphas_cumprod', t, x.shape
@@ -148,7 +154,7 @@ class DPMOT(nn.Module):
             sigma_t = torch.sqrt(self.spectral_schedule.extract('posterior_variance', t, x.shape))
 
             # Predict noise
-            noise_pred = self.denoiser(x, t)
+            noise_pred = self._predict_noise(x, t, conditioning)
 
             # Update sample
             if i > 0:
@@ -177,7 +183,7 @@ class DPMOT(nn.Module):
         steps: int = 20,
     ) -> torch.Tensor:
         """
-        DPM Solver v3 sampling for faster inference.
+        Deterministic reduced-step DDIM sampling.
 
         Args:
             shape: Output shape [B, C, H, W]
@@ -187,60 +193,59 @@ class DPMOT(nn.Module):
         Returns:
             Generated sample tensor
         """
-        x = self._prepare_starting_point(shape, device, conditioning)
-
-        # Time steps for solver (evenly spaced for simplicity)
-        t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)[:-1]
-
-        # DPM-Solver v3 uses lower-order solvers for the first few steps
-        # and higher-order solvers for later steps
-
-        batch_size = shape[0]
-        zero_t = t_steps.new_zeros(batch_size)
-
-        for i in tqdm(range(steps), desc="DPM-Solver sampling"):
-            # Keep timestep values as tensors. Calling Tensor.item() here forces a
-            # GPU synchronization once per solver step and is unnecessary because
-            # all downstream helpers accept batched tensor timesteps.
-            t_tensor = t_steps[i].expand(batch_size)
-            prev_t_tensor = (
-                t_steps[i + 1].expand(batch_size)
-                if i < steps - 1
-                else zero_t
+        if steps < 1 or steps > self.timesteps:
+            raise ValueError(
+                f"steps must be in [1, {self.timesteps}], got {steps}"
             )
 
-            # For DPM-Solver v3, we need to approximate the ODE more accurately.
-            pred_noise = self.denoiser(x, self._time_to_index(t_tensor))
+        x = self._prepare_starting_point(shape, device, conditioning)
+        batch_size = shape[0]
+        timestep_values = torch.linspace(
+            self.timesteps - 1,
+            0,
+            steps,
+            device=device,
+        ).round().long()
+        terminal = timestep_values.new_full((1,), -1)
+        next_values = torch.cat([timestep_values[1:], terminal])
 
-            # First-order update
-            x_1 = self._dpm_solver_update(x, pred_noise, t_tensor, prev_t_tensor)
-
-            # For higher-order updates (used in later steps)
-            if i > 0:  # Use first-order for first step
-                mid_t_tensor = 0.5 * (t_tensor + prev_t_tensor)
-                pred_noise_mid = self.denoiser(x_1, self._time_to_index(mid_t_tensor))
-
-                # Second-order correction
-                x_2 = self._dpm_solver_second_order_update(
-                    x, x_1, pred_noise, pred_noise_mid,
-                    t_tensor, mid_t_tensor, prev_t_tensor
-                )
-
-                # For even higher accuracy in final steps
-                if i > steps // 2:  # Use higher-order for later steps
-                    pred_noise_end = self.denoiser(x_2, self._time_to_index(prev_t_tensor))
-
-                    # Third-order correction
-                    x = self._dpm_solver_third_order_update(
-                        x, x_1, x_2, pred_noise, pred_noise_mid, pred_noise_end,
-                        t_tensor, mid_t_tensor, prev_t_tensor
-                    )
-                else:
-                    x = x_2
-            else:
-                x = x_1
+        for t_value, next_value in tqdm(
+            zip(timestep_values, next_values),
+            total=steps,
+            desc="DDIM sampling",
+        ):
+            t = t_value.expand(batch_size)
+            next_t = next_value.expand(batch_size)
+            pred_noise = self._predict_noise(x, t, conditioning)
+            x = self._ddim_update(x, pred_noise, t, next_t)
 
         return x
+
+    def _ddim_update(
+        self,
+        x: torch.Tensor,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        next_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one deterministic epsilon-prediction DDIM update."""
+        alpha_t = self._gather_alphas(t).view(-1, 1, 1, 1)
+        next_indices = next_t.clamp(min=0)
+        alpha_next = self._gather_alphas(next_indices).view(-1, 1, 1, 1)
+        alpha_next = torch.where(
+            (next_t < 0).view(-1, 1, 1, 1),
+            torch.ones_like(alpha_next),
+            alpha_next,
+        )
+
+        sqrt_alpha_t = torch.sqrt(torch.clamp(alpha_t, min=_EPS))
+        sigma_t = torch.sqrt(torch.clamp(1.0 - alpha_t, min=_EPS))
+        pred_x0 = (x - sigma_t * noise_pred) / sqrt_alpha_t
+
+        return (
+            torch.sqrt(torch.clamp(alpha_next, min=_EPS)) * pred_x0
+            + torch.sqrt(torch.clamp(1.0 - alpha_next, min=0.0)) * noise_pred
+        )
 
     def _prepare_starting_point(
         self,
@@ -248,8 +253,8 @@ class DPMOT(nn.Module):
         device: torch.device | str,
         conditioning: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Return initial noisy state, optionally conditioned on an encoder latent."""
-        if conditioning is None:
+        """Return the sampler's initial noisy state."""
+        if conditioning is None or self.conditional:
             return torch.randn(shape, device=device)
 
         if list(conditioning.shape) != list(shape):
@@ -261,6 +266,14 @@ class DPMOT(nn.Module):
         )
         noisy_latent, _ = self.q_sample(conditioning, timesteps)
         return noisy_latent
+
+    def _predict_noise(self, x, t, conditioning=None):
+        """Call conditional denoisers without changing legacy checkpoint behavior."""
+        if self.conditional:
+            if conditioning is None:
+                raise ValueError("Conditional diffusion requires a conditioning latent")
+            return self.denoiser(x, t, conditioning=conditioning)
+        return self.denoiser(x, t)
 
     def _dpm_solver_update(
         self, x: torch.Tensor, noise_pred: torch.Tensor, t: torch.Tensor, next_t: torch.Tensor

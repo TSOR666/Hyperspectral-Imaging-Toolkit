@@ -10,30 +10,45 @@ class HSIDecoder(nn.Module):
     """
     Decoder network with spectral attention to map latent representation to HSI
     """
-    def __init__(self, out_channels=31, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        out_channels=31,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
         super().__init__()
-        
+
         # Initial processing in latent space with spectral attention
-        self.init_attn = CrossSpectralAttention(latent_dim)
-        self.init_res = ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+        self.init_attn = CrossSpectralAttention(
+            latent_dim,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
+        self.init_res = ResidualBlock(
+            latent_dim, use_batchnorm, norm_type, norm_groups
+        )
         
         # Upsampling blocks with spectral attention
         self.up1 = nn.Sequential(
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(latent_dim),
             nn.ConvTranspose2d(latent_dim, 128, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.up2 = nn.Sequential(
-            ResidualBlock(128, use_batchnorm=use_batchnorm),
+            ResidualBlock(128, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(128),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.up3 = nn.Sequential(
-            ResidualBlock(64, use_batchnorm=use_batchnorm),
+            ResidualBlock(64, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(64),
             nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.SiLU()
@@ -64,16 +79,31 @@ class WaveletHSIDecoder(nn.Module):
     """
     HSI decoder using inverse wavelet transform for multi-scale reconstruction
     """
-    def __init__(self, out_channels=31, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        out_channels=31,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
         super().__init__()
         
         # Initial processing in latent space
-        self.init_attn = CrossSpectralAttention(latent_dim)
-        self.init_res = ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+        self.init_attn = CrossSpectralAttention(
+            latent_dim,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
+        self.init_res = ResidualBlock(
+            latent_dim, use_batchnorm, norm_type, norm_groups
+        )
         
         # First upsampling (conventional)
         self.up1 = nn.Sequential(
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(latent_dim),
             nn.ConvTranspose2d(latent_dim, 128, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
@@ -85,7 +115,7 @@ class WaveletHSIDecoder(nn.Module):
         
         # Process reconstructed features
         self.up3 = nn.Sequential(
-            ResidualBlock(128, use_batchnorm=use_batchnorm),
+            ResidualBlock(128, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(128),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.SiLU()
@@ -93,7 +123,9 @@ class WaveletHSIDecoder(nn.Module):
         
         # Final spectral-aware processing
         self.final_attn = SpectralAttention(64)
-        self.final_res = ResidualBlock(64, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            64, use_batchnorm, norm_type, norm_groups
+        )
         self.final_conv = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
         
     def forward(self, x):
@@ -125,19 +157,32 @@ class MultiscaleHSIDecoder(nn.Module):
     """
     HSI decoder with multi-scale reconstruction at different resolutions
     """
-    def __init__(self, out_channels=31, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        out_channels=31,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
         super().__init__()
         
         # Initial processing
         self.init_block = nn.Sequential(
-            CrossSpectralAttention(latent_dim),
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+            CrossSpectralAttention(
+                latent_dim,
+                mode=cross_attention_mode,
+                window_size=attention_window_size,
+            ),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups)
         )
         
         # Multi-scale path: create decoders at different scales
         # Scale 1: Original resolution (finest detail)
         self.decoder_scale1 = nn.Sequential(
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(latent_dim),
             nn.ConvTranspose2d(latent_dim, 64, kernel_size=4, stride=2, padding=1),
             nn.SiLU(),
@@ -147,7 +192,7 @@ class MultiscaleHSIDecoder(nn.Module):
         
         # Scale 2: Medium resolution (mid-level detail)
         self.decoder_scale2 = nn.Sequential(
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(latent_dim),
             nn.ConvTranspose2d(latent_dim, 64, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
@@ -155,7 +200,7 @@ class MultiscaleHSIDecoder(nn.Module):
         
         # Scale 3: Low resolution (coarse structure)
         self.decoder_scale3 = nn.Sequential(
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm),
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(latent_dim)
         )
         

@@ -67,6 +67,10 @@ early_stopping_final_stage_only: true
 # ===========================================================================
 # Start a fresh run for this objective/schedule combination. Resuming the old
 # 100k pure-L1 optimizer state would immediately place the new run near its end.
+# NOTE: l1_with_mrae is a deliberate deviation from the pure-L1 paper recipe
+# and from MRAE-only MST++ training. Runs with this objective are NOT
+# loss-protocol-comparable with MST++ baselines; use `objective: l1` (paper)
+# or `objective: mrae` (MST++) for strict benchmark comparisons.
 objective: l1_with_mrae  # L1 + small stabilized MRAE; keeps the target metric moving
 optimizer: adamw         # adamw regularizes the small dataset | adam
 weight_decay: 1.0e-2     # was 0.0; the regularization the 44.8M overfit run lacked

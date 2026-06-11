@@ -133,6 +133,7 @@ class TestLossFunctions:
         bucket_frac_sum = sum(
             value for key, value in diagnostics.items()
             if key.startswith("bucket_") and key.endswith("_frac")
+            and not key.endswith("_contrib_frac")
         )
         contrib_sum = sum(
             value for key, value in diagnostics.items()

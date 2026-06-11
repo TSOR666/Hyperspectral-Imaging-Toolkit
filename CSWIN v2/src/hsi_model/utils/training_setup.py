@@ -281,12 +281,23 @@ class GeneratorEMA:
 
     def __init__(self, module: "torch.nn.Module", decay: float = 0.999) -> None:
         self.decay = float(decay)
-        self.shadow: Dict[str, torch.Tensor] = {
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self._backup: Optional[Dict[str, torch.Tensor]] = None
+        self.reinit_from(module)
+
+    @torch.no_grad()
+    def reinit_from(self, module: "torch.nn.Module") -> None:
+        """Re-clone the shadow from the module's CURRENT weights.
+
+        Needed after loading a checkpoint into the module when the EMA object
+        was constructed earlier (the construction-time clone would otherwise
+        keep averaging from the stale/random-init weights).
+        """
+        self.shadow = {
             name: param.detach().clone()
             for name, param in module.named_parameters()
             if param.requires_grad and param.dtype.is_floating_point
         }
-        self._backup: Optional[Dict[str, torch.Tensor]] = None
 
     @torch.no_grad()
     def update(self, module: "torch.nn.Module") -> None:
@@ -462,14 +473,21 @@ def resume_training_state(
         if sc is not None and name in ck:
             sc.load_state_dict(ck[name])
 
-    # EMA shadow weights — optional. Missing on pre-EMA checkpoints, in which
-    # case the freshly-initialized shadow (a clone of the loaded model weights)
-    # is the correct starting point, so silently skip.
-    if ema is not None and ck.get("ema"):
-        try:
-            ema.load_state_dict(ck["ema"], device=device)
-        except (RuntimeError, TypeError, ValueError) as e:
-            logger.warning("Could not restore EMA state: %s", e)
+    # EMA shadow weights — optional. Missing on pre-EMA checkpoints; the EMA
+    # object was constructed BEFORE this checkpoint loaded, so its shadow holds
+    # the random-init weights — re-clone it from the just-loaded model.
+    if ema is not None:
+        if ck.get("ema"):
+            try:
+                ema.load_state_dict(ck["ema"], device=device)
+            except (RuntimeError, TypeError, ValueError) as e:
+                logger.warning("Could not restore EMA state: %s", e)
+        else:
+            ema.reinit_from(target)
+            logger.info(
+                "Checkpoint has no EMA state; re-initialized the EMA shadow "
+                "from the loaded model weights."
+            )
 
     # RNG state — best-effort. Mismatched CUDA device counts at resume can
     # raise; log and continue rather than die because RNG drift across

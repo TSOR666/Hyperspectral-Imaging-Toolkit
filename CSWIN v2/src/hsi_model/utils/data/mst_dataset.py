@@ -235,6 +235,30 @@ class MST_TrainDataset(Dataset):
             self.patch_per_img = self.patch_per_line * self.patch_per_column
         logger.info("Finished loading MST++ training dataset")
 
+    def set_patch_geometry(self, crop_size: int, stride: Optional[int] = None) -> None:
+        """Re-index the in-RAM scenes for a new patch size (progressive stages).
+
+        The stored scenes are full resolution; only the crop indexing depends on
+        ``crop_size``/``stride``, so progressive-training stage transitions can
+        reuse this dataset instead of re-loading ~30 GB of scenes.
+        """
+        crop_size = int(crop_size)
+        stride = int(stride) if stride is not None else self.stride
+        if self.img_num == 0:
+            raise RuntimeError("Cannot set patch geometry on an empty dataset.")
+        h, w = self.bgrs[0].shape[1:]
+        if h < crop_size or w < crop_size:
+            raise ValueError(
+                f"crop_size={crop_size} exceeds loaded image size {(h, w)}"
+            )
+        if stride <= 0:
+            raise ValueError(f"stride must be positive, got {stride}")
+        self.crop_size = crop_size
+        self.stride = stride
+        self.patch_per_line = (w - crop_size) // stride + 1
+        self.patch_per_column = (h - crop_size) // stride + 1
+        self.patch_per_img = self.patch_per_line * self.patch_per_column
+
     @staticmethod
     def arguement(
         data: np.ndarray, rot_times: int, v_flip: int, h_flip: int

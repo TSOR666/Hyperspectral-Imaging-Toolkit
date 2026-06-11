@@ -281,20 +281,46 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
         for j in range(len(yh) - 1, -1, -1):
             yh_level = yh[j]
             H_curr, W_curr = current.shape[-2:]
-            
+
             # Efficient tensor concatenation and reshaping
             combined = torch.cat([current.unsqueeze(2), yh_level], dim=2)  # (B, C, 1, H, W) + (B, C, 3, H, W) -> (B, C, 4, H, W)
             combined = combined.view(B, 4*C, H_curr, W_curr)  # (B, C, 4, H, W) -> (B, 4*C, H, W)
-            
+
             # Optimized transposed convolution
             kernel_size = filters.shape[-1]
             padding = (kernel_size - 1) // 2
-            
-            current = F.conv_transpose2d(
-                combined, filters, stride=2, padding=padding,
-                output_padding=0, groups=C
-            )  # (B, 4*C, H, W) -> (B, C, 2*H, 2*W)
-        
+
+            if self.mode == 'periodic' and padding > 0:
+                # The analysis transform circularly pads by `padding` before the
+                # valid stride-2 conv, so the exact inverse is the ADJOINT of
+                # that operator: a zero-padding conv_transpose (padding=0)
+                # followed by folding the circular-pad overhang back in.
+                # Using conv_transpose2d(padding=p) instead (the old code)
+                # implements the adjoint of a ZERO-padded analysis - interior
+                # pixels reconstruct, but the border band of width ~2K had up
+                # to ~67% (db2) / ~120% (db3) relative roundtrip error.
+                t = F.conv_transpose2d(
+                    combined, filters, stride=2, padding=0,
+                    output_padding=0, groups=C
+                )  # (B, 4*C, H, W) -> (B, C, 2*H + 2p, 2*W + 2p)
+                p = padding
+                H2, W2 = 2 * H_curr, 2 * W_curr
+                # Fold height overhang (adjoint of circular pad): the rows that
+                # came from wrapped padding are added back to the rows they
+                # were copies of.
+                t[:, :, p:2 * p, :] += t[:, :, H2 + p:H2 + 2 * p, :]
+                t[:, :, H2:H2 + p, :] += t[:, :, 0:p, :]
+                t = t[:, :, p:H2 + p, :]
+                # Fold width overhang.
+                t[:, :, :, p:2 * p] += t[:, :, :, W2 + p:W2 + 2 * p]
+                t[:, :, :, W2:W2 + p] += t[:, :, :, 0:p]
+                current = t[:, :, :, p:W2 + p]
+            else:
+                current = F.conv_transpose2d(
+                    combined, filters, stride=2, padding=padding,
+                    output_padding=0, groups=C
+                )  # (B, 4*C, H, W) -> (B, C, 2*H, 2*W)
+
         return current
 
 # ===================== ENHANCED PERFORMANCE MONITORING =====================
@@ -317,7 +343,11 @@ class PerformanceMonitor:
         self._memory_baseline = None
         
         if self.profile_memory:
-            torch.cuda.reset_peak_memory_stats()
+            # Do NOT reset CUDA peak-memory stats here: reset() runs at the top
+            # of every model forward, which clobbered any external peak-memory
+            # measurement (the trainer's end-of-epoch "Peak GPU memory" only
+            # covered the final forward). Per-stage deltas below use
+            # memory_allocated() snapshots and don't need the peak counter.
             self._memory_baseline = torch.cuda.memory_allocated()
     
     def start_stage(self, stage_name: str) -> None:
@@ -664,13 +694,14 @@ class OptimizedWindowAttention2D(nn.Module):
         pad_w = (self.window_size - W % self.window_size) % self.window_size
         
         if pad_h > 0 or pad_w > 0:
-            # SAFE symmetric padding to avoid reflect pad >= input size errors
-            ph0, ph1 = pad_h // 2, pad_h - pad_h // 2
-            pw0, pw1 = pad_w // 2, pad_w - pad_w // 2
+            # Pad bottom/right ONLY: the unpad below crops [:H, :W] (top-left),
+            # so symmetric padding would shift the attention output down/right
+            # by pad//2 pixels relative to the residual branch (this triggered
+            # at the deepest stage for default 128x128 crops: 4x4 LL -> 8x8).
             pad_mode = 'reflect'
-            if H <= 1 or W <= 1 or ph0 >= H or ph1 >= H or pw0 >= W or pw1 >= W:
+            if H <= 1 or W <= 1 or pad_h >= H or pad_w >= W:
                 pad_mode = 'replicate'
-            x = F.pad(x, (pw0, pw1, ph0, ph1), mode=pad_mode)  # (B, C, H, W) -> (B, C, H_pad, W_pad)
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)  # (B, C, H, W) -> (B, C, H_pad, W_pad)
             H_pad, W_pad = H + pad_h, W + pad_w
         else:
             H_pad, W_pad = H, W
@@ -706,10 +737,14 @@ class OptimizedWindowAttention2D(nn.Module):
             # SDPA is equally valid for inference; previously this path was
             # gated on self.training which forced a slow fp32 manual softmax
             # at eval time.
-            bias = relative_position_bias.unsqueeze(0).expand(q.shape[0], -1, -1, -1)  # (B*nh*nw, Heads, N, N)
+            # Keep the mask broadcastable as (1, Heads, N, N): casting BEFORE
+            # any expand avoids materializing a (B*nh*nw, Heads, N, N) copy
+            # under fp16/bf16 autocast (.to() on an expanded view allocates the
+            # full broadcast size).
+            bias = relative_position_bias.to(dtype=q.dtype).unsqueeze(0)  # (1, Heads, N, N)
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=bias.to(dtype=q.dtype),
+                attn_mask=bias,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 scale=self.scale
             )  # (B*nh*nw, Heads, N, D)
@@ -1566,6 +1601,15 @@ class IntegratedMSWRNet(nn.Module):
             nn.init.constant_(self.input_skip.weight, 0.01)
             if self.input_skip.bias is not None:
                 nn.init.zeros_(self.input_skip.bias)
+
+        # Re-apply the wavelet-gate soft-identity init (gate ~ sigmoid(1.0) ~
+        # 0.73 pass-through of the high-frequency bands at start); the Kaiming
+        # apply() above wiped it in the same way it wiped the output head.
+        for module in self.modules():
+            gate = getattr(module, "wavelet_gate", None)
+            if gate is not None:
+                nn.init.constant_(gate[-2].weight, 0.01)
+                nn.init.constant_(gate[-2].bias, 1.0)
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):

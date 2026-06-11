@@ -11,8 +11,24 @@ class UNetDenoiser(nn.Module):
     """
     U-Net architecture with spectral attention for denoising in latent space
     """
-    def __init__(self, channels=64, time_embedding_dim=128, use_batchnorm=True):
+    def __init__(
+        self,
+        channels=64,
+        time_embedding_dim=128,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+        conditional=False,
+    ):
         super().__init__()
+        self.conditional = conditional
+        self.condition_proj = (
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            if conditional
+            else None
+        )
         
         # Time embedding
         self.time_dim = time_embedding_dim
@@ -31,37 +47,51 @@ class UNetDenoiser(nn.Module):
         
         # Encoder part of U-Net with spectral attention
         self.down1 = nn.Sequential(
-            ResidualBlock(channels, use_batchnorm=use_batchnorm),
+            ResidualBlock(channels, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(channels),
             nn.Conv2d(channels, channels * 2, kernel_size=3, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.down2 = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 2),
             nn.Conv2d(channels * 2, channels * 2, kernel_size=3, stride=2, padding=1),
             nn.SiLU()
         )
         
         # Middle blocks with cross-spectral attention
-        self.middle_attn = CrossSpectralAttention(channels * 2)
+        self.middle_attn = CrossSpectralAttention(
+            channels * 2,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
         self.middle = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 2),
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            )
         )
         
         # Decoder part of U-Net with spectral attention
         self.up1 = nn.Sequential(
-            ResidualBlock(channels * 4, use_batchnorm=use_batchnorm),  # Doubled due to skip connection
+            ResidualBlock(
+                channels * 4, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 4),
             nn.ConvTranspose2d(channels * 4, channels * 2, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.up2 = nn.Sequential(
-            ResidualBlock(channels * 3, use_batchnorm=use_batchnorm),  # Doubled due to skip connection
+            ResidualBlock(
+                channels * 3, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 3),
             nn.ConvTranspose2d(channels * 3, channels, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
@@ -69,10 +99,23 @@ class UNetDenoiser(nn.Module):
         
         # Final blocks with spectral-spatial attention
         self.final_attn = SpectralSpatialAttention(channels * 2)  # Doubled due to skip connection
-        self.final_res = ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            channels * 2, use_batchnorm, norm_type, norm_groups
+        )
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
         
-    def forward(self, x, t):
+    def forward(self, x, t, conditioning=None):
+        if self.condition_proj is not None:
+            if conditioning is None:
+                conditioning = torch.zeros_like(x)
+            if conditioning.shape[-2:] != x.shape[-2:]:
+                conditioning = F.interpolate(
+                    conditioning,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            x = x + self.condition_proj(conditioning)
         # Embed timestep
         t_emb = get_timestep_embedding(t, self.time_dim, dtype=x.dtype)
         t_emb = self.time_mlp(t_emb)
@@ -137,8 +180,24 @@ class WaveletUNetDenoiser(nn.Module):
     """
     U-Net denoiser with wavelet transform for multi-scale noise prediction
     """
-    def __init__(self, channels=64, time_embedding_dim=128, use_batchnorm=True):
+    def __init__(
+        self,
+        channels=64,
+        time_embedding_dim=128,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+        conditional=False,
+    ):
         super().__init__()
+        self.conditional = conditional
+        self.condition_proj = (
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            if conditional
+            else None
+        )
         
         # Time embedding
         self.time_dim = time_embedding_dim
@@ -171,11 +230,19 @@ class WaveletUNetDenoiser(nn.Module):
         self.combine_wavelet = nn.Conv2d(channels * 4, channels * 2, kernel_size=3, padding=1)
         
         # Middle blocks with spectral attention
-        self.middle_attn = CrossSpectralAttention(channels * 2)
+        self.middle_attn = CrossSpectralAttention(
+            channels * 2,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
         self.middle = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 2),
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            )
         )
         
         # Inverse wavelet transform
@@ -186,7 +253,9 @@ class WaveletUNetDenoiser(nn.Module):
         # shape [B, channels//2, H*2, W*2]
         # So self.up must accept channels//2 channels, not channels*2
         self.up = nn.Sequential(
-            ResidualBlock(channels // 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels // 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels // 2),
             nn.Conv2d(channels // 2, channels, kernel_size=3, padding=1),
             nn.SiLU()
@@ -194,10 +263,12 @@ class WaveletUNetDenoiser(nn.Module):
 
         # Final blocks: expects concatenation of [up output (channels) + original input (channels)]
         self.final_attn = SpectralSpatialAttention(channels * 2)
-        self.final_res = ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            channels * 2, use_batchnorm, norm_type, norm_groups
+        )
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
 
-    def forward(self, x, t):
+    def forward(self, x, t, conditioning=None):
         """
         Forward pass through WaveletUNetDenoiser.
 
@@ -208,6 +279,18 @@ class WaveletUNetDenoiser(nn.Module):
         Returns:
             Predicted noise [B, C, H, W]
         """
+        if self.condition_proj is not None:
+            if conditioning is None:
+                conditioning = torch.zeros_like(x)
+            if conditioning.shape[-2:] != x.shape[-2:]:
+                conditioning = F.interpolate(
+                    conditioning,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            x = x + self.condition_proj(conditioning)
+
         # Original input for residual connection
         original_x = x
 
@@ -268,9 +351,27 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
     """
     Wavelet UNet denoiser with adaptive thresholding
     """
-    def __init__(self, channels=64, time_embedding_dim=128, use_batchnorm=True,
-                threshold_method='soft', init_threshold=0.1, trainable_threshold=True):
+    def __init__(
+        self,
+        channels=64,
+        time_embedding_dim=128,
+        use_batchnorm=True,
+        threshold_method='soft',
+        init_threshold=0.1,
+        trainable_threshold=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+        conditional=False,
+    ):
         super().__init__()
+        self.conditional = conditional
+        self.condition_proj = (
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            if conditional
+            else None
+        )
         
         # Time embedding
         self.time_dim = time_embedding_dim
@@ -316,11 +417,19 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
         self.combine_wavelet = nn.Conv2d(channels * 4, channels * 2, kernel_size=3, padding=1)
         
         # Middle blocks with spectral attention
-        self.middle_attn = CrossSpectralAttention(channels * 2)
+        self.middle_attn = CrossSpectralAttention(
+            channels * 2,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
         self.middle = nn.Sequential(
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels * 2),
-            ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            )
         )
         
         # Inverse wavelet transform
@@ -329,7 +438,9 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
         # SHAPE FIX: After middle, features has channels*2, then reshaped to (channels//2, 4, H, W)
         # IWT output: [B, channels//2, H*2, W*2]. So self.up must accept channels//2.
         self.up = nn.Sequential(
-            ResidualBlock(channels // 2, use_batchnorm=use_batchnorm),
+            ResidualBlock(
+                channels // 2, use_batchnorm, norm_type, norm_groups
+            ),
             SpectralAttention(channels // 2),
             nn.Conv2d(channels // 2, channels, kernel_size=3, padding=1),
             nn.SiLU()
@@ -337,11 +448,25 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
 
         # Final blocks: expects [up output (channels) + original input (channels)]
         self.final_attn = SpectralSpatialAttention(channels * 2)
-        self.final_res = ResidualBlock(channels * 2, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            channels * 2, use_batchnorm, norm_type, norm_groups
+        )
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
 
-    def forward(self, x, t):
+    def forward(self, x, t, conditioning=None):
         """Forward pass through ThresholdingWaveletUNetDenoiser."""
+        if self.condition_proj is not None:
+            if conditioning is None:
+                conditioning = torch.zeros_like(x)
+            if conditioning.shape[-2:] != x.shape[-2:]:
+                conditioning = F.interpolate(
+                    conditioning,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            x = x + self.condition_proj(conditioning)
+
         # Original input for residual connection
         original_x = x
 

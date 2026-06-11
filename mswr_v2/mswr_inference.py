@@ -384,7 +384,11 @@ class EnsembleProcessor:
                 4: lambda x: torch.rot90(x, k=-1, dims=[2, 3]),
                 5: lambda x: torch.rot90(x, k=-2, dims=[2, 3]),
                 6: lambda x: torch.rot90(x, k=-3, dims=[2, 3]),
-                7: lambda x: torch.rot90(torch.flip(x, dims=[2]), k=-1, dims=[2, 3]),
+                # Forward #7 is rot90(flip(x)): invert in reverse order —
+                # rotate back FIRST, then flip. The previous flip-then-rotate
+                # inverse landed at the rot180 position, silently averaging a
+                # misaligned prediction into the ensemble.
+                7: lambda x: torch.flip(torch.rot90(x, k=-1, dims=[2, 3]), dims=[2]),
             }
             if transform_idx in inverse_map:
                 return inverse_map[transform_idx](tensor)
@@ -466,17 +470,31 @@ class MSWRInference:
         # outputs in practice.
         ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
         ema_used = False
+        incompatible = None
         if ema_state and isinstance(ema_state, dict):
-            # The trainer's ModelEMA.state_dict() shape may either be
-            # {'shadow': {...params...}, 'num_updates': N} or a bare param dict.
-            shadow = ema_state.get('shadow', ema_state) if isinstance(ema_state, dict) else ema_state
-            if isinstance(shadow, dict) and shadow:
+            # Normalize the trainer's EMA container formats (mirrors
+            # mswr_test_ntire.py): full checkpoints store
+            # {'decay': ..., 'ema_state': <model state_dict>}; legacy formats
+            # store {'shadow': {...}}; lightweight ones a bare param dict.
+            # Previously the {'decay','ema_state'} wrapper itself was passed to
+            # load_state_dict(strict=False), which loaded ZERO weights and
+            # silently ran inference on random init.
+            container = ema_state
+            if isinstance(container.get('ema_state'), dict):
+                container = container['ema_state']
+            elif isinstance(container.get('shadow'), dict):
+                container = container['shadow']
+            elif 'decay' in container:
+                container = {}  # wrapper without recognizable weights - don't guess
+            if container:
                 try:
-                    incompatible = model.load_state_dict(shadow, strict=False)
+                    incompatible = model.load_state_dict(container, strict=False)
                     ema_used = True
                     logger.info("Loaded EMA shadow weights for inference (preferred over base state_dict).")
                 except Exception as ema_exc:
                     logger.warning("Failed to load EMA weights (%s); falling back to base state_dict.", ema_exc)
+                    incompatible = None
+                    ema_used = False
 
         if not ema_used:
             if 'state_dict' in checkpoint:
@@ -484,7 +502,15 @@ class MSWRInference:
             else:
                 incompatible = model.load_state_dict(checkpoint, strict=False)
 
-        if incompatible.missing_keys or incompatible.unexpected_keys:
+        n_model_keys = len(model.state_dict())
+        if incompatible is not None and len(incompatible.missing_keys) > 0.25 * n_model_keys:
+            raise RuntimeError(
+                f"Checkpoint did not match the model: {len(incompatible.missing_keys)}/"
+                f"{n_model_keys} parameter keys missing after load. Refusing to run "
+                "inference on (near-)randomly initialized weights. Check the "
+                "checkpoint format / model_size."
+            )
+        if incompatible is not None and (incompatible.missing_keys or incompatible.unexpected_keys):
             logger.warning(
                 "Checkpoint loaded with missing keys=%s unexpected keys=%s",
                 incompatible.missing_keys,
@@ -502,10 +528,18 @@ class MSWRInference:
         if 'best_mrae' in checkpoint:
             logger.info(f"Model performance - Best MRAE: {checkpoint['best_mrae']:.6f}")
         
-        # Optimize model for inference
-        if hasattr(torch, 'compile') and not self.config.gradient_checkpointing:
+        # Optional torch.compile (opt-in): 'reduce-overhead' CUDA-graph capture
+        # recompiles for every input-shape change (TTA rotations swap H/W,
+        # tiling adds tile shapes) and compile failures surface at the first
+        # forward, outside this try/except - so default OFF for a tool that
+        # processes a handful of variably-sized images.
+        if (
+            getattr(self.config, "use_compile", False)
+            and hasattr(torch, "compile")
+            and not self.config.gradient_checkpointing
+        ):
             try:
-                model = torch.compile(model, mode='reduce-overhead')
+                model = torch.compile(model, dynamic=True)
                 logger.info("Model compiled with torch.compile")
             except Exception:
                 logger.warning("Failed to compile model, using eager mode")
@@ -698,10 +732,16 @@ class MSWRInference:
             with torch.inference_mode():
                 if self.config.use_amp and self.device.type == 'cuda':
                     with autocast():
-                        output = self.model(tile_tensor)
+                        if self.ensemble_processor:
+                            output = self.ensemble_processor.process(self.model, tile_tensor)
+                        else:
+                            output = self.model(tile_tensor)
                 else:
-                    output = self.model(tile_tensor)
-            
+                    if self.ensemble_processor:
+                        output = self.ensemble_processor.process(self.model, tile_tensor)
+                    else:
+                        output = self.model(tile_tensor)
+
             processed_tiles.append(self.postprocess(output))
         
         # Merge tiles

@@ -19,7 +19,10 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
     frequency analysis and reconstruction.
     """
     def __init__(self, latent_dim=64, out_channels=31, timesteps=1000,
-                 use_batchnorm=True, masking_config=None, refinement_config=None):
+                 use_batchnorm=True, masking_config=None, refinement_config=None,
+                 norm_type=None, norm_groups=8,
+                 cross_attention_mode="channel", attention_window_size=8,
+                 conditional_residual_diffusion=False, residual_scale=1.0):
         refinement_config = refinement_config or {}
         super().__init__(
             latent_dim=latent_dim,
@@ -28,27 +31,44 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
             use_batchnorm=use_batchnorm,
             masking_config=masking_config,
             refinement_config=refinement_config,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
+            conditional_residual_diffusion=conditional_residual_diffusion,
+            residual_scale=residual_scale,
         )
 
         # RGB Encoder with wavelet transform
         self.encoder = WaveletRGBEncoder(
             in_channels=3,
             latent_dim=latent_dim,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
         )
         
         # Wavelet-enhanced denoiser
         self.denoiser = WaveletUNetDenoiser(
-            channels=latent_dim, 
-            time_embedding_dim=128, 
-            use_batchnorm=use_batchnorm
+            channels=latent_dim,
+            time_embedding_dim=128,
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
+            conditional=conditional_residual_diffusion,
         )
         
         # HSI Decoder with wavelet reconstruction
         self.decoder = WaveletHSIDecoder(
             out_channels=out_channels, 
             latent_dim=latent_dim, 
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
         )
 
         # Spectral refinement head shared with base implementation
@@ -58,7 +78,11 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
             in_channels=out_channels,
             hidden_channels=refinement_hidden,
             num_blocks=spectral_blocks,
-            use_batchnorm=refinement_config.get('spectral_batchnorm', use_batchnorm)
+            use_batchnorm=refinement_config.get(
+                'spectral_batchnorm', use_batchnorm
+            ),
+            norm_type=refinement_config.get('spectral_norm_type', norm_type),
+            norm_groups=norm_groups,
         )
 
         pixel_config = refinement_config.get('pixel', {})
@@ -70,6 +94,8 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
                 num_blocks=pixel_config.get('num_blocks', 2),
                 use_batchnorm=pixel_config.get('use_batchnorm', use_batchnorm),
                 expansion=pixel_config.get('expansion', 2),
+                norm_type=pixel_config.get('norm_type', norm_type),
+                norm_groups=norm_groups,
             )
         
         # HSI to RGB converter for cycle consistency
@@ -89,7 +115,8 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         self.dpm_ot = DPMOT(
             denoiser=self.denoiser,
             spectral_schedule=self.spectral_schedule,
-            timesteps=timesteps
+            timesteps=timesteps,
+            conditional=conditional_residual_diffusion,
         )
         
         # Advanced masking configuration
@@ -102,8 +129,8 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         
         self.masking_manager = MaskingManager(self.masking_config)
         
-        # Initialize wavelet transform for loss calculation
-        self.wavelet_transform = None  # Will be initialized on first use
+        # Fixed transform used by the supervised wavelet-domain objective.
+        self.wavelet_transform = HaarWaveletTransform(out_channels)
     
     def calculate_losses(self, outputs, rgb_target, hsi_target=None):
         """
@@ -116,25 +143,11 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         
         # Add wavelet-specific losses if HSI target is available
         if hsi_target is not None:
-            # Predicted HSI and mask
+            # Predicted HSI
             hsi_output = outputs['hsi_output']
-            mask = outputs['mask']
             
-            # Initialize wavelet transforms for loss calculation if needed
-            if self.wavelet_transform is None:
-                self.wavelet_transform = HaarWaveletTransform(hsi_target.shape[1]).to(hsi_target.device)
-            
-            if mask is not None:
-                mask_expanded = self._align_mask_channels(mask, hsi_target.shape[1])
-                hsi_output_masked = self.apply_mask(hsi_output, mask_expanded)
-                hsi_target_masked = self.apply_mask(hsi_target, mask_expanded)
-
-                output_coeffs = self.wavelet_transform(hsi_output_masked)
-                target_coeffs = self.wavelet_transform(hsi_target_masked)
-            else:
-                # Transform to wavelet domain without masking
-                output_coeffs = self.wavelet_transform(hsi_output)
-                target_coeffs = self.wavelet_transform(hsi_target)
+            output_coeffs = self.wavelet_transform(hsi_output)
+            target_coeffs = self.wavelet_transform(hsi_target)
             
             # Calculate wavelet domain loss (MSE on wavelet coefficients)
             # Separate losses for approximation and detail coefficients
@@ -156,7 +169,7 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         hsi = batch.get('hsi', None)
         
         # Forward pass
-        outputs = self.forward(rgb, use_masking=True)
+        outputs = self.forward(rgb, use_masking=True, hsi_target=hsi)
         
         # Calculate losses
         losses = self.calculate_losses(outputs, rgb, hsi)
@@ -192,7 +205,7 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         hsi = batch.get('hsi', None)
         
         # Forward pass without masking
-        outputs = self.forward(rgb, use_masking=False)
+        outputs = self.forward(rgb, use_masking=False, hsi_target=hsi)
         
         # Calculate losses
         losses = self.calculate_losses(outputs, rgb, hsi)

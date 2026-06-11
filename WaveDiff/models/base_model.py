@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules.encoders import RGBEncoder
+from modules.encoders import HSILatentEncoder, RGBEncoder
 from modules.decoders import HSIDecoder, HSI2RGBConverter
 from modules.denoisers import UNetDenoiser
 from modules.refinement import SpectralRefinementHead, PixelRefinementHead
@@ -19,12 +19,24 @@ class HSILatentDiffusionModel(nn.Module):
     def __init__(self, latent_dim=64, out_channels=31, timesteps=1000,
                  use_batchnorm=True, masking_config=None, refinement_config=None,
                  use_enhanced_attention=False, use_domain_adaptation=False,
-                 dropout=0.1):
+                 dropout=0.1, enhanced_attention_mode="spatial",
+                 norm_type=None, norm_groups=8,
+                 cross_attention_mode="channel", attention_window_size=8,
+                 conditional_residual_diffusion=False,
+                 residual_scale=1.0):
         super().__init__()
 
         # Store out_channels as instance variable for later reference
         self.out_channels = out_channels
         self.latent_dim = latent_dim
+        self.conditional_residual_diffusion = bool(
+            conditional_residual_diffusion
+        )
+        self.residual_scale = float(residual_scale)
+        self.norm_type = norm_type
+        self.norm_groups = norm_groups
+        self.cross_attention_mode = cross_attention_mode
+        self.attention_window_size = attention_window_size
 
         self.use_enhanced_attention = use_enhanced_attention
         self.use_domain_adaptation = use_domain_adaptation
@@ -33,21 +45,46 @@ class HSILatentDiffusionModel(nn.Module):
         self.encoder = RGBEncoder(
             in_channels=3,
             latent_dim=latent_dim,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
         )
+
+        self.hsi_encoder = None
+        if self.conditional_residual_diffusion:
+            self.hsi_encoder = HSILatentEncoder(
+                in_channels=out_channels,
+                latent_dim=latent_dim,
+                use_batchnorm=use_batchnorm,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                cross_attention_mode=cross_attention_mode,
+                attention_window_size=attention_window_size,
+            )
 
         # Latent Denoiser: For reverse diffusion process in latent space
         self.denoiser = UNetDenoiser(
             channels=latent_dim,
             time_embedding_dim=128,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
+            conditional=self.conditional_residual_diffusion,
         )
 
         # HSI Decoder: Reconstructs HSI from latent space
         self.decoder = HSIDecoder(
             out_channels=out_channels,
             latent_dim=latent_dim,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
         )
         
         refinement_config = refinement_config or {}
@@ -58,7 +95,8 @@ class HSILatentDiffusionModel(nn.Module):
                 channels=latent_dim,
                 num_heads=8,
                 reduction=4,
-                dropout=dropout
+                dropout=dropout,
+                mode=enhanced_attention_mode,
             )
         else:
             self.enhanced_attention = None
@@ -80,7 +118,11 @@ class HSILatentDiffusionModel(nn.Module):
             in_channels=out_channels,
             hidden_channels=spectral_hidden,
             num_blocks=spectral_blocks,
-            use_batchnorm=refinement_config.get('spectral_batchnorm', use_batchnorm)
+            use_batchnorm=refinement_config.get(
+                'spectral_batchnorm', use_batchnorm
+            ),
+            norm_type=refinement_config.get('spectral_norm_type', norm_type),
+            norm_groups=norm_groups,
         )
 
         pixel_config = refinement_config.get('pixel', {})
@@ -92,6 +134,8 @@ class HSILatentDiffusionModel(nn.Module):
                 num_blocks=pixel_config.get('num_blocks', 2),
                 use_batchnorm=pixel_config.get('use_batchnorm', use_batchnorm),
                 expansion=pixel_config.get('expansion', 2),
+                norm_type=pixel_config.get('norm_type', norm_type),
+                norm_groups=norm_groups,
             )
         
         # HSI to RGB converter for cycle consistency
@@ -110,7 +154,8 @@ class HSILatentDiffusionModel(nn.Module):
         self.dpm_ot = DPMOT(
             denoiser=self.denoiser,
             spectral_schedule=self.spectral_schedule,
-            timesteps=timesteps
+            timesteps=timesteps,
+            conditional=self.conditional_residual_diffusion,
         )
         
         # Advanced masking configuration
@@ -177,41 +222,76 @@ class HSILatentDiffusionModel(nn.Module):
     def encode(self, rgb):
         """Encode RGB images to latent representations"""
         return self.encoder(rgb)
+
+    def _encode_condition(self, rgb):
+        """Encode RGB and apply the same latent conditioning in train and eval."""
+        latent = self.encode(rgb)
+        if self.enhanced_attention is not None:
+            latent = self.enhanced_attention(latent)
+        if self.domain_attention is not None:
+            latent = self.domain_attention(latent)
+        return latent
     
     def decode(self, latent):
         """Decode latent representations to HSI"""
         return self.decoder(latent)
     
-    def rgb_to_hsi(self, rgb, sampling_steps=None, return_stages=False):
+    def _decode_and_refine(self, latent):
+        """Decode a latent and apply the configured reconstruction heads."""
+        hsi_initial = self.decode(latent)
+        hsi_after_spectral = self.refinement_head(hsi_initial)
+        if self.pixel_refinement_head is not None:
+            hsi_final = self.pixel_refinement_head(hsi_after_spectral)
+        else:
+            hsi_final = hsi_after_spectral
+        return hsi_final, hsi_initial, hsi_after_spectral
+
+    def rgb_to_hsi(
+        self,
+        rgb,
+        sampling_steps=None,
+        return_stages=False,
+        *,
+        latent_mode="direct",
+    ):
         """
         Convert RGB to HSI using the full model
         
         Args:
             rgb: RGB image tensor [B, 3, H, W]
             sampling_steps: Optional reduced number of sampling steps
+            latent_mode: ``"direct"`` decodes the supervised encoder latent.
+                ``"diffusion"`` enables the experimental latent sampler.
             
         Returns:
             HSI image tensor [B, C, H, W]
         """
         # Encode RGB to latent space
-        latent = self.encode(rgb)
+        latent = self._encode_condition(rgb)
         
-        # Sample latent using DPM Solver v3 for efficient inference
-        sampled_latent = self.dpm_ot.sample(
-            latent.shape,
-            latent.device,
-            conditioning=latent,
-            use_dpm_solver=True,
-            steps=sampling_steps or 20
-        )
-        
-        # Decode to HSI
-        hsi_initial = self.decode(sampled_latent)
-        hsi_after_spectral = self.refinement_head(hsi_initial)
-        if self.pixel_refinement_head is not None:
-            hsi_final = self.pixel_refinement_head(hsi_after_spectral)
+        if latent_mode == "direct":
+            reconstruction_latent = latent
+        elif latent_mode == "diffusion":
+            sampled = self.dpm_ot.sample(
+                latent.shape,
+                latent.device,
+                conditioning=latent,
+                use_dpm_solver=True,
+                steps=sampling_steps or 20,
+            )
+            reconstruction_latent = (
+                latent + self.residual_scale * sampled
+                if self.conditional_residual_diffusion
+                else sampled
+            )
         else:
-            hsi_final = hsi_after_spectral
+            raise ValueError(
+                f"latent_mode must be 'direct' or 'diffusion', got {latent_mode!r}"
+            )
+
+        hsi_final, hsi_initial, hsi_after_spectral = self._decode_and_refine(
+            reconstruction_latent
+        )
 
         if return_stages:
             stages = {
@@ -225,7 +305,14 @@ class HSILatentDiffusionModel(nn.Module):
 
         return hsi_final
     
-    def forward(self, rgb, t=None, mask=None, use_masking=False):
+    def forward(
+        self,
+        rgb,
+        t=None,
+        mask=None,
+        use_masking=False,
+        hsi_target=None,
+    ):
         """
         Forward pass for training
         
@@ -260,40 +347,49 @@ class HSILatentDiffusionModel(nn.Module):
             mask = None
         
         # Encode RGB to latent space
-        latent = self.encode(rgb_masked)
-
-        # Apply enhanced attention if enabled (improves generalization)
-        if self.enhanced_attention is not None:
-            latent = self.enhanced_attention(latent)
-
-        # Apply domain-adaptive attention if enabled (cross-dataset transfer)
-        if self.domain_attention is not None:
-            latent = self.domain_attention(latent)
+        latent = self._encode_condition(rgb_masked)
 
         # Sample timestep if not provided
         batch_size = rgb.shape[0]
         if t is None:
             t = torch.randint(0, self.dpm_ot.timesteps, (batch_size,), device=rgb.device)
 
-        # DPM-OT loss calculation
-        diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(latent, t)
+        target_latent = None
+        target_latent_hsi = None
+        if self.conditional_residual_diffusion and hsi_target is not None:
+            target_latent = self.hsi_encoder(hsi_target)
+            residual_target = target_latent - latent.detach()
+            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(
+                residual_target,
+                t,
+                conditioning=latent.detach(),
+            )
+            target_latent_hsi = self._decode_and_refine(target_latent)[0]
+        elif self.conditional_residual_diffusion:
+            residual_target = torch.zeros_like(latent)
+            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(
+                residual_target,
+                t,
+                conditioning=latent.detach(),
+            )
+        else:
+            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(latent, t)
 
         # Get clean latent (for direct path)
         latent_clean = latent
         
         # Decode latent to HSI then refine spectrally
-        hsi_initial = self.decode(latent_clean)
-        hsi_after_spectral = self.refinement_head(hsi_initial)
-        if self.pixel_refinement_head is not None:
-            hsi_output = self.pixel_refinement_head(hsi_after_spectral)
-        else:
-            hsi_output = hsi_after_spectral
+        hsi_output, hsi_initial, hsi_after_spectral = self._decode_and_refine(
+            latent_clean
+        )
 
         # Convert HSI back to RGB for cycle consistency
         rgb_from_hsi = self.hsi2rgb(hsi_output)
 
         return {
             'latent': latent,
+            'target_latent': target_latent,
+            'target_latent_hsi': target_latent_hsi,
             'diffusion_loss': diffusion_loss,
             'pred_noise': pred_noise,
             'noise': noise,
@@ -319,48 +415,30 @@ class HSILatentDiffusionModel(nn.Module):
         # Predicted outputs
         hsi_output = outputs['hsi_output']
         rgb_from_hsi = outputs['rgb_from_hsi']
-        mask = outputs['mask']
-
-        # Cycle consistency loss (RGB → HSI → RGB)
-        mask_for_loss = mask
-        if mask_for_loss is not None:
-            losses['cycle_loss'] = F.l1_loss(
-                self.apply_mask(rgb_from_hsi, mask_for_loss),
-                self.apply_mask(rgb_target, mask_for_loss)
-            )
-        else:
-            losses['cycle_loss'] = F.l1_loss(rgb_from_hsi, rgb_target)
+        # The mask corrupts the input. Supervision must still cover the full
+        # target, especially the hidden regions the model is asked to recover.
+        losses['cycle_loss'] = F.l1_loss(rgb_from_hsi, rgb_target)
         
         # L1 loss for HSI reconstruction (if target available)
         if hsi_target is not None:
-            if mask is not None:
-                losses['l1_loss'] = F.l1_loss(
-                    self.apply_mask(hsi_output, mask),
-                    self.apply_mask(hsi_target, mask)
+            losses['l1_loss'] = F.l1_loss(hsi_output, hsi_target)
+            target_latent_hsi = outputs.get('target_latent_hsi')
+            if target_latent_hsi is not None:
+                losses['latent_reconstruction_loss'] = F.l1_loss(
+                    target_latent_hsi,
+                    hsi_target,
                 )
-            else:
-                losses['l1_loss'] = F.l1_loss(hsi_output, hsi_target)
 
             # Track intermediate reconstruction losses for analysis
             hsi_initial = outputs.get('hsi_initial')
             if hsi_initial is not None:
-                if mask is not None:
-                    losses['pre_spectral_l1'] = F.l1_loss(
-                        self.apply_mask(hsi_initial, mask),
-                        self.apply_mask(hsi_target, mask)
-                    )
-                else:
-                    losses['pre_spectral_l1'] = F.l1_loss(hsi_initial, hsi_target)
+                losses['pre_spectral_l1'] = F.l1_loss(hsi_initial, hsi_target)
 
             hsi_after_spectral = outputs.get('hsi_after_spectral')
             if hsi_after_spectral is not None and hsi_after_spectral is not hsi_output:
-                if mask is not None:
-                    losses['pre_pixel_l1'] = F.l1_loss(
-                        self.apply_mask(hsi_after_spectral, mask),
-                        self.apply_mask(hsi_target, mask)
-                    )
-                else:
-                    losses['pre_pixel_l1'] = F.l1_loss(hsi_after_spectral, hsi_target)
+                losses['pre_pixel_l1'] = F.l1_loss(
+                    hsi_after_spectral, hsi_target
+                )
         else:
             # Default L1 loss if no target (just for code consistency)
             losses['l1_loss'] = torch.tensor(0.0, device=rgb_target.device)

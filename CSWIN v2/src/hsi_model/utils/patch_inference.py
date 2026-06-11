@@ -122,31 +122,36 @@ class PatchInference:
         H, W = info['original_shape']
         positions = info['positions']
         
-        # Initialize output and weight tensors
-        output = torch.zeros(1, out_channels, H, W, device=patches.device, dtype=patches.dtype)
-        weights = torch.zeros(1, 1, H, W, device=patches.device, dtype=patches.dtype)
-        
+        # Initialize output and weight tensors. Accumulate in fp32 regardless
+        # of the patch dtype: fp16 accumulation across overlapping tiles adds
+        # ~1e-3-relative rounding noise to the stitched cube, the same order
+        # as the MRAE gaps being measured.
+        output = torch.zeros(1, out_channels, H, W, device=patches.device, dtype=torch.float32)
+        weights = torch.zeros(1, 1, H, W, device=patches.device, dtype=torch.float32)
+
         # Create weight mask for blending
         patch_weight = self._create_weight_mask(self.patch_size, self.overlap)
-        patch_weight = patch_weight.to(device=patches.device, dtype=patches.dtype)
-        
+        patch_weight = patch_weight.to(device=patches.device, dtype=torch.float32)
+
         # Place each patch
         for idx, (h_start, w_start, h_end, w_end) in enumerate(positions):
             h_size = h_end - h_start
             w_size = w_end - w_start
-            
+
             # Get the patch and weight mask, cropping if necessary
-            patch = patches[idx:idx+1, :, :h_size, :w_size]
+            patch = patches[idx:idx+1, :, :h_size, :w_size].float()
             weight = patch_weight[:, :, :h_size, :w_size]
-            
+
             # Add to output with weighting
             output[:, :, h_start:h_end, w_start:w_end] += patch * weight
             weights[:, :, h_start:h_end, w_start:w_end] += weight
-        
-        # Normalize by weights
-        output = output / (weights + 1e-8)
-        
-        return output
+
+        # Normalize by weights. clamp_min (not +eps) so positions covered by a
+        # single low-weight border tile divide by their TRUE weight - additive
+        # eps biased the 1-px ring by eps/weight (~1% at the old corners).
+        output = output / weights.clamp_min(1e-8)
+
+        return output.to(dtype=patches.dtype)
     
     def _create_weight_mask(self, patch_size: int, overlap: int) -> torch.Tensor:
         """Create weight mask for smooth blending"""
@@ -162,6 +167,13 @@ class PatchInference:
             plateau_size = max(1, patch_size - 2 * ramp_size)
             plateau = torch.ones(plateau_size)
             weight_1d = torch.cat([ramp, plateau, ramp.flip(0)])
+            # Floor the profile: ramp[0] is exactly 0 (cos(pi)), and image-border
+            # pixels are covered by only ONE tile whose mask is 0 there - the
+            # epsilon-normalized result zeroed the outer 1-px ring of every
+            # stitched prediction. Interior seams renormalize by the weight
+            # sum, so the floor leaves them bit-identical. 1e-2 keeps the
+            # corner weight (floor^2 = 1e-4) far above the normalizer guard.
+            weight_1d = weight_1d.clamp_min(1e-2)
         else:
             weight_1d = torch.ones(patch_size)
         

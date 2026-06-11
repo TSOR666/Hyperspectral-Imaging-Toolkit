@@ -2,10 +2,12 @@ import os
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 import numpy as np
 import argparse
 import json
+import math
+from collections import OrderedDict
 from tqdm import tqdm
 from datetime import datetime
 
@@ -22,6 +24,7 @@ from utils.visualization import (
 from utils.augmentation import RGBHSIAugmentation
 from utils.progressive_training import ProgressiveTrainingManager
 from losses.spectral_consistency import CombinedSpectralLoss
+from utils.ema import ModelEMA
 
 
 def _torch_load_checkpoint(path, map_location):
@@ -32,9 +35,108 @@ def _torch_load_checkpoint(path, map_location):
         return torch.load(path, map_location=map_location)
 
 
+def ensure_hsi_chw(hsi_tensor, num_bands=31):
+    """Validate and convert a 3D HSI cube to channel-first layout."""
+    if hsi_tensor.ndim != 3:
+        raise ValueError(
+            f"Expected a 3D HSI cube, got shape {tuple(hsi_tensor.shape)}"
+        )
+    if hsi_tensor.shape[0] == num_bands:
+        return hsi_tensor
+    if hsi_tensor.shape[-1] == num_bands:
+        return hsi_tensor.permute(2, 0, 1)
+    raise ValueError(
+        f"Could not identify {num_bands} spectral bands in shape "
+        f"{tuple(hsi_tensor.shape)}"
+    )
+
+
+def get_loss_weight(loss_weights, config, loss_name, default):
+    """Read either ``name`` or ``name_weight`` curriculum conventions."""
+    weight_key = f"{loss_name}_weight"
+    if weight_key in loss_weights:
+        return loss_weights[weight_key]
+    if loss_name in loss_weights:
+        return loss_weights[loss_name]
+    return config.get(weight_key, default)
+
+
+def combine_weighted_losses(losses, config, loss_weights=None):
+    """Combine all configured training losses with consistent key handling."""
+    loss_weights = loss_weights or config
+    total = (
+        losses['diffusion_loss']
+        * get_loss_weight(loss_weights, config, 'diffusion_loss', 1.0)
+        + losses['cycle_loss']
+        * get_loss_weight(loss_weights, config, 'cycle_loss', 0.8)
+        + losses['l1_loss']
+        * get_loss_weight(loss_weights, config, 'l1_loss', 1.0)
+    )
+    optional_defaults = {
+        'wavelet_loss': 0.5,
+        'threshold_reg': 1e-4,
+        'spectral_consistency': 0.3,
+        'latent_reconstruction_loss': 0.5,
+    }
+    for name, default in optional_defaults.items():
+        if name in losses:
+            total = total + losses[name] * get_loss_weight(
+                loss_weights, config, name, default
+            )
+    return total
+
+
+def build_optimizer(model, learning_rate, weight_decay):
+    """Create AdamW groups without decaying bias and normalization scales."""
+    decay = []
+    no_decay = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim == 1 or name.endswith('.bias'):
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    return optim.AdamW(
+        [
+            {'params': decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ],
+        lr=learning_rate,
+    )
+
+
+def build_lr_scheduler(
+    optimizer,
+    total_steps,
+    warmup_steps,
+    learning_rate,
+    min_lr,
+):
+    """Single warmup-plus-cosine schedule stepped once per optimizer update."""
+    min_ratio = min_lr / max(learning_rate, 1e-12)
+
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return max((step + 1) / warmup_steps, 1.0 / warmup_steps)
+        decay_steps = max(total_steps - warmup_steps, 1)
+        progress = min(max((step - warmup_steps) / decay_steps, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 # Dataset class for HSI data
 class HSIDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, transform=None, hsi_transform=None, augmentation=None):
+    def __init__(
+        self,
+        root_dir,
+        transform=None,
+        hsi_transform=None,
+        augmentation=None,
+        npy_cache_size=0,
+    ):
         """
         Dataset for RGB-HSI pairs
 
@@ -48,6 +150,10 @@ class HSIDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.hsi_transform = hsi_transform
         self.augmentation = augmentation
+        self.npy_cache_size = max(int(npy_cache_size), 0)
+        self._npy_cache = OrderedDict()
+        self.cache_hits = 0
+        self.cache_misses = 0
         
         # Assuming directory structure:
         # root_dir/
@@ -84,15 +190,23 @@ class HSIDataset(torch.utils.data.Dataset):
         hsi_filename = os.path.splitext(self.rgb_files[idx])[0]
         hsi_path_npy = os.path.join(self.hsi_dir, f"{hsi_filename}.npy")
         hsi_path_mat = os.path.join(self.hsi_dir, f"{hsi_filename}.mat")
-        
+        hsi_cache_key = None
+        hsi_is_cached = False
+
         if os.path.exists(hsi_path_npy):
-            # Load as numpy array
-            hsi_data = np.load(hsi_path_npy)
-            # Convert to tensor if not already
-            hsi_tensor = torch.from_numpy(hsi_data).float()
-            # Ensure channel first format (C, H, W)
-            if hsi_tensor.shape[0] != 31:
-                hsi_tensor = hsi_tensor.permute(2, 0, 1)
+            cached = self._npy_cache.get(hsi_path_npy)
+            if cached is not None:
+                self.cache_hits += 1
+                self._npy_cache.move_to_end(hsi_path_npy)
+                hsi_tensor = cached.clone()
+                hsi_is_cached = True
+            else:
+                self.cache_misses += 1
+                hsi_data = np.load(hsi_path_npy)
+                hsi_tensor = ensure_hsi_chw(
+                    torch.from_numpy(hsi_data).float()
+                )
+                hsi_cache_key = hsi_path_npy
         elif os.path.exists(hsi_path_mat):
             # Load from .mat file
             mat_data = sio.loadmat(hsi_path_mat)
@@ -115,15 +229,17 @@ class HSIDataset(torch.utils.data.Dataset):
 
             # Convert to tensor
             hsi_tensor = torch.from_numpy(hsi_data).float()
-            # Ensure channel first format (C, H, W)
-            if hsi_tensor.shape[0] != 31:
-                hsi_tensor = hsi_tensor.permute(2, 0, 1)
+            hsi_tensor = ensure_hsi_chw(hsi_tensor)
         else:
             raise FileNotFoundError(f"HSI data not found for {hsi_filename}")
 
         # Apply transform to HSI if provided
-        if self.hsi_transform:
+        if self.hsi_transform and not hsi_is_cached:
             hsi_tensor = self.hsi_transform(hsi_tensor)
+        if hsi_cache_key is not None and self.npy_cache_size > 0:
+            self._npy_cache[hsi_cache_key] = hsi_tensor.clone()
+            while len(self._npy_cache) > self.npy_cache_size:
+                self._npy_cache.popitem(last=False)
 
         # Apply synchronized augmentation if provided
         if self.augmentation is not None:
@@ -136,9 +252,21 @@ class HSIDataset(torch.utils.data.Dataset):
         }
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_loss, config, path):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    train_loss,
+    val_loss,
+    config,
+    path,
+    history=None,
+    scaler=None,
+    ema=None,
+):
     """Save model checkpoint"""
-    torch.save({
+    checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -146,11 +274,26 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_loss, co
         'train_loss': train_loss,
         'val_loss': val_loss,
         'config': config
-    }, path)
+    }
+    if history is not None:
+        checkpoint['history'] = history
+    if scaler is not None and scaler.is_enabled():
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+    if ema is not None:
+        checkpoint['ema_state_dict'] = ema.state_dict()
+    torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
 
 
-def load_checkpoint(model, optimizer, scheduler, path, device):
+def load_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    path,
+    device,
+    scaler=None,
+    ema=None,
+):
     """Load model checkpoint"""
     if not os.path.exists(path):
         return None, 0, float('inf')
@@ -158,9 +301,19 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     print(f"Loading checkpoint from {path}")
     checkpoint = _torch_load_checkpoint(path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    except ValueError as exc:
+        print(f"Optimizer layout changed; resuming with fresh optimizer state: {exc}")
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    if ema is not None and 'ema_state_dict' in checkpoint:
+        ema.load_state_dict(checkpoint['ema_state_dict'])
+    elif ema is not None:
+        ema.module.load_state_dict(model.state_dict())
+        ema.num_updates = 0
     
     return checkpoint, checkpoint['epoch'] + 1, checkpoint.get('val_loss', float('inf'))
 
@@ -170,10 +323,25 @@ def train(config):
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    use_amp = bool(config.get('use_amp', True) and device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # Ensure HSI normalization parameters are available
     config.setdefault('hsi_max_value', 1.0)
     config.setdefault('hsi_normalize_to_neg_one_to_one', True)
+    config.setdefault('enhanced_attention_mode', 'channel')
+    config.setdefault('norm_type', 'group')
+    config.setdefault('norm_groups', 8)
+    config.setdefault('cross_attention_mode', 'channel')
+    config.setdefault('attention_window_size', 8)
+    config.setdefault('conditional_residual_diffusion', True)
+    config.setdefault('residual_scale', 1.0)
+    config.setdefault('gradient_accumulation_steps', 1)
+    config.setdefault('use_ema', True)
+    config.setdefault('ema_decay', 0.999)
+    config.setdefault('use_torch_compile', False)
+    config.setdefault('compile_mode', 'default')
+    config.setdefault('npy_cache_size', 8)
     
     # Data transforms
     from torchvision import transforms
@@ -190,7 +358,7 @@ def train(config):
     normalize_to_neg_one = config.get('hsi_normalize_to_neg_one_to_one', True)
 
     def hsi_transform(hsi_tensor: torch.Tensor) -> torch.Tensor:
-        tensor = hsi_tensor.clone().float()
+        tensor = hsi_tensor.float()
         tensor = hsi_resize(tensor)
 
         denominator: float
@@ -224,7 +392,7 @@ def train(config):
             geometric_prob=aug_strength,
             photometric_prob=aug_strength,
             noise_prob=aug_strength * 0.6,
-            spectral_shift_prob=0.2,
+            spectral_shift_prob=config.get('spectral_shift_prob', 0.0),
             mixup_prob=config.get('mixup_prob', 0.0),
             training=True
         )
@@ -234,31 +402,43 @@ def train(config):
         root_dir=config['train_dir'],
         transform=rgb_transform,
         hsi_transform=hsi_transform,
-        augmentation=train_augmentation
+        augmentation=train_augmentation,
+        npy_cache_size=config['npy_cache_size'],
     )
 
     val_dataset = HSIDataset(
         root_dir=config['val_dir'],
         transform=rgb_transform,
         hsi_transform=hsi_transform,
-        augmentation=None  # No augmentation for validation
+        augmentation=None,
+        npy_cache_size=config.get(
+            'val_npy_cache_size', config['npy_cache_size']
+        ),
     )
     
     # Create data loaders
+    pin_memory = device.type == 'cuda'
+    loader_worker_options = {}
+    if config['num_workers'] > 0:
+        loader_worker_options['persistent_workers'] = True
+        loader_worker_options['prefetch_factor'] = config.get('prefetch_factor', 2)
+
     train_loader = DataLoader(
-        train_dataset, 
+        train_dataset,
         batch_size=config['batch_size'],
-        shuffle=True, 
+        shuffle=True,
         num_workers=config['num_workers'],
-        pin_memory=True
+        pin_memory=pin_memory,
+        **loader_worker_options,
     )
     
     val_loader = DataLoader(
-        val_dataset, 
+        val_dataset,
         batch_size=config['batch_size'],
-        shuffle=False, 
+        shuffle=False,
         num_workers=config['num_workers'],
-        pin_memory=True
+        pin_memory=pin_memory,
+        **loader_worker_options,
     )
     
     # Create masking configuration
@@ -299,7 +479,8 @@ def train(config):
             spectral_grad_weight=config.get('spectral_grad_weight', 0.5),
             frequency_weight=config.get('frequency_weight', 0.3),
             perceptual_weight=config.get('perceptual_weight', 0.2),
-            physical_weight=config.get('physical_weight', 0.1)
+            physical_weight=config.get('physical_weight', 0.1),
+            normalized_to_neg_one_to_one=normalize_to_neg_one,
         ).to(device)
 
     if model_type == 'base':
@@ -313,7 +494,16 @@ def train(config):
             refinement_config=refinement_config,
             use_enhanced_attention=config.get('use_enhanced_attention', True),
             use_domain_adaptation=config.get('use_domain_adaptation', True),
-            dropout=config.get('dropout', 0.1)
+            dropout=config.get('dropout', 0.1),
+            enhanced_attention_mode=config['enhanced_attention_mode'],
+            norm_type=config['norm_type'],
+            norm_groups=config['norm_groups'],
+            cross_attention_mode=config['cross_attention_mode'],
+            attention_window_size=config['attention_window_size'],
+            conditional_residual_diffusion=config[
+                'conditional_residual_diffusion'
+            ],
+            residual_scale=config['residual_scale'],
         ).to(device)
     elif model_type == 'wavelet':
         print("Initializing Wavelet-enhanced HSI Latent Diffusion Model")
@@ -323,7 +513,15 @@ def train(config):
             timesteps=config['timesteps'],
             use_batchnorm=config['use_batchnorm'],
             masking_config=masking_config,
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            norm_type=config['norm_type'],
+            norm_groups=config['norm_groups'],
+            cross_attention_mode=config['cross_attention_mode'],
+            attention_window_size=config['attention_window_size'],
+            conditional_residual_diffusion=config[
+                'conditional_residual_diffusion'
+            ],
+            residual_scale=config['residual_scale'],
         ).to(device)
     elif model_type == 'adaptive_wavelet':
         print("Initializing Adaptive Wavelet HSI Latent Diffusion Model")
@@ -336,23 +534,53 @@ def train(config):
             threshold_method=config.get('threshold_method', 'soft'),
             init_threshold=config.get('init_threshold', 0.1),
             trainable_threshold=config.get('trainable_threshold', True),
-            refinement_config=refinement_config
+            refinement_config=refinement_config,
+            norm_type=config['norm_type'],
+            norm_groups=config['norm_groups'],
+            cross_attention_mode=config['cross_attention_mode'],
+            attention_window_size=config['attention_window_size'],
+            conditional_residual_diffusion=config[
+                'conditional_residual_diffusion'
+            ],
+            residual_scale=config['residual_scale'],
         ).to(device)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
     # Setup optimizer and scheduler
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=config['learning_rate'],
-        weight_decay=config['weight_decay']
+    optimizer = build_optimizer(
+        model,
+        learning_rate=config['learning_rate'],
+        weight_decay=config['weight_decay'],
     )
-    
-    scheduler = CosineAnnealingLR(
-        optimizer, 
-        T_max=config['num_epochs'] * len(train_loader), 
-        eta_min=config['min_lr']
+    accumulation_steps = max(
+        int(config['gradient_accumulation_steps']),
+        1,
     )
+    updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    total_steps = config['num_epochs'] * updates_per_epoch
+    warmup_steps = config.get('lr_warmup_epochs', 5) * updates_per_epoch
+    scheduler = build_lr_scheduler(
+        optimizer,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        learning_rate=config['learning_rate'],
+        min_lr=config['min_lr'],
+    )
+    ema = ModelEMA(model, decay=config['ema_decay']) if config['use_ema'] else None
+    forward_model = model
+    if config['use_torch_compile']:
+        if not hasattr(torch, 'compile'):
+            print("torch.compile is unavailable; continuing without compilation")
+        else:
+            try:
+                forward_model = torch.compile(
+                    model,
+                    mode=config['compile_mode'],
+                )
+                print(f"Enabled torch.compile mode={config['compile_mode']}")
+            except Exception as exc:
+                print(f"torch.compile setup failed; continuing eagerly: {exc}")
     
     # Create output directories
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
@@ -381,7 +609,13 @@ def train(config):
     if config['resume_from_checkpoint']:
         checkpoint_path = config['resume_from_checkpoint']
         checkpoint, start_epoch, best_val_loss = load_checkpoint(
-            model, optimizer, scheduler, checkpoint_path, device
+            model,
+            optimizer,
+            scheduler,
+            checkpoint_path,
+            device,
+            scaler=scaler,
+            ema=ema,
         )
         if checkpoint is not None and 'history' in checkpoint:
             history = checkpoint['history']
@@ -397,11 +631,6 @@ def train(config):
         if progressive_manager is not None:
             progressive_manager.update_epoch(epoch)
 
-            # Update learning rate based on progressive schedule
-            new_lr = progressive_manager.get_learning_rate(epoch)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
-
             # Update augmentation strength
             if train_augmentation is not None:
                 aug_strength = progressive_manager.get_augmentation_strength(epoch)
@@ -413,6 +642,7 @@ def train(config):
         model.update_masking_epoch(epoch)
         
         model.train()
+        forward_model.train()
         epoch_loss = 0.0
         epoch_metrics = {
             'diffusion_loss': 0.0,
@@ -425,62 +655,66 @@ def train(config):
             'pre_spectral_l1': {'sum': 0.0, 'count': 0},
             'pre_pixel_l1': {'sum': 0.0, 'count': 0}
         }
-        
+
         # Training epoch
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']}")
-        
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, batch in enumerate(train_pbar):
             # Move data to device
-            rgb_imgs = batch['rgb'].to(device)
-            hsi_data = batch['hsi'].to(device)
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass with masking
-            outputs = model(rgb_imgs, use_masking=config['use_masking'])
-            
-            # Calculate losses
-            losses = model.calculate_losses(outputs, rgb_imgs, hsi_data)
-            
+            rgb_imgs = batch['rgb'].to(device, non_blocking=pin_memory)
+            hsi_data = batch['hsi'].to(device, non_blocking=pin_memory)
+
             # Get loss weights (potentially progressive)
             if progressive_manager is not None:
                 loss_weights = progressive_manager.get_loss_weights(epoch)
             else:
                 loss_weights = config
 
-            # Combine losses with weights
-            total_loss = (
-                losses['diffusion_loss'] * loss_weights.get('diffusion_loss_weight', config['diffusion_loss_weight']) +
-                losses['cycle_loss'] * loss_weights.get('cycle_loss_weight', config['cycle_loss_weight']) +
-                losses['l1_loss'] * loss_weights.get('l1_loss_weight', config['l1_loss_weight'])
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = forward_model(
+                    rgb_imgs,
+                    use_masking=config['use_masking'],
+                    hsi_target=hsi_data,
+                )
+                losses = model.calculate_losses(outputs, rgb_imgs, hsi_data)
+                if spectral_loss_module is not None:
+                    losses['spectral_consistency'] = spectral_loss_module(
+                        outputs['hsi_output'], hsi_data
+                    )
+                total_loss = combine_weighted_losses(
+                    losses, config, loss_weights=loss_weights
+                )
+
+            remainder = len(train_loader) % accumulation_steps
+            final_group_start = len(train_loader) - (remainder or accumulation_steps)
+            group_size = (
+                remainder
+                if remainder and batch_idx >= final_group_start
+                else accumulation_steps
             )
-
-            # Add wavelet loss if available
-            if 'wavelet_loss' in losses:
-                total_loss += losses['wavelet_loss'] * loss_weights.get('wavelet_loss_weight', config.get('wavelet_loss_weight', 0.5))
-
-            # Add threshold regularization if available
-            if 'threshold_reg' in losses:
-                total_loss += losses['threshold_reg'] * config.get('threshold_reg_weight', 1e-4)
-
-            # Add spectral consistency loss if enabled
-            if spectral_loss_module is not None:
-                spectral_loss = spectral_loss_module(outputs['hsi_output'], hsi_data)
-                spectral_weight = loss_weights.get('spectral_consistency_weight', config.get('spectral_consistency_weight', 0.3))
-                total_loss += spectral_loss * spectral_weight
-                if 'spectral_consistency' not in epoch_metrics:
-                    epoch_metrics['spectral_consistency'] = 0.0
-                epoch_metrics['spectral_consistency'] += spectral_loss.item()
-            
-            # Backward pass and optimization
-            total_loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
-            
-            optimizer.step()
-            scheduler.step()
+            scaler.scale(total_loss / group_size).backward()
+            should_step = (
+                (batch_idx + 1) % accumulation_steps == 0
+                or batch_idx + 1 == len(train_loader)
+            )
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config['max_grad_norm'],
+                )
+                previous_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer_ran = (
+                    not use_amp or scaler.get_scale() >= previous_scale
+                )
+                if optimizer_ran:
+                    scheduler.step()
+                    if ema is not None:
+                        ema.update(model)
+                optimizer.zero_grad(set_to_none=True)
             
             # Update metrics
             epoch_loss += total_loss.item()
@@ -490,6 +724,12 @@ def train(config):
             epoch_metrics['l1_loss'] += losses['l1_loss'].item()
             if 'wavelet_loss' in losses:
                 epoch_metrics['wavelet_loss'] += losses['wavelet_loss'].item()
+            if 'spectral_consistency' in losses:
+                if 'spectral_consistency' not in epoch_metrics:
+                    epoch_metrics['spectral_consistency'] = 0.0
+                epoch_metrics['spectral_consistency'] += losses[
+                    'spectral_consistency'
+                ].item()
 
             for key in optional_metrics:
                 if key in losses:
@@ -544,7 +784,8 @@ def train(config):
               f"Wavelet={epoch_metrics['wavelet_loss']:.4f}")
         
         # Validation
-        model.eval()
+        evaluation_model = ema.module if ema is not None else model
+        evaluation_model.eval()
         val_loss = 0.0
         val_metrics = {
             'diffusion_loss': 0.0,
@@ -558,30 +799,32 @@ def train(config):
             'pre_pixel_l1': {'sum': 0.0, 'count': 0}
         }
         
-        with torch.no_grad():
+        with torch.inference_mode():
             val_pbar = tqdm(val_loader, desc="Validation")
-            
+
             for batch_idx, batch in enumerate(val_pbar):
                 # Move data to device
-                rgb_imgs = batch['rgb'].to(device)
-                hsi_data = batch['hsi'].to(device)
-                
-                # Forward pass without masking
-                outputs = model(rgb_imgs, use_masking=False)
-                
-                # Calculate losses
-                losses = model.calculate_losses(outputs, rgb_imgs, hsi_data)
-                
-                # Combine losses with weights
-                total_loss = (
-                    losses['diffusion_loss'] * config['diffusion_loss_weight'] +
-                    losses['cycle_loss'] * config['cycle_loss_weight'] + 
-                    losses['l1_loss'] * config['l1_loss_weight']
-                )
-                
-                # Add wavelet loss if available
-                if 'wavelet_loss' in losses:
-                    total_loss += losses['wavelet_loss'] * config.get('wavelet_loss_weight', 0.5)
+                rgb_imgs = batch['rgb'].to(device, non_blocking=pin_memory)
+                hsi_data = batch['hsi'].to(device, non_blocking=pin_memory)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = evaluation_model(
+                        rgb_imgs,
+                        use_masking=False,
+                        hsi_target=hsi_data,
+                    )
+                    losses = evaluation_model.calculate_losses(
+                        outputs,
+                        rgb_imgs,
+                        hsi_data,
+                    )
+                    if spectral_loss_module is not None:
+                        losses['spectral_consistency'] = spectral_loss_module(
+                            outputs['hsi_output'], hsi_data
+                        )
+                    total_loss = combine_weighted_losses(
+                        losses, config, loss_weights=loss_weights
+                    )
                 
                 # Update metrics
                 val_loss += total_loss.item()
@@ -591,6 +834,12 @@ def train(config):
                 val_metrics['l1_loss'] += losses['l1_loss'].item()
                 if 'wavelet_loss' in losses:
                     val_metrics['wavelet_loss'] += losses['wavelet_loss'].item()
+                if 'spectral_consistency' in losses:
+                    if 'spectral_consistency' not in val_metrics:
+                        val_metrics['spectral_consistency'] = 0.0
+                    val_metrics['spectral_consistency'] += losses[
+                        'spectral_consistency'
+                    ].item()
 
                 for key in val_optional_metrics:
                     if key in losses:
@@ -640,9 +889,13 @@ def train(config):
             best_val_loss = val_metrics['total_loss']
             checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_epoch_{epoch+1}.pt")
             save_checkpoint(
-                model, optimizer, scheduler, epoch, 
-                epoch_metrics['total_loss'], val_metrics['total_loss'], 
-                config, checkpoint_path
+                model, optimizer, scheduler, epoch,
+                epoch_metrics['total_loss'], val_metrics['total_loss'],
+                config,
+                checkpoint_path,
+                history=history,
+                scaler=scaler,
+                ema=ema,
             )
             
             # Save training history
@@ -653,9 +906,13 @@ def train(config):
         # Always save latest model
         latest_path = os.path.join(config['checkpoint_dir'], "latest_model.pt")
         save_checkpoint(
-            model, optimizer, scheduler, epoch, 
-            epoch_metrics['total_loss'], val_metrics['total_loss'], 
-            config, latest_path
+            model, optimizer, scheduler, epoch,
+            epoch_metrics['total_loss'], val_metrics['total_loss'],
+            config,
+            latest_path,
+            history=history,
+            scaler=scaler,
+            ema=ema,
         )
         
         # Visualize training progress
@@ -664,11 +921,24 @@ def train(config):
             save_path=os.path.join(config['visualization_dir'], 'training_progress.png')
         )
     
+    if ema is not None:
+        model._wavediff_ema_state = ema.state_dict()
     return model, history
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train HSI Latent Diffusion Model")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        '--config',
+        type=str,
+        default=None,
+        help='JSON configuration file; explicit CLI flags take precedence',
+    )
+    config_args, _ = config_parser.parse_known_args()
+    parser = argparse.ArgumentParser(
+        description="Train HSI Latent Diffusion Model",
+        parents=[config_parser],
+    )
     
     # Model parameters
     parser.add_argument('--model_type', type=str, default='base', 
@@ -682,6 +952,33 @@ def main():
                         help='Enable batch normalization')
     parser.add_argument('--no_batchnorm', dest='use_batchnorm', action='store_false',
                         help='Disable batch normalization')
+    parser.add_argument(
+        '--norm_type',
+        choices=['batch', 'group', 'none'],
+        default='group',
+        help='Normalization used by residual and refinement blocks',
+    )
+    parser.add_argument('--norm_groups', type=int, default=8)
+    parser.add_argument(
+        '--cross_attention_mode',
+        choices=['spatial', 'channel', 'windowed'],
+        default='channel',
+        help='Attention axis for encoder, denoiser, and decoder attention',
+    )
+    parser.add_argument('--attention_window_size', type=int, default=8)
+    parser.add_argument(
+        '--conditional_residual_diffusion',
+        dest='conditional_residual_diffusion',
+        action='store_true',
+        help='Diffuse an HSI residual latent conditioned on the RGB latent',
+    )
+    parser.add_argument(
+        '--legacy_latent_diffusion',
+        dest='conditional_residual_diffusion',
+        action='store_false',
+        help='Use the legacy unconditional latent diffusion objective',
+    )
+    parser.add_argument('--residual_scale', type=float, default=1.0)
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=8,
@@ -694,10 +991,35 @@ def main():
                         help='Weight decay for optimizer')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Maximum gradient norm for clipping')
+    parser.add_argument('--use_amp', dest='use_amp', action='store_true',
+                        help='Enable CUDA automatic mixed precision')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                        help='Disable CUDA automatic mixed precision')
     parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--npy_cache_size', type=int, default=8)
+    parser.add_argument('--val_npy_cache_size', type=int, default=8)
+    parser.add_argument('--use_ema', dest='use_ema', action='store_true')
+    parser.add_argument('--no_ema', dest='use_ema', action='store_false')
+    parser.add_argument('--ema_decay', type=float, default=0.999)
+    parser.add_argument(
+        '--use_torch_compile',
+        dest='use_torch_compile',
+        action='store_true',
+    )
+    parser.add_argument(
+        '--no_torch_compile',
+        dest='use_torch_compile',
+        action='store_false',
+    )
+    parser.add_argument(
+        '--compile_mode',
+        choices=['default', 'reduce-overhead', 'max-autotune'],
+        default='default',
+    )
     
     # Loss weights
     parser.add_argument('--diffusion_loss_weight', type=float, default=1.0,
@@ -724,6 +1046,13 @@ def main():
                         help='Use spectral consistency losses')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate for regularization')
+    parser.add_argument(
+        '--enhanced_attention_mode',
+        type=str,
+        choices=['spatial', 'channel'],
+        default='channel',
+        help='Attention axis for the optional enhanced latent attention',
+    )
     
     # Data parameters
     parser.add_argument('--train_dir', type=str, default='data/ARAD1K/train',
@@ -762,13 +1091,28 @@ def main():
                         help='Interval for logging training progress')
     
     # Ensure sensible defaults for boolean flags
-    parser.set_defaults(use_batchnorm=True, use_masking=True)
+    parser.set_defaults(
+        use_batchnorm=True,
+        use_masking=True,
+        use_amp=True,
+        use_ema=True,
+        use_torch_compile=False,
+        conditional_residual_diffusion=True,
+    )
+
+    if config_args.config:
+        with open(config_args.config, 'r') as config_file:
+            file_config = json.load(config_file)
+        if not isinstance(file_config, dict):
+            raise ValueError("Training config JSON must contain an object")
+        parser.set_defaults(**file_config)
 
     # Parse arguments
     args = parser.parse_args()
     
     # Create config dictionary
     config = vars(args)
+    config.pop('config', None)
     
     # Add timestamp to checkpoint and visualization directories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -780,11 +1124,14 @@ def main():
     
     # Save final model
     final_path = os.path.join(config['checkpoint_dir'], "final_model.pt")
-    torch.save({
+    final_checkpoint = {
         'model_state_dict': model.state_dict(),
         'config': config,
         'history': history
-    }, final_path)
+    }
+    if hasattr(model, '_wavediff_ema_state'):
+        final_checkpoint['ema_state_dict'] = model._wavediff_ema_state
+    torch.save(final_checkpoint, final_path)
     print(f"Saved final model to {final_path}")
 
 

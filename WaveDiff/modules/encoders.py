@@ -3,36 +3,55 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from modules.attention import SpectralAttention, SpectralSpatialAttention, CrossSpectralAttention
+from modules.normalization import make_norm, resolve_norm_type
 from transforms.haar_wavelet import HaarWaveletTransform
 
 class ResidualBlock(nn.Module):
-    """Residual block with optional batch normalization"""
-    def __init__(self, channels, use_batchnorm=True):
+    """Residual block with configurable batch, group, or no normalization."""
+
+    def __init__(
+        self,
+        channels,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+    ):
         super().__init__()
-        self.use_batchnorm = use_batchnorm
-        
+        self.norm_type = resolve_norm_type(use_batchnorm, norm_type)
+        self.use_normalization = self.norm_type != "none"
+
         # First convolution block
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        if use_batchnorm:
-            self.bn1 = nn.BatchNorm2d(channels)
-            
+        if self.use_normalization:
+            self.bn1 = make_norm(
+                channels,
+                use_batchnorm=use_batchnorm,
+                norm_type=self.norm_type,
+                norm_groups=norm_groups,
+            )
+
         # Second convolution block
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        if use_batchnorm:
-            self.bn2 = nn.BatchNorm2d(channels)
+        if self.use_normalization:
+            self.bn2 = make_norm(
+                channels,
+                use_batchnorm=use_batchnorm,
+                norm_type=self.norm_type,
+                norm_groups=norm_groups,
+            )
     
     def forward(self, x):
         identity = x
         
         # First conv block
         out = self.conv1(x)
-        if self.use_batchnorm:
+        if self.use_normalization:
             out = self.bn1(out)
         out = F.silu(out)
         
         # Second conv block
         out = self.conv2(out)
-        if self.use_batchnorm:
+        if self.use_normalization:
             out = self.bn2(out)
             
         # Add skip connection and activation
@@ -43,7 +62,16 @@ class RGBEncoder(nn.Module):
     """
     Encoder network with spectral attention to map RGB images to latent space
     """
-    def __init__(self, in_channels=3, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        in_channels=3,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
         super().__init__()
         
         self.latent_dim = latent_dim
@@ -53,29 +81,35 @@ class RGBEncoder(nn.Module):
         
         # Downsampling blocks with spectral attention
         self.down1 = nn.Sequential(
-            ResidualBlock(32, use_batchnorm=use_batchnorm),
+            ResidualBlock(32, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(32),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.down2 = nn.Sequential(
-            ResidualBlock(64, use_batchnorm=use_batchnorm),
+            ResidualBlock(64, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(64),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.SiLU()
         )
         
         self.down3 = nn.Sequential(
-            ResidualBlock(128, use_batchnorm=use_batchnorm),
-            CrossSpectralAttention(128),
+            ResidualBlock(128, use_batchnorm, norm_type, norm_groups),
+            CrossSpectralAttention(
+                128,
+                mode=cross_attention_mode,
+                window_size=attention_window_size,
+            ),
             nn.Conv2d(128, latent_dim, kernel_size=3, stride=1, padding=1),
             nn.SiLU()
         )
         
         # Final spectral-spatial attention
         self.final_attn = SpectralSpatialAttention(latent_dim)
-        self.final_res = ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            latent_dim, use_batchnorm, norm_type, norm_groups
+        )
         
     def forward(self, x):
         # Initial features
@@ -97,7 +131,15 @@ class WaveletRGBEncoder(nn.Module):
     """
     RGB encoder using wavelet transform for multi-scale analysis
     """
-    def __init__(self, in_channels=3, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        in_channels=3,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        **_,
+    ):
         super().__init__()
         
         self.latent_dim = latent_dim
@@ -120,7 +162,7 @@ class WaveletRGBEncoder(nn.Module):
         self.down1_conv = nn.Conv2d(64 * 4, 128, kernel_size=3, padding=1)
         
         self.down2 = nn.Sequential(
-            ResidualBlock(128, use_batchnorm=use_batchnorm),
+            ResidualBlock(128, use_batchnorm, norm_type, norm_groups),
             SpectralAttention(128),
             nn.Conv2d(128, latent_dim, kernel_size=3, stride=1, padding=1),
             nn.SiLU()
@@ -128,7 +170,9 @@ class WaveletRGBEncoder(nn.Module):
         
         # Final spectral-spatial attention
         self.final_attn = SpectralSpatialAttention(latent_dim)
-        self.final_res = ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+        self.final_res = ResidualBlock(
+            latent_dim, use_batchnorm, norm_type, norm_groups
+        )
     
     def _create_wavelet_attention(self, channels):
         """Helper to create attention modules for wavelet coefficients"""
@@ -197,28 +241,43 @@ class EnhancedRGBEncoder(nn.Module):
     """
     Enhanced RGB encoder with additional frequency domain processing
     """
-    def __init__(self, in_channels=3, latent_dim=64, use_batchnorm=True):
+    def __init__(
+        self,
+        in_channels=3,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
         super().__init__()
         
         # Standard encoder path
         self.standard_encoder = RGBEncoder(
             in_channels=in_channels,
             latent_dim=latent_dim,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            cross_attention_mode=cross_attention_mode,
+            attention_window_size=attention_window_size,
         )
         
         # Wavelet encoder path
         self.wavelet_encoder = WaveletRGBEncoder(
             in_channels=in_channels,
             latent_dim=latent_dim,
-            use_batchnorm=use_batchnorm
+            use_batchnorm=use_batchnorm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
         )
         
         # Fusion of both paths
         self.fusion = nn.Sequential(
             nn.Conv2d(latent_dim * 2, latent_dim, kernel_size=1),
             nn.SiLU(),
-            ResidualBlock(latent_dim, use_batchnorm=use_batchnorm)
+            ResidualBlock(latent_dim, use_batchnorm, norm_type, norm_groups)
         )
         
     def forward(self, x):
@@ -233,3 +292,44 @@ class EnhancedRGBEncoder(nn.Module):
         latent = self.fusion(fused)
         
         return latent
+
+
+class HSILatentEncoder(nn.Module):
+    """Encode target HSI cubes into the same quarter-resolution latent space."""
+
+    def __init__(
+        self,
+        in_channels=31,
+        latent_dim=64,
+        use_batchnorm=True,
+        norm_type=None,
+        norm_groups=8,
+        cross_attention_mode="channel",
+        attention_window_size=8,
+    ):
+        super().__init__()
+        self.init_conv = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.down1 = nn.Sequential(
+            ResidualBlock(32, use_batchnorm, norm_type, norm_groups),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.down2 = nn.Sequential(
+            ResidualBlock(64, use_batchnorm, norm_type, norm_groups),
+            nn.Conv2d(64, latent_dim, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.attention = CrossSpectralAttention(
+            latent_dim,
+            mode=cross_attention_mode,
+            window_size=attention_window_size,
+        )
+        self.output = ResidualBlock(
+            latent_dim, use_batchnorm, norm_type, norm_groups
+        )
+
+    def forward(self, hsi):
+        h = F.silu(self.init_conv(hsi))
+        h = self.down1(h)
+        h = self.down2(h)
+        return self.output(self.attention(h))

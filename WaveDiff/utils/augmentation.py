@@ -19,7 +19,7 @@ class RGBHSIAugmentation:
         geometric_prob=0.5,
         photometric_prob=0.5,
         noise_prob=0.3,
-        spectral_shift_prob=0.2,
+        spectral_shift_prob=0.0,
         mixup_prob=0.0,
         training=True
     ):

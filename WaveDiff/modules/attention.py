@@ -46,16 +46,23 @@ class SpectralAttention(nn.Module):
 
 
 class CrossSpectralAttention(nn.Module):
-    """
-    Cross-spectral attention module that models relationships between different frequency bands
-    using a multi-head attention mechanism
-    """
-    def __init__(self, channels, num_heads=4):
+    """Multi-head attention over channels, spatial tokens, or local windows."""
+
+    def __init__(self, channels, num_heads=4, mode="channel", window_size=8):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         assert self.head_dim * num_heads == channels, "channels must be divisible by num_heads"
+        if mode not in {"channel", "spatial", "windowed"}:
+            raise ValueError(
+                "mode must be 'channel', 'spatial', or 'windowed', "
+                f"got {mode!r}"
+            )
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+        self.mode = mode
+        self.window_size = int(window_size)
         
         # Projection layers
         self.query = nn.Conv2d(channels, channels, kernel_size=1)
@@ -80,15 +87,27 @@ class CrossSpectralAttention(nn.Module):
         """
         b, c, h, w = x.size()
 
-        # Calculate query, key, value: [B, num_heads, H*W, head_dim]
-        q = self.query(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
-        k = self.key(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
-        v = self.value(x).view(b, self.num_heads, self.head_dim, h * w).transpose(2, 3)
+        if self.mode == "channel":
+            out = self._channel_attention(x)
+        elif self.mode == "windowed":
+            out = self._windowed_attention(x)
+        else:
+            out = self._spatial_attention(x)
+        return self.out_proj(out)
+
+    def _spatial_attention(self, x):
+        b, c, h, w = x.shape
+        q = self.query(x).view(
+            b, self.num_heads, self.head_dim, h * w
+        ).transpose(2, 3)
+        k = self.key(x).view(
+            b, self.num_heads, self.head_dim, h * w
+        ).transpose(2, 3)
+        v = self.value(x).view(
+            b, self.num_heads, self.head_dim, h * w
+        ).transpose(2, 3)
 
         if _HAS_SDPA:
-            # Flash / memory-efficient kernel: avoids materialising the
-            # (H*W, H*W) attention matrix which dominated memory at full
-            # spatial resolution.
             out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -96,8 +115,73 @@ class CrossSpectralAttention(nn.Module):
             attn = F.softmax(attn, dim=-1)
             out = attn @ v
 
-        out = out.transpose(2, 3).contiguous().view(b, c, h, w)
-        return self.out_proj(out)
+        return out.transpose(2, 3).contiguous().view(b, c, h, w)
+
+    def _channel_attention(self, x):
+        b, c, h, w = x.shape
+        q = self.query(x).view(b, self.num_heads, self.head_dim, h * w)
+        k = self.key(x).view(b, self.num_heads, self.head_dim, h * w)
+        v = self.value(x).view(b, self.num_heads, self.head_dim, h * w)
+        q = F.normalize(q, dim=-1, eps=_EPS)
+        k = F.normalize(k, dim=-1, eps=_EPS)
+
+        if _HAS_SDPA:
+            out = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+        else:
+            attn = q @ k.transpose(-2, -1)
+            attn = F.softmax(attn, dim=-1)
+            out = attn @ v
+
+        return out.reshape(b, c, h, w)
+
+    def _windowed_attention(self, x):
+        b, c, h, w = x.shape
+        window = self.window_size
+        pad_h = (window - h % window) % window
+        pad_w = (window - w % window) % window
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h))
+        padded_h, padded_w = x_padded.shape[-2:]
+
+        def to_windows(tensor):
+            tensor = tensor.view(
+                b,
+                self.num_heads,
+                self.head_dim,
+                padded_h // window,
+                window,
+                padded_w // window,
+                window,
+            )
+            tensor = tensor.permute(0, 3, 5, 1, 4, 6, 2)
+            return tensor.reshape(
+                -1,
+                self.num_heads,
+                window * window,
+                self.head_dim,
+            )
+
+        q = to_windows(self.query(x_padded))
+        k = to_windows(self.key(x_padded))
+        v = to_windows(self.value(x_padded))
+        if _HAS_SDPA:
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            out = attn @ v
+
+        out = out.view(
+            b,
+            padded_h // window,
+            padded_w // window,
+            self.num_heads,
+            window,
+            window,
+            self.head_dim,
+        )
+        out = out.permute(0, 3, 6, 1, 4, 2, 5).contiguous()
+        out = out.view(b, c, padded_h, padded_w)
+        return out[:, :, :h, :w]
 
 
 class SpectralSpatialAttention(nn.Module):
