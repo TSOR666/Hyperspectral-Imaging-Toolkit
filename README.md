@@ -24,6 +24,28 @@ All projects target **Python 3.9+** and PyTorch environments with CUDA accelerat
 
 ## Quick start per project
 
+### Unified checkpoint benchmark
+
+Use [`benchmark_hsi.py`](benchmark_hsi.py) to evaluate native checkpoints and
+official MST++ model-zoo checkpoints on CAVE, ICVL, BGU, or custom datasets:
+
+```bash
+python benchmark_hsi.py \
+  --model "MSWR=mswr:base@checkpoints/mswr_best.pth" \
+  --model "MST++=mst:mst_plus_plus@model_zoo/mst_plus_plus.pth" \
+  --mst-root ../MST-plus-plus \
+  --dataset "cave=/data/CAVE" \
+  --dataset "icvl=/data/ICVL" \
+  --dataset "bgu=/data/BGU" \
+  --output results/paper_benchmark
+```
+
+The command exports per-scene and per-band metrics, 95% confidence intervals,
+runtime/memory measurements, PNG/PDF qualitative figures, hsi-viz-compatible
+arrays, and CSV/Markdown/LaTeX paper tables. See
+[`BENCHMARKING.md`](BENCHMARKING.md) for supported checkpoint formats,
+manifests, wavelength calibration, RGB synthesis, and reproducibility notes.
+
 ### CSWIN v2
 
 ```bash
@@ -75,7 +97,7 @@ Point `--results` at a folder that contains `hsi/*.npy` reconstructions and opti
 ```bash
 cd mswr_v2
 pip install -r requirements.txt  # supply your own file if needed
-python train_mswr_v212_logging.py --model_size base --data_root /path/to/ARAD_1K
+python train_mswr_v212_logging.py --config configs/train.yaml --data_root /path/to/ARAD_1K
 ```
 
 MSWR scripts expect the legacy `dataloader.py` module on the Python path. The training driver enables EMA, SAM loss, and extensive logging by default; refer to the [MSWR README](mswr_v2/README.md) for CLI flags and inference notes.

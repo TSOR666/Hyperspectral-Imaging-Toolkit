@@ -4,7 +4,7 @@
 #
 # Trains FROM SCRATCH with MRAE-only loss, matching MST++'s recipe so the
 # ARAD-1K MRAE result is a clean comparison against the MST++ baseline.
-# See mswr_v2/configs/mswr_mstpp_baseline.yaml for the recipe details.
+# See mswr_v2/configs/experiments/baseline_mstpp.yaml for the recipe details.
 #
 # Update the "EDIT ME" lines for your account and submit with:
 #   bsub < mswr_v2/scripts/submit_mstpp_baseline.sh
@@ -62,7 +62,7 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
 #=======================
 echo "=== Launching MST++-faithful baseline ==="
 python train_mswr_v212_logging.py \
-  --config configs/mswr_mstpp_baseline.yaml \
+  --config configs/experiments/baseline_mstpp.yaml \
   --data_root       "${DATA_ROOT}" \
   --log_base        "${REPO_DIR}/experiments/logs" \
   --checkpoint_base "${REPO_DIR}/experiments/checkpoints"

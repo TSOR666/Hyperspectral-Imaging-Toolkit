@@ -18,6 +18,7 @@ from .loaders import (
     create_training_datasets,
     create_mst_dataloaders,
     create_dataloaders,
+    make_worker_init_fn,
     worker_init_fn_mst,
 )
 from .transforms import (
@@ -39,6 +40,7 @@ __all__ = [
     "create_mst_dataloaders",
     "create_dataloaders",
     "create_arad1k_dataloader",
+    "make_worker_init_fn",
     "worker_init_fn_mst",
     # Transforms
     "mst_to_gan_batch",

@@ -148,6 +148,7 @@ DATA_ROOT = os.path.abspath(os.environ.get('MSWR_DATA_ROOT', os.path.join(REPO_R
 EXPERIMENTS_ROOT = os.path.abspath(os.environ.get('MSWR_EXPERIMENTS_ROOT', os.path.join(REPO_ROOT, 'experiments')))
 LOG_DIR_BASE = os.path.join(EXPERIMENTS_ROOT, 'logs')
 CHECKPOINT_DIR_BASE = os.path.join(EXPERIMENTS_ROOT, 'checkpoints')
+DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, 'configs', 'train.yaml')
 
 TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
 
@@ -508,7 +509,12 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="MSWR-Net v2.1.2 Training")
     
     # Configuration file
-    parser.add_argument('--config', type=str, default=None, help='YAML config file')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=DEFAULT_CONFIG_PATH,
+        help='YAML config file (default: configs/train.yaml)',
+    )
     
     # Model loading
     parser.add_argument('--pretrained_model_path', type=str, default=None)

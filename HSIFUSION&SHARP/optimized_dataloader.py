@@ -31,6 +31,32 @@ def _resolve_rgb_path(rgb_dir: str, name: str) -> Optional[str]:
     return None
 
 
+_HSI_RANGE_WARNED = False
+
+
+def _warn_if_hsi_out_of_range(hsi: np.ndarray, path: str) -> None:
+    """Emit a single loud warning if an HSI cube is not in the expected [0, 1] range.
+
+    Does not modify the data. A cube with max >> 1 (e.g. raw 16-bit reflectance in [0, 10000])
+    silently breaks the loss scale, the [0,1]-targeting output activations, and the PSNR
+    data_range=1.0 assumption. We warn once so misuse is visible without per-image rescaling
+    (which would destroy absolute reflectance scale and benchmark comparability).
+    """
+    global _HSI_RANGE_WARNED
+    if _HSI_RANGE_WARNED:
+        return
+    hmax = float(hsi.max())
+    hmin = float(hsi.min())
+    if hmax > 2.0 or hmin < -0.01:
+        _HSI_RANGE_WARNED = True
+        logger.warning(
+            "HSI cube %s has range [%.4g, %.4g], outside the expected [0, 1]. The loss, "
+            "output activation, and PSNR (data_range=1.0) all assume [0, 1]-normalized cubes "
+            "(MST++/ARAD-1K convention). Pre-normalize your .mat cubes; data is NOT auto-scaled.",
+            os.path.basename(path), hmin, hmax,
+        )
+
+
 class OptimizedTrainDataset(Dataset):
     """Optimized training dataset with memory modes"""
     
@@ -152,6 +178,12 @@ class OptimizedTrainDataset(Dataset):
         with h5py.File(self.hsi_files[idx], 'r') as f:
             hsi = np.array(f['cube'], dtype=np.float32)
         hsi = np.transpose(hsi, [0, 2, 1])  # [31, H, W]
+
+        # The pipeline assumes HSI cubes are pre-normalized to [0, 1] (MST++/ARAD-1K convention):
+        # RGB is /255, the model output activations target [0,1], and PSNR uses data_range=1.0.
+        # Warn (do NOT auto-normalize — per-image rescaling would destroy absolute reflectance
+        # scale and break cross-dataset comparability) if a cube is clearly out of range.
+        _warn_if_hsi_out_of_range(hsi, self.hsi_files[idx])
 
         if rgb.shape[:2] != hsi.shape[1:]:
             raise ValueError(
@@ -371,7 +403,8 @@ class OptimizedValDataset(Dataset):
             with h5py.File(self.hsi_files[i], 'r') as f:
                 hsi = np.array(f['cube'], dtype=np.float32)
             hsi = np.transpose(hsi, [0, 2, 1])
-            
+            _warn_if_hsi_out_of_range(hsi, self.hsi_files[i])
+
             # Apply memory mode
             if self.memory_mode == 'float16':
                 rgb = rgb.astype(np.float16)

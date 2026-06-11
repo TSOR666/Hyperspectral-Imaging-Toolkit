@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import pytest
+import pickle
 import shutil
 import uuid
 from pathlib import Path
@@ -11,6 +12,7 @@ cv2 = pytest.importorskip("cv2")
 
 from hsi_model.utils.data.arad_dataset import ARAD1KDataset
 from hsi_model.utils.data.mst_dataset import MST_TrainDataset, MST_ValidDataset
+from hsi_model.utils.data import mst_dataset as mst_dataset_module
 from hsi_model.utils.data.transforms import normalize_batch, denormalize_batch
 
 
@@ -132,5 +134,132 @@ def test_mst_valid_dataset_prefers_validation_directories():
         assert hsi_full.shape == (31, 4, 5)
         assert np.isfinite(rgb_full).all()
         assert np.isfinite(hsi_full).all()
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_mst_lazy_mode_reads_matching_patches_without_full_cube_init(monkeypatch):
+    root = Path(__file__).resolve().parents[1] / ".tmp_manual_dataset"
+    case_dir = root / f"mst_lazy_case_{uuid.uuid4().hex}"
+    spec_dir = case_dir / "Train_Spec"
+    rgb_dir = case_dir / "Train_RGB"
+    split_dir = case_dir / "split_txt"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir.mkdir(parents=True, exist_ok=True)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    scenes = ("scene001", "scene002")
+    (split_dir / "train_list.txt").write_text(
+        "\n".join(scenes) + "\n", encoding="utf-8"
+    )
+    (split_dir / "valid_list.txt").write_text("scene001\n", encoding="utf-8")
+
+    try:
+        for scene_idx, scene in enumerate(scenes):
+            hyper = (
+                np.arange(31 * 6 * 5, dtype=np.float32).reshape(31, 6, 5)
+                + scene_idx * 10000
+            )
+            with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
+                mat.create_dataset("cube", data=hyper)
+            rgb = (
+                np.arange(5 * 6 * 3, dtype=np.uint8).reshape(5, 6, 3)
+                + scene_idx
+            )
+            assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb)
+
+        standard = MST_TrainDataset(
+            data_root=str(case_dir),
+            crop_size=3,
+            stride=1,
+            arg=False,
+            memory_mode="standard",
+        )
+
+        original_loader = mst_dataset_module._load_mst_cube
+
+        def reject_full_cube_read(path):
+            raise AssertionError(f"lazy initialization read full cube {path}")
+
+        monkeypatch.setattr(
+            mst_dataset_module,
+            "_load_mst_cube",
+            reject_full_cube_read,
+        )
+        lazy = MST_TrainDataset(
+            data_root=str(case_dir),
+            crop_size=3,
+            stride=1,
+            arg=False,
+            memory_mode="lazy",
+            lazy_cache_size=1,
+        )
+        monkeypatch.setattr(mst_dataset_module, "_load_mst_cube", original_loader)
+
+        assert lazy.hypers == []
+        assert lazy.bgrs == []
+        standard_rgb, standard_hsi = standard[0]
+        lazy_rgb, lazy_hsi = lazy[0]
+        assert np.allclose(lazy_rgb, standard_rgb)
+        assert np.array_equal(lazy_hsi, standard_hsi)
+
+        _ = lazy[lazy.patch_per_img]
+        assert len(lazy._rgb_cache) == 1
+        assert len(lazy._h5_files) == 1
+        restored = pickle.loads(pickle.dumps(lazy))
+        assert restored._h5_files == {}
+        assert restored._rgb_cache == {}
+
+        valid = MST_ValidDataset(
+            data_root=str(case_dir),
+            memory_mode="lazy",
+            lazy_cache_size=1,
+        )
+        rgb_full, hsi_full = valid[0]
+        assert rgb_full.shape == (3, 5, 6)
+        assert hsi_full.shape == (31, 5, 6)
+        assert valid.hypers == []
+        assert valid.bgrs == []
+    finally:
+        for name in ("lazy", "valid"):
+            dataset = locals().get(name)
+            if dataset is not None:
+                dataset.close()
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_mst_float16_mode_reduces_resident_dtype():
+    root = Path(__file__).resolve().parents[1] / ".tmp_manual_dataset"
+    case_dir = root / f"mst_fp16_case_{uuid.uuid4().hex}"
+    spec_dir = case_dir / "Train_Spec"
+    rgb_dir = case_dir / "Train_RGB"
+    split_dir = case_dir / "split_txt"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir.mkdir(parents=True, exist_ok=True)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    scene = "scene001"
+    (split_dir / "train_list.txt").write_text(f"{scene}\n", encoding="utf-8")
+
+    try:
+        with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
+            mat.create_dataset(
+                "cube", data=np.random.rand(31, 6, 5).astype(np.float32)
+            )
+        assert cv2.imwrite(
+            str(rgb_dir / f"{scene}.jpg"),
+            np.random.randint(0, 255, (5, 6, 3), dtype=np.uint8),
+        )
+        dataset = MST_TrainDataset(
+            data_root=str(case_dir),
+            crop_size=3,
+            stride=1,
+            arg=False,
+            memory_mode="float16",
+        )
+        assert dataset.bgrs[0].dtype == np.float16
+        assert dataset.hypers[0].dtype == np.float16
+        rgb_patch, hsi_patch = dataset[0]
+        assert rgb_patch.dtype == np.float32
+        assert hsi_patch.dtype == np.float32
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)

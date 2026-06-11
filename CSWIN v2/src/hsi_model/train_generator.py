@@ -73,7 +73,7 @@ from hsi_model.utils.data import (
     create_training_datasets,
     mst_to_gan_batch,
     compute_mst_center_crop_metrics,
-    worker_init_fn_mst,
+    make_worker_init_fn,
 )
 # Reuse the warmup->cosine scheduler and checkpoint helpers (acyclic imports).
 from hsi_model.training_script_fixed import WarmupCosineScheduler
@@ -233,7 +233,7 @@ def _build_train_loader(dataset, batch_size, config, distributed, seed, rank):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed_base, rank),
+        worker_init_fn=make_worker_init_fn(seed_base, rank),
         persistent_workers=(num_workers > 0),
     )
 
@@ -263,7 +263,7 @@ def validate_generator(
         sampler=val_sampler,
         num_workers=config.get("num_workers", 8),
         pin_memory=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=make_worker_init_fn(seed, rank),
         persistent_workers=False,
     )
 
@@ -277,7 +277,8 @@ def validate_generator(
     if validation_max_batches is not None:
         validation_max_batches = int(validation_max_batches)
 
-    with torch.no_grad():
+    validation_error: Optional[str] = None
+    with torch.inference_mode():
         for batch_idx, (bgr_batch, hyper_batch) in enumerate(val_loader):
             if validation_max_batches is not None and validation_max_batches > 0:
                 if batch_idx >= validation_max_batches:
@@ -302,9 +303,26 @@ def validate_generator(
                 num_batches += 1
             except Exception as e:  # noqa: BLE001 - validation must not kill training
                 val_logger.warning("Validation error: %s", str(e))
-                continue
+                validation_error = f"batch {batch_idx}: {e}"
+                break
 
     del val_loader
+
+    validation_failed = torch.tensor(
+        1 if validation_error is not None else 0,
+        device=device,
+        dtype=torch.int32,
+    )
+    if distributed and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            validation_failed, op=torch.distributed.ReduceOp.MAX
+        )
+    if validation_failed.item():
+        detail = validation_error or "validation failed on another distributed rank"
+        raise RuntimeError(
+            f"Validation aborted because at least one batch failed ({detail}). "
+            "Refusing to select checkpoints from partial or empty metrics."
+        )
 
     # Each rank evaluated a disjoint shard under DistributedSampler; aggregate
     # before averaging so best-model selection and early stopping use the FULL

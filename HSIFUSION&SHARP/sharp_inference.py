@@ -63,6 +63,10 @@ class SHARPInference:
                 'max_global_tokens': _config_get(config, 'max_global_tokens', None),
                 'key_rbf_mode': _config_get(config, 'key_rbf_mode', 'mean'),
                 'sparsemax_pad_value': _config_get(config, 'sparsemax_pad_value', None),
+                # Legacy checkpoints predate the output_activation option and were trained
+                # with tanh; honour their saved value if present, else default to tanh so old
+                # weights stay numerically consistent. New checkpoints carry 'sigmoid'.
+                'output_activation': _config_get(config, 'output_activation', 'tanh'),
                 'ema_update_every': _config_get(config, 'ema_update_every', 1),
             }
         else:
@@ -82,6 +86,7 @@ class SHARPInference:
                 'max_global_tokens': None,
                 'key_rbf_mode': 'mean',
                 'sparsemax_pad_value': None,
+                'output_activation': 'tanh',  # configless checkpoints predate sigmoid default
                 'ema_update_every': 1,
             }
         

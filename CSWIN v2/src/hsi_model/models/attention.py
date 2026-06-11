@@ -212,6 +212,21 @@ class CSWinAttentionBlock(nn.Module):
         self.split_size = split_size
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self._attention_mode = (
+            str(config.get("cswin_attention_mode", "axial")).lower()
+            if config
+            else "axial"
+        )
+        if self._attention_mode not in ("axial", "local_global"):
+            raise ValueError(
+                "cswin_attention_mode must be 'axial' or 'local_global', "
+                f"got {self._attention_mode!r}"
+            )
+        self._global_token_threshold = (
+            max(0, int(config.get("cswin_global_tokens", 1024)))
+            if config
+            else 1024
+        )
         
         # QKV projections
         self.qkv_h = nn.Conv2d(dim, dim*3, kernel_size=1, bias=qkv_bias)
@@ -291,13 +306,17 @@ class CSWinAttentionBlock(nn.Module):
         # is unused (frozen) and contributes only ``(2s-1)^2 * num_heads``
         # parameters which is negligible (≤ a few KiB).
         table_shape = (2 * split_size - 1, 2 * split_size - 1, num_heads)
+        use_window_bias = (
+            self._attention_mode == "local_global"
+            or self._bias_mode == "window_cyclic"
+        )
         self.relative_position_bias_table_h = nn.Parameter(
             torch.zeros(table_shape, dtype=bias_dtype),
-            requires_grad=(self._bias_mode == 'window_cyclic'),
+            requires_grad=use_window_bias,
         )
         self.relative_position_bias_table_v = nn.Parameter(
             torch.zeros(table_shape, dtype=bias_dtype),
-            requires_grad=(self._bias_mode == 'window_cyclic'),
+            requires_grad=use_window_bias,
         )
         nn.init.trunc_normal_(self.relative_position_bias_table_h, std=0.02)
         nn.init.trunc_normal_(self.relative_position_bias_table_v, std=0.02)
@@ -306,7 +325,7 @@ class CSWinAttentionBlock(nn.Module):
         # signed offsets in ``[-(M-1), +(M-1)]``. Only allocated in long_axis
         # mode — keeps ``window_cyclic`` checkpoints loadable without extra
         # missing-keys.
-        if self._bias_mode == 'long_axis':
+        if self._attention_mode == "axial" and self._bias_mode == 'long_axis':
             long_table_shape = (2 * self._max_long_axis - 1, num_heads)
             self.relative_position_bias_table_h_long = nn.Parameter(
                 torch.zeros(long_table_shape, dtype=bias_dtype)
@@ -330,10 +349,28 @@ class CSWinAttentionBlock(nn.Module):
             torch.tensor(split_size - 1, dtype=torch.long),
             persistent=False,
         )
+        window_coords = torch.arange(split_size, dtype=torch.long)
+        window_rows = window_coords.repeat_interleave(split_size)
+        window_cols = window_coords.repeat(split_size)
+        window_rel = torch.stack(
+            (
+                window_rows[:, None] - window_rows[None, :] + split_size - 1,
+                window_cols[:, None] - window_cols[None, :] + split_size - 1,
+            ),
+            dim=-1,
+        )
+        self.register_buffer(
+            "_window_relative_position_index", window_rel, persistent=False
+        )
 
         logger.debug(
-            "CSWinAttentionBlock initialized with bias dtype %s, mode %s, max_long_axis %d",
-            bias_dtype, self._bias_mode, self._max_long_axis,
+            "CSWinAttentionBlock initialized with bias dtype %s, bias mode %s, "
+            "attention mode %s, max_long_axis %d, global_tokens %d",
+            bias_dtype,
+            self._bias_mode,
+            self._attention_mode,
+            self._max_long_axis,
+            self._global_token_threshold,
         )
 
     def _long_axis_bias(self, table: torch.Tensor, length: int) -> torch.Tensor:
@@ -384,6 +421,163 @@ class CSWinAttentionBlock(nn.Module):
                 .expand(-1, tiles_long, s, tiles_long, s)
                 .reshape(H, tiles_long * s, tiles_long * s))
         return bias
+
+    def _window_bias(self, table: torch.Tensor) -> torch.Tensor:
+        """Return a true 2-D relative bias for one local ``s x s`` window."""
+        rel = self._window_relative_position_index
+        bias = table[rel[..., 0], rel[..., 1]]
+        return bias.permute(2, 0, 1).contiguous()
+
+    def _scaled_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply SDPA with a numerically stable fallback."""
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_mask = None
+            if bias is not None:
+                attn_mask = bias.unsqueeze(0).to(dtype=q.dtype, device=q.device)
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=self.scale
+            )
+
+        q_float = q.float()
+        logits = (q_float @ k.float().transpose(-2, -1)) * self.scale
+        if bias is not None:
+            logits = logits + bias.unsqueeze(0).to(
+                dtype=logits.dtype, device=logits.device
+            )
+        weights = logits.float()
+        weights = weights - weights.amax(dim=-1, keepdim=True)
+        weights = F.softmax(weights, dim=-1)
+        return (weights @ v.float()).to(q.dtype)
+
+    @staticmethod
+    def _safe_spatial_pad(
+        x: torch.Tensor,
+        pad: Tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        left, right, top, bottom = pad
+        if not any(pad):
+            return x
+        height, width = x.shape[-2:]
+        mode = "reflect"
+        if (
+            (left and width <= left)
+            or (right and width <= right)
+            or (top and height <= top)
+            or (bottom and height <= bottom)
+        ):
+            mode = "replicate"
+        return F.pad(x, pad, mode=mode)
+
+    def _compute_local_window_attention(
+        self,
+        x: torch.Tensor,
+        qkv_projection: nn.Module,
+        bias_table: torch.Tensor,
+        lepe: nn.Module,
+        shifted: bool,
+    ) -> torch.Tensor:
+        """Bounded 2-D window attention with an optional offset window grid."""
+        B, _, H, W = x.shape
+        window = self.split_size
+        shift = window // 2 if shifted and window > 1 else 0
+
+        if shift:
+            work = self._safe_spatial_pad(x, (shift, 0, shift, 0))
+        else:
+            work = x
+        work_h, work_w = work.shape[-2:]
+        pad_h = (window - work_h % window) % window
+        pad_w = (window - work_w % window) % window
+        work = self._safe_spatial_pad(work, (0, pad_w, 0, pad_h))
+        padded_h, padded_w = work.shape[-2:]
+        n_h = padded_h // window
+        n_w = padded_w // window
+
+        qkv = qkv_projection(work)
+        qkv = rearrange(
+            qkv,
+            "b (three head d) (nh sh) (nw sw) -> "
+            "three (b nh nw) head (sh sw) d",
+            three=3,
+            head=self.num_heads,
+            d=self.head_dim,
+            nh=n_h,
+            nw=n_w,
+            sh=window,
+            sw=window,
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        out = self._scaled_attention(q, k, v, self._window_bias(bias_table))
+        out = rearrange(
+            out,
+            "(b nh nw) head (sh sw) d -> b (head d) (nh sh) (nw sw)",
+            b=B,
+            nh=n_h,
+            nw=n_w,
+            sh=window,
+            sw=window,
+        )
+        if shift:
+            out = out[..., shift : shift + H, shift : shift + W]
+        else:
+            out = out[..., :H, :W]
+        return lepe(out)
+
+    def _compute_local_attention_h(self, x: torch.Tensor) -> torch.Tensor:
+        return self._compute_local_window_attention(
+            x,
+            self.qkv_h,
+            self.relative_position_bias_table_h,
+            self.lepe_h,
+            shifted=False,
+        )
+
+    def _compute_local_attention_v(self, x: torch.Tensor) -> torch.Tensor:
+        return self._compute_local_window_attention(
+            x,
+            self.qkv_v,
+            self.relative_position_bias_table_v,
+            self.lepe_v,
+            shifted=True,
+        )
+
+    def _compute_global_attention(
+        self,
+        x: torch.Tensor,
+        qkv_projection: nn.Module,
+        lepe: nn.Module,
+    ) -> torch.Tensor:
+        """Global spatial attention used only below the configured token cap."""
+        B, _, H, W = x.shape
+        qkv = qkv_projection(x)
+        qkv = rearrange(
+            qkv,
+            "b (three head d) h w -> three b head (h w) d",
+            three=3,
+            head=self.num_heads,
+            d=self.head_dim,
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        out = self._scaled_attention(q, k, v)
+        out = rearrange(
+            out,
+            "b head (h w) d -> b (head d) h w",
+            h=H,
+            w=W,
+        )
+        return lepe(out)
+
+    def _compute_global_attention_h(self, x: torch.Tensor) -> torch.Tensor:
+        return self._compute_global_attention(x, self.qkv_h, self.lepe_h)
+
+    def _compute_global_attention_v(self, x: torch.Tensor) -> torch.Tensor:
+        return self._compute_global_attention(x, self.qkv_v, self.lepe_v)
         
     def _compute_horizontal_attention(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -595,9 +789,15 @@ class CSWinAttentionBlock(nn.Module):
         if C != self.dim:
             raise ValueError(f"Channel mismatch: expected {self.dim}, got {C}")
         
-        # Pad input if needed to make it divisible by split_size
-        pad_h = (self.split_size - H % self.split_size) % self.split_size
-        pad_w = (self.split_size - W % self.split_size) % self.split_size
+        # The legacy axial path requires divisibility before its stripe
+        # rearranges. The local-window path pads internally, while its global
+        # fallback should attend only to real tokens.
+        if self._attention_mode == "axial":
+            pad_h = (self.split_size - H % self.split_size) % self.split_size
+            pad_w = (self.split_size - W % self.split_size) % self.split_size
+        else:
+            pad_h = 0
+            pad_w = 0
         
         if pad_h > 0 or pad_w > 0:
             # Reflect padding matches the documented symmetric-padding path and
@@ -612,6 +812,26 @@ class CSWinAttentionBlock(nn.Module):
         else:
             padded_H, padded_W = H, W
         
+        use_global = (
+            self._attention_mode == "local_global"
+            and self._global_token_threshold > 0
+            and padded_H * padded_W <= self._global_token_threshold
+        )
+        if self._attention_mode == "local_global":
+            horizontal_fn = (
+                self._compute_global_attention_h
+                if use_global
+                else self._compute_local_attention_h
+            )
+            vertical_fn = (
+                self._compute_global_attention_v
+                if use_global
+                else self._compute_local_attention_v
+            )
+        else:
+            horizontal_fn = self._compute_horizontal_attention
+            vertical_fn = self._compute_vertical_attention
+
         # v3.0: Version-aware gradient checkpointing.
         # v4.0: Conditional on spatial token count — checkpointing the
         # smaller/deeper stages spent more time on recompute than it saved
@@ -620,15 +840,15 @@ class CSWinAttentionBlock(nn.Module):
         should_ckpt = self.training and (num_tokens >= self._ckpt_min_tokens)
         if should_ckpt:
             if self._supports_non_reentrant_ckpt:
-                out_h = checkpoint(self._compute_horizontal_attention, x, use_reentrant=False)
-                out_v = checkpoint(self._compute_vertical_attention, x, use_reentrant=False)
+                out_h = checkpoint(horizontal_fn, x, use_reentrant=False)
+                out_v = checkpoint(vertical_fn, x, use_reentrant=False)
             else:
                 # Fallback for older PyTorch versions
-                out_h = checkpoint(self._compute_horizontal_attention, x)
-                out_v = checkpoint(self._compute_vertical_attention, x)
+                out_h = checkpoint(horizontal_fn, x)
+                out_v = checkpoint(vertical_fn, x)
         else:
-            out_h = self._compute_horizontal_attention(x)
-            out_v = self._compute_vertical_attention(x)
+            out_h = horizontal_fn(x)
+            out_v = vertical_fn(x)
         
         # Combine horizontal and vertical attention and apply projection
         out = self.proj((out_h + out_v) / 2)

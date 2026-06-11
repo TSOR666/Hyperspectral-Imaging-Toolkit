@@ -45,6 +45,7 @@ mixed_precision_dtype: auto
 deterministic: false
 allow_tf32: true
 memory_mode: standard
+lazy_cache_size: 3  # per-worker RGB scene + open-HDF5 handle LRU when memory_mode=lazy
 validation_max_batches: null
 finite_check_interval: 100
 
@@ -88,6 +89,12 @@ spectral_attention_force_fp32: auto
 # Trainer-level finite checks remain enabled every 100 steps; disabling the
 # per-block scans removes dozens of GPU synchronization points per iteration.
 spectral_attention_sanitize_nonfinite: false
+# Scalable spatial attention: local 7x7 windows at high resolution, with a
+# second offset grid for cross-window mixing; switch to true global attention
+# only when a feature map has at most 1024 tokens. This replaces the legacy
+# row/column axial path whose cost remained quadratic along the full image axis.
+cswin_attention_mode: local_global
+cswin_global_tokens: 1024
 sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (paper uses pixel shuffle)
 use_noise_block: false           # NoiseAwareBlock is not in the paper
 thick_output_head: false         # paper ToOut is a single conv

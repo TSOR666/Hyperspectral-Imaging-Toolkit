@@ -11,6 +11,7 @@ import math
 import random
 import argparse
 import warnings
+import contextlib
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
@@ -106,7 +107,12 @@ class SHARPTrainingConfig:
     rbf_centers_per_head: int = 32          # RBF centers per attention head
     key_rbf_mode: str = 'linear'            # Preserve query-dependent key rankings
     sparsemax_pad_value: Optional[float] = None  # Custom pad value for sparsemax
+    output_activation: str = 'sigmoid'      # Output param for [0,1] reflectance (sigmoid|tanh|relu|softplus|none)
     ema_update_every: int = 1               # EMA update frequency (v3.2.2 throttling)
+    # Training objective. 'mrae' matches the MST++/ARAD-1K selection+eval metric and the
+    # sibling HSIFusion baseline (fair benchmark comparability). 'l1_curvature' uses the
+    # model's compute_loss (L1 + 0.1*spectral-curvature) and is kept for ablation only.
+    loss_type: str = 'mrae'                  # mrae | l1_curvature
     
     # Data configuration
     data_root: str = './dataset'
@@ -188,6 +194,10 @@ class SHARPTrainingConfig:
             raise ValueError("ema_update_every must be > 0")
         if self.key_rbf_mode not in {'mean', 'linear', 'none'}:
             raise ValueError("key_rbf_mode must be one of mean/linear/none")
+        if self.loss_type not in {'mrae', 'l1_curvature'}:
+            raise ValueError("loss_type must be one of mrae/l1_curvature")
+        if self.output_activation not in {'sigmoid', 'tanh', 'relu', 'softplus', 'none'}:
+            raise ValueError("output_activation must be one of sigmoid/tanh/relu/softplus/none")
 
 
 class SHARPLoss(nn.Module):
@@ -248,6 +258,10 @@ class DedicatedSHARPTrainer:
         # Create model
         self.model = self._create_model()
 
+        # Build the optimization objective once so both trainer paths agree with the
+        # MRAE selection/eval metric (None -> built-in SHARPv32Trainer uses model.compute_loss).
+        self._criterion = self._build_criterion()
+
         # Create dataloaders before trainers/schedulers so step counts reflect the real dataset.
         self.train_loader, self.val_loader = self._create_dataloaders()
         
@@ -266,6 +280,7 @@ class DedicatedSHARPTrainer:
                 ema_decay=config.ema_decay,
                 use_amp=config.use_amp,
                 ema_update_every=config.ema_update_every,
+                criterion=self._criterion,
             )
         else:
             if SHARP_TRAINER_AVAILABLE and config.accumulate_steps > 1:
@@ -352,6 +367,7 @@ class DedicatedSHARPTrainer:
                 sparse_max_tokens=self.config.sparse_max_tokens,
                 key_rbf_mode=self.config.key_rbf_mode,
                 sparsemax_pad_value=self.config.sparsemax_pad_value,
+                output_activation=self.config.output_activation,
                 ema_update_every=self.config.ema_update_every,
                 verbose=True
             )
@@ -367,10 +383,26 @@ class DedicatedSHARPTrainer:
             print(f"Error creating SHARP model: {e}")
             raise
     
+    def _build_criterion(self):
+        """Build the training objective shared by both trainer paths.
+
+        Returns MSTPlusPlusLoss (MRAE) for loss_type='mrae' so the optimization target
+        matches the MRAE selection/eval metric and the sibling HSIFusion baseline. Returns
+        None for loss_type='l1_curvature' so callers fall back to the model's compute_loss
+        (L1 + 0.1*spectral-curvature), retained for ablation.
+        """
+        if self.config.loss_type == 'mrae':
+            if not DATALOADER_AVAILABLE:
+                raise RuntimeError("loss_type='mrae' requires optimized_dataloader.MSTPlusPlusLoss")
+            return MSTPlusPlusLoss(eps=self.config.min_mrae_denom)
+        return None  # 'l1_curvature' -> use model.compute_loss
+
     def _setup_training_components(self):
         """Setup training components if not using SHARPv32Trainer"""
         # Keep the optimization objective aligned with the built-in trainer path.
-        if hasattr(self.model, "compute_loss"):
+        if self._criterion is not None:
+            self.criterion = self._criterion
+        elif hasattr(self.model, "compute_loss"):
             self.criterion = self.model.compute_loss
         elif DATALOADER_AVAILABLE:
             self.criterion = MSTPlusPlusLoss()
@@ -734,15 +766,42 @@ class DedicatedSHARPTrainer:
         
         return metrics
     
+    @contextlib.contextmanager
+    def _ema_weights_applied(self):
+        """Temporarily load EMA params into the live model, restoring originals on exit.
+
+        Only swaps requires_grad parameters (matching _create_ema_state); buffers are left
+        as-is. Restoration is guaranteed via finally so a raised exception cannot leave the
+        model in the EMA state.
+        """
+        model_ref = getattr(self.model, '_orig_mod', self.model)
+        if not getattr(self, 'ema_state', None):
+            yield
+            return
+        backup = {}
+        try:
+            with torch.no_grad():
+                for name, param in model_ref.named_parameters():
+                    if name in self.ema_state:
+                        backup[name] = param.detach().clone()
+                        param.copy_(self.ema_state[name].to(device=param.device, dtype=param.dtype))
+            yield
+        finally:
+            with torch.no_grad():
+                for name, param in model_ref.named_parameters():
+                    if name in backup:
+                        param.copy_(backup[name])
+
     @torch.no_grad()
     def _manual_validate(self) -> Dict:
-        """Manual validation implementation"""
+        """Manual validation implementation (evaluates EMA weights when available)."""
         total_mrae = 0.0
         total_rmse = 0.0
         total_psnr = 0.0
         num_samples = 0
-        
-        for rgb, hsi in self.val_loader:
+
+        with self._ema_weights_applied():
+          for rgb, hsi in self.val_loader:
             rgb = rgb.to(self.device)
             hsi = hsi.to(self.device)
             
@@ -829,6 +888,16 @@ class DedicatedSHARPTrainer:
                 'scaler_state_dict': self.scaler.state_dict(),
                 'ema_state': self.ema_state
             })
+            # Persist an EMA-applied weight set so inference loads the weights that were
+            # actually validated/selected (mirrors the built-in trainer path).
+            if getattr(self, 'ema_state', None):
+                ema_model_state = dict(model_state)
+                for name, ema_val in self.ema_state.items():
+                    if name in ema_model_state:
+                        ema_model_state[name] = ema_val.to(
+                            device='cpu', dtype=ema_model_state[name].dtype
+                        )
+                checkpoint['ema_model_state_dict'] = ema_model_state
         
         if is_best:
             path = self.exp_dir / 'best_model.pth'
@@ -944,7 +1013,13 @@ def main():
                         help='RBF key projection mode')
     parser.add_argument('--ema_update_every', type=int, default=1,
                         help='EMA update frequency (v3.2.2 throttling)')
-    
+    parser.add_argument('--output_activation', type=str, default='sigmoid',
+                        choices=['sigmoid', 'tanh', 'relu', 'softplus', 'none'],
+                        help='Output parameterization for [0,1] HSI reflectance (default sigmoid)')
+    parser.add_argument('--loss_type', type=str, default='mrae',
+                        choices=['mrae', 'l1_curvature'],
+                        help='Training objective: mrae (matches eval metric/MST++) or l1_curvature (ablation)')
+
     # Optimization
     parser.add_argument('--compile', '--compile_model', dest='compile', action='store_true',
                         help='Compile model with torch.compile')
@@ -1012,6 +1087,8 @@ def main():
         sparse_window_size=args.window_size,
         max_global_tokens=args.max_global_tokens,
         key_rbf_mode=args.key_rbf_mode,
+        output_activation=args.output_activation,
+        loss_type=args.loss_type,
         ema_update_every=args.ema_update_every,
         compile_model=args.compile,
         use_amp=not args.no_amp,

@@ -127,7 +127,8 @@ This subproject, along with the rest of the toolkit, is distributed under the [M
 
 - Generator (NoiseRobustCSWinGenerator)
   - U‑Net backbone with two encoder stages, a transformer bottleneck, and symmetric decoder.
-  - Dual attention per block: spectral attention and CSWin spatial attention; adaptive GroupNorm everywhere.
+  - Dual attention per block: spectral attention plus scalable 2D local/global spatial attention; adaptive GroupNorm everywhere.
+  - Legacy axial CSWin attention remains available for checkpoint compatibility.
   - Noise‑aware gating block; optional output activations (none/sigmoid/tanh/delayed sigmoid) and safe clamping during warm‑up.
   - See `src/hsi_model/models/generator_v3.py`.
 
@@ -139,7 +140,8 @@ This subproject, along with the rest of the toolkit, is distributed under the [M
 
 ## Configuration (Hydra: src/configs/config.yaml)
 
-- Data/Runtime: `data_dir`, `log_dir`, `checkpoint_dir`, `batch_size`, `val_batch_size`, `patch_size`, `stride`, `epochs`, `iterations_per_epoch`, `validation_max_batches`, `num_workers`, `memory_mode`, `mixed_precision`.
+- Data/Runtime: `data_dir`, `log_dir`, `checkpoint_dir`, `batch_size`, `val_batch_size`, `patch_size`, `stride`, `epochs`, `iterations_per_epoch`, `validation_max_batches`, `num_workers`, `memory_mode`, `lazy_cache_size`, `mixed_precision`.
+- Spatial attention: `cswin_attention_mode=local_global` uses bounded 2D windows and switches to global attention below `cswin_global_tokens`; use `axial` for legacy checkpoints.
 - Optimizer/Scheduler: `generator_lr`, `discriminator_lr`, `warmup_steps`, `gradient_accumulation_steps`.
 - Adversarial: `n_critic`, `use_r1_regularization`, `r1_gamma`.
 - Sinkhorn: `sinkhorn_epsilon`, `sinkhorn_iters`, `sinkhorn_flatten_spatial`.

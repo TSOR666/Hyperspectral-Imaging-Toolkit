@@ -49,21 +49,29 @@ model checkpoint from being hidden by EMA-only ranking.
 ```bash
 cd mswr_v2
 python train_mswr_v212_logging.py \
-  --model_size base \
-  --data_root /path/to/ARAD_1K \
-  --use_wavelet \
-  --use_enhanced_loss
+  --config configs/train.yaml \
+  --data_root /path/to/ARAD_1K
 ```
 
 ### Configuration workflow
 
-Training options can be supplied directly on the CLI or through a YAML file:
+[`configs/train.yaml`](configs/train.yaml) is the single maintained recipe for
+new training runs and is loaded automatically when `--config` is omitted.
+Historical benchmark and ablation recipes are isolated under
+[`configs/experiments/`](configs/experiments/) and documented in
+[`configs/README.md`](configs/README.md).
+
+Training options can still be overridden directly on the CLI:
 
 ```bash
-python train_mswr_v212_logging.py --config configs/mswr_base.yaml --init_lr 1e-4
+python train_mswr_v212_logging.py --data_root /path/to/ARAD_1K --init_lr 1e-4
 ```
 
-YAML keys match the CLI names without leading dashes. Explicit CLI values override YAML values, so the command above would keep the YAML setup but replace `init_lr`. Unknown YAML keys are ignored by the trainer. Logs and checkpoints are saved under timestamped folders in `./experiments/` unless `--log_base`, `--checkpoint_base`, or `MSWR_EXPERIMENTS_ROOT` are set.
+YAML keys match the CLI names without leading dashes. Explicit CLI values
+override YAML values, so the command above keeps `configs/train.yaml` but
+replaces `init_lr`. Unknown YAML keys are reported as warnings. Logs and
+checkpoints are saved under timestamped folders in `./experiments/` unless
+`--log_base`, `--checkpoint_base`, or `MSWR_EXPERIMENTS_ROOT` are set.
 
 By default, MSWR uses MST++-style logical epochs: `--steps_per_epoch 1000` caps each epoch to 1000 training batches even when dense patch extraction produces far more available batches. This keeps LR warmup, cosine decay, EMA start, and loss warmup on the intended iteration scale. Set `--steps_per_epoch 0` to consume the full DataLoader each epoch. When resuming older checkpoints, the trainer derives the logical epoch from the saved iteration count if the checkpoint epoch is behind.
 
@@ -96,7 +104,7 @@ Run and path options:
 
 | Flag | Choices / type | Default | Notes |
 | --- | --- | --- | --- |
-| `--config` | path | `None` | Optional YAML config. CLI values take precedence. |
+| `--config` | path | `configs/train.yaml` | Canonical recipe; CLI values take precedence. |
 | `--pretrained_model_path` | path | `None` | Resume/load path stored as `resume_path`. |
 | `--data_root` | path | `MSWR_DATA_ROOT` or `./data/ARAD_1K` | Dataset root with ARAD-style folders. |
 | `--log_base` | path | `./experiments/logs` | Timestamped run log directory is created here. |
@@ -260,11 +268,9 @@ Example:
 
 ```bash
 python train_mswr_v212_logging.py \
-  --model_size base --data_root /path/to/ARAD_1K \
-  --batch_size 8 --end_epoch 300 --init_lr 2e-4 \
-  --use_wavelet --wavelet_type db2 --use_enhanced_loss \
-  --use_amp --amp_dtype auto --channels_last \
-  --use_checkpoint --use_flash_attn
+  --config configs/train.yaml \
+  --data_root /path/to/ARAD_1K \
+  --batch_size 8
 ```
 
 ## Full Model Configuration (`MSWRDualConfig`)

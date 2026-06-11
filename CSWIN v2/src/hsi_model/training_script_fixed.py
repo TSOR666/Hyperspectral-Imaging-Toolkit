@@ -45,7 +45,7 @@ from hsi_model.models import NoiseRobustCSWinModel
 from hsi_model.models.losses_consolidated import NoiseRobustLoss, ComputeSinkhornDiscriminatorLoss
 from hsi_model.utils import setup_logging, MetricsLogger
 from hsi_model.utils.data import (
-    mst_to_gan_batch, compute_mst_center_crop_metrics, worker_init_fn_mst
+    mst_to_gan_batch, compute_mst_center_crop_metrics, make_worker_init_fn
 )
 from hsi_model.utils.training_setup import (
     setup_paths, setup_distributed_training, setup_seed,
@@ -514,7 +514,7 @@ def train_sinkhorn_gan(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=make_worker_init_fn(seed, rank),
         persistent_workers=(num_workers > 0),
     )
 

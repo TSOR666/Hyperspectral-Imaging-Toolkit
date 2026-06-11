@@ -109,7 +109,7 @@ from hsi_model.utils.data import (
     mst_to_gan_batch,
     compute_mst_center_crop_metrics,
     show_dataloader_diagnostics,
-    worker_init_fn_mst,
+    make_worker_init_fn,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,7 +250,7 @@ def validate_mst_style(
         sampler=val_sampler,
         num_workers=config.get("num_workers", 8),
         pin_memory=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed, rank),
+        worker_init_fn=make_worker_init_fn(seed, rank),
         persistent_workers=False  # KEY: Don't keep validation workers alive
     )
     
@@ -391,10 +391,12 @@ def train_mst_gan_optimized(
     
     # Create single training DataLoader
     # Use consistent seed across sampler and workers for determinism
-    seed_base = seed + rank * 1000  # Unique per rank
+    seed_base = seed + rank * 1000  # Unique augmentation stream per rank
     train_sampler = None
     if distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed_base)
+        # Every rank must shard the same permutation. Rank-specific sampler
+        # seeds create overlapping shards; worker seeds remain rank-specific.
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
 
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -404,7 +406,7 @@ def train_mst_gan_optimized(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=lambda w: worker_init_fn_mst(w, seed_base, rank),
+        worker_init_fn=make_worker_init_fn(seed_base, rank),
         persistent_workers=(num_workers > 0)
     )
     

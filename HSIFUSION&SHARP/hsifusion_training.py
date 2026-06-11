@@ -344,7 +344,15 @@ class HSIFusionTrainer:
                     continue
 
                 self.consecutive_nonfinite = 0
-                loss_scaled = loss / self.config.accumulate_steps
+                # Scale each micro-batch by the size of ITS OWN accumulation group: this is
+                # accumulate_steps for every full group, but only the remainder for the final
+                # partial group of the epoch. Using a constant accumulate_steps would shrink the
+                # last optimizer step's gradient (it averaged fewer micro-batches), under-weighting
+                # ~1/accumulate_steps of every epoch's updates.
+                accum = self.config.accumulate_steps
+                n_full = (total_steps // accum) * accum
+                group_size = accum if batch_idx < n_full else (total_steps - n_full)
+                loss_scaled = loss / max(1, group_size)
                 self.scaler.scale(loss_scaled).backward()
 
                 if should_optimizer_step(batch_idx, total_steps, self.config.accumulate_steps):
