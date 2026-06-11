@@ -21,7 +21,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 
 try:
@@ -81,6 +84,28 @@ def _torch_load_compat(path: str, map_location: torch.device):
         return torch.load(path, map_location=map_location)
 
 
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying SHARP module through DDP and torch.compile wrappers."""
+    if isinstance(model, DDP):
+        model = model.module
+    return getattr(model, "_orig_mod", model)
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class _NoOpWriter:
+    def add_scalar(self, *args, **kwargs) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 def should_optimizer_step(batch_idx: int, total_batches: int, accumulate_steps: int) -> bool:
     """Return whether an optimizer update should be executed for this batch index."""
     if accumulate_steps <= 0:
@@ -99,10 +124,12 @@ class SHARPTrainingConfig:
     # SHARP v3.2.2 specific parameters
     sparse_sparsity_ratio: float = 0.9      # Fraction of attention weights to zero out
     sparse_block_size: int = 2048           # Block size for streaming attention
-    sparse_max_tokens: int = 8192           # Max tokens before window fallback
-    sparse_window_size: int = 49            # Window size for fallback (odd)
+    sparse_max_tokens: int = 8192           # Legacy hard cap for exact all-key scans
+    sparse_window_size: int = 49            # Number of 2D local candidates
     sparse_k_cap: int = 1024                # Maximum k_keep to prevent memory spikes
     sparse_q_block_size: int = 1024         # Query block size for tiling
+    sparse_exact_topk_max_tokens: int = 1024 # Exact all-key scan threshold
+    sparse_landmark_tokens: int = 256        # Pooled global candidates above threshold
     max_global_tokens: Optional[int] = 1024 # Bound dense global/cross-attention context
     rbf_centers_per_head: int = 32          # RBF centers per attention head
     key_rbf_mode: str = 'linear'            # Preserve query-dependent key rankings
@@ -159,6 +186,11 @@ class SHARPTrainingConfig:
     # Hardware
     device: str = 'cuda'
     seed: int = 42
+    distributed: bool = False
+    ddp_find_unused_parameters: bool = False
+    local_rank: int = 0
+    rank: int = field(default=0, init=False)
+    world_size: int = field(default=1, init=False)
     min_mrae_denom: float = 1e-6
     max_consecutive_nonfinite: int = 8
     skip_oom_batches: bool = True
@@ -188,6 +220,10 @@ class SHARPTrainingConfig:
             raise ValueError("psnr_data_range must be > 0")
         if self.max_global_tokens is not None and self.max_global_tokens <= 0:
             self.max_global_tokens = None
+        if self.sparse_exact_topk_max_tokens <= 0:
+            raise ValueError("sparse_exact_topk_max_tokens must be > 0")
+        if self.sparse_landmark_tokens <= 0:
+            raise ValueError("sparse_landmark_tokens must be > 0")
         if self.cache_size < 0:
             raise ValueError("cache_size must be >= 0")
         if self.ema_update_every <= 0:
@@ -243,17 +279,23 @@ class DedicatedSHARPTrainer:
     
     def __init__(self, config: SHARPTrainingConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        self._setup_distributed()
+        self.device = self._resolve_device()
+        self.is_main_process = self.rank == 0
         
         # Set random seeds
         self._set_seeds(config.seed)
         
         # Create output directory
         self.exp_dir = Path(config.output_dir) / config.experiment_name
-        self.exp_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main_process:
+            self.exp_dir.mkdir(parents=True, exist_ok=True)
+        if self.distributed:
+            dist.barrier()
         
         # Save configuration
-        self._save_config()
+        if self.is_main_process:
+            self._save_config()
         
         # Create model
         self.model = self._create_model()
@@ -292,7 +334,11 @@ class DedicatedSHARPTrainer:
             self._setup_training_components()
         
         # Logging
-        self.writer = SummaryWriter(self.exp_dir / 'logs')
+        self.writer = (
+            SummaryWriter(self.exp_dir / 'logs')
+            if self.is_main_process
+            else _NoOpWriter()
+        )
         self.best_mrae = float('inf')
         self.start_epoch = 0
         self.iteration = 0
@@ -307,6 +353,57 @@ class DedicatedSHARPTrainer:
         
         # Print model info
         self._print_model_info()
+
+    def _setup_distributed(self) -> None:
+        """Initialize torchrun-provided distributed state."""
+        env_world_size = _env_int("WORLD_SIZE", 1)
+        self.distributed = bool(self.config.distributed or env_world_size > 1)
+        self.local_rank = _env_int("LOCAL_RANK", self.config.local_rank)
+        self.rank = _env_int("RANK", 0)
+        self.world_size = env_world_size if self.distributed else 1
+
+        if self.distributed:
+            if not dist.is_available():
+                raise RuntimeError(
+                    "Distributed training requested but torch.distributed is unavailable."
+                )
+            requested_type = torch.device(self.config.device).type
+            use_cuda = requested_type == "cuda" and torch.cuda.is_available()
+            backend = "nccl" if use_cuda else "gloo"
+            if use_cuda:
+                torch.cuda.set_device(self.local_rank)
+            if not dist.is_initialized():
+                dist.init_process_group(backend=backend, init_method="env://")
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+
+        self.config.distributed = self.distributed
+        self.config.local_rank = self.local_rank
+        self.config.rank = self.rank
+        self.config.world_size = self.world_size
+
+    def _resolve_device(self) -> torch.device:
+        requested = torch.device(self.config.device)
+        if requested.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested but is not available.")
+            if self.distributed:
+                return torch.device("cuda", self.local_rank)
+            return requested
+        return requested
+
+    def _print(self, *args, **kwargs) -> None:
+        if getattr(self, "is_main_process", True):
+            print(*args, **kwargs)
+
+    def _all_ranks_true(self, value: bool) -> bool:
+        if not getattr(self, "distributed", False):
+            return value
+        flag = torch.tensor(
+            int(value), device=self.device, dtype=torch.int32
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item())
     
     def _is_oom_error(self, exc: BaseException) -> bool:
         return "out of memory" in str(exc).lower()
@@ -362,6 +459,8 @@ class DedicatedSHARPTrainer:
                 sparse_k_cap=self.config.sparse_k_cap,
                 sparse_block_size=self.config.sparse_block_size,
                 sparse_q_block_size=self.config.sparse_q_block_size,
+                sparse_exact_topk_max_tokens=self.config.sparse_exact_topk_max_tokens,
+                sparse_landmark_tokens=self.config.sparse_landmark_tokens,
                 max_global_tokens=self.config.max_global_tokens,
                 sparse_window_size=self.config.sparse_window_size,
                 sparse_max_tokens=self.config.sparse_max_tokens,
@@ -369,18 +468,29 @@ class DedicatedSHARPTrainer:
                 sparsemax_pad_value=self.config.sparsemax_pad_value,
                 output_activation=self.config.output_activation,
                 ema_update_every=self.config.ema_update_every,
-                verbose=True
+                verbose=getattr(self, "is_main_process", True),
             )
             
             # Move to device and optimize memory format
             model = model.to(self.device)
             if self.config.use_channels_last and torch.cuda.is_available():
                 model = model.to(memory_format=torch.channels_last)
+
+            if getattr(self, "distributed", False):
+                ddp_kwargs = {
+                    "find_unused_parameters": self.config.ddp_find_unused_parameters,
+                }
+                if self.device.type == "cuda":
+                    ddp_kwargs.update({
+                        "device_ids": [self.local_rank],
+                        "output_device": self.local_rank,
+                    })
+                model = DDP(model, **ddp_kwargs)
             
             return model
             
         except Exception as e:
-            print(f"Error creating SHARP model: {e}")
+            self._print(f"Error creating SHARP model: {e}")
             raise
     
     def _build_criterion(self):
@@ -402,8 +512,8 @@ class DedicatedSHARPTrainer:
         # Keep the optimization objective aligned with the built-in trainer path.
         if self._criterion is not None:
             self.criterion = self._criterion
-        elif hasattr(self.model, "compute_loss"):
-            self.criterion = self.model.compute_loss
+        elif hasattr(unwrap_model(self.model), "compute_loss"):
+            self.criterion = unwrap_model(self.model).compute_loss
         elif DATALOADER_AVAILABLE:
             self.criterion = MSTPlusPlusLoss()
         else:
@@ -458,7 +568,7 @@ class DedicatedSHARPTrainer:
     def _create_ema_state(self):
         """Create EMA state dictionary"""
         ema_state = {}
-        for name, param in self.model.named_parameters():
+        for name, param in unwrap_model(self.model).named_parameters():
             if param.requires_grad:
                 ema_state[name] = param.detach().cpu().clone()
         return ema_state
@@ -466,7 +576,7 @@ class DedicatedSHARPTrainer:
     def _update_ema(self):
         """Update EMA weights"""
         with torch.no_grad():
-            for name, param in self.model.named_parameters():
+            for name, param in unwrap_model(self.model).named_parameters():
                 if name in self.ema_state:
                     self.ema_state[name].mul_(self.config.ema_decay).add_(
                         param.detach().cpu(), alpha=1 - self.config.ema_decay
@@ -499,6 +609,9 @@ class DedicatedSHARPTrainer:
                 cache_size=self.config.cache_size,
                 seed=self.config.seed,
                 val_num_workers=min(2, self.config.num_workers),
+                distributed=self.distributed,
+                rank=self.rank,
+                world_size=self.world_size,
             )
             
             return create_optimized_dataloaders(dataloader_config, memory_mode=self.config.memory_mode)
@@ -508,7 +621,9 @@ class DedicatedSHARPTrainer:
     
     def _print_model_info(self):
         """Print detailed model information"""
-        model_ref = getattr(self.model, '_orig_mod', self.model)
+        if not self.is_main_process:
+            return
+        model_ref = unwrap_model(self.model)
         params_info = model_ref.num_parameters
         
         print(f"\n{'='*80}")
@@ -522,7 +637,9 @@ class DedicatedSHARPTrainer:
         print(f"  Sparsity ratio: {self.config.sparse_sparsity_ratio}")
         print(f"  Block size: {self.config.sparse_block_size}")
         print(f"  Query block size: {self.config.sparse_q_block_size}")
-        print(f"  Max tokens: {self.config.sparse_max_tokens}")
+        print(f"  Exact hard cap: {self.config.sparse_max_tokens}")
+        print(f"  Exact top-k threshold: {self.config.sparse_exact_topk_max_tokens}")
+        print(f"  Global landmarks: {self.config.sparse_landmark_tokens}")
         print(f"  Global context cap: {self.config.max_global_tokens or 'disabled'}")
         print(f"  Window size: {self.config.sparse_window_size}")
         print(f"  K-cap: {self.config.sparse_k_cap if self.config.sparse_k_cap else 'disabled'}")
@@ -533,9 +650,14 @@ class DedicatedSHARPTrainer:
         sample_k = max(1, int(sample_n * (1 - self.config.sparse_sparsity_ratio)))
         if self.config.sparse_k_cap:
             sample_k = min(sample_k, self.config.sparse_k_cap)
-        print(f"\n  Example: For N={sample_n} tokens:")
+        print(f"\n  Exact-path example: For N={sample_n} tokens:")
         print(f"    k_keep = {sample_k} (top {100*(1-self.config.sparse_sparsity_ratio):.1f}%)")
         print(f"    Peak memory: O(BH x {self.config.sparse_q_block_size} x {self.config.sparse_block_size})")
+        print(
+            "  Hybrid-path compute: "
+            f"O(N x ({self.config.sparse_window_size} + "
+            f"{self.config.sparse_landmark_tokens}))"
+        )
         
         print(f"\nTraining Configuration:")
         print(f"  Batch size: {self.config.batch_size}")
@@ -556,8 +678,13 @@ class DedicatedSHARPTrainer:
     
     def train(self):
         """Main training loop"""
-        print(f"Starting SHARP v3.2.2 training...")
-        print(f"Experiment: {self.config.experiment_name}")
+        self._print("Starting SHARP v3.2.2 training...")
+        self._print(f"Experiment: {self.config.experiment_name}")
+        if self.distributed:
+            self._print(
+                f"DDP: {self.world_size} processes "
+                f"(backend={dist.get_backend()})"
+            )
         start_time = time.time()
         self.start_time = start_time  # Store for logging
         
@@ -574,7 +701,7 @@ class DedicatedSHARPTrainer:
                     self.best_mrae = val_metrics['mrae']
                     self.bad_val_epochs = 0
                     self._save_checkpoint(epoch, is_best=True)
-                    print(f"New best model! MRAE: {self.best_mrae:.6f}")
+                    self._print(f"New best model! MRAE: {self.best_mrae:.6f}")
                 else:
                     self.bad_val_epochs += 1
 
@@ -582,7 +709,7 @@ class DedicatedSHARPTrainer:
                     self.config.early_stopping_patience > 0
                     and self.bad_val_epochs >= self.config.early_stopping_patience
                 ):
-                    print(
+                    self._print(
                         f"Early stopping triggered after {self.bad_val_epochs} validation checks "
                         f"without improvement > {self.config.early_stopping_min_delta}."
                     )
@@ -594,11 +721,16 @@ class DedicatedSHARPTrainer:
         
         # Training completed
         total_time = time.time() - start_time
-        print(f"\nTraining completed in {total_time/3600:.1f} hours")
-        print(f"Best MRAE: {self.best_mrae:.6f}")
-        print(f"Skipped batches - OOM: {self.skipped_oom_batches}, non-finite: {self.skipped_nonfinite_batches}")
-        print(f"Results saved to: {self.exp_dir}")
+        self._print(f"\nTraining completed in {total_time/3600:.1f} hours")
+        self._print(f"Best MRAE: {self.best_mrae:.6f}")
+        self._print(
+            f"Skipped batches - OOM: {self.skipped_oom_batches}, "
+            f"non-finite: {self.skipped_nonfinite_batches}"
+        )
+        self._print(f"Results saved to: {self.exp_dir}")
         self.writer.close()
+        if self.distributed:
+            dist.barrier()
     
     def _train_epoch(self, epoch: int) -> Dict:
         """Train for one epoch"""
@@ -606,6 +738,8 @@ class DedicatedSHARPTrainer:
         epoch_losses = []
         epoch_start = time.time()
         total_batches = len(self.train_loader)
+        if isinstance(self.train_loader.sampler, DistributedSampler):
+            self.train_loader.sampler.set_epoch(epoch)
         
         for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
             try:
@@ -621,7 +755,11 @@ class DedicatedSHARPTrainer:
                         is_last_batch=(batch_idx + 1) == total_batches,
                     )
             except RuntimeError as exc:
-                if self.config.skip_oom_batches and self._is_oom_error(exc):
+                if (
+                    self.config.skip_oom_batches
+                    and not self.distributed
+                    and self._is_oom_error(exc)
+                ):
                     self.skipped_oom_batches += 1
                     if not self.use_sharp_trainer:
                         self.optimizer.zero_grad(set_to_none=True)
@@ -647,15 +785,27 @@ class DedicatedSHARPTrainer:
         
         # Epoch statistics
         epoch_time = time.time() - epoch_start
-        avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float('nan')
+        loss_sum = float(np.sum(epoch_losses)) if epoch_losses else 0.0
+        loss_count = len(epoch_losses)
+        if self.distributed:
+            packed = torch.tensor(
+                [loss_sum, float(loss_count)],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            loss_sum, loss_count = packed.tolist()
+        avg_loss = loss_sum / loss_count if loss_count else float('nan')
         
-        print(f"\nEpoch {epoch+1}/{self.config.epochs} completed in {epoch_time:.1f}s")
-        print(f"Average loss: {avg_loss:.4f}")
+        self._print(
+            f"\nEpoch {epoch+1}/{self.config.epochs} completed in {epoch_time:.1f}s"
+        )
+        self._print(f"Average loss: {avg_loss:.4f}")
         
         # Memory logging
         if torch.cuda.is_available():
             memory_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-            print(f"Peak GPU memory: {memory_mb:.1f} MB")
+            self._print(f"Peak GPU memory: {memory_mb:.1f} MB")
             torch.cuda.reset_peak_memory_stats()
         
         return {'avg_loss': avg_loss, 'epoch_time': epoch_time}
@@ -677,7 +827,7 @@ class DedicatedSHARPTrainer:
                 pred = pred[0]
             loss = self.criterion(pred, hsi)
 
-        if not torch.isfinite(loss):
+        if not self._all_ranks_true(bool(torch.isfinite(loss).item())):
             self.consecutive_nonfinite += 1
             warnings.warn(
                 f"Non-finite loss at batch={batch_idx+1}; skipping update "
@@ -706,7 +856,7 @@ class DedicatedSHARPTrainer:
                 self.model.parameters(), 
                 self.config.gradient_clip
             )
-            if not self._has_finite_gradients():
+            if not self._all_ranks_true(self._has_finite_gradients()):
                 self.consecutive_nonfinite += 1
                 warnings.warn(f"Non-finite gradients at batch={batch_idx+1}; skipping optimizer step.")
                 self.optimizer.zero_grad(set_to_none=True)
@@ -754,10 +904,10 @@ class DedicatedSHARPTrainer:
             metrics = self._manual_validate()
         
         # Log metrics
-        print(f"\nValidation @ Epoch {epoch+1}:")
-        print(f"  MRAE: {metrics['mrae']:.6f}")
-        print(f"  RMSE: {metrics['rmse']:.6f}")
-        print(f"  PSNR: {metrics['psnr']:.2f} dB")
+        self._print(f"\nValidation @ Epoch {epoch+1}:")
+        self._print(f"  MRAE: {metrics['mrae']:.6f}")
+        self._print(f"  RMSE: {metrics['rmse']:.6f}")
+        self._print(f"  PSNR: {metrics['psnr']:.2f} dB")
         
         # TensorBoard logging
         self.writer.add_scalar('val/mrae', metrics['mrae'], epoch)
@@ -774,7 +924,7 @@ class DedicatedSHARPTrainer:
         as-is. Restoration is guaranteed via finally so a raised exception cannot leave the
         model in the EMA state.
         """
-        model_ref = getattr(self.model, '_orig_mod', self.model)
+        model_ref = unwrap_model(self.model)
         if not getattr(self, 'ema_state', None):
             yield
             return
@@ -835,6 +985,17 @@ class DedicatedSHARPTrainer:
             num_samples += 1
         
         if num_samples == 0:
+            totals = torch.zeros(4, device=self.device, dtype=torch.float64)
+        else:
+            totals = torch.tensor(
+                [total_mrae, total_rmse, total_psnr, float(num_samples)],
+                device=self.device,
+                dtype=torch.float64,
+            )
+        if getattr(self, "distributed", False):
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_mrae, total_rmse, total_psnr, num_samples = totals.tolist()
+        if num_samples == 0:
             return {'mrae': 0.0, 'rmse': 0.0, 'psnr': 0.0}
 
         return {
@@ -848,11 +1009,13 @@ class DedicatedSHARPTrainer:
         avg_loss = np.mean(epoch_losses[-100:])
         elapsed = time.time() - self.start_time if hasattr(self, 'start_time') else 0
         
-        print(f"Epoch [{epoch+1}/{self.config.epochs}] "
-              f"Iter [{batch_idx}/{len(self.train_loader)}] "
-              f"Loss: {metrics['loss']:.4f} (avg: {avg_loss:.4f}) "
-              f"LR: {metrics['lr']:.2e} "
-              f"GradNorm: {metrics['grad_norm']:.2f}")
+        self._print(
+            f"Epoch [{epoch+1}/{self.config.epochs}] "
+            f"Iter [{batch_idx}/{len(self.train_loader)}] "
+            f"Loss: {metrics['loss']:.4f} (avg: {avg_loss:.4f}) "
+            f"LR: {metrics['lr']:.2e} "
+            f"GradNorm: {metrics['grad_norm']:.2f}"
+        )
         
         # TensorBoard logging
         self.writer.add_scalar('train/loss', metrics['loss'], self.iteration)
@@ -861,7 +1024,11 @@ class DedicatedSHARPTrainer:
     
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint"""
-        model_state = getattr(self.model, '_orig_mod', self.model).state_dict()
+        if not self.is_main_process:
+            if self.distributed:
+                dist.barrier()
+            return
+        model_state = unwrap_model(self.model).state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -905,15 +1072,17 @@ class DedicatedSHARPTrainer:
             path = self.exp_dir / f'checkpoint_epoch_{epoch+1}.pth'
         
         torch.save(checkpoint, path)
-        print(f"Saved checkpoint to {path}")
+        self._print(f"Saved checkpoint to {path}")
+        if self.distributed:
+            dist.barrier()
     
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint for resuming training"""
-        print(f"Loading checkpoint from {checkpoint_path}...")
+        self._print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = _torch_load_compat(checkpoint_path, self.device)
         
         # Load model state
-        model_ref = getattr(self.model, '_orig_mod', self.model)
+        model_ref = unwrap_model(self.model)
         model_ref.load_state_dict(checkpoint['model_state_dict'])
         
         # Load training state
@@ -940,7 +1109,12 @@ class DedicatedSHARPTrainer:
             if 'ema_state' in checkpoint:
                 self.ema_state = checkpoint['ema_state']
         
-        print(f"Resumed from epoch {self.start_epoch}, best MRAE: {self.best_mrae:.6f}")
+        self._print(
+            f"Resumed from epoch {self.start_epoch}, "
+            f"best MRAE: {self.best_mrae:.6f}"
+        )
+        if self.distributed:
+            dist.barrier()
 
 
 def main():
@@ -1000,12 +1174,18 @@ def main():
     parser.add_argument('--q_block_size', '--sparse_q_block_size', dest='q_block_size',
                         type=int, default=1024,
                         help='Query block size for tiling')
+    parser.add_argument('--exact_topk_max_tokens', '--sparse_exact_topk_max_tokens',
+                        dest='exact_topk_max_tokens', type=int, default=1024,
+                        help='Maximum token count for exact all-key streaming top-k')
+    parser.add_argument('--landmark_tokens', '--sparse_landmark_tokens',
+                        dest='landmark_tokens', type=int, default=256,
+                        help='Maximum pooled global candidates above the exact top-k threshold')
     parser.add_argument('--max_tokens', '--sparse_max_tokens', dest='max_tokens',
                         type=int, default=8192,
-                        help='Token count above which sparse attention uses its local fallback')
+                        help='Legacy hard cap for exact all-key top-k scans')
     parser.add_argument('--window_size', '--sparse_window_size', dest='window_size',
                         type=int, default=49,
-                        help='Local fallback window size')
+                        help='Number of 2D local candidates in hybrid attention')
     parser.add_argument('--max_global_tokens', type=int, default=1024,
                         help='Maximum key/value tokens in dense global and cross attention (0 disables cap)')
     parser.add_argument('--key_rbf_mode', type=str, default='linear',
@@ -1057,6 +1237,15 @@ def main():
     # Other
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (42 for deterministic mode)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Training device (cuda or cpu)')
+    parser.add_argument('--distributed', action='store_true',
+                        help='Enable DDP (automatically enabled when launched with torchrun)')
+    parser.add_argument('--local-rank', '--local_rank', dest='local_rank',
+                        type=int, default=0,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--ddp_find_unused_parameters', action='store_true',
+                        help='Enable DDP unused-parameter graph traversal for debugging')
     
     args = parser.parse_args()
     
@@ -1083,6 +1272,8 @@ def main():
         sparse_k_cap=args.k_cap,
         sparse_block_size=args.block_size,
         sparse_q_block_size=args.q_block_size,
+        sparse_exact_topk_max_tokens=args.exact_topk_max_tokens,
+        sparse_landmark_tokens=args.landmark_tokens,
         sparse_max_tokens=args.max_tokens,
         sparse_window_size=args.window_size,
         max_global_tokens=args.max_global_tokens,
@@ -1105,12 +1296,20 @@ def main():
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,
         resume_from=args.resume,
-        seed=args.seed
+        seed=args.seed,
+        device=args.device,
+        distributed=args.distributed,
+        local_rank=args.local_rank,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
     )
     
     # Create trainer and start training
-    trainer = DedicatedSHARPTrainer(config)
-    trainer.train()
+    try:
+        trainer = DedicatedSHARPTrainer(config)
+        trainer.train()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':

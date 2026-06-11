@@ -10,9 +10,10 @@ import numpy as np
 import h5py
 import cv2
 import random
-from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional, Dict, List, Any
-from functools import lru_cache
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data.distributed import DistributedSampler
+from typing import Tuple, Optional, Dict, List, Any, Iterator
+from functools import lru_cache, partial
 import logging
 from packaging import version
 
@@ -20,6 +21,42 @@ logger = logging.getLogger(__name__)
 cv2.setNumThreads(0)
 TORCH_VERSION = version.parse(torch.__version__.split('+')[0])
 RGB_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation data without padding or duplicated samples."""
+
+    def __init__(self, dataset: Dataset, num_replicas: int, rank: int):
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be > 0")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
+
+
+def _seed_dataloader_worker(worker_id: int, base_seed: int, rank: int) -> None:
+    """Seed spawn/fork workers deterministically and independently per rank."""
+    try:
+        import h5py._hl.base
+        h5py._hl.base.phil.acquire()
+        h5py._hl.base.default_file_cache_size = 4 * 1024 * 1024
+        h5py._hl.base.phil.release()
+    except Exception:
+        pass
+
+    worker_seed = base_seed + rank * 1000 + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def _resolve_rgb_path(rgb_dir: str, name: str) -> Optional[str]:
@@ -455,6 +492,9 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
     augment = getattr(config, "augment", True)
     cache_size = int(getattr(config, "cache_size", 4 if memory_mode == 'lazy' else 0))
     base_seed = int(getattr(config, "seed", 42))
+    distributed = bool(getattr(config, "distributed", False))
+    rank = int(getattr(config, "rank", 0))
+    world_size = int(getattr(config, "world_size", 1))
     
     # Create datasets
     train_dataset = OptimizedTrainDataset(
@@ -471,20 +511,11 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         memory_mode=memory_mode
     )
     
-    # Worker init function to reduce h5py cache
-    def worker_init_fn(worker_id):
-        # Set h5py cache to 4MB instead of default 64MB
-        try:
-            import h5py._hl.base
-            h5py._hl.base.phil.acquire()
-            h5py._hl.base.default_file_cache_size = 4 * 1024 * 1024
-            h5py._hl.base.phil.release()
-        except:
-            pass
-        
-        # Set random seed
-        np.random.seed(base_seed + worker_id)
-        random.seed(base_seed + worker_id)
+    worker_init_fn = partial(
+        _seed_dataloader_worker,
+        base_seed=base_seed,
+        rank=rank,
+    )
     
     pin_memory = torch.cuda.is_available()
     pin_memory_kwargs: Dict[str, object] = {}
@@ -496,11 +527,34 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
             return {"prefetch_factor": max(2, getattr(config, "prefetch_factor", 2))}
         return {}
 
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=base_seed,
+            drop_last=True,
+        )
+        if distributed
+        else None
+    )
+    val_sampler = (
+        DistributedEvalSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+        )
+        if distributed
+        else None
+    )
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
@@ -515,6 +569,7 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         val_dataset,
         batch_size=1,  # Full images for validation
         shuffle=False,
+        sampler=val_sampler,
         num_workers=val_workers,
         pin_memory=pin_memory,
         worker_init_fn=worker_init_fn,
@@ -527,6 +582,7 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
     logger.info(f"  Train batches: {len(train_loader)}")
     logger.info(f"  Val samples: {len(val_loader)}")
     logger.info(f"  Memory mode: {memory_mode}")
+    logger.info(f"  Distributed: {distributed} (rank={rank}/{world_size})")
     
     return train_loader, val_loader
 

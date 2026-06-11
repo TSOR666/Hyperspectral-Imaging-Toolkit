@@ -87,18 +87,32 @@ python sharp_training_script_fixed.py \
   --batch_size 20 \
   --model_size base \
   --sparse_sparsity_ratio 0.9 \
+  --sparse_exact_topk_max_tokens 1024 \
+  --sparse_landmark_tokens 256 \
   --max_global_tokens 1024
 ```
 
 Important parameters:
 
-- `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, and `--sparse_window_size` tune the streaming attention kernels and must respect GPU memory limits.
+- `--sparse_exact_topk_max_tokens` bounds exact all-key top-k. Longer sequences use 2D local candidates plus `--sparse_landmark_tokens` pooled global candidates, reducing attention compute to `O(N * (window + landmarks))`.
+- `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, and `--sparse_window_size` tune the sparse attention kernels and must respect GPU memory limits.
 - `--max_global_tokens` bounds dense global and decoder cross-attention context without changing checkpoint parameter shapes.
 - `--key_rbf_mode linear` preserves query-dependent sparse rankings and is the training default; `mean` remains available for legacy experiments.
 - `--ema_decay` together with `--ema_update_every` mirrors the production EMA scheme – keep these defaults unless you benchmark alternatives.
 - Set `--memory_mode lazy --cache_size 4` to stream tiles with a bounded per-worker float16 cache.
 
-These trainers are single-process. Do not wrap them with `torch.distributed.run` until DDP samplers, rank-aware checkpointing, and metric reduction are implemented.
+Multi-GPU SHARP training uses native DDP:
+
+```bash
+torchrun --standalone --nproc_per_node=4 sharp_training_script_fixed.py \
+  --data_root ${HSI_DATA_DIR:-./data/ARAD_1K} \
+  --batch_size 5 \
+  --model_size base
+```
+
+`--batch_size` is per process. Training and validation use disjoint distributed
+samplers; validation metrics are reduced globally, while logs and checkpoints
+are written only by rank zero.
 
 ## SHARP inference
 
@@ -138,7 +152,7 @@ The HSIFusion and SHARP implementations are distributed under the [MIT License](
   - Reference: `hsifusion_v252_complete.py` (`LightningProConfig`, factory `create_hsifusion_lightning_pro`).
 
 - SHARP v3.2.2 (Hardened)
-  - Attention: Multi‑scale attention + streaming sparse attention (`sparse_attention_topk_streaming`) with top‑k and local window fallback; RBF query/key projection modes (mean/linear/none).
+  - Attention: Multi-scale attention plus exact top-k for short sequences and bounded 2D-local + pooled-landmark top-k for moderate/high resolutions; RBF query/key projection modes (mean/linear/none).
   - Norm: Channel RMSNorm with eval‑time caches; cross‑attention fusion in the decoder.
   - Topology: Hierarchical encoder–decoder with ChannelRMSNorm, spectral basis regularization in the head.
   - Reference: `sharp_v322_hardened.py` (`SHARPv32Config`, factory `create_sharp_v32`).
@@ -152,9 +166,9 @@ The HSIFusion and SHARP implementations are distributed under the [MIT License](
   - Common flags: `--model_size`, `--batch_size`, `--accumulate_steps`, `--warmup_epochs`, `--compile_model`, `--use_channels_last`.
 
 - SHARP (`sharp_training_script_fixed.py`)
-  - Sparse config: `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, `--sparse_window_size`, `--sparse_sparsity_ratio`, `--rbf_centers_per_head`, `--key_rbf_mode`.
+  - Sparse config: `--sparse_block_size`, `--sparse_q_block_size`, `--sparse_max_tokens`, `--sparse_exact_topk_max_tokens`, `--sparse_landmark_tokens`, `--sparse_window_size`, `--sparse_sparsity_ratio`, `--rbf_centers_per_head`, `--key_rbf_mode`.
   - Optimizer/Runtime: AdamW, AMP, gradient clipping, EMA with configurable `ema_update_every`, optional `torch.compile` (version‑gated).
-  - Distributed: Wrapper via `torch.distributed.run` identical to CSWIN.
+  - Distributed: Native `torchrun`/DDP with rank-aware samplers, metrics, EMA, resume, and checkpoints.
 
 ## Key Configuration
 
@@ -165,7 +179,7 @@ The HSIFusion and SHARP implementations are distributed under the [MIT License](
 
 - SHARP v3.2.2
   - Core: `in_channels`, `out_channels`, `base_dim`, `depths`, `heads`, `mlp_ratios`, `drop_path_rate`, `use_checkpoint`.
-  - Sparse: `sparse_block_size`, `sparse_max_tokens`, `sparse_window_size`, `sparse_k_cap`, `sparse_q_block_size`, `sparse_sparsity_ratio`, `rbf_centers_per_head`, `key_rbf_mode`, `sparsemax_pad_value`.
+  - Sparse: `sparse_block_size`, `sparse_max_tokens`, `sparse_exact_topk_max_tokens`, `sparse_landmark_tokens`, `sparse_window_size`, `sparse_k_cap`, `sparse_q_block_size`, `sparse_sparsity_ratio`, `rbf_centers_per_head`, `key_rbf_mode`, `sparsemax_pad_value`.
   - Runtime: `compile_mode`, `ema_update_every`.
 
-Tip: With `sparse_sparsity_ratio=0`, SHARP auto‑disables `k_cap` for dense attention; windowed fallback is used for very long sequences.
+Tip: With `sparse_sparsity_ratio=0`, SHARP auto-disables `k_cap`. Attention is exact only up to `sparse_exact_topk_max_tokens`; longer sequences still use bounded local and landmark candidates.
