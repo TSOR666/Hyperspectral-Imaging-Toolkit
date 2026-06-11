@@ -8,7 +8,8 @@ Fixed in this version:
 - Separate index tensors for k and v gathering operations
 
 All v3.2.2 features maintained:
-- Streaming sparse attention with O(B * H * N * k * D) footprint
+- Exact streaming top-k for short sequences
+- Bounded 2D-local + pooled-landmark candidates for larger sequences
 - FP16-safe padding sentinels with dtype awareness
 - Query tiling for bounded memory O(BH * q_block * k_block)
 - Configurable sparsity_ratio and rbf_centers_per_head
@@ -24,6 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils import checkpoint
 
 from common_utils_v32 import (
@@ -146,12 +148,19 @@ def sparse_attention_topk_streaming(
     window_size: int = 49, k_cap: Optional[int] = 1024,
     q_block_size: int = 1024,
     spatial_shape: Optional[Tuple[int, int]] = None,
+    exact_topk_max_tokens: int = 1024,
+    landmark_tokens: int = 256,
 ) -> torch.Tensor:
     """
-    Streaming top-k attention that avoids allocating the full (N x N) scores.
+    Sparse attention with exact streaming top-k only for short sequences.
+
+    For longer spatial sequences, global candidates are represented by pooled
+    landmarks and combined with a 2D local neighborhood. This bounds compute to
+    O(N * (window_size + landmark_tokens)) instead of scanning all N keys for
+    every query.
     
     v3.2.2: 
-    - Auto-disables k_cap when sparsity_ratio=0 for true dense attention
+    - Auto-disables k_cap when sparsity_ratio=0
     - Short-circuits to efficient dense SDPA when k_keep >= N
     - Fixed to handle different q/k/v dimensions from RBF transforms
     """
@@ -165,6 +174,14 @@ def sparse_attention_topk_streaming(
         raise ValueError(f"window_size must be > 0, got {window_size}")
     if q_block_size <= 0:
         raise ValueError(f"q_block_size must be > 0, got {q_block_size}")
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be > 0, got {max_tokens}")
+    if exact_topk_max_tokens <= 0:
+        raise ValueError(
+            f"exact_topk_max_tokens must be > 0, got {exact_topk_max_tokens}"
+        )
+    if landmark_tokens <= 0:
+        raise ValueError(f"landmark_tokens must be > 0, got {landmark_tokens}")
     
     # Clamp sparsity_ratio to valid range
     if not (0.0 <= sparsity_ratio <= 1.0):
@@ -177,8 +194,8 @@ def sparse_attention_topk_streaming(
     
     # Handle edge case where sparsity_ratio >= 1.0 (keep nothing)
     if sparsity_ratio >= 1.0:
-        # Return zeros with v's dimension
-        return torch.zeros(BH, N, D_v, device=q.device, dtype=q.dtype)
+        # Preserve zero gradients through q/k/v so DDP sees a complete graph.
+        return v * 0.0 + (q.sum() + k.sum()).to(dtype=v.dtype) * 0.0
     
     # v3.2.2: Auto-disable k_cap when sparsity_ratio=0 for true dense attention
     if sparsity_ratio == 0.0:
@@ -190,35 +207,30 @@ def sparse_attention_topk_streaming(
     # Cap k_keep to prevent memory spikes (graceful handling of k_cap)
     if k_cap is not None and k_cap > 0:
         k_keep = min(k_keep, k_cap)
+
+    exact_limit = min(max_tokens, exact_topk_max_tokens)
     
     # v3.2.2: Short-circuit to dense attention when k_keep == N
-    if k_keep >= N and N <= max_tokens:
+    if k_keep >= N and N <= exact_limit:
         # Use efficient dense attention
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn = F.softmax(scores.to(torch.float32), dim=-1).to(scores.dtype)
         return torch.matmul(attn, v)
     
-    # Safety cap for very large sequences
-    if N > max_tokens:
-        # Fallback to local window attention (ensure odd window_size)
-        logger.warning(
-            f"Sequence length N={N} exceeds max_tokens={max_tokens}. "
-            f"Falling back to local window attention with window_size={window_size}. "
-            f"This changes the attention pattern from sparse to local windowed. "
-            f"Consider increasing max_tokens or using a different attention mechanism "
-            f"for very long sequences."
-        )
-
+    if N > exact_limit:
         adjusted_window_size = window_size if window_size % 2 == 1 else window_size - 1
         if adjusted_window_size != window_size:
             logger.debug(f"Adjusted window_size from {window_size} to {adjusted_window_size} (must be odd)")
 
-        return local_window_attention(
+        return sparse_attention_local_landmark(
             q,
             k,
             v,
-            adjusted_window_size,
-            scale,
+            sparsity_ratio=sparsity_ratio,
+            scale=scale,
+            window_size=adjusted_window_size,
+            landmark_tokens=landmark_tokens,
+            k_cap=k_cap,
             spatial_shape=spatial_shape,
             q_block_size=q_block_size,
         )
@@ -281,6 +293,141 @@ def sparse_attention_topk_streaming(
         # Write to output
         out[:, q_start:q_end, :] = out_chunk
     
+    return out
+
+
+def sparse_attention_local_landmark(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sparsity_ratio: float,
+    scale: float,
+    window_size: int,
+    landmark_tokens: int,
+    k_cap: Optional[int],
+    spatial_shape: Optional[Tuple[int, int]] = None,
+    q_block_size: int = 1024,
+) -> torch.Tensor:
+    """Top-k attention over bounded 2D-local and pooled-global candidates."""
+    BH, N, D_q = q.shape
+    D_k = k.shape[-1]
+    D_v = v.shape[-1]
+    if D_q != D_k:
+        raise ValueError(f"q/k dimensions must match, got {D_q} and {D_k}")
+
+    if spatial_shape is None:
+        height = int(math.sqrt(N))
+        width = N // height if height > 0 and N % height == 0 else N
+        height = N // width
+    else:
+        height, width = spatial_shape
+    if height * width != N:
+        raise ValueError(
+            f"spatial_shape={(height, width)} does not match sequence length N={N}"
+        )
+
+    pooled_h, pooled_w = _pooled_spatial_size(height, width, landmark_tokens)
+    landmark_count = pooled_h * pooled_w
+    k_landmarks = F.adaptive_avg_pool2d(
+        k.transpose(1, 2).reshape(BH, D_k, height, width),
+        (pooled_h, pooled_w),
+    ).flatten(2).transpose(1, 2).contiguous()
+    v_landmarks = F.adaptive_avg_pool2d(
+        v.transpose(1, 2).reshape(BH, D_v, height, width),
+        (pooled_h, pooled_w),
+    ).flatten(2).transpose(1, 2).contiguous()
+
+    window_side = max(1, int(math.ceil(math.sqrt(window_size))))
+    if window_side % 2 == 0:
+        window_side += 1
+    half = window_side // 2
+    offsets_y, offsets_x = torch.meshgrid(
+        torch.arange(-half, half + 1, device=q.device),
+        torch.arange(-half, half + 1, device=q.device),
+        indexing="ij",
+    )
+    offsets_y = offsets_y.reshape(1, -1)
+    offsets_x = offsets_x.reshape(1, -1)
+
+    out = q.new_zeros(BH, N, D_v)
+    batch_offsets = torch.arange(BH, device=q.device).view(BH, 1, 1) * N
+    landmark_offsets = (
+        torch.arange(BH, device=q.device).view(BH, 1, 1) * landmark_count
+    )
+    k_flat = k.reshape(BH * N, D_k)
+    v_flat = v.reshape(BH * N, D_v)
+    v_landmarks_flat = v_landmarks.reshape(BH * landmark_count, D_v)
+
+    for q_start in range(0, N, q_block_size):
+        q_end = min(q_start + q_block_size, N)
+        q_chunk = q[:, q_start:q_end]
+        positions = torch.arange(q_start, q_end, device=q.device).unsqueeze(1)
+        center_y = positions // width
+        center_x = positions % width
+        neighbor_y = center_y + offsets_y
+        neighbor_x = center_x + offsets_x
+        valid_local = (
+            (neighbor_y >= 0)
+            & (neighbor_y < height)
+            & (neighbor_x >= 0)
+            & (neighbor_x < width)
+        )
+        neighbor_idx = (
+            neighbor_y.clamp(0, height - 1) * width
+            + neighbor_x.clamp(0, width - 1)
+        ).long()
+        q_len, local_count = neighbor_idx.shape
+        gather_idx = (neighbor_idx.unsqueeze(0) + batch_offsets).reshape(-1)
+        k_local = k_flat.index_select(0, gather_idx).view(
+            BH, q_len, local_count, D_k
+        )
+        v_local = v_flat.index_select(0, gather_idx).view(
+            BH, q_len, local_count, D_v
+        )
+
+        local_scores = torch.einsum("bnd,bnwd->bnw", q_chunk, k_local) * scale
+        local_scores = local_scores.masked_fill(
+            ~valid_local.unsqueeze(0), float("-inf")
+        )
+        landmark_scores = torch.matmul(
+            q_chunk, k_landmarks.transpose(-2, -1)
+        ) * scale
+        candidate_scores = torch.cat([local_scores, landmark_scores], dim=-1)
+
+        candidate_count = local_count + landmark_count
+        k_keep = max(1, int(candidate_count * (1.0 - sparsity_ratio)))
+        if k_cap is not None and k_cap > 0:
+            k_keep = min(k_keep, k_cap)
+        k_keep = min(k_keep, candidate_count)
+        topk_vals, topk_idx = torch.topk(
+            candidate_scores, k_keep, dim=-1, sorted=False
+        )
+        attn = F.softmax(topk_vals.to(torch.float32), dim=-1).to(topk_vals.dtype)
+
+        is_local = topk_idx < local_count
+        local_idx = topk_idx.clamp(max=local_count - 1)
+        local_values = torch.gather(
+            v_local,
+            2,
+            local_idx.unsqueeze(-1).expand(-1, -1, -1, D_v),
+        )
+
+        landmark_idx = (topk_idx - local_count).clamp(
+            min=0, max=landmark_count - 1
+        )
+        landmark_gather_idx = (
+            landmark_idx + landmark_offsets
+        ).reshape(-1)
+        landmark_values = v_landmarks_flat.index_select(
+            0, landmark_gather_idx
+        ).view(BH, q_len, k_keep, D_v)
+        selected_values = torch.where(
+            is_local.unsqueeze(-1), local_values, landmark_values
+        )
+        out[:, q_start:q_end] = torch.einsum(
+            "bnk,bnkd->bnd", attn, selected_values
+        )
+
     return out
 
 
@@ -575,7 +722,9 @@ class OptimizedSparseAttention(nn.Module):
                  window_size: int = 49, k_cap: int = 1024,
                  q_block_size: int = 1024, rbf_centers_per_head: int = 32,
                  key_rbf_mode: str = KeyRBFMode.MEAN,
-                 sparsemax_pad_value: Optional[float] = None):
+                 sparsemax_pad_value: Optional[float] = None,
+                 exact_topk_max_tokens: int = 1024,
+                 landmark_tokens: int = 256):
         super().__init__()
 
         # Proper input validation (not assert - works with python -O)
@@ -614,6 +763,8 @@ class OptimizedSparseAttention(nn.Module):
             k_cap = None
         self.k_cap = k_cap
         self.q_block_size = q_block_size
+        self.exact_topk_max_tokens = exact_topk_max_tokens
+        self.landmark_tokens = landmark_tokens
         
         groups = get_optimal_groups(dim, dim * 3)
         self.qkv = nn.Conv2d(dim, dim * 3, 1, groups=groups, bias=False)
@@ -692,6 +843,8 @@ class OptimizedSparseAttention(nn.Module):
                 k_cap=self.k_cap,
                 q_block_size=self.q_block_size,
                 spatial_shape=(H, W),
+                exact_topk_max_tokens=self.exact_topk_max_tokens,
+                landmark_tokens=self.landmark_tokens,
             )
             out = out_flat.reshape(B, self.num_heads, N, -1)
         else:
@@ -722,7 +875,13 @@ class OptimizedSparseAttention(nn.Module):
                 attn = F.softmax(scores_masked.to(torch.float32), dim=-1).to(scores_masked.dtype)
             
             out = torch.matmul(attn, v)
-        
+
+        # Keep the alternate-branch threshold in the autograd graph so DDP can
+        # run with find_unused_parameters=False without an expensive graph scan.
+        out = out + self.threshold.sum().to(dtype=out.dtype) * 0.0
+        if self.use_rbf and self.key_rbf_mode == KeyRBFMode.NONE:
+            for parameter in self.rbf_kernel.parameters():
+                out = out + parameter.sum().to(dtype=out.dtype) * 0.0
         out = out.permute(0, 1, 3, 2).contiguous().reshape(B, C, H, W)
         return self.proj(out)
 
@@ -861,6 +1020,8 @@ class SHARPv32Config:
     sparse_k_cap: int = 1024
     sparse_q_block_size: int = 1024
     sparse_sparsity_ratio: float = 0.9
+    sparse_exact_topk_max_tokens: int = 1024
+    sparse_landmark_tokens: int = 256
     max_global_tokens: Optional[int] = None
     # RBF kernel parameters
     rbf_centers_per_head: int = 32
@@ -895,6 +1056,10 @@ class SHARPv32Config:
             self.sparse_k_cap = None
         if self.max_global_tokens is not None and self.max_global_tokens <= 0:
             raise ValueError("max_global_tokens must be positive or None")
+        if self.sparse_exact_topk_max_tokens <= 0:
+            raise ValueError("sparse_exact_topk_max_tokens must be > 0")
+        if self.sparse_landmark_tokens <= 0:
+            raise ValueError("sparse_landmark_tokens must be > 0")
         if self.ema_update_every <= 0:
             raise ValueError("ema_update_every must be > 0")
 
@@ -936,6 +1101,8 @@ class SHARPv32(nn.Module):
             'k_cap': config.sparse_k_cap,
             'q_block_size': config.sparse_q_block_size,
             'sparsity_ratio': config.sparse_sparsity_ratio,
+            'exact_topk_max_tokens': config.sparse_exact_topk_max_tokens,
+            'landmark_tokens': config.sparse_landmark_tokens,
             'rbf_centers_per_head': config.rbf_centers_per_head,
             'key_rbf_mode': config.key_rbf_mode,
             'sparsemax_pad_value': config.sparsemax_pad_value
@@ -1186,6 +1353,8 @@ def create_sharp_v32(
         logger.info(f"  window_size: {config.sparse_window_size}")
         logger.info(f"  k_cap: {config.sparse_k_cap}")
         logger.info(f"  sparsity_ratio: {config.sparse_sparsity_ratio}")
+        logger.info(f"  exact_topk_max_tokens: {config.sparse_exact_topk_max_tokens}")
+        logger.info(f"  landmark_tokens: {config.sparse_landmark_tokens}")
         logger.info(f"  rbf_centers_per_head: {config.rbf_centers_per_head}")
         logger.info(f"  key_rbf_mode: {config.key_rbf_mode}")
         logger.info(f"  ema_update_every: {config.ema_update_every}")
@@ -1269,7 +1438,12 @@ class SHARPv32Trainer:
         criterion: Optional[Callable] = None,
     ):
         self.model = model
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._orig_model = model.module if hasattr(model, "module") else model
+        self._orig_model = getattr(self._orig_model, "_orig_mod", self._orig_model)
+        try:
+            self.device = next(model.parameters()).device
+        except StopIteration:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
         # Optional loss override. When None, falls back to model.compute_loss (L1+curvature).
@@ -1277,9 +1451,6 @@ class SHARPv32Trainer:
         # matches the MRAE selection/eval metric (MST++/ARAD-1K protocol).
         self.criterion = criterion
 
-        # Store original model reference for compiled models
-        self._orig_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-        
         # v3.2.2: Get EMA update frequency from config if not specified
         if ema_update_every is None:
             ema_update_every = getattr(self._orig_model.config, 'ema_update_every', 1)
@@ -1298,6 +1469,13 @@ class SHARPv32Trainer:
         self.ema_state = self._create_ema_state() if ema_decay > 0 else None
         
         self.gradient_clip = gradient_clip
+
+    def _all_ranks_true(self, value: bool) -> bool:
+        if not (dist.is_available() and dist.is_initialized()):
+            return value
+        flag = torch.tensor(int(value), device=self.device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item())
         
     def _create_optimizer(self, lr: float, wd: float):
         """Module-aware weight decay grouping."""
@@ -1427,7 +1605,7 @@ class SHARPv32Trainer:
             outputs = self.model(inputs)
             loss = self._loss(outputs, targets)
 
-        if not torch.isfinite(loss):
+        if not self._all_ranks_true(bool(torch.isfinite(loss).item())):
             self.optimizer.zero_grad(set_to_none=True)
             return {
                 'loss': float('nan'),
@@ -1454,7 +1632,7 @@ class SHARPv32Trainer:
                 has_finite_grads = False
                 break
 
-        if not has_finite_grads:
+        if not self._all_ranks_true(has_finite_grads):
             self.optimizer.zero_grad(set_to_none=True)
             return {
                 'loss': float('nan'),
@@ -1536,6 +1714,21 @@ class SHARPv32Trainer:
             total_psnr += psnr.item()
             num_batches += 1
         
+        totals = torch.tensor(
+            [
+                total_loss,
+                total_mrae,
+                total_rmse,
+                total_psnr,
+                float(num_batches),
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss, total_mrae, total_rmse, total_psnr, num_batches = totals.tolist()
+
         if num_batches == 0:
             return {'loss': 0.0, 'mrae': 0.0, 'rmse': 0.0, 'psnr': 0.0}
         

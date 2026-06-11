@@ -60,6 +60,12 @@ class SHARPInference:
                 'sparse_q_block_size': _config_get(config, 'sparse_q_block_size', 1024),
                 'sparse_window_size': _config_get(config, 'sparse_window_size', 49),
                 'sparse_max_tokens': _config_get(config, 'sparse_max_tokens', 8192),
+                'sparse_exact_topk_max_tokens': _config_get(
+                    config, 'sparse_exact_topk_max_tokens', 1024
+                ),
+                'sparse_landmark_tokens': _config_get(
+                    config, 'sparse_landmark_tokens', 256
+                ),
                 'max_global_tokens': _config_get(config, 'max_global_tokens', None),
                 'key_rbf_mode': _config_get(config, 'key_rbf_mode', 'mean'),
                 'sparsemax_pad_value': _config_get(config, 'sparsemax_pad_value', None),
@@ -83,6 +89,8 @@ class SHARPInference:
                 'sparse_q_block_size': 1024,
                 'sparse_window_size': 49,
                 'sparse_max_tokens': 8192,
+                'sparse_exact_topk_max_tokens': 1024,
+                'sparse_landmark_tokens': 256,
                 'max_global_tokens': None,
                 'key_rbf_mode': 'mean',
                 'sparsemax_pad_value': None,
