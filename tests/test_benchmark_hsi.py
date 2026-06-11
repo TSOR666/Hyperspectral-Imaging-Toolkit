@@ -118,6 +118,29 @@ def test_tiled_prediction_matches_full_image() -> None:
     np.testing.assert_allclose(result.numpy(), expected, atol=1e-6)
 
 
+def test_tiled_mst_prediction_uses_full_image_normalization() -> None:
+    adapter = ModelAdapter(
+        _RepeatModel(),
+        torch.device("cpu"),
+        name="repeat",
+        kind="test",
+        normalization="mst",
+        use_amp=False,
+    )
+    rgb = np.linspace(0.2, 0.8, 3 * 35 * 41, dtype=np.float32).reshape(3, 35, 41)
+
+    result = predict_tiled(
+        adapter,
+        rgb,
+        tile_size=16,
+        overlap=4,
+        tile_batch_size=3,
+    )
+
+    expected = adapter.predict_batch(torch.from_numpy(rgb).unsqueeze(0))[0]
+    torch.testing.assert_close(result, expected, atol=1e-6, rtol=0.0)
+
+
 def test_ema_shadow_overlays_exact_base_state() -> None:
     model = nn.Linear(3, 2)
     base = {
