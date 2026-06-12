@@ -11,9 +11,22 @@ PIL_Image = pytest.importorskip("PIL.Image")
 cv2 = pytest.importorskip("cv2")
 
 from hsi_model.utils.data.arad_dataset import ARAD1KDataset
+from hsi_model.utils.data.loaders import DistributedEvalSampler
 from hsi_model.utils.data.mst_dataset import MST_TrainDataset, MST_ValidDataset
 from hsi_model.utils.data import mst_dataset as mst_dataset_module
 from hsi_model.utils.data.transforms import normalize_batch, denormalize_batch
+
+
+def test_distributed_eval_sampler_partitions_without_duplicates():
+    dataset = list(range(11))
+    shards = [
+        list(DistributedEvalSampler(dataset, num_replicas=4, rank=rank))
+        for rank in range(4)
+    ]
+
+    flattened = [index for shard in shards for index in shard]
+    assert sorted(flattened) == list(range(len(dataset)))
+    assert len(flattened) == len(set(flattened))
 
 
 def test_arad1k_dataset_loads_minimal():

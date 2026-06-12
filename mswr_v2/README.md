@@ -134,7 +134,7 @@ Architecture and attention options:
 | Flag | Choices / type | Default | Notes |
 | --- | --- | --- | --- |
 | `--model_size` | `tiny`, `small`, `base`, `large` | `base` | Selects a preset factory. |
-| `--attention_type` | `window`, `dual`, `landmark`, `hybrid` | `dual` | Attention block mode. |
+| `--attention_type` | `window`, `dual`, `landmark`, `hybrid` | `dual` | `window` and `landmark` select one spatial branch, `dual` fuses both, and `hybrid` adds spectral attention to the dual branches. |
 | `--landmark_pooling` | `learned`, `uniform`, `adaptive` | `learned` | Landmark/global attention pooling. |
 | `--use_checkpoint` | flag | off | Enables activation checkpointing in the training config. |
 | `--use_flash_attn` | flag | on | Defaults to enabled; set `use_flash_attn: false` in YAML to disable. |
@@ -259,7 +259,8 @@ Reference: `model/mswr_net_v212.py` (`IntegratedMSWRNet`, `MSWRDualConfig`).
 ## Training Overview
 
 - Driver: `train_mswr_v212_logging.py` with robust logging and error capture.
-- Loss: `EnhancedMSWRLoss` combines L1, SSIM, SAM (radians, logged in degrees), and gradient loss with warm‑up weighting.
+- Loss: `EnhancedMSWRLoss` combines L1, SSIM, SAM (radians, logged in degrees), and gradient loss with warm-up weighting.
+- Validation: reports clamped reflectance-domain metrics and raw MRAE; checkpoint selection follows the official MST++ raw-MRAE protocol.
 - Optimizer: AdamW/Adam/SGD with grouped parameter decay; continuous warm‑up + cosine/step/exponential scheduler via `LambdaLR`.
 - Efficiency: AMP with `--amp_dtype auto|fp16|bf16`, channels-last CUDA training, gradient checkpointing, gradient accumulation, optional `torch.compile`, multi‑GPU DDP, EMA.
 - Data: `dataloader.py` (ARAD‑1K MST++ style). Patch extraction by `patch_size` and `stride`, optional RGB BGR→RGB, min/max scaling.

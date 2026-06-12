@@ -48,6 +48,11 @@ memory_mode: standard
 lazy_cache_size: 3  # per-worker RGB scene + open-HDF5 handle LRU when memory_mode=lazy
 validation_max_batches: null
 finite_check_interval: 100
+# Score checkpoints in the same physical reflectance domain used by
+# cswin_test_ntire.py and prediction export. Keep raw MRAE as a diagnostic so
+# output-range drift remains visible without selecting a worse deployed model.
+validation_clamp_output: true
+validation_report_raw_mrae: true
 
 # Stop a single-resolution run after validation MRAE has genuinely plateaued.
 # For progressive training this is applied only to the final patch-size stage,

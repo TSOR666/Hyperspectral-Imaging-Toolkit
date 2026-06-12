@@ -166,6 +166,20 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
+def _validate_checkpoint_compatibility(
+    incompatible: Any,
+    model_key_count: int,
+    label: str,
+) -> None:
+    """Refuse to resume from a checkpoint that leaves most weights random."""
+    missing = list(incompatible.missing_keys)
+    if len(missing) > 0.25 * max(1, model_key_count):
+        raise RuntimeError(
+            f"{label}: {len(missing)}/{model_key_count} model keys were not loaded; "
+            "checkpoint and architecture are incompatible."
+        )
+
+
 def _env_int(name: str, default: int = 0) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -931,6 +945,30 @@ def create_scheduler(optimizer: torch.optim.Optimizer, config: TrainingConfig,
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
+
+def _accumulation_group_size(
+    batch_index: int,
+    total_batches: int,
+    accumulation_steps: int,
+) -> int:
+    """Return the number of microbatches in this batch's accumulation group."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    group_start = (batch_index // accumulation_steps) * accumulation_steps
+    return min(accumulation_steps, total_batches - group_start)
+
+
+def _is_accumulation_boundary(
+    batch_index: int,
+    total_batches: int,
+    accumulation_steps: int,
+) -> bool:
+    """Return whether this microbatch should trigger an optimizer step."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    return (
+        (batch_index + 1) % accumulation_steps == 0
+        or batch_index + 1 == total_batches
+    )
+
 class ModelEMA:
     """Exponential moving average (EMA) of model parameters for better generalization"""
     def __init__(self, model: nn.Module, decay: float = 0.999):
@@ -1039,7 +1077,9 @@ class EnhancedTrainer:
         self.val_losses = []
         self.early_stopping = None
         self.early_stopping_warmup = max(0, config.early_stopping_warmup)
-        self.early_stopping_metric_key = 'psnr' if config.early_stopping_mode == 'max' else 'mrae'
+        self.early_stopping_metric_key = (
+            'psnr' if config.early_stopping_mode == 'max' else 'selection_mrae'
+        )
         self.ema = None
         self._consecutive_nan_count = 0  # Convergence safeguard: halt after N consecutive NaN losses
 
@@ -1377,13 +1417,13 @@ class EnhancedTrainer:
         
         # Scheduler stepping is gated by gradient_accumulation_steps in
         # train_epoch (only on accumulation boundaries). The total number of
-        # scheduler.step() calls per epoch is therefore floor(N / accum), not N.
+        # scheduler.step() calls per epoch is therefore ceil(N / accum), not N.
         # Without this division the cosine schedule would only complete
         # 1/accum of its trajectory by the time training ends, and warmup
         # would last accum× longer than configured.
         accum = max(1, int(getattr(self.config, "gradient_accumulation_steps", 1)))
         train_batches_per_epoch = self._logical_batches_per_epoch()
-        steps_per_epoch = max(1, train_batches_per_epoch // accum)
+        steps_per_epoch = max(1, math.ceil(train_batches_per_epoch / accum))
         self.scheduler = create_scheduler(self.optimizer, self.config, steps_per_epoch)
         
         # Resume from checkpoint if specified
@@ -1503,6 +1543,11 @@ class EnhancedTrainer:
             
             # Load model state
             incompatible = unwrap_model(self.model).load_state_dict(checkpoint['state_dict'], strict=False)
+            _validate_checkpoint_compatibility(
+                incompatible,
+                len(unwrap_model(self.model).state_dict()),
+                "Training checkpoint",
+            )
 
             if incompatible.missing_keys or incompatible.unexpected_keys:
                 self.logger.warning(
@@ -1630,6 +1675,11 @@ class EnhancedTrainer:
         for i, (images, labels) in enumerate(pbar):
             images = self._to_device(images)
             labels = self._to_device(labels)
+            accumulation_group_size = _accumulation_group_size(
+                i,
+                max_batches,
+                self.config.gradient_accumulation_steps,
+            )
             
             # Get current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1665,9 +1715,9 @@ class EnhancedTrainer:
                         continue
                     if self.config.use_enhanced_loss:
                         loss, loss_dict = self.criterion(output_fp32, labels_fp32)
-                        loss = loss / self.config.gradient_accumulation_steps
+                        loss = loss / accumulation_group_size
                     else:
-                        loss = self.criterion(output_fp32, labels_fp32) / self.config.gradient_accumulation_steps
+                        loss = self.criterion(output_fp32, labels_fp32) / accumulation_group_size
                 else:
                     output = self.model(images)
                     if check_output_finite and not torch.isfinite(output).all():
@@ -1677,9 +1727,9 @@ class EnhancedTrainer:
                         continue
                     if self.config.use_enhanced_loss:
                         loss, loss_dict = self.criterion(output, labels)
-                        loss = loss / self.config.gradient_accumulation_steps
+                        loss = loss / accumulation_group_size
                     else:
-                        loss = self.criterion(output, labels) / self.config.gradient_accumulation_steps
+                        loss = self.criterion(output, labels) / accumulation_group_size
 
                 # NaN/Inf loss guard
                 if not torch.isfinite(loss):
@@ -1720,7 +1770,11 @@ class EnhancedTrainer:
                 raise
             
             # Gradient accumulation and optimization step
-            if (i + 1) % self.config.gradient_accumulation_steps == 0:
+            if _is_accumulation_boundary(
+                i,
+                max_batches,
+                self.config.gradient_accumulation_steps,
+            ):
                 if self.scaler is not None:
                     if self.config.gradient_clip > 0:
                         self.scaler.unscale_(self.optimizer)
@@ -1772,7 +1826,7 @@ class EnhancedTrainer:
                     )
             
             # Update metrics
-            losses.update(loss.item() * self.config.gradient_accumulation_steps)
+            losses.update(loss.item() * accumulation_group_size)
             
             # Update component losses
             if self.config.use_enhanced_loss and loss_dict:
@@ -1848,9 +1902,13 @@ class EnhancedTrainer:
                 self._track_source_bests(val_metrics)
                 
                 # Track best checkpoint using validation MRAE
-                new_best = val_metrics.get('mrae', float('inf')) < self.best_mrae
+                selection_mrae = val_metrics.get(
+                    'selection_mrae',
+                    val_metrics.get('mrae_unclamped', val_metrics.get('mrae', float('inf'))),
+                )
+                new_best = selection_mrae < self.best_mrae
                 if new_best:
-                    self.best_mrae = val_metrics['mrae']
+                    self.best_mrae = selection_mrae
                     self.save_checkpoint('best.pth', is_best=True)
                     self.logger.info(
                         f"New best validation MRAE: {self.best_mrae:.6f} "
@@ -2016,10 +2074,17 @@ class EnhancedTrainer:
             desc = 'Validation (EMA)' if use_ema else 'Validation'
             results = self._validation_pass(model_to_eval, desc=desc)
             results['evaluation_model'] = 'ema' if use_ema else 'model'
+
+        # Official MST++ validation selects checkpoints on raw model outputs.
+        # Keep clamped metrics for reflectance-domain reporting, but use the
+        # unclamped MRAE for benchmark-comparable model selection.
+        results['selection_mrae'] = results['mrae_unclamped']
         
         if self.wandb is not None:
             log_dict = {
                 'val/mrae': results['mrae'],
+                'val/mrae_unclamped': results['mrae_unclamped'],
+                'val/selection_mrae': results['selection_mrae'],
                 'val/rmse': results['rmse'],
                 'val/psnr': results['psnr'],
                 'val/epoch': self.epoch,
@@ -2050,11 +2115,19 @@ class EnhancedTrainer:
 
     @staticmethod
     def _source_mrae(val_metrics: Dict[str, float], source: str) -> float:
+        source_unclamped_key = f'{source}_mrae_unclamped'
+        if source_unclamped_key in val_metrics:
+            return float(val_metrics[source_unclamped_key])
         source_key = f'{source}_mrae'
         if source_key in val_metrics:
             return float(val_metrics[source_key])
-        if val_metrics.get('evaluation_model') == source and 'mrae' in val_metrics:
-            return float(val_metrics['mrae'])
+        if val_metrics.get('evaluation_model') == source:
+            if 'selection_mrae' in val_metrics:
+                return float(val_metrics['selection_mrae'])
+            if 'mrae_unclamped' in val_metrics:
+                return float(val_metrics['mrae_unclamped'])
+            if 'mrae' in val_metrics:
+                return float(val_metrics['mrae'])
         return float('inf')
 
     def _save_source_weights(self, source: str, mrae: float) -> None:
@@ -2224,8 +2297,12 @@ class EnhancedTrainer:
                 self._track_source_bests(val_metrics)
                 
                 # Track best performance
-                if val_metrics['mrae'] < self.best_mrae:
-                    self.best_mrae = val_metrics['mrae']
+                selection_mrae = val_metrics.get(
+                    'selection_mrae',
+                    val_metrics.get('mrae_unclamped', val_metrics['mrae']),
+                )
+                if selection_mrae < self.best_mrae:
+                    self.best_mrae = selection_mrae
                     best_epoch = epoch
                     best_eval_source = val_metrics.get('evaluation_model', 'model')
                     self.save_checkpoint('best_epoch.pth', is_best=True)
@@ -2260,6 +2337,7 @@ class EnhancedTrainer:
                 
                 log_msg += (
                     f" | Val MRAE: {val_metrics['mrae']:.6f} "
+                    f"| Val MRAE (raw): {selection_mrae:.6f} "
                     f"| Val RMSE: {val_metrics['rmse']:.6f} "
                     f"| Val PSNR: {val_metrics['psnr']:.2f}dB"
                 )
@@ -2270,7 +2348,7 @@ class EnhancedTrainer:
                 log_msg += f" | Eval Weights: {val_metrics.get('evaluation_model', 'model')}"
                 
                 # Add best performance info
-                if val_metrics['mrae'] == self.best_mrae:
+                if selection_mrae == self.best_mrae:
                     log_msg += " [best]"
                 self.logger.info(log_msg)
                 
@@ -2280,7 +2358,7 @@ class EnhancedTrainer:
                 
                 # Track metrics for analysis
                 self.train_losses.append(train_metrics['loss'])
-                self.val_losses.append(val_metrics['mrae'])
+                self.val_losses.append(selection_mrae)
 
                 # Loss plateau detection (last 20 epochs)
                 _stall_window = 20

@@ -70,6 +70,7 @@ from hsi_model.utils.training_setup import (
     setup_seed,
 )
 from hsi_model.utils.data import (
+    DistributedEvalSampler,
     create_training_datasets,
     mst_to_gan_batch,
     compute_mst_center_crop_metrics,
@@ -255,7 +256,11 @@ def validate_generator(
 
     val_sampler = None
     if distributed:
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed)
+        val_sampler = DistributedEvalSampler(
+            val_dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
+        )
     val_loader = DataLoader(
         dataset=val_dataset,
         batch_size=config.get("val_batch_size", 1),
@@ -269,7 +274,7 @@ def validate_generator(
 
     total_loss = torch.tensor(0.0, device=device)
     total_metrics: Dict[str, torch.Tensor] = {}
-    num_batches = 0
+    num_samples = 0
     amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
@@ -292,15 +297,25 @@ def validate_generator(
                 with autocast(enabled=use_amp, dtype=autocast_dtype):
                     pred_hsi = net(rgb_tensor)
                     loss = criterion(pred_hsi.float(), hsi_tensor.float())
-                total_loss += loss
-                metrics = compute_mst_center_crop_metrics(pred_hsi, hsi_tensor)
+                batch_size = int(hsi_tensor.shape[0])
+                total_loss += loss * batch_size
+                metrics = compute_mst_center_crop_metrics(
+                    pred_hsi,
+                    hsi_tensor,
+                    clamp_prediction=bool(
+                        config.get("validation_clamp_output", False)
+                    ),
+                    report_raw_mrae=bool(
+                        config.get("validation_report_raw_mrae", False)
+                    ),
+                )
                 for key, value in metrics.items():
                     if key not in total_metrics:
                         total_metrics[key] = torch.tensor(0.0, device=device)
                     if not isinstance(value, torch.Tensor):
                         value = torch.tensor(value, device=device)
-                    total_metrics[key] += value
-                num_batches += 1
+                    total_metrics[key] += value * batch_size
+                num_samples += batch_size
             except Exception as e:  # noqa: BLE001 - validation must not kill training
                 val_logger.warning("Validation error: %s", str(e))
                 validation_error = f"batch {batch_idx}: {e}"
@@ -324,18 +339,18 @@ def validate_generator(
             "Refusing to select checkpoints from partial or empty metrics."
         )
 
-    # Each rank evaluated a disjoint shard under DistributedSampler; aggregate
-    # before averaging so best-model selection and early stopping use the FULL
-    # validation set rather than rank 0's shard.
+    # Each rank evaluates a disjoint, non-padding shard. Aggregate sample sums
+    # before averaging so uneven shards and partial final batches are weighted
+    # correctly.
     if distributed and torch.distributed.is_initialized():
-        batches_t = torch.tensor(float(num_batches), device=device)
+        samples_t = torch.tensor(float(num_samples), device=device)
         torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(batches_t, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(samples_t, op=torch.distributed.ReduceOp.SUM)
         for value in total_metrics.values():
             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-        num_batches = int(batches_t.item())
+        num_samples = int(samples_t.item())
 
-    denom = max(num_batches, 1)
+    denom = max(num_samples, 1)
     avg = {"gen_loss": total_loss.item() / denom}
     avg.update({k: v.item() / denom for k, v in total_metrics.items()})
     val_logger.info(
@@ -802,7 +817,7 @@ def train_generator_only(
     train_logger.info("Progressive training complete. Best MRAE: %.6f", record_mrae_loss)
 
 
-@hydra.main(config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
     cfg = OmegaConf.to_container(config, resolve=True)
     main_logger = logging.getLogger("hsi_model.main")

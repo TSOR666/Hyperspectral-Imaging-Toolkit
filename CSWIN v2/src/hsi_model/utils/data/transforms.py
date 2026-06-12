@@ -43,12 +43,19 @@ def compute_mst_center_crop_metrics(
     pred_hsi: torch.Tensor,
     target_hsi: torch.Tensor,
     criterion: torch.nn.Module = None,
+    clamp_prediction: bool = False,
+    report_raw_mrae: bool = False,
 ) -> Dict[str, float]:
     """
     Compute metrics using the MST++ center-crop evaluation protocol.
+
+    ``clamp_prediction=True`` scores the same physical ``[0, 1]`` reflectance
+    domain used by the NTIRE inference/export path. ``report_raw_mrae`` keeps
+    the unclamped MRAE visible for diagnosing output-range drift without using
+    that mismatched value for checkpoint selection.
     """
     # Import locally to avoid circular dependencies.
-    from ...utils.metrics import compute_metrics_arad1k, compute_metrics
+    from ...utils.metrics import compute_metrics, compute_mrae
 
     pred_crop = pred_hsi[
         :,
@@ -83,15 +90,28 @@ def compute_mst_center_crop_metrics(
         VALIDATION_CENTER_CROP_START_H,
     )
 
-    try:
-        metrics = compute_metrics_arad1k(pred_crop, target_crop)
-    except Exception:
-        logger.exception("Falling back to generic metrics for MST center crop.")
-        metrics = compute_metrics(pred_crop, target_crop, compute_all=True)
+    raw_pred_crop = pred_crop.float()
+    target_crop = target_crop.float()
+    metric_pred_crop = (
+        raw_pred_crop.clamp(0.0, 1.0)
+        if clamp_prediction
+        else raw_pred_crop
+    )
+    metrics = compute_metrics(metric_pred_crop, target_crop, compute_all=True)
+
+    if clamp_prediction:
+        out_of_range = (raw_pred_crop < 0.0) | (raw_pred_crop > 1.0)
+        metrics["out_of_range_fraction"] = out_of_range.float().mean().item()
+        if report_raw_mrae:
+            metrics["raw_mrae"] = compute_mrae(
+                raw_pred_crop,
+                target_crop,
+            ).item()
 
     if criterion is not None:
         try:
-            loss_val = criterion(pred_crop, target_crop)[0]
+            loss_result = criterion(pred_crop, target_crop)
+            loss_val = loss_result[0] if isinstance(loss_result, tuple) else loss_result
             metrics["loss"] = (
                 loss_val.item() if torch.is_tensor(loss_val) else float(loss_val)
             )
