@@ -28,6 +28,13 @@ def test_packaged_training_config_matches_repository_config() -> None:
     assert packaged == repository
 
 
+def test_published_training_config_uses_l1_loss() -> None:
+    config = TrainingConfig.from_json("configs/train_arad1k.json")
+    assert config.loss.l1_weight == 1.0
+    assert config.loss.mrae_weight == 0.0
+    assert config.loss.sam_weight == 0.0
+
+
 def test_one_iteration_training_cycle_saves_reusable_checkpoint(tmp_path) -> None:
     data_root = tmp_path / "data"
     rgb_root = data_root / "Train_RGB"

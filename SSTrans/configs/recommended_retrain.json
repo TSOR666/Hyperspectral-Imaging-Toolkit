@@ -1,0 +1,4 @@
+{
+  "preset": "recommended_retrain",
+  "description": "Recommended fresh-training architecture: no spectral RPE, intended stage-wise spectral heads, CAT spatial RPE, paper residual topology, and activation checkpointing."
+}

@@ -19,7 +19,8 @@ from .attention import (
 )
 from .cat import CATBlock
 
-ResidualMode = Literal["legacy", "paper"]
+ResidualMode = Literal["legacy", "paper", "branch_delta"]
+SpectralHeadMode = Literal["legacy_constant", "stage"]
 
 
 class Spectral_MSAB(nn.Module):
@@ -29,14 +30,16 @@ class Spectral_MSAB(nn.Module):
         head: int,
         *,
         rpe_mode: RPEMode = "legacy_post_softmax",
+        head_mode: SpectralHeadMode = "legacy_constant",
         enabled: bool = True,
     ) -> None:
         super().__init__()
         self.enabled = enabled
         self.norm1 = nn.LayerNorm(dim)
+        num_heads = dim // head if head_mode == "legacy_constant" else head
         self.s_msa = Spectral_MSA(
             dim,
-            dim // head,
+            num_heads,
             False,
             rpe_mode=rpe_mode,
         )
@@ -203,6 +206,7 @@ class SST(nn.Module):
         split_size: int,
         *,
         spectral_rpe: RPEMode = "legacy_post_softmax",
+        spectral_head_mode: SpectralHeadMode = "legacy_constant",
         use_spectral_attention: bool = True,
         use_spatial_attention: bool = True,
     ) -> None:
@@ -212,6 +216,7 @@ class SST(nn.Module):
             dim,
             head,
             rpe_mode=spectral_rpe,
+            head_mode=spectral_head_mode,
             enabled=use_spectral_attention,
         )
         self.spatial_msa = Spatial_MSAB(
@@ -261,6 +266,7 @@ class SSTB(nn.Module):
         split_size: int,
         *,
         spectral_rpe: RPEMode = "legacy_post_softmax",
+        spectral_head_mode: SpectralHeadMode = "legacy_constant",
         residual_mode: ResidualMode = "legacy",
         use_spectral_attention: bool = True,
         use_spatial_attention: bool = True,
@@ -274,6 +280,7 @@ class SSTB(nn.Module):
             resolution,
             split_size,
             spectral_rpe=spectral_rpe,
+            spectral_head_mode=spectral_head_mode,
             use_spectral_attention=use_spectral_attention,
             use_spatial_attention=use_spatial_attention,
         )
@@ -282,7 +289,10 @@ class SSTB(nn.Module):
         attended = self.channel_attn(x)
         if self.residual_mode == "legacy":
             return attended + self.sst(attended)
-        return x + self.sst(attended)
+        transformed = self.sst(attended)
+        if self.residual_mode == "paper":
+            return x + transformed
+        return x + transformed - attended
 
 
 class SSTLayer(nn.Module):
@@ -295,6 +305,7 @@ class SSTLayer(nn.Module):
         num_blocks: int,
         *,
         spectral_rpe: RPEMode = "legacy_post_softmax",
+        spectral_head_mode: SpectralHeadMode = "legacy_constant",
         residual_mode: ResidualMode = "legacy",
         use_spectral_attention: bool = True,
         use_spatial_attention: bool = True,
@@ -309,6 +320,7 @@ class SSTLayer(nn.Module):
                     resolution,
                     split_size,
                     spectral_rpe=spectral_rpe,
+                    spectral_head_mode=spectral_head_mode,
                     residual_mode=residual_mode,
                     use_spectral_attention=use_spectral_attention,
                     use_spatial_attention=use_spatial_attention,
@@ -346,6 +358,7 @@ class CATLayer(nn.Module):
         use_checkpoint: bool = False,
         *,
         spectral_rpe: RPEMode = "legacy_post_softmax",
+        spectral_head_mode: SpectralHeadMode = "legacy_constant",
         cat_rpe: bool = True,
         use_spectral_attention: bool = True,
         use_spatial_attention: bool = True,
@@ -418,6 +431,7 @@ class CATLayer(nn.Module):
                     dim,
                     num_heads,
                     rpe_mode=spectral_rpe,
+                    head_mode=spectral_head_mode,
                     enabled=use_spectral_attention,
                 )
             )
@@ -552,6 +566,7 @@ class SSTransformer(nn.Module):
         patch_size: int = 8,
         *,
         spectral_rpe: RPEMode = "legacy_post_softmax",
+        spectral_head_mode: SpectralHeadMode = "legacy_constant",
         cat_rpe: bool = True,
         residual_mode: ResidualMode = "legacy",
         use_spectral_attention: bool = True,
@@ -559,8 +574,12 @@ class SSTransformer(nn.Module):
         use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
-        if residual_mode not in {"legacy", "paper"}:
+        if residual_mode not in {"legacy", "paper", "branch_delta"}:
             raise ValueError(f"Unknown residual mode: {residual_mode}")
+        if spectral_head_mode not in {"legacy_constant", "stage"}:
+            raise ValueError(
+                f"Unknown spectral head mode: {spectral_head_mode}"
+            )
 
         resolution = _resolution_tuple(input_resolution)
         encoder_depths = tuple(n_blocks)
@@ -593,6 +612,7 @@ class SSTransformer(nn.Module):
                             current_split,
                             block_count,
                             spectral_rpe=spectral_rpe,
+                            spectral_head_mode=spectral_head_mode,
                             residual_mode=residual_mode,
                             use_spectral_attention=use_spectral_attention,
                             use_spatial_attention=use_spatial_attention,
@@ -616,6 +636,7 @@ class SSTransformer(nn.Module):
             patch_size,
             use_checkpoint=use_checkpoint,
             spectral_rpe=spectral_rpe,
+            spectral_head_mode=spectral_head_mode,
             cat_rpe=cat_rpe,
             use_spectral_attention=use_spectral_attention,
             use_spatial_attention=use_spatial_attention,
@@ -649,6 +670,7 @@ class SSTransformer(nn.Module):
                             current_split,
                             block_count,
                             spectral_rpe=spectral_rpe,
+                            spectral_head_mode=spectral_head_mode,
                             residual_mode=residual_mode,
                             use_spectral_attention=use_spectral_attention,
                             use_spatial_attention=use_spatial_attention,
@@ -664,6 +686,7 @@ class SSTransformer(nn.Module):
             current_split,
             n_refine,
             spectral_rpe=spectral_rpe,
+            spectral_head_mode=spectral_head_mode,
             residual_mode=residual_mode,
             use_spectral_attention=use_spectral_attention,
             use_spatial_attention=use_spatial_attention,
@@ -779,4 +802,3 @@ def _resolution_tuple(
     if isinstance(resolution, int):
         return (resolution, resolution)
     return (int(resolution[0]), int(resolution[1]))
-

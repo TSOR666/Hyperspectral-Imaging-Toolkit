@@ -4,13 +4,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from .attention import RPEMode
-from .model import HSIFormer, ResidualMode
+from .model import HSIFormer, ResidualMode, SpectralHeadMode
 
 PresetName = Literal[
     "legacy",
     "ablation_no_rpe",
     "corrected_rpe",
     "optimized_candidate",
+    "recommended_retrain",
 ]
 
 
@@ -26,6 +27,7 @@ class HSIFormerConfig:
     n_refine: int = 2
     patch_size: int = 8
     spectral_rpe: RPEMode = "legacy_post_softmax"
+    spectral_head_mode: SpectralHeadMode = "legacy_constant"
     cat_rpe: bool = True
     residual_mode: ResidualMode = "legacy"
     use_spectral_attention: bool = True
@@ -50,6 +52,14 @@ def get_config(name: PresetName = "legacy") -> HSIFormerConfig:
             residual_mode="paper",
             use_checkpoint=True,
         )
+    if name == "recommended_retrain":
+        return HSIFormerConfig(
+            spectral_rpe="none",
+            spectral_head_mode="stage",
+            cat_rpe=True,
+            residual_mode="paper",
+            use_checkpoint=True,
+        )
     raise ValueError(f"Unknown preset: {name}")
 
 
@@ -60,4 +70,3 @@ def build_model(
     values = asdict(get_config(preset))
     values.update(overrides)
     return HSIFormer(**values)
-
