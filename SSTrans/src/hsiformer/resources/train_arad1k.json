@@ -1,0 +1,45 @@
+{
+  "data_root": "path/to/ARAD_1K",
+  "output_dir": "runs/hsiformer_arad1k",
+  "preset": "ablation_no_rpe",
+  "model": {
+    "use_checkpoint": true
+  },
+  "stages": [
+    {
+      "patch_size": 128,
+      "iterations": 300000,
+      "batch_size": 32,
+      "learning_rate": 0.0004
+    },
+    {
+      "patch_size": 256,
+      "iterations": 50000,
+      "batch_size": 8,
+      "learning_rate": 0.00004
+    },
+    {
+      "patch_size": 512,
+      "iterations": 50000,
+      "batch_size": 1,
+      "learning_rate": 0.00004
+    }
+  ],
+  "loss": {
+    "mrae_weight": 1.0,
+    "l1_weight": 0.0,
+    "sam_weight": 0.0
+  },
+  "min_learning_rate": 0.000001,
+  "crops_per_scene": 16,
+  "num_workers": 8,
+  "validation_every": 2000,
+  "checkpoint_every": 2000,
+  "log_every": 50,
+  "validation_tile_size": null,
+  "validation_overlap": 16,
+  "rgb_normalization": "scale_255",
+  "seed": 42,
+  "amp": true,
+  "grad_clip_norm": null
+}

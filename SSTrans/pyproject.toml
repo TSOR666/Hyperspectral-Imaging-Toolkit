@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hsiformer"
+version = "0.1.0"
+description = "Spatial-spectral transformer for RGB-to-hyperspectral reconstruction"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "einops>=0.7",
+    "h5py>=3.10",
+    "numpy>=1.26",
+    "pillow>=10",
+    "torch>=2.1",
+]
+
+[project.scripts]
+hsiformer-train = "hsiformer.cli:train_main"
+hsiformer-infer = "hsiformer.cli:infer_main"
+hsiformer-test = "hsiformer.cli:test_main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hsiformer = ["resources/*.txt", "resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,5 @@
+{
+  "preset": "ablation_no_rpe",
+  "description": "Disables spectral relative position bias. This is the strongest reported ablation on ARAD-origin."
+}
+
