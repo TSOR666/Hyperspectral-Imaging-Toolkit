@@ -1,0 +1,4 @@
+{
+  "preset": "rectangular_candidate",
+  "description": "Opt-in retraining candidate with native rectangular CSWin stripe pairing and local CAT padding; preserves the recommended spectral and residual settings."
+}

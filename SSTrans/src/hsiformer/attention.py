@@ -590,10 +590,16 @@ class CSWinCrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         resolution: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        crossed: bool = False,
+        compute_lepe: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, _, channels = x.shape
         height, width = resolution
-        window_height, window_width = self._window_shape(resolution)
+        window_height, window_width = self._window_shape(
+            resolution,
+            crossed=crossed,
+        )
         x = x.transpose(-2, -1).contiguous().view(
             batch,
             channels,
@@ -613,17 +619,19 @@ class CSWinCrossAttention(nn.Module):
             .contiguous()
             .reshape(-1, channels, window_height, window_width)
         )
-        lepe = (
-            self.get_v(x)
-            .reshape(
-                -1,
-                self.num_heads,
-                channels // self.num_heads,
-                window_height * window_width,
+        lepe = None
+        if compute_lepe:
+            lepe = (
+                self.get_v(x)
+                .reshape(
+                    -1,
+                    self.num_heads,
+                    channels // self.num_heads,
+                    window_height * window_width,
+                )
+                .permute(0, 1, 3, 2)
+                .contiguous()
             )
-            .permute(0, 1, 3, 2)
-            .contiguous()
-        )
         value = (
             x.reshape(
                 -1,
@@ -636,19 +644,38 @@ class CSWinCrossAttention(nn.Module):
         )
         return value, lepe
 
-    def forward(
+    @staticmethod
+    def _match_window_count(
+        windows: torch.Tensor,
+        *,
+        batch: int,
+        target_count: int,
+    ) -> torch.Tensor:
+        source_count = windows.shape[0] // batch
+        if source_count == target_count:
+            return windows
+
+        indices = (
+            (
+                torch.arange(target_count, device=windows.device)
+                + 0.5
+            )
+            * (source_count / target_count)
+        )
+        indices = indices.long().clamp_max(source_count - 1)
+        return (
+            windows.view(batch, source_count, *windows.shape[1:])
+            .index_select(1, indices)
+            .contiguous()
+            .view(batch * target_count, *windows.shape[1:])
+        )
+
+    def _forward_square(
         self,
         x1: torch.Tensor,
         x2: torch.Tensor,
-        resolution: tuple[int, int] | None = None,
+        resolution: tuple[int, int],
     ) -> torch.Tensor:
-        resolution = resolution or self.resolution
-        height, width = resolution
-        if height != width:
-            raise ValueError(
-                "Cross-shaped cross-attention currently requires square feature maps."
-            )
-
         q = self._windows(self.to_q(x1), resolution, crossed=True)
         # These names intentionally preserve the trained legacy projection order.
         value, lepe = self._value_windows(self.to_k(x2), resolution)
@@ -670,6 +697,83 @@ class CSWinCrossAttention(nn.Module):
             channels,
         )
         return self.proj_drop(self.proj(x))
+
+    def _forward_rectangular(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        resolution: tuple[int, int],
+    ) -> torch.Tensor:
+        batch, tokens, channels = x1.shape
+        q = self._windows(self.to_q(x1), resolution, crossed=True)
+
+        # Pair perpendicular stripe banks by nearest normalized spatial
+        # position. Query and key sequence lengths may differ.
+        value_map = self.to_k(x2)
+        value, _ = self._value_windows(
+            value_map,
+            resolution,
+            compute_lepe=False,
+        )
+        k = self._windows(self.to_v(x2), resolution)
+        target_count = q.shape[0] // batch
+        value = self._match_window_count(
+            value,
+            batch=batch,
+            target_count=target_count,
+        )
+        k = self._match_window_count(
+            k,
+            batch=batch,
+            target_count=target_count,
+        )
+        _, lepe = self._value_windows(
+            value_map,
+            resolution,
+            crossed=True,
+        )
+        assert lepe is not None
+
+        x = (
+            _scaled_cosine_attention(
+                q,
+                k,
+                value,
+                self.scale,
+                dropout_p=self.attn_drop.p,
+                training=self.training,
+            )
+            + lepe
+        ).transpose(1, 2).reshape(
+            -1,
+            q.shape[-2],
+            channels,
+        )
+        height, width = resolution
+        window_height, window_width = self._window_shape(
+            resolution,
+            crossed=True,
+        )
+        x = windows2img(
+            x,
+            window_height,
+            window_width,
+            height,
+            width,
+        ).view(batch, tokens, channels)
+        return self.proj_drop(self.proj(x))
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        resolution: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        resolution = resolution or self.resolution
+        height, width = resolution
+        if height == width:
+            return self._forward_square(x1, x2, resolution)
+        return self._forward_rectangular(x1, x2, resolution)
 
     def change_resol(self, new_resolution: int | tuple[int, int]) -> None:
         self.resolution = _resolution_tuple(new_resolution)

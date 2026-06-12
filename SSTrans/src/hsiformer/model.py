@@ -369,6 +369,7 @@ class CATLayer(nn.Module):
         self.depth = depth
         self.use_checkpoint = use_checkpoint
         self.use_spatial_attention = use_spatial_attention
+        self.patch_size = min(patch_size, min(self.input_resolution))
 
         self.pre_ipsa_blocks = nn.ModuleList()
         self.cpsa_blocks = nn.ModuleList()
@@ -454,7 +455,19 @@ class CATLayer(nn.Module):
         return block(x, resolution)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, _, height, width = x.shape
+        _, _, input_height, input_width = x.shape
+        pad_height = (-input_height) % self.patch_size
+        pad_width = (-input_width) % self.patch_size
+        if pad_height or pad_width:
+            mode = "reflect"
+            if pad_height >= input_height or pad_width >= input_width:
+                mode = "replicate"
+            x = F.pad(
+                x,
+                (0, pad_width, 0, pad_height),
+                mode=mode,
+            )
+        height, width = x.shape[-2:]
         resolution = (height, width)
         x = rearrange(x, "b c h w -> b (h w) c")
         for pre, cross, post, spectral in zip(
@@ -470,12 +483,13 @@ class CATLayer(nn.Module):
             x = spectral(x, height, width)
         if self.downsample is not None:
             x = self.downsample(x)
-        return rearrange(
+        x = rearrange(
             x,
             "b (h w) c -> b c h w",
             h=height,
             w=width,
         )
+        return x[:, :, :input_height, :input_width]
 
     def change_resolution(self, new_resolution: tuple[int, int]) -> None:
         self.input_resolution = tuple(new_resolution)
@@ -572,6 +586,7 @@ class SSTransformer(nn.Module):
         use_spectral_attention: bool = True,
         use_spatial_attention: bool = True,
         use_checkpoint: bool = False,
+        rectangular_spatial: bool = False,
     ) -> None:
         super().__init__()
         if residual_mode not in {"legacy", "paper", "branch_delta"}:
@@ -588,10 +603,16 @@ class SSTransformer(nn.Module):
         self.split_size = split_size
         self.input_resolution = resolution
         self.stage = len(encoder_depths)
+        self.rectangular_spatial = rectangular_spatial
         deepest_split = split_size * 2 ** max(0, self.stage - 1)
         self.min_window = math.lcm(
             patch_size * 2**self.stage,
             deepest_split * 2**self.stage,
+        )
+        deepest_scale = 2 ** max(0, self.stage - 1)
+        self.min_spatial_multiple = math.lcm(
+            2**self.stage,
+            deepest_split * deepest_scale,
         )
 
         new_channels = hidden_dim
@@ -706,7 +727,10 @@ class SSTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, input_height, input_width = x.shape
-        x = _pad_to_square_multiple(x, self.min_window)
+        if self.rectangular_spatial:
+            x = _pad_to_multiple(x, self.min_spatial_multiple)
+        else:
+            x = _pad_to_square_multiple(x, self.min_window)
         x = self.embed(x)
         residual = x
 
@@ -766,11 +790,17 @@ class SST_Multi_Stage(nn.Module):
             ]
         )
         self.min_window = patch_size * 4
+        self.rectangular_spatial = bool(
+            model_kwargs.get("rectangular_spatial", False)
+        )
         self.out = nn.Conv2d(out_dim, out_dim, 3, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, input_height, input_width = x.shape
-        x = _pad_to_square_multiple(x, self.min_window)
+        if self.rectangular_spatial:
+            x = _pad_to_multiple(x, self.min_window)
+        else:
+            x = _pad_to_square_multiple(x, self.min_window)
         x = self.embed(x)
         residual = x
         for layer in self.body:
@@ -788,6 +818,23 @@ def _pad_to_square_multiple(
     padded_side = math.ceil(side / multiple) * multiple
     pad_height = padded_side - height
     pad_width = padded_side - width
+    if not pad_height and not pad_width:
+        return x
+    mode = "reflect"
+    if pad_height >= height or pad_width >= width:
+        mode = "replicate"
+    return F.pad(x, (0, pad_width, 0, pad_height), mode=mode)
+
+
+def _pad_to_multiple(
+    x: torch.Tensor,
+    multiple: int,
+) -> torch.Tensor:
+    height, width = x.shape[-2:]
+    padded_height = math.ceil(height / multiple) * multiple
+    padded_width = math.ceil(width / multiple) * multiple
+    pad_height = padded_height - height
+    pad_width = padded_width - width
     if not pad_height and not pad_width:
         return x
     mode = "reflect"

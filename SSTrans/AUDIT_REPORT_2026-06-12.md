@@ -73,7 +73,7 @@ measured locally.
 | MEDIUM, assessed | Architecture/Quality | `src/hsiformer/model.py:260`, `src/hsiformer/model.py:298` | Legacy residual topology differs from paper equations | Neutral branches amplify by 2x per legacy block | Use paper topology for the recommended retraining preset; retain exact-identity branch-delta as an ablation |
 | MEDIUM, assessed | Architecture/Quality | `src/hsiformer/presets.py:55` | Paper text says CAT has no positional encoding, while source uses CAT RPE | Paper prose and demonstrated implementation disagree | Retain the valid pre-softmax 2-D CAT bias; remove only spectral RPE |
 | MEDIUM, unresolved | Memory/Speed | `src/hsiformer/model.py:434` | Activation checkpointing covers CAT blocks, not dominant high-resolution SST blocks | Training activations remain expensive at 256/512 stages | Add an opt-in whole-SST checkpoint mode after CUDA measurement |
-| LOW, unresolved | Speed | `src/hsiformer/model.py:759`, `src/hsiformer/attention.py:649` | Rectangular ARAD frames are padded to square for cross-attention | 482x512 becomes 512x512, adding 6.22% pixels | Redesign cross-attention for rectangular stripe pairing; retraining validation required |
+| LOW, candidate implemented | Speed/Quality | `src/hsiformer/model.py:720`, `src/hsiformer/attention.py:499` | Rectangular ARAD frames were padded to square for cross-attention | 482x512 became 512x512, adding 6.22% pixels | Opt-in native rectangular stripe pairing lowers outer padding to 496x512; retraining validation required |
 
 ## 4. Detailed Findings
 
@@ -232,12 +232,60 @@ Decision:
   Q and K projections make the two conventions equivalent up to
   reparameterization when training from scratch.
 
+### 4.6 Native rectangular spatial path
+
+Problem:
+
+- Cross-shaped cross-attention paired one vertical and one horizontal stripe
+  by batch index. The original implementation therefore required equal stripe
+  counts and equal token lengths, which only holds for square features.
+- The whole model padded both axes to one square side. ARAD's 482x512 input
+  consequently became 512x512.
+
+Candidate design:
+
+- Square inputs retain the original cross-attention path exactly.
+- For rectangular inputs, perpendicular key/value stripe banks are selected by
+  nearest normalized spatial position to match the query stripe count.
+- Query and key token lengths remain independent, which is directly supported
+  by scaled dot-product attention.
+- Cross-attention output windows are explicitly reversed into query spatial
+  order rather than flattened as if they were already raster ordered.
+- CAT pads once at the bottleneck boundary to its patch multiple and crops
+  once after the complete layer.
+- Outer padding is independent per axis and needs only the downsampling and
+  CSWin stripe multiple. For the default network this is 16 rather than 64.
+
+Safety:
+
+- `rectangular_spatial=False` remains the constructor default.
+- Existing presets and checkpoints retain their prior behavior.
+- The opt-in `rectangular_candidate` preset requires retraining.
+- A full square model with identical weights is bit-exact between the
+  recommended and rectangular modes.
+- Both rectangular stripe directions pass finite forward and backward tests.
+
+Measured CPU proxy:
+
+| input | square-padded path | rectangular path | speedup |
+|---|---:|---:|---:|
+| 120x128 | 258.1 ms | 238.2 ms | 1.08x |
+| 240x256 | 1787.5 ms | 1450.2 ms | 1.23x |
+
+These timings use a one-stage, width-8 CPU model with one thread. They
+demonstrate that the overhead is amortized at representative spatial sizes;
+they are not a CUDA or full-width throughput claim. On ARAD dimensions, outer
+tensor area drops 3.125% relative to the old padded tensor and stripe-attention
+score work drops by approximately 4.64%.
+
 ## 5. Patches Implemented
 
 - `src/hsiformer/attention.py`
   - Added CUDA SDPA dispatch for spectral, CSWin self-, and CSWin
     cross-attention.
   - Preserved the legacy post-softmax spectral RPE path.
+  - Added native rectangular cross-stripe pairing while retaining the exact
+    square path.
 - `src/hsiformer/cat.py`
   - Routed CAT attention through the shared cosine-attention kernel.
 - `src/hsiformer/data.py`
@@ -252,9 +300,12 @@ Decision:
 - `src/hsiformer/model.py`
   - Added checkpoint-compatible stage-wise spectral head selection.
   - Added an opt-in exact-identity `branch_delta` residual form.
+  - Added independent-axis outer padding and one-time CAT bottleneck padding
+    for the rectangular candidate.
 - `src/hsiformer/presets.py`
   - Added `recommended_retrain`: no spectral RPE, stage heads, CAT RPE, paper
     residual topology, and CAT activation checkpointing.
+  - Added opt-in `rectangular_candidate`.
 - `configs/train_arad1k.json`
   - Restored L1 training weights and selected `recommended_retrain`.
 - `src/hsiformer/resources/train_arad1k.json`
@@ -279,6 +330,10 @@ Added coverage:
 - Recommended spectral heads are 2/4/8/16 with constant width 16.
 - Recommended preset keeps CAT RPE while removing spectral RPE.
 - A zero transform branch is exact identity in `branch_delta` mode.
+- Native rectangular cross-attention supports both stripe directions and
+  finite gradients.
+- Square output is bit-exact with rectangular mode enabled.
+- Rectangular outer padding remains rectangular.
 
 Run:
 
@@ -290,7 +345,7 @@ uv run python scripts/smoke_model.py --preset recommended_retrain
 Final local result:
 
 ```text
-30 passed, 1 skipped
+34 passed, 1 skipped
 ```
 
 The skipped test is CUDA-only.
@@ -344,8 +399,8 @@ Medium risk:
 
 High risk, high reward:
 
-1. Redesign CSWin cross-attention to support rectangular feature maps without
-   square padding.
+1. Train and evaluate `rectangular_candidate` against `recommended_retrain`
+   from identical seeds.
 2. Distill the proven model into a narrower deployment model.
 3. Explore low-rank spectral bases only if ARAD quality and RGB back-projection
    metrics remain at or above the current result.
@@ -359,4 +414,5 @@ checkpoint behavior remains available, while fresh training now uses the most
 defensible combination supported by the paper, source lineage, and numerical
 conditioning probes. Real ARAD validation is still required before claiming
 that the stage-head and residual corrections improve reconstruction metrics;
-the more speculative identity-conditioned residual remains opt-in.
+the identity-conditioned residual and native rectangular pairing remain opt-in
+until controlled retraining confirms raw reconstruction quality.

@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from hsiformer.attention import _scaled_cosine_attention
+from hsiformer.attention import CSWinCrossAttention, _scaled_cosine_attention
 
 
 def _reference_attention(
@@ -40,6 +40,30 @@ def test_scaled_cosine_attention_matches_reference_on_cpu() -> None:
         attention_bias=bias,
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("stripe_index", [0, 1])
+def test_cross_attention_supports_rectangular_features(
+    stripe_index: int,
+) -> None:
+    torch.manual_seed(0)
+    attention = CSWinCrossAttention(
+        dim=8,
+        resolution=(6, 8),
+        idx=stripe_index,
+        split_size=2,
+        num_heads=2,
+    )
+    first = torch.randn(2, 48, 8, requires_grad=True)
+    second = torch.randn(2, 48, 8, requires_grad=True)
+
+    output = attention(first, second)
+    output.square().mean().backward()
+
+    assert output.shape == first.shape
+    assert torch.isfinite(output).all()
+    assert first.grad is not None and torch.isfinite(first.grad).all()
+    assert second.grad is not None and torch.isfinite(second.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
