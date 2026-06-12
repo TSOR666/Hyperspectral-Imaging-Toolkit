@@ -12,6 +12,7 @@ PresetName = Literal[
     "corrected_rpe",
     "optimized_candidate",
     "recommended_retrain",
+    "rectangular_candidate",
 ]
 
 
@@ -33,6 +34,7 @@ class HSIFormerConfig:
     use_spectral_attention: bool = True
     use_spatial_attention: bool = True
     use_checkpoint: bool = False
+    rectangular_spatial: bool = False
 
     def build(self) -> HSIFormer:
         return HSIFormer(**asdict(self))
@@ -59,6 +61,15 @@ def get_config(name: PresetName = "legacy") -> HSIFormerConfig:
             cat_rpe=True,
             residual_mode="paper",
             use_checkpoint=True,
+        )
+    if name == "rectangular_candidate":
+        return HSIFormerConfig(
+            spectral_rpe="none",
+            spectral_head_mode="stage",
+            cat_rpe=True,
+            residual_mode="paper",
+            use_checkpoint=True,
+            rectangular_spatial=True,
         )
     raise ValueError(f"Unknown preset: {name}")
 

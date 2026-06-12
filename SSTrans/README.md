@@ -94,11 +94,19 @@ Available presets are:
   activation checkpointing.
 - `recommended_retrain`: no spectral RPE, intended stage-wise spectral heads,
   CAT RPE, paper residual topology, and activation checkpointing.
+- `rectangular_candidate`: the recommended retraining architecture plus native
+  rectangular CSWin stripe pairing and local CAT patch padding. Square inputs
+  remain bit-exact; rectangular behavior requires retraining validation.
 
 `residual_mode="branch_delta"` is also available for controlled experiments.
 It makes each neutral SST branch an exact identity, unlike the legacy and
 literal paper graphs, but is not the default until an ARAD-1K ablation confirms
 its reconstruction quality.
+
+The rectangular candidate is intentionally separate from the default training
+configuration. Select `"preset": "rectangular_candidate"` only for a fresh
+training run; its square path is checkpoint-equivalent, but rectangular stripe
+pairing changes the function and should be compared on raw ARAD metrics.
 
 Change `preset`, model overrides, stages, loss weights, or validation tiling in
 the JSON configuration for controlled ablations.

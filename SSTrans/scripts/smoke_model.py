@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
             "corrected_rpe",
             "optimized_candidate",
             "recommended_retrain",
+            "rectangular_candidate",
         ),
     )
     parser.add_argument("--size", type=int, default=64)

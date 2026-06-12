@@ -24,6 +24,7 @@ PRESETS = (
     "corrected_rpe",
     "optimized_candidate",
     "recommended_retrain",
+    "rectangular_candidate",
 )
 
 

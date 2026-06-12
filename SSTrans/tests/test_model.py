@@ -50,6 +50,36 @@ def test_recommended_retrain_preset_runs() -> None:
     assert torch.isfinite(outputs).all()
 
 
+def test_rectangular_candidate_avoids_outer_square_padding() -> None:
+    model = _tiny_model("rectangular_candidate").eval()
+    embedded_shapes: list[tuple[int, int]] = []
+    handle = model.embed.register_forward_pre_hook(
+        lambda _module, inputs: embedded_shapes.append(
+            tuple(inputs[0].shape[-2:])
+        )
+    )
+    with torch.inference_mode():
+        outputs = model(torch.rand(1, 3, 13, 15))
+    handle.remove()
+
+    assert embedded_shapes == [(14, 16)]
+    assert outputs.shape == (1, 31, 13, 15)
+    assert torch.isfinite(outputs).all()
+
+
+def test_rectangular_mode_preserves_square_model_output() -> None:
+    torch.manual_seed(5)
+    square = _tiny_model("recommended_retrain").eval()
+    rectangular = _tiny_model("rectangular_candidate").eval()
+    rectangular.load_state_dict(square.state_dict())
+    inputs = torch.rand(1, 3, 16, 16)
+
+    with torch.inference_mode():
+        expected = square(inputs)
+        actual = rectangular(inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_recommended_retrain_uses_stage_spectral_heads() -> None:
     model = build_model(
         "recommended_retrain",
