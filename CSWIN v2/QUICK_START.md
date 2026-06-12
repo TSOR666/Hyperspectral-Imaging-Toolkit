@@ -67,14 +67,14 @@ export HSI_DATA_DIR=/path/to/your/ARAD_1K
 
 ### Basic Training
 ```bash
-python src/hsi_model/training_script_fixed.py \
+python src/hsi_model/train_generator.py \
     --config-name config \
     data_dir=/path/to/ARAD_1K
 ```
 
-### Memory-Optimized Training
+### Legacy Sinkhorn-GAN Training
 ```bash
-python src/hsi_model/train_optimized.py \
+python src/hsi_model/training_script_fixed.py \
     --config-name config \
     data_dir=/path/to/ARAD_1K
 ```
@@ -82,7 +82,7 @@ python src/hsi_model/train_optimized.py \
 ### Multi-GPU Training
 ```bash
 python -m torch.distributed.run --nproc_per_node=4 \
-    src/hsi_model/training_script_fixed.py \
+    src/hsi_model/train_generator.py \
     --config-name config \
     data_dir=/path/to/ARAD_1K
 ```
@@ -94,13 +94,12 @@ python -m torch.distributed.run --nproc_per_node=4 \
 Override any parameter from the config:
 
 ```bash
-python src/hsi_model/training_script_fixed.py \
+python src/hsi_model/train_generator.py \
     data_dir=/path/to/ARAD_1K \
     batch_size=16 \
     epochs=500 \
-    optimizer.generator_lr=1e-4 \
-    optimizer.discriminator_lr=5e-5 \
-    lambda_adversarial=0.2 \
+    generator_lr=1e-4 \
+    objective=l1_with_mrae \
     mixed_precision=true
 ```
 
@@ -144,8 +143,8 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 ### "CUDA out of memory"
 **Solutions:**
 1. Reduce batch size: `batch_size=8`
-2. Use gradient accumulation: `gradient_accumulation_steps=4`
-3. Use memory-optimized trainer: `train_optimized.py`
+2. Reduce the progressive-stage batch sizes
+3. Set `memory_mode=lazy` to trade loader throughput for lower host RAM
 
 ### "Padding error at dimension 3"
 **Solution:** This is already fixed in the code. Ensure you're using the latest version.
@@ -156,19 +155,17 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `batch_size` | 20 | Batch size for training |
+| `batch_size` | 32 | Batch size for training |
 | `val_batch_size` | 1 | Batch size for validation |
 | `patch_size` | 128 | Size of image patches |
-| `epochs` | 300 | Number of training epochs |
-| `generator_lr` | 0.0001 | Generator learning rate |
-| `discriminator_lr` | 0.00002 | Discriminator learning rate |
-| `lambda_rec` | 1.0 | Reconstruction loss weight |
-| `lambda_mrae` | 0.2 | Relative MRAE-style loss weight |
-| `lambda_adversarial` | 0.01 | Adversarial loss weight |
-| `lambda_perceptual` | 0.0 | Perceptual loss weight |
-| `lambda_sam` | 0.10 | SAM loss weight |
+| `epochs` | 40 | Number of single-stage training epochs |
+| `generator_lr` | 0.0004 | Generator learning rate |
+| `optimizer` | `adamw` | Generator optimizer |
+| `weight_decay` | 0.01 | AdamW weight decay |
+| `objective` | `l1_with_mrae` | Active reconstruction objective |
+| `mrae_weight` | 0.1 | Stabilized MRAE correction weight |
 | `mixed_precision` | true | Use automatic mixed precision |
-| `n_critic` | 1 | Discriminator steps per generator step |
+| `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
 
 See `src/configs/config.yaml` for all parameters.
 
@@ -205,20 +202,18 @@ print('✅ Installation verified!')
 - Use `mixed_precision=true` (enabled by default)
 - Increase `batch_size` if GPU memory allows
 - Use `num_workers=4` or more for data loading
-- Enable `gradient_accumulation_steps=2` for larger effective batch size
 
 ### For Lower Memory:
-- Use `train_optimized.py` instead of `training_script_fixed.py`
 - Reduce `batch_size=8`
-- Increase `gradient_accumulation_steps=4`
+- Reduce batch sizes in `progressive_stages`
 - Set `memory_mode=lazy` in config for file-backed MST data with bounded per-worker caches.
 - Tune `lazy_cache_size` to trade RAM for random-access speed. Keep `memory_mode=standard` when throughput matters more than resident memory.
 
 ### For Better Quality:
 - Increase `epochs=500`
-- Tune loss weights (`lambda_*`)
-- Experiment with `sinkhorn_epsilon` and `sinkhorn_iters`
-- Enable `use_r1_regularization=true`
+- Compare `objective=l1`, `objective=mrae`, and `objective=l1_with_mrae`
+- Enable the documented progressive 128 -> 256 -> 512 stages
+- Track both deployed `mrae` and diagnostic `raw_mrae`
 
 ---
 
@@ -226,7 +221,7 @@ print('✅ Installation verified!')
 
 **Get detailed logs:**
 ```bash
-HYDRA_FULL_ERROR=1 python src/hsi_model/training_script_fixed.py ...
+HYDRA_FULL_ERROR=1 python src/hsi_model/train_generator.py ...
 ```
 
 **Check GPU usage:**
@@ -251,12 +246,11 @@ export HSI_LOG_DIR=./experiments/run1/logs
 export HSI_CKPT_DIR=./experiments/run1/checkpoints
 
 # 2. Run training with custom params
-python src/hsi_model/training_script_fixed.py \
+python src/hsi_model/train_generator.py \
     --config-name config \
     batch_size=16 \
-    epochs=500 \
-    optimizer.generator_lr=1e-4 \
-    lambda_adversarial=0.15
+    epochs=40 \
+    generator_lr=4e-4
 
 # 3. Monitor (in another terminal)
 tail -f experiments/run1/logs/training.log
@@ -282,7 +276,7 @@ ls -lh experiments/run1/checkpoints/
 
 Just run:
 ```bash
-python src/hsi_model/training_script_fixed.py \
+python src/hsi_model/train_generator.py \
     --config-name config \
     data_dir=/path/to/ARAD_1K
 ```

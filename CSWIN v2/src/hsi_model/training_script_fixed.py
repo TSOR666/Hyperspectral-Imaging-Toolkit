@@ -990,7 +990,7 @@ def train_sinkhorn_gan(
 # Main Entry Point
 # ============================================
 
-@hydra.main(config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
     """Main function for Sinkhorn GAN training."""
     cfg = OmegaConf.to_container(config, resolve=True)

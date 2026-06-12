@@ -58,6 +58,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 # Setup logging
 logger = logging.getLogger(__name__)
 
+_WAVELET_GATE_INIT_BIAS = 4.0
+
 
 def _wrap_block_with_checkpoint(block: nn.Module) -> nn.Module:
     """Apply activation checkpointing with the supported torch.utils API."""
@@ -479,15 +481,37 @@ class MSWRDualConfig:
     
     def __post_init__(self) -> None:
         """Enhanced validation with detailed error messages"""
+        if self.attention_type not in {'window', 'dual', 'landmark', 'hybrid'}:
+            raise ValueError(f"Unsupported attention_type: {self.attention_type!r}")
+
         if self.wavelet_levels is None:
             self.wavelet_levels = list(range(1, self.num_stages + 1))
-        
-        if self.base_channels % self.num_heads != 0:
-            raise ValueError(
-                f"base_channels ({self.base_channels}) must be divisible by "
-                f"num_heads ({self.num_heads}). "
-                f"Try base_channels={self.base_channels - (self.base_channels % self.num_heads) + self.num_heads}"
-            )
+
+        if self.channel_expansion <= 0:
+            raise ValueError("channel_expansion must be positive")
+
+        stage_channels = []
+        channels = self.base_channels
+        for stage_idx in range(self.num_stages):
+            stage_channels.append(channels)
+            if channels % self.num_heads != 0:
+                raise ValueError(
+                    f"stage {stage_idx} channels ({channels}) must be divisible by "
+                    f"num_heads ({self.num_heads}); base_channels={self.base_channels}, "
+                    f"channel_expansion={self.channel_expansion}."
+                )
+            if stage_idx < self.num_stages - 1:
+                channels = int(channels * self.channel_expansion)
+
+        decoder_channels = stage_channels[-1]
+        for expected_channels in reversed(stage_channels[:-1]):
+            decoder_channels = int(decoder_channels / self.channel_expansion)
+            if decoder_channels != expected_channels:
+                raise ValueError(
+                    "channel_expansion does not invert the encoder widths cleanly: "
+                    f"expected decoder width {expected_channels}, got {decoder_channels} "
+                    f"from encoder widths {stage_channels}."
+                )
         
         if len(self.wavelet_levels) != self.num_stages:
             logger.warning(
@@ -970,45 +994,51 @@ class EnhancedDualAttention2D(nn.Module):
         super().__init__()
         self.config = config
         self.dim = dim
+        self.use_window_attn = config.attention_type in {'window', 'dual', 'hybrid'}
+        self.use_landmark_attn = config.attention_type in {'landmark', 'dual', 'hybrid'}
         
         # Use create_norm_layer which now properly handles all norm types
         # For BatchNorm/GroupNorm, it returns AdaptiveNorm2d to handle NCHW format
         self.norm = create_norm_layer(dim, config.norm_type, for_conv=False)
         
-        # Optimized attention modules
-        self.window_attn = OptimizedWindowAttention2D(
-            dim, config.num_heads, config.window_size,
-            config.use_flash_attn, config.attention_dropout,
-            config.fuse_qkv_small_maps, config.memory_efficient
-        )
-        
-        self.landmark_attn = OptimizedLandmarkAttention2D(
-            dim, config.num_heads, config.num_landmarks,
-            config.landmark_pooling, config.use_flash_attn,
-            config.attention_dropout
-        )
+        if self.use_window_attn:
+            self.window_attn = OptimizedWindowAttention2D(
+                dim, config.num_heads, config.window_size,
+                config.use_flash_attn, config.attention_dropout,
+                config.fuse_qkv_small_maps, config.memory_efficient
+            )
 
-        # Optional MST++-style spectral (band-to-band) attention branch. getattr
-        # keeps older configs/checkpoints (without the field) working.
-        self.use_spectral_attn = getattr(config, 'use_spectral_attn', False)
+        if self.use_landmark_attn:
+            self.landmark_attn = OptimizedLandmarkAttention2D(
+                dim, config.num_heads, config.num_landmarks,
+                config.landmark_pooling, config.use_flash_attn,
+                config.attention_dropout
+            )
+
+        # "hybrid" means dual spatial attention plus spectral attention.
+        # use_spectral_attn remains an orthogonal opt-in for the other modes.
+        self.use_spectral_attn = (
+            config.attention_type == 'hybrid'
+            or getattr(config, 'use_spectral_attn', False)
+        )
         if self.use_spectral_attn:
             self.spectral_attn = SpectralMSA2D(dim, config.num_heads, config.attention_dropout)
 
         # Enhanced fusion mechanisms
-        if config.local_global_fusion == 'adaptive':
+        if self.use_window_attn and self.use_landmark_attn and config.local_global_fusion == 'adaptive':
             self.fusion_gate = nn.Sequential(
                 nn.Conv2d(dim * 2, dim // 2, 1),
                 nn.GELU(),
                 nn.Conv2d(dim // 2, dim, 1),
                 nn.Sigmoid()
             )
-        elif config.local_global_fusion == 'gated':
+        elif self.use_window_attn and self.use_landmark_attn and config.local_global_fusion == 'gated':
             self.gate_proj = nn.Sequential(
                 nn.Conv2d(dim * 2, dim, 1),
                 nn.GELU(),
                 nn.Conv2d(dim, dim * 2, 1)
             )
-        elif config.local_global_fusion == 'concat':
+        elif self.use_window_attn and self.use_landmark_attn and config.local_global_fusion == 'concat':
             self.fusion_proj = nn.Conv2d(dim * 2, dim, 1)
         
         self.proj = nn.Conv2d(dim, dim, 1)
@@ -1038,12 +1068,14 @@ class EnhancedDualAttention2D(nn.Module):
             x_norm = self.norm(x_norm)  # (B, H, W, C) -> (B, H, W, C)
             x_norm = x_norm.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         
-        # Parallel attention computation
-        local_out = self.window_attn(x_norm)  # (B, C, H, W)
-        global_out = self.landmark_attn(x_norm)  # (B, C, H, W)
-        
-        # Enhanced fusion
-        if self.config.local_global_fusion == 'adaptive':
+        local_out = self.window_attn(x_norm) if self.use_window_attn else None
+        global_out = self.landmark_attn(x_norm) if self.use_landmark_attn else None
+
+        if local_out is None:
+            fused = global_out
+        elif global_out is None:
+            fused = local_out
+        elif self.config.local_global_fusion == 'adaptive':
             gate = self.fusion_gate(torch.cat([local_out, global_out], dim=1))  # (B, 2*C, H, W) -> (B, C, H, W)
             fused = gate * local_out + (1 - gate) * global_out  # broadcast is elementwise (B, C, H, W)
         elif self.config.local_global_fusion == 'gated':
@@ -1167,17 +1199,22 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             )
             
             # Better initialization for wavelet gate
-            nn.init.constant_(self.wavelet_gate[-2].weight, 0.01)
-            nn.init.constant_(self.wavelet_gate[-2].bias, 1.0)
+            nn.init.zeros_(self.wavelet_gate[-2].weight)
+            nn.init.constant_(self.wavelet_gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
         else:
             self.dwt = None
             self.wavelet_level = 0
         
         # Core transformer components
         self.attn = EnhancedDualAttention2D(dim, config)
+        block_is_checkpointed = (
+            config.use_checkpoint
+            and stage_idx in (config.checkpoint_blocks or [])
+        )
         self.ffn = OptimizedFFN2D(
             dim, config.mlp_ratio, config.ffn_type, 
-            config.dropout, config.memory_efficient
+            config.dropout,
+            config.memory_efficient and config.use_checkpoint and not block_is_checkpointed
         )
         
         # Use standard LayerNorm for FFN (we handle format conversion)
@@ -1494,7 +1531,9 @@ class IntegratedMSWRNet(nn.Module):
         if config.use_multi_scale_input:
             try:
                 self.input_proj = EnhancedMultiScaleInputProjection(
-                    config.input_channels, config.base_channels, config.memory_efficient
+                    config.input_channels,
+                    config.base_channels,
+                    config.memory_efficient and config.use_checkpoint,
                 )
             except ValueError as e:
                 # Fallback to simple projection if grouped conv fails
@@ -1602,14 +1641,12 @@ class IntegratedMSWRNet(nn.Module):
             if self.input_skip.bias is not None:
                 nn.init.zeros_(self.input_skip.bias)
 
-        # Re-apply the wavelet-gate soft-identity init (gate ~ sigmoid(1.0) ~
-        # 0.73 pass-through of the high-frequency bands at start); the Kaiming
-        # apply() above wiped it in the same way it wiped the output head.
+        # Re-apply the near-identity wavelet-gate init after Kaiming.
         for module in self.modules():
             gate = getattr(module, "wavelet_gate", None)
             if gate is not None:
-                nn.init.constant_(gate[-2].weight, 0.01)
-                nn.init.constant_(gate[-2].bias, 1.0)
+                nn.init.zeros_(gate[-2].weight)
+                nn.init.constant_(gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):
@@ -1840,7 +1877,10 @@ class IntegratedMSWRNet(nn.Module):
                 'num_stages': self.config.num_stages,
                 'base_channels': self.config.base_channels,
                 'attention_type': self.config.attention_type,
-                'use_spectral_attn': getattr(self.config, 'use_spectral_attn', False),
+                'use_spectral_attn': (
+                    self.config.attention_type == 'hybrid'
+                    or getattr(self.config, 'use_spectral_attn', False)
+                ),
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
                 'wavelet_levels': list(self.config.wavelet_levels or []),
@@ -1874,8 +1914,7 @@ def create_mswr_tiny(**kwargs: Any) -> IntegratedMSWRNet:
     """Create tiny MSWR model optimized for speed"""
     config = MSWRDualConfig(
         base_channels=32, num_stages=2, num_heads=4,
-        window_size=4, num_landmarks=32, 
-        norm_type='layer', memory_efficient=True,
+        window_size=4, num_landmarks=32,
         **kwargs
     )
     return IntegratedMSWRNet(config)
@@ -1885,7 +1924,6 @@ def create_mswr_small(**kwargs: Any) -> IntegratedMSWRNet:
     config = MSWRDualConfig(
         base_channels=48, num_stages=3, num_heads=6,
         window_size=8, num_landmarks=49,
-        norm_type='layer', memory_efficient=True,
         **kwargs
     )
     return IntegratedMSWRNet(config)
@@ -1895,7 +1933,6 @@ def create_mswr_base(**kwargs: Any) -> IntegratedMSWRNet:
     config = MSWRDualConfig(
         base_channels=64, num_stages=3, num_heads=8,
         window_size=8, num_landmarks=64,
-        norm_type='layer', memory_efficient=True,
         **kwargs
     )
     return IntegratedMSWRNet(config)
@@ -1905,7 +1942,6 @@ def create_mswr_large(**kwargs: Any) -> IntegratedMSWRNet:
     config = MSWRDualConfig(
         base_channels=96, num_stages=4, num_heads=12,
         window_size=12, num_landmarks=128,
-        norm_type='layer', memory_efficient=True,
         **kwargs
     )
     return IntegratedMSWRNet(config)

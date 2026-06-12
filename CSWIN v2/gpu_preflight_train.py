@@ -24,6 +24,7 @@ from hsi_model.models import (  # noqa: E402
     NoiseRobustCSWinModel,
     NoiseRobustLoss,
 )
+from hsi_model.train_generator import build_criterion  # noqa: E402
 from hsi_model.utils.metrics import compute_metrics  # noqa: E402
 from hsi_model.utils.training_setup import setup_paths  # noqa: E402
 
@@ -49,8 +50,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--trainer",
-        choices=("sinkhorn", "optimized"),
-        default="sinkhorn",
+        choices=("generator", "sinkhorn", "optimized"),
+        default="generator",
         help="Training entrypoint to launch after preflight passes.",
     )
     parser.add_argument("--device", type=int, default=0, help="CUDA device index to test.")
@@ -113,7 +114,12 @@ def hydra_override_value(args: Sequence[str], key: str, default: str | None = No
 
 
 def trainer_script(trainer: str) -> Path:
-    filename = "train_optimized.py" if trainer == "optimized" else "training_script_fixed.py"
+    filenames = {
+        "generator": "train_generator.py",
+        "sinkhorn": "training_script_fixed.py",
+        "optimized": "train_optimized.py",
+    }
+    filename = filenames[trainer]
     return ROOT / "src" / "hsi_model" / filename
 
 
@@ -140,6 +146,15 @@ def tiny_config() -> dict[str, object]:
         "num_heads": 2,
         "norm_groups": 4,
         "output_activation": "none",
+        "objective": "l1_with_mrae",
+        "mrae_epsilon": 1e-2,
+        "mrae_weight": 0.1,
+        "l1_weight": 1.0,
+        "sampling": "pixelshuffle",
+        "spectral_attention_type": "s_msa",
+        "cswin_attention_mode": "local_global",
+        "cswin_global_tokens": 1024,
+        "stage_depths": [1, 1, 1, 1, 1],
         "lambda_rec": 1.0,
         "lambda_perceptual": 0.0,
         "lambda_adversarial": 0.1,
@@ -223,9 +238,11 @@ def build_gpu_context(args: argparse.Namespace) -> dict[str, object]:
     device = torch.device(f"cuda:{args.device}")
     torch.manual_seed(123)
     torch.cuda.manual_seed_all(123)
-    model = NoiseRobustCSWinModel(tiny_config()).to(device)
-    criterion = NoiseRobustLoss(tiny_config()).to(device)
+    config = tiny_config()
+    model = NoiseRobustCSWinModel(config).to(device)
+    criterion = NoiseRobustLoss(config).to(device)
     disc_criterion = ComputeSinkhornDiscriminatorLoss(criterion)
+    generator_criterion = build_criterion(config).to(device)
     batch_size = int(args.preflight_batch_size)
     size = int(args.preflight_size)
     rgb = torch.rand(batch_size, 3, size, size, device=device)
@@ -235,6 +252,8 @@ def build_gpu_context(args: argparse.Namespace) -> dict[str, object]:
         "model": model,
         "criterion": criterion,
         "disc_criterion": disc_criterion,
+        "generator_criterion": generator_criterion,
+        "generator_only": args.trainer == "generator",
         "rgb": rgb,
         "hsi": hsi,
     }
@@ -278,6 +297,20 @@ def assert_training_step(context: dict[str, object]) -> str:
     assert isinstance(hsi, torch.Tensor)
 
     model.train()
+    if context.get("generator_only", False):
+        generator_criterion = context["generator_criterion"]
+        assert isinstance(generator_criterion, torch.nn.Module)
+        optimizer = torch.optim.AdamW(model.generator.parameters(), lr=1e-4)
+        optimizer.zero_grad(set_to_none=True)
+        pred = model.generator(rgb)
+        loss = generator_criterion(pred.float(), hsi.float())
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"non-finite generator-only loss: {loss}")
+        loss.backward()
+        optimizer.step()
+        context["pred_train"] = pred.detach()
+        return f"generator_loss={loss.item():.6f}"
+
     optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=1e-4)
     optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=1e-4)
 
@@ -319,12 +352,21 @@ def assert_amp_step(context: dict[str, object], enabled: bool) -> str:
     assert isinstance(hsi, torch.Tensor)
 
     model.train()
-    optimizer = torch.optim.Adam(model.generator.parameters(), lr=1e-4)
+    optimizer = (
+        torch.optim.AdamW(model.generator.parameters(), lr=1e-4)
+        if context.get("generator_only", False)
+        else torch.optim.Adam(model.generator.parameters(), lr=1e-4)
+    )
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(enabled=True):
         pred = model.generator(rgb)
-        loss, _ = criterion(pred, hsi, current_iteration=2)
+        if context.get("generator_only", False):
+            generator_criterion = context["generator_criterion"]
+            assert isinstance(generator_criterion, torch.nn.Module)
+            loss = generator_criterion(pred.float(), hsi.float())
+        else:
+            loss, _ = criterion(pred, hsi, current_iteration=2)
     if not torch.isfinite(loss):
         raise RuntimeError(f"non-finite AMP loss: {loss}")
     scaler.scale(loss).backward()
@@ -366,11 +408,16 @@ def run_preflight(args: argparse.Namespace) -> list[CheckResult]:
             context.update(build_gpu_context(args))
             return f"device={context['device']}"
 
+        train_step_name = (
+            "Generator train step"
+            if args.trainer == "generator"
+            else "Sinkhorn train step"
+        )
         gpu_checks: list[tuple[str, Callable[[], str]]] = [
             ("GPU context allocation", build_context),
             ("Model instantiation", lambda: assert_model_instantiates(context)),
             ("Generator forward finite", lambda: assert_forward_finite(context)),
-            ("Sinkhorn train step", lambda: assert_training_step(context)),
+            (train_step_name, lambda: assert_training_step(context)),
             ("AMP train step", lambda: assert_amp_step(context, not args.no_amp_check)),
             ("Metrics finite", lambda: assert_metrics_finite(context)),
         ]
@@ -381,7 +428,11 @@ def run_preflight(args: argparse.Namespace) -> list[CheckResult]:
             "GPU context allocation",
             "Model instantiation",
             "Generator forward finite",
-            "Sinkhorn train step",
+            (
+                "Generator train step"
+                if args.trainer == "generator"
+                else "Sinkhorn train step"
+            ),
             "AMP train step",
             "Metrics finite",
         ):

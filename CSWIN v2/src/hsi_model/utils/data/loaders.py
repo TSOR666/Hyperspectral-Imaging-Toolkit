@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Any
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from .mst_dataset import MST_TrainDataset, MST_ValidDataset
@@ -28,6 +28,28 @@ from ...constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation indices across ranks without padding or duplication."""
+
+    def __init__(self, dataset: Dataset, num_replicas: int, rank: int) -> None:
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"rank must be in [0, {num_replicas}), got {rank}"
+            )
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = max(0, len(self.dataset) - self.rank)
+        return (remaining + self.num_replicas - 1) // self.num_replicas
 
 
 def _dataset_source(config: Dict[str, Any]) -> str:
@@ -168,7 +190,11 @@ def create_mst_dataloaders(
     val_sampler = None
     if distributed:
         train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed)
+        val_sampler = DistributedEvalSampler(
+            val_dataset,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
+        )
         logger.info("  - Using DistributedSampler")
 
     worker_init = make_worker_init_fn(seed, rank)

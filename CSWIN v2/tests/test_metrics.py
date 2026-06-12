@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from hsi_model.models.generator_v3 import NoiseRobustCSWinGenerator
+from hsi_model.utils.data.transforms import compute_mst_center_crop_metrics
 from hsi_model.utils.metrics import (
     compute_metrics,
     compute_mrae,
@@ -37,3 +38,22 @@ def test_validate_model_architecture_uses_configured_output_channels():
     }
     model = NoiseRobustCSWinGenerator(config)
     assert validate_model_architecture(model, (1, 3, 8, 8), strict=True)
+
+
+def test_mst_metrics_can_match_clamped_ntire_output_domain():
+    target = torch.full((1, 1, 482, 512), 0.5)
+    pred = target.clone()
+    pred[:, :, 128:180, 128:180] = 1.5
+    pred[:, :, 180:232, 180:232] = -0.5
+
+    raw = compute_mst_center_crop_metrics(pred, target)
+    deployed = compute_mst_center_crop_metrics(
+        pred,
+        target,
+        clamp_prediction=True,
+        report_raw_mrae=True,
+    )
+
+    assert deployed["mrae"] < raw["mrae"]
+    assert deployed["raw_mrae"] == pytest.approx(raw["mrae"])
+    assert deployed["out_of_range_fraction"] > 0.0

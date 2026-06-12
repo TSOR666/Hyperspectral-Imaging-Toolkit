@@ -1,157 +1,153 @@
-# CSWIN v2 — Sinkhorn-GAN Training Pipelines
+# CSWIN v2
 
-This package contains the latest training code for the noise-robust CSWin transformer that reconstructs hyperspectral imagery from RGB measurements. Two complementary entry points are provided:
+CSWIN v2 reconstructs a 31-band hyperspectral cube from an RGB image. The
+active model is a hierarchical U-Net/Transformer hybrid with spectral
+self-attention, bounded local/global spatial attention, and learned
+PixelShuffle sampling.
 
-- [`src/hsi_model/training_script_fixed.py`](src/hsi_model/training_script_fixed.py) — the production Sinkhorn-GAN trainer with R1 regularization and EMA logging.
-- [`src/hsi_model/train_optimized.py`](src/hsi_model/train_optimized.py) — a heavily memory-optimized MST++ trainer that keeps peak GPU RAM < 30 GB on 80 GB A100 GPUs.
+## Active Entry Point
 
-Both scripts share the same configuration schema (`src/configs/config.yaml`) and utilities (`src/hsi_model/utils`).
-
-## Environment setup
-
-1. Create a virtual environment and install the core dependencies:
-   ```bash
-   python -m venv .venv && source .venv/bin/activate
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   pip install hydra-core numpy h5py psutil tqdm wandb
-   ```
-2. (Optional) Register the project as an editable package if you plan to extend the modules:
-   ```bash
-   pip install -e src
-   ```
-
-Key environment variables recognised by the scripts:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `HSI_DATA_DIR` | Root of the ARAD-1K (or compatible) dataset. | `./data/ARAD_1K` |
-| `HSI_LOG_DIR` | Folder where logs and hydra outputs are written. | `./artifacts/logs` |
-| `HSI_CKPT_DIR` | Folder for checkpoints. | `./artifacts/checkpoints` |
-| `PYTORCH_CUDA_ALLOC_CONF` | Recommended CUDA allocator tweak. | `expandable_segments:True,max_split_size_mb:256` |
-| `OMP_NUM_THREADS` | Number of intra-op CPU threads for dataloader workers. | `2` |
-
-## Running training
-
-Launch the Sinkhorn-GAN trainer with:
+Use the generator-only trainer:
 
 ```bash
-cd "CSWIN v2"
-python src/hsi_model/training_script_fixed.py --config-name config
+python src/hsi_model/train_generator.py \
+  --config-name config \
+  data_dir=/path/to/ARAD_1K
 ```
 
-The script uses [Hydra](https://hydra.cc/) for configuration. Override parameters via CLI flags, e.g. `python ... optimizer.generator_lr=1e-4 data_dir=/datasets/arad1k`.
-
-For the memory-optimized pipeline, run:
+The older Sinkhorn-GAN trainers remain available for legacy experiments:
 
 ```bash
+python src/hsi_model/training_script_fixed.py --config-name config
 python src/hsi_model/train_optimized.py --config-name config
 ```
 
-### GPU preflight gate
+Their discriminator, Sinkhorn, R1, and gradient-accumulation settings are not
+used by `train_generator.py`.
 
-To make training start only after required GPU checks pass, launch through the
-preflight runner:
+## Environment
 
-```bash
-python gpu_preflight_train.py --trainer sinkhorn -- --config-name config data_dir=/datasets/ARAD_1K
-```
-
-The runner prints one PASS/FAIL row per item (CUDA visibility, free memory,
-data paths, model allocation, finite forward pass, Sinkhorn train step, AMP
-step, and metrics). If any row fails, training is not started. If every row is
-green, the console prints `All GPU preflight checks passed.` followed by
-`Training is starting now:` and then starts the selected training script.
-
-Useful options:
+Python 3.10-3.12 is supported.
 
 ```bash
-# Memory-optimized trainer after the same gate
-python gpu_preflight_train.py --trainer optimized -- --config-name config data_dir=/datasets/ARAD_1K
-
-# Multi-GPU launch after a single-device preflight
-python gpu_preflight_train.py --nproc-per-node 4 -- --config-name config data_dir=/datasets/ARAD_1K
-
-# Check command and results without starting training
-python gpu_preflight_train.py --dry-run -- --config-name config data_dir=/datasets/ARAD_1K
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
 ```
 
-### Distributed training
+Useful environment variables:
 
-Both drivers support multi-GPU setups via PyTorch Distributed:
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `HSI_DATA_DIR` | ARAD-1K/MST++ dataset root | `./data/ARAD_1K` |
+| `HSI_LOG_DIR` | Training logs | `./artifacts/logs` |
+| `HSI_CKPT_DIR` | Checkpoints | `./artifacts/checkpoints` |
 
-```bash
-python -m torch.distributed.run --nproc_per_node=4 src/hsi_model/training_script_fixed.py --config-name config
-```
+The default `.venv` in this checkout may be incomplete. Recreate it if imports
+or `uv run` fail before training starts.
 
-Hydra automatically expands log and checkpoint directories per-rank. Ensure `NCCL_P2P_DISABLE=1` on multi-node clusters if you observe NCCL timeouts.
+## Active Recipe
 
-### Checkpoints and logs
+The defaults in `src/configs/config.yaml` use:
 
-- Checkpoints land under `${HSI_CKPT_DIR}` with rolling retention controlled by `checkpoint_keep`.
-- Hydra logs and the custom `MetricsLogger` go to `${HSI_LOG_DIR}`.
-- Validation metrics follow the MST++ centre-crop protocol (see `DEFAULT_STRIDE`, `DEFAULT_PATCH_SIZE`, etc. in [`src/hsi_model/constants.py`](src/hsi_model/constants.py)).
-
-## Project structure
-
-```
-src/
-├─ configs/config.yaml          # Shared defaults
-└─ hsi_model/
-   ├─ constants.py              # Centralised hyperparameters and dataset metadata
-   ├─ training_script_fixed.py  # Sinkhorn-GAN trainer (production)
-   ├─ train_optimized.py        # Memory-optimized MST++ trainer
-   ├─ models/                   # NoiseRobustCSWinModel & loss definitions
-   ├─ utils/                    # Logging, metrics, dataloader helpers
-   └─ ...                       # Additional support modules
-```
-
-## Troubleshooting
-
-- **Padding errors on tiny feature maps** — the Sinkhorn trainer ships with symmetric reflect padding to avoid the `padding (...) at dimension 3` crash when window size exceeds feature map size.
-- **Data loader stalls** — set `MST_MEMORY_MODE=lazy` and `MST_LAZY_CACHE_SIZE=3` to reduce I/O pressure, as recommended in the optimized trainer docstring.
-- **Hydra output clutter** — add `HYDRA_FULL_ERROR=1` to surface full stack traces or set `hydra.output_subdir=null` (already configured) to keep logs inside `${HSI_LOG_DIR}`.
-
-## Related tools
-
-Pair these trainers with:
-
-- [`../HSIFUSION&SHARP`](../HSIFUSION&SHARP/README.md) for transformer baselines (HSIFusionNet and SHARP) that share dataset utilities.
-- [`../mswr_v2`](../mswr_v2/README.md) for a CNN-based baseline with SAM loss.
-- [`../hsi_viz_suite`](../hsi_viz_suite/README.md) to visualise reconstructions, error maps, and spectral curves.
-
-## License
-
-This subproject, along with the rest of the toolkit, is distributed under the [MIT License](../LICENSE). Contributions and redistributions must comply with its terms.
-
-## Architecture Overview
-
-- Generator (NoiseRobustCSWinGenerator)
-  - U‑Net backbone with two encoder stages, a transformer bottleneck, and symmetric decoder.
-  - Dual attention per block: spectral attention plus scalable 2D local/global spatial attention; adaptive GroupNorm everywhere.
-  - Legacy axial CSWin attention remains available for checkpoint compatibility.
-  - Noise‑aware gating block; optional output activations (none/sigmoid/tanh/delayed sigmoid) and safe clamping during warm‑up.
-  - See `src/hsi_model/models/generator_v3.py`.
-
-- Discriminator (Spectral Normalized Transformer Discriminator)
-  - Spectral normalization on all layers; GELU activations.
-  - Spectral self‑attention with temperature scaling and NaN‑safe logits; progressive downsampling.
-  - Input concatenates RGB and HSI channels; outputs spatial feature maps (no global pooling).
-  - See `src/hsi_model/models/discriminator_v2.py`.
-
-## Configuration (Hydra: src/configs/config.yaml)
-
-- Data/Runtime: `data_dir`, `log_dir`, `checkpoint_dir`, `batch_size`, `val_batch_size`, `patch_size`, `stride`, `epochs`, `iterations_per_epoch`, `validation_max_batches`, `num_workers`, `memory_mode`, `lazy_cache_size`, `mixed_precision`.
-- Spatial attention: `cswin_attention_mode=local_global` uses bounded 2D windows and switches to global attention below `cswin_global_tokens`; use `axial` for legacy checkpoints.
-- Optimizer/Scheduler: `generator_lr`, `discriminator_lr`, `warmup_steps`, `gradient_accumulation_steps`.
-- Adversarial: `n_critic`, `use_r1_regularization`, `r1_gamma`.
-- Sinkhorn: `sinkhorn_epsilon`, `sinkhorn_iters`, `sinkhorn_flatten_spatial`.
-- Loss weights: `lambda_rec`, `lambda_mrae`, `lambda_perceptual`, `lambda_adversarial`, `lambda_sam`.
-- Checkpointing: `checkpoint_keep`.
+- RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
+- AdamW with learning rate `4e-4` and cosine decay.
+- L1 plus a small stabilized MRAE correction.
+- BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
+- EMA weights for validation and best-checkpoint export.
+- Local 7x7 spatial attention at high resolution and bounded global attention
+  at low resolution.
+- MST++ center-crop validation.
+- `[0,1]` validation clamping to match NTIRE inference/export, with unclamped
+  `raw_mrae` and `out_of_range_fraction` logged for diagnosis.
 
 Example overrides:
 
 ```bash
-python src/hsi_model/training_script_fixed.py \
-  optimizer.generator_lr=1e-4 optimizer.discriminator_lr=5e-5 \
-  data_dir=/datasets/ARAD_1K batch_size=16 memory_mode=standard
+python src/hsi_model/train_generator.py \
+  --config-name config \
+  data_dir=/datasets/ARAD_1K \
+  batch_size=16 \
+  generator_lr=1e-4 \
+  objective=l1_with_mrae \
+  memory_mode=standard
 ```
+
+For final training, enable and tune `progressive_stages` in the config for the
+128 -> 256 -> 512 patch schedule.
+
+## GPU Preflight
+
+The preflight gate defaults to the active generator trainer:
+
+```bash
+python gpu_preflight_train.py -- \
+  --config-name config \
+  data_dir=/datasets/ARAD_1K
+```
+
+It checks CUDA visibility, free memory, data paths, model allocation, finite
+forward and training steps, AMP, and metrics before launching training.
+
+Legacy trainer selection remains explicit:
+
+```bash
+python gpu_preflight_train.py --trainer sinkhorn -- --config-name config
+python gpu_preflight_train.py --trainer optimized -- --config-name config
+```
+
+## Distributed Training
+
+```bash
+python -m torch.distributed.run --nproc_per_node=4 \
+  src/hsi_model/train_generator.py \
+  --config-name config \
+  data_dir=/datasets/ARAD_1K
+```
+
+## Inference
+
+Load generator-only or legacy checkpoints through
+`hsi_model.utils.inference.load_generator`. For full NTIRE/ARAD evaluation:
+
+```bash
+python cswin_test_ntire.py \
+  --model_path /path/to/best_model.pth \
+  --data_root /path/to/ARAD_1K \
+  --output_dir ./cswin_test_results
+```
+
+Patch inference uses overlap blending and inference mode. Add
+`--ensemble_mode d4` for the eight-way geometric self-ensemble.
+
+## Verification
+
+```bash
+.\.venv-audit\Scripts\python.exe -m pytest -q -p no:cacheprovider
+.\.venv-audit\Scripts\python.exe smoke_run.py
+.\.venv-audit\Scripts\python.exe smoke_infer.py
+```
+
+## Memory Guidance
+
+- Use `memory_mode=standard` for maximum loader throughput.
+- Use `memory_mode=float16` to reduce resident scene memory.
+- Use `memory_mode=lazy` and tune `lazy_cache_size` when host RAM is limited.
+- Reduce stage batch sizes before changing architecture width.
+
+## Project Map
+
+```text
+src/configs/config.yaml
+src/hsi_model/train_generator.py
+src/hsi_model/models/generator_v3.py
+src/hsi_model/models/attention.py
+src/hsi_model/models/losses_consolidated.py
+src/hsi_model/utils/data/
+src/hsi_model/utils/inference.py
+src/hsi_model/utils/patch_inference.py
+```
+
+See `MODEL_OPTIMIZATION_REPORT.md` for the bottleneck audit and benchmark
+history.

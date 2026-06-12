@@ -791,7 +791,7 @@ def train_mst_gan_optimized(
     logger.info(f"Training completed successfully. Best MRAE: {record_mrae_loss:.4f}")
 
 
-@hydra.main(config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(config: DictConfig) -> None:
     """Main function with all memory optimizations (v3.0)."""
     cfg = OmegaConf.to_container(config, resolve=True)

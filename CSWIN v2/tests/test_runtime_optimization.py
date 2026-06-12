@@ -49,6 +49,29 @@ class _FailingModel(torch.nn.Module):
         raise RuntimeError("systematic validation failure")
 
 
+class _UnevenValidationDataset(Dataset):
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, index):
+        target_value = (1.0, 1.0, 3.0)[index]
+        return (
+            torch.zeros(3, 482, 512),
+            torch.full((1, 482, 512), target_value),
+        )
+
+
+class _ZeroModel(torch.nn.Module):
+    def forward(self, x):
+        return torch.zeros(
+            x.shape[0],
+            1,
+            x.shape[2],
+            x.shape[3],
+            device=x.device,
+        )
+
+
 def test_validation_does_not_turn_all_failed_batches_into_zero_loss():
     with pytest.raises(RuntimeError, match="Refusing to select checkpoints"):
         validate_generator(
@@ -66,6 +89,26 @@ def test_validation_does_not_turn_all_failed_batches_into_zero_loss():
             seed=42,
             rank=0,
         )
+
+
+def test_validation_loss_is_weighted_by_sample_count():
+    metrics = validate_generator(
+        _ZeroModel(),
+        _UnevenValidationDataset(),
+        torch.nn.L1Loss(),
+        torch.device("cpu"),
+        iteration=1,
+        config={
+            "val_batch_size": 2,
+            "num_workers": 0,
+            "validation_max_batches": None,
+        },
+        distributed=False,
+        seed=42,
+        rank=0,
+    )
+
+    assert metrics["gen_loss"] == pytest.approx(5.0 / 3.0)
 
 
 def test_strict_checkpoint_load_rejects_missing_state(tmp_path):
