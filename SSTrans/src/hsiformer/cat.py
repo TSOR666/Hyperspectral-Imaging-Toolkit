@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from ._compat import DropPath, to_2tuple
+from .attention import _scaled_cosine_attention
 
 
 def partition(x: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -142,19 +142,24 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
+        attention_bias = None
         if self.rpe:
             height, width = self.patch_size
             bias = self.relative_position_bias_table[
                 self.relative_position_index.reshape(-1)
             ].view(height * width, height * width, -1)
-            attn = attn + bias.permute(2, 0, 1).contiguous().unsqueeze(0)
+            attention_bias = bias.permute(2, 0, 1).contiguous().unsqueeze(0)
 
-        attn = self.attn_drop(self.softmax(attn))
-        x = (attn @ v).transpose(1, 2).reshape(batch, tokens, channels)
+        x = _scaled_cosine_attention(
+            q,
+            k,
+            v,
+            self.scale,
+            attention_bias=attention_bias,
+            dropout_p=self.attn_drop.p,
+            training=self.training,
+        )
+        x = x.transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj_drop(self.proj(x))
 
 
@@ -267,4 +272,3 @@ class CATBlock(nn.Module):
     def change_resolution(self, new_resolution: tuple[int, int]) -> None:
         """Compatibility shim for older callers; forward no longer mutates state."""
         self.input_resolution = tuple(new_resolution)
-

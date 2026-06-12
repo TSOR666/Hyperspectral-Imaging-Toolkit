@@ -38,8 +38,8 @@ class TrainingStage:
 
 @dataclass(frozen=True)
 class LossConfig:
-    mrae_weight: float = 1.0
-    l1_weight: float = 0.0
+    mrae_weight: float = 0.0
+    l1_weight: float = 1.0
     sam_weight: float = 0.0
 
 
@@ -47,7 +47,7 @@ class LossConfig:
 class TrainingConfig:
     data_root: str
     output_dir: str = "runs/hsiformer_arad1k"
-    preset: str = "ablation_no_rpe"
+    preset: str = "recommended_retrain"
     model: dict[str, Any] = field(default_factory=dict)
     stages: tuple[TrainingStage, ...] = (
         TrainingStage(128, 300_000, 32, 4e-4),
@@ -204,7 +204,7 @@ def train(
             stage_index,
         )
         train_iterator = iter(train_loader)
-        running_loss = 0.0
+        running_loss = torch.zeros((), device=selected_device)
         running_count = 0
         model.train()
         print(
@@ -240,7 +240,7 @@ def train(
 
             stage_step += 1
             global_step += 1
-            running_loss += float(loss.detach().item())
+            running_loss.add_(loss.detach())
             running_count += 1
 
             if global_step % config.log_every == 0:
@@ -249,7 +249,7 @@ def train(
                     "global_step": global_step,
                     "stage_index": stage_index,
                     "stage_step": stage_step,
-                    "loss": running_loss / running_count,
+                    "loss": float((running_loss / running_count).item()),
                     "learning_rate": optimizer.param_groups[0]["lr"],
                 }
                 _append_jsonl(metrics_path, train_record)
@@ -258,7 +258,7 @@ def train(
                     f"loss={train_record['loss']:.6f} "
                     f"lr={train_record['learning_rate']:.3e}"
                 )
-                running_loss = 0.0
+                running_loss.zero_()
                 running_count = 0
 
             should_validate = (

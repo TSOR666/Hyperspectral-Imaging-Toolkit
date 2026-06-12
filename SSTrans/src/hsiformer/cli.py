@@ -23,6 +23,7 @@ PRESETS = (
     "ablation_no_rpe",
     "corrected_rpe",
     "optimized_candidate",
+    "recommended_retrain",
 )
 
 
@@ -100,11 +101,12 @@ def infer_main(argv: Sequence[str] | None = None) -> None:
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
     )
-    model, _ = build_model_from_checkpoint(
+    model, payload = build_model_from_checkpoint(
         args.checkpoint,
         preset=args.preset,
-        map_location=device,
+        map_location="cpu",
     )
+    del payload
     model.to(device)
     scene_ids = infer_loader(
         model,
@@ -166,11 +168,12 @@ def test_main(argv: Sequence[str] | None = None) -> None:
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
     )
-    model, _ = build_model_from_checkpoint(
+    model, payload = build_model_from_checkpoint(
         args.checkpoint,
         preset=args.preset,
-        map_location=device,
+        map_location="cpu",
     )
+    del payload
     model.to(device)
 
     output_dir = Path(args.output_dir)

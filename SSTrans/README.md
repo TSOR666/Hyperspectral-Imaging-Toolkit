@@ -50,7 +50,7 @@ style:
 
 - Adam with betas `(0.9, 0.999)`
 - per-iteration cosine learning-rate decay to `1e-6`
-- MRAE objective
+- L1 objective, matching the reported ARAD-1K training procedure
 - 300,000 iterations with 128x128 crops
 - 50,000 iterations with 256x256 crops
 - 50,000 full-resolution iterations (the 512 stage uses 482x512 ARAD frames)
@@ -80,15 +80,25 @@ Each checkpoint includes the model architecture, optimizer, scheduler, AMP
 scaler, stage position, global iteration, and resolved training configuration.
 Training metrics are appended to `metrics.jsonl`.
 
-The default preset is `ablation_no_rpe`, because the reported ablation improved
-MRAE from `0.1497` to `0.1468` and SAM from `0.0824` to `0.0774`. Available
-presets are:
+The default fresh-training preset is `recommended_retrain`. It keeps the
+reported no-spectral-RPE improvement (MRAE `0.1497` to `0.1468`, SAM `0.0824`
+to `0.0774`), restores the intended 2/4/8/16 spectral head schedule, retains
+CAT's valid spatial relative bias, and uses the paper residual topology.
+Available presets are:
 
 - `legacy`: published source behavior, for reproducing existing checkpoints.
-- `ablation_no_rpe`: strongest reported ablation and default retraining model.
+- `ablation_no_rpe`: strongest reported ablation with legacy head/residual
+  behavior.
 - `corrected_rpe`: places spectral RPE before softmax.
 - `optimized_candidate`: no spectral/CAT RPE, corrected residual topology, and
   activation checkpointing.
+- `recommended_retrain`: no spectral RPE, intended stage-wise spectral heads,
+  CAT RPE, paper residual topology, and activation checkpointing.
+
+`residual_mode="branch_delta"` is also available for controlled experiments.
+It makes each neutral SST branch an exact identity, unlike the legacy and
+literal paper graphs, but is not the default until an ARAD-1K ablation confirms
+its reconstruction quality.
 
 Change `preset`, model overrides, stages, loss weights, or validation tiling in
 the JSON configuration for controlled ablations.
@@ -147,7 +157,7 @@ outputs/public_test/
 ```python
 from hsiformer import build_model
 
-model = build_model("ablation_no_rpe")
+model = build_model("recommended_retrain")
 ```
 
 The package also exposes `ARAD1KDataset`, `RGBImageDataset`, `TrainingConfig`,
@@ -157,5 +167,5 @@ The package also exposes `ARAD1KDataset`, `RGBImageDataset`, `TrainingConfig`,
 
 ```powershell
 python -m pytest
-python scripts/smoke_model.py --preset ablation_no_rpe
+python scripts/smoke_model.py --preset recommended_retrain
 ```

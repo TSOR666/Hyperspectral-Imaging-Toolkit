@@ -10,6 +10,40 @@ from torch.nn import functional as F
 RPEMode = Literal["none", "legacy_post_softmax", "pre_softmax"]
 
 
+def _scaled_cosine_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    attention_bias: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    training: bool = False,
+) -> torch.Tensor:
+    """Run cosine attention through PyTorch's memory-efficient SDPA kernels."""
+    query = F.normalize(query, dim=-1)
+    key = F.normalize(key, dim=-1)
+    if not query.is_cuda:
+        attention = (query @ key.transpose(-2, -1)) * scale
+        if attention_bias is not None:
+            attention = attention + attention_bias
+        attention = F.dropout(
+            attention.softmax(dim=-1),
+            p=dropout_p,
+            training=training,
+        )
+        return attention @ value
+
+    return F.scaled_dot_product_attention(
+        query * scale,
+        key,
+        value,
+        attn_mask=attention_bias,
+        dropout_p=dropout_p if training else 0.0,
+        scale=1.0,
+    )
+
+
 def img2windows(
     image: torch.Tensor,
     window_height: int,
@@ -256,22 +290,23 @@ class Spectral_MSA(nn.Module):
             "b (head c) h w -> b head c (h w)",
             head=self.num_heads,
         )
-        logits = (
-            F.normalize(q, dim=-1)
-            @ F.normalize(k, dim=-1).transpose(-2, -1)
-        ) * self.temperature
-
         bias = None
         if self.rpe_mode != "none":
             bias = self.relative_bias[self.coords].unsqueeze(0).unsqueeze(0)
-        if self.rpe_mode == "pre_softmax":
-            logits = logits + bias
-
-        attention = logits.softmax(dim=-1)
         if self.rpe_mode == "legacy_post_softmax":
-            attention = attention + bias
-
-        out = attention @ value
+            logits = (
+                F.normalize(q, dim=-1)
+                @ F.normalize(k, dim=-1).transpose(-2, -1)
+            ) * self.temperature
+            out = (logits.softmax(dim=-1) + bias) @ value
+        else:
+            out = _scaled_cosine_attention(
+                q,
+                k,
+                value,
+                self.temperature,
+                attention_bias=bias,
+            )
         out = rearrange(
             out,
             "b head c (h w) -> b (head c) h w",
@@ -431,12 +466,14 @@ class LePEAttentionCross(nn.Module):
         q = self._tokens_to_windows(q, resolution, crossed=cross)
         k = self._tokens_to_windows(k, resolution)
         v, lepe = self._value_windows(v, resolution)
-        attention = (
-            F.normalize(q, dim=-1)
-            @ F.normalize(k, dim=-1).transpose(-2, -1)
-        ) * self.scale
-        attention = self.attn_drop(attention.softmax(dim=-1))
-        x = attention @ v + lepe
+        x = _scaled_cosine_attention(
+            q,
+            k,
+            v,
+            self.scale,
+            dropout_p=self.attn_drop.p,
+            training=self.training,
+        ) + lepe
 
         window_height, window_width = self._window_shape(resolution)
         batch, _, channels = qkv[0].shape
@@ -616,14 +653,18 @@ class CSWinCrossAttention(nn.Module):
         # These names intentionally preserve the trained legacy projection order.
         value, lepe = self._value_windows(self.to_k(x2), resolution)
         k = self._windows(self.to_v(x2), resolution)
-        attention = (
-            F.normalize(q, dim=-1)
-            @ F.normalize(k, dim=-1).transpose(-2, -1)
-        ) * self.scale
-        attention = self.attn_drop(attention.softmax(dim=-1))
-
         batch, tokens, channels = x1.shape
-        x = (attention @ value + lepe).transpose(1, 2).reshape(
+        x = (
+            _scaled_cosine_attention(
+                q,
+                k,
+                value,
+                self.scale,
+                dropout_p=self.attn_drop.p,
+                training=self.training,
+            )
+            + lepe
+        ).transpose(1, 2).reshape(
             batch,
             tokens,
             channels,
@@ -641,4 +682,3 @@ def _resolution_tuple(
     if isinstance(resolution, int):
         return (resolution, resolution)
     return (int(resolution[0]), int(resolution[1]))
-

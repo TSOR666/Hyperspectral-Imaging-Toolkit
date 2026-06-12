@@ -1,7 +1,7 @@
 {
   "data_root": "path/to/ARAD_1K",
   "output_dir": "runs/hsiformer_arad1k",
-  "preset": "ablation_no_rpe",
+  "preset": "recommended_retrain",
   "model": {
     "use_checkpoint": true
   },
@@ -26,8 +26,8 @@
     }
   ],
   "loss": {
-    "mrae_weight": 1.0,
-    "l1_weight": 0.0,
+    "mrae_weight": 0.0,
+    "l1_weight": 1.0,
     "sam_weight": 0.0
   },
   "min_learning_rate": 0.000001,

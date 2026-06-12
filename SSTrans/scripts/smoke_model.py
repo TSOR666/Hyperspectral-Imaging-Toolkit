@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
             "ablation_no_rpe",
             "corrected_rpe",
             "optimized_candidate",
+            "recommended_retrain",
         ),
     )
     parser.add_argument("--size", type=int, default=64)
@@ -46,4 +47,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

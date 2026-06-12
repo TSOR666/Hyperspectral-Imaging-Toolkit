@@ -168,25 +168,35 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
                 f"Scene {scene_id} has size {(height, width)}, but the grid "
                 f"was built for {self.image_size}."
             )
-        label = self._load_cube(scene_id, height, width)
 
         augment = self.augment
+        active_crop_size: tuple[int, int] | None = None
         if self.crop_size is not None:
             crop_fits = (
                 self.crop_size[0] <= height and self.crop_size[1] <= width
             )
-            if self.random_crop and not crop_fits:
-                # The published 512 stage uses complete 482x512 ARAD frames.
-                augment = False
-            else:
+            if not (self.random_crop and not crop_fits):
                 if crop_position is None:
                     crop_position = _random_crop_position(
                         (height, width),
                         self.crop_size,
                     )
+                active_crop_size = self.crop_size
                 rgb_uint8 = _crop(rgb_uint8, crop_position, self.crop_size)
-                ycrcb_uint8 = _crop(ycrcb_uint8, crop_position, self.crop_size)
-                label = _crop(label, crop_position, self.crop_size)
+                if ycrcb_uint8 is not None:
+                    ycrcb_uint8 = _crop(
+                        ycrcb_uint8,
+                        crop_position,
+                        self.crop_size,
+                    )
+
+        label = self._load_cube(
+            scene_id,
+            height,
+            width,
+            crop_position=crop_position if active_crop_size is not None else None,
+            crop_size=active_crop_size,
+        )
 
         cond = _normalize_rgb(rgb_uint8, self.rgb_normalization)
         sample: dict[str, torch.Tensor | str] = {
@@ -195,6 +205,8 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
             "scene_id": scene_id,
         }
         if self.include_ycrcb:
+            if ycrcb_uint8 is None:
+                raise RuntimeError("YCbCr input was requested but not loaded.")
             ycrcb = _normalize_rgb(ycrcb_uint8, self.rgb_normalization)
             sample["ycrcb"] = torch.cat([cond, ycrcb], dim=0)
 
@@ -210,17 +222,25 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
                 sample[key] = tensor
         return sample
 
-    def _load_rgb(self, scene_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load_rgb(
+        self,
+        scene_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         path = self._rgb_path(scene_id)
         if not path.is_file():
             raise FileNotFoundError(path)
-        return _load_rgb_tensors(path)
+        if self.include_ycrcb:
+            return _load_rgb_tensors(path)
+        return _load_rgb_tensor(path), None
 
     def _load_cube(
         self,
         scene_id: str,
         height: int,
         width: int,
+        *,
+        crop_position: tuple[int, int] | None = None,
+        crop_size: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         path = self._spectral_path(scene_id)
         if not path.is_file():
@@ -228,8 +248,33 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         with h5py.File(path, "r") as handle:
             if self.cube_key not in handle:
                 raise KeyError(f"{path} does not contain '{self.cube_key}'.")
-            cube = np.asarray(handle[self.cube_key], dtype=np.float32).squeeze()
-        cube = _to_chw(cube, self.spectral_channels, height, width)
+            dataset = handle[self.cube_key]
+            cube = None
+            if crop_position is not None and crop_size is not None:
+                cube = _read_cube_crop(
+                    dataset,
+                    self.spectral_channels,
+                    height,
+                    width,
+                    crop_position,
+                    crop_size,
+                )
+            if cube is None:
+                cube = np.asarray(dataset, dtype=np.float32).squeeze()
+                cube = _to_chw(
+                    cube,
+                    self.spectral_channels,
+                    height,
+                    width,
+                )
+                if crop_position is not None and crop_size is not None:
+                    row, column = crop_position
+                    crop_height, crop_width = crop_size
+                    cube = cube[
+                        :,
+                        row : row + crop_height,
+                        column : column + crop_width,
+                    ]
         return torch.from_numpy(np.ascontiguousarray(cube))
 
 
@@ -298,7 +343,7 @@ class RGBImageDataset(Dataset[dict[str, torch.Tensor | str]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         path = self.paths[index]
-        rgb, _ = _load_rgb_tensors(path)
+        rgb = _load_rgb_tensor(path)
         return {
             "cond": _normalize_rgb(rgb, self.rgb_normalization),
             "scene_id": path.stem,
@@ -314,17 +359,51 @@ def _to_chw(
 ) -> np.ndarray:
     if cube.ndim != 3:
         raise ValueError(f"Expected a three-dimensional cube, got {cube.shape}.")
+    order = _cube_axis_order(cube.shape, channels, height, width)
+    if order is None:
+        raise ValueError(
+            f"Cannot align spectral cube {cube.shape} to CHW target "
+            f"{(channels, height, width)}."
+        )
+    return np.transpose(cube, order)
+
+
+def _cube_axis_order(
+    shape: Sequence[int],
+    channels: int,
+    height: int,
+    width: int,
+) -> tuple[int, int, int] | None:
     target = (channels, height, width)
     matching = [
         order
         for order in permutations(range(3))
-        if tuple(cube.shape[index] for index in order) == target
+        if tuple(shape[index] for index in order) == target
     ]
-    if not matching:
-        raise ValueError(
-            f"Cannot align spectral cube {cube.shape} to CHW target {target}."
-        )
-    return np.transpose(cube, matching[0])
+    return matching[0] if matching else None
+
+
+def _read_cube_crop(
+    dataset: h5py.Dataset,
+    channels: int,
+    height: int,
+    width: int,
+    position: tuple[int, int],
+    crop_size: tuple[int, int],
+) -> np.ndarray | None:
+    if dataset.ndim != 3:
+        return None
+    order = _cube_axis_order(dataset.shape, channels, height, width)
+    if order is None:
+        return None
+
+    row, column = position
+    crop_height, crop_width = crop_size
+    slices = [slice(None), slice(None), slice(None)]
+    slices[order[1]] = slice(row, row + crop_height)
+    slices[order[2]] = slice(column, column + crop_width)
+    cube = np.asarray(dataset[tuple(slices)], dtype=np.float32)
+    return np.transpose(cube, order)
 
 
 def _normalize_rgb(
@@ -350,6 +429,12 @@ def _load_rgb_tensors(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
         torch.from_numpy(rgb).permute(2, 0, 1).contiguous(),
         torch.from_numpy(ycrcb).permute(2, 0, 1).contiguous(),
     )
+
+
+def _load_rgb_tensor(path: Path) -> torch.Tensor:
+    with Image.open(path) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    return torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
 
 
 def _normalize_extension(value: str) -> str:

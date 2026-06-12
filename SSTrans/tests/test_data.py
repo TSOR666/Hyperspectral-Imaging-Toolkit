@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from itertools import permutations
+
 import h5py
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
+import hsiformer.data as data_module
 from hsiformer import (
     ARAD1KDataset,
     load_arad_manifest,
     spectral_metrics,
 )
+from hsiformer.data import _read_cube_crop
 
 
 def _write_scene(root, scene_id: str = "ARAD_1K_0001"):
@@ -102,10 +106,59 @@ def test_random_crop_length_is_controlled_per_scene(tmp_path) -> None:
     assert dataset[0]["cond"].shape == (3, 4, 4)
 
 
-def test_oversized_training_crop_uses_full_arad_frame(tmp_path) -> None:
+@pytest.mark.parametrize("storage_order", tuple(permutations(range(3))))
+def test_hdf5_crop_reader_preserves_all_axis_orders(
+    tmp_path,
+    storage_order,
+) -> None:
+    channels, height, width = 31, 6, 8
+    cube = np.arange(channels * height * width, dtype=np.float32).reshape(
+        channels,
+        height,
+        width,
+    )
+    stored = np.transpose(cube, storage_order)
+    path = tmp_path / "cube.mat"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("cube", data=stored)
+
+    inverse_order = tuple(storage_order.index(axis) for axis in range(3))
+    with h5py.File(path, "r") as handle:
+        cropped = _read_cube_crop(
+            handle["cube"],
+            channels,
+            height,
+            width,
+            (1, 2),
+            (3, 4),
+        )
+
+    assert cropped is not None
+    np.testing.assert_array_equal(
+        cropped,
+        np.transpose(stored, inverse_order)[:, 1:4, 2:6],
+    )
+
+
+def test_oversized_training_crop_uses_full_arad_frame(
+    tmp_path,
+    monkeypatch,
+) -> None:
     _write_scene(tmp_path)
     manifest = tmp_path / "split.txt"
     manifest.write_text("ARAD_1K_0001\n", encoding="utf-8")
+    augmentation_called = False
+
+    def record_augmentation(tensors):
+        nonlocal augmentation_called
+        augmentation_called = True
+        return tensors
+
+    monkeypatch.setattr(
+        data_module,
+        "_paired_augmentation",
+        record_augmentation,
+    )
     dataset = ARAD1KDataset(
         tmp_path,
         manifest_path=manifest,
@@ -116,6 +169,7 @@ def test_oversized_training_crop_uses_full_arad_frame(tmp_path) -> None:
     sample = dataset[0]
     assert sample["cond"].shape == (3, 6, 8)
     assert sample["label"].shape == (31, 6, 8)
+    assert augmentation_called
 
 
 def test_spectral_metrics_match_simple_reference() -> None:
