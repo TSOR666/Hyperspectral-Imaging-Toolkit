@@ -1,0 +1,5 @@
+{
+  "preset": "corrected_rpe",
+  "description": "Places spectral relative position bias before softmax, matching Equation 7 in the paper. Requires retraining and validation."
+}
+

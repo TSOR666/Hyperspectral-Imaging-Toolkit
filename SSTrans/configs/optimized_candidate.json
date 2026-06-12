@@ -1,0 +1,5 @@
+{
+  "preset": "optimized_candidate",
+  "description": "Retraining candidate: no spectral RPE, no inherited CAT RPE, paper-consistent residual topology, and activation checkpointing."
+}
+
