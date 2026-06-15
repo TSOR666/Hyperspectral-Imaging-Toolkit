@@ -58,7 +58,8 @@ The defaults in `src/configs/config.yaml` use:
 - EMA weights for validation and best-checkpoint export.
 - Local 7x7 spatial attention at high resolution and bounded global attention
   at low resolution.
-- MST++ center-crop validation.
+- Deployment-matched 128x128 tiled validation with FP32 overlap blending and
+  the fixed centered 226x256 ARAD-1K scoring window.
 - Explicit exclusion of the known-corrupt `ARAD_1K_0314` scene, while other
   missing or corrupt split entries fail dataset initialization.
 - `[0,1]` validation clamping to match NTIRE inference/export, with unclamped
@@ -122,6 +123,8 @@ python cswin_test_ntire.py \
 
 Patch inference uses overlap blending and inference mode. Add
 `--ensemble_mode d4` for the eight-way geometric self-ensemble.
+`--amp_dtype auto` selects BF16 on Ampere-or-newer GPUs and FP16 on older
+Tensor Core GPUs; use `--amp_dtype fp32` for full-precision inference.
 
 ## Verification
 

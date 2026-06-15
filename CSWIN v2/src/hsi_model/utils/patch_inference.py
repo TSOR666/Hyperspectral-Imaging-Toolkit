@@ -23,7 +23,8 @@ class PatchInference:
         batch_size: int = 4,
         device: torch.device = None,
         use_fp16: bool = False,
-        apply_sigmoid: bool = False
+        apply_sigmoid: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
     ):
         """
         Args:
@@ -34,6 +35,8 @@ class PatchInference:
             device: Device to run on
             use_fp16: Whether to use mixed precision for inference
             apply_sigmoid: Whether to apply sigmoid to model output (for models that output logits)
+            amp_dtype: Explicit autocast dtype. Overrides ``use_fp16`` and
+                supports BF16 inference on Ampere-or-newer CUDA devices.
         """
         self.model = model
         self.patch_size = patch_size
@@ -41,7 +44,13 @@ class PatchInference:
         self.stride = patch_size - overlap
         self.batch_size = batch_size
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+        if amp_dtype not in (None, torch.float16, torch.bfloat16):
+            raise ValueError(f"amp_dtype must be float16, bfloat16, or None, got {amp_dtype}")
+        if amp_dtype is None and use_fp16:
+            amp_dtype = torch.float16
+        self.amp_dtype = amp_dtype if self.device.type == "cuda" else None
+        self.use_amp = self.amp_dtype is not None
+        self.use_fp16 = self.amp_dtype == torch.float16
         self.apply_sigmoid = apply_sigmoid
         
         # Validate parameters
@@ -153,7 +162,7 @@ class PatchInference:
         # eps biased the 1-px ring by eps/weight (~1% at the old corners).
         output = output / weights.clamp_min(1e-8)
 
-        return output.to(dtype=patches.dtype)
+        return output
     
     def _create_weight_mask(self, patch_size: int, overlap: int) -> torch.Tensor:
         """Create weight mask for smooth blending"""
@@ -211,24 +220,28 @@ class PatchInference:
         if H <= self.patch_size and W <= self.patch_size:
             logger.info(f"Image size {H}x{W} is smaller than patch size, processing directly")
             with torch.inference_mode():
-                with autocast_context(self.device.type, self.use_fp16, torch.float16):
+                with autocast_context(
+                    self.device.type,
+                    self.use_amp,
+                    self.amp_dtype or torch.float16,
+                ):
                     if hasattr(self.model, 'generator'):
                         output = self.model.generator(img.to(self.device))
                     else:
                         output = self.model(img.to(self.device))
-                    
+
                     # Apply sigmoid if requested
                     if self.apply_sigmoid:
                         output = torch.sigmoid(output)
-                    
-                    return output
-        
+
+                    return output.float()
+
         # Extract patches
         patches, info = self._extract_patches(img)
         n_patches = patches.shape[0]
         
         logger.info(f"Extracted {n_patches} patches from {info['original_shape']} image")
-        
+
         # Process patches in batches
         outputs = []
         
@@ -245,7 +258,11 @@ class PatchInference:
                 batch = patches[i:i+self.batch_size].to(self.device)
                 
                 # Forward pass with mixed precision if enabled
-                with autocast_context(self.device.type, self.use_fp16, torch.float16):
+                with autocast_context(
+                    self.device.type,
+                    self.use_amp,
+                    self.amp_dtype or torch.float16,
+                ):
                     if hasattr(self.model, 'generator'):
                         output = self.model.generator(batch)
                     else:
@@ -271,7 +288,7 @@ class PatchInference:
         # Stitch patches back together
         full_output = self._stitch_patches(all_outputs, info, out_channels)
         
-        return full_output.to(self.device)
+        return full_output
     
     def predict_dataset(
         self, 

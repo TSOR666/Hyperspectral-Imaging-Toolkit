@@ -57,3 +57,23 @@ def test_mst_metrics_can_match_clamped_ntire_output_domain():
     assert deployed["mrae"] < raw["mrae"]
     assert deployed["raw_mrae"] == pytest.approx(raw["mrae"])
     assert deployed["out_of_range_fraction"] > 0.0
+
+
+def test_mst_metrics_use_fixed_arad_center_window_on_noncanonical_size():
+    target = torch.ones(1, 1, 512, 512)
+    pred = target.clone()
+    # This strip lies inside the legacy 128:-128 border crop but outside the
+    # centered 226x256 ARAD scoring window (rows 143:369 for a 512px image).
+    pred[:, :, 128:143, 128:384] = 0.0
+
+    metrics = compute_mst_center_crop_metrics(pred, target)
+
+    assert metrics["mrae"] == pytest.approx(0.0)
+
+
+def test_mst_metrics_score_small_aligned_inputs_instead_of_sentinels():
+    target = torch.rand(1, 3, 16, 16)
+    metrics = compute_mst_center_crop_metrics(target.clone(), target)
+
+    assert metrics["mrae"] == pytest.approx(0.0)
+    assert metrics["rmse"] == pytest.approx(0.0)

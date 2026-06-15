@@ -537,13 +537,18 @@ def resume_training_state(
     # object was constructed BEFORE this checkpoint loaded, so its shadow holds
     # the random-init weights — re-clone it from the just-loaded model.
     if ema is not None:
+        # The EMA object is constructed before resume, so its current shadow
+        # still reflects random initialization. Rebase every entry on the
+        # strictly loaded model first; a partial/legacy EMA payload can then
+        # overwrite the keys it actually contains without leaving random
+        # shadows behind.
+        ema.reinit_from(target)
         if ck.get("ema"):
             try:
                 ema.load_state_dict(ck["ema"], device=device)
             except (RuntimeError, TypeError, ValueError) as e:
                 logger.warning("Could not restore EMA state: %s", e)
         else:
-            ema.reinit_from(target)
             logger.info(
                 "Checkpoint has no EMA state; re-initialized the EMA shadow "
                 "from the loaded model weights."

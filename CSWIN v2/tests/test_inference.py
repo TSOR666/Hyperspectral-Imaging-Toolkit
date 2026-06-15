@@ -66,6 +66,35 @@ def test_load_generator_applies_ema_shadow(tmp_path):
     assert not torch.allclose(got, dict(gen.named_parameters())[ref], atol=1e-3)
 
 
+def test_load_generator_rejects_partial_ema_shadow(tmp_path):
+    gen = _build_gen(seed=4)
+    first_name, first_param = next(iter(gen.named_parameters()))
+    ckpt = tmp_path / "partial_ema.pth"
+    torch.save(
+        {
+            "state_dict": gen.state_dict(),
+            "config": _GEN_CFG,
+            "ema": {
+                "decay": 0.999,
+                "shadow": {first_name: first_param.detach().clone() + 1.0},
+            },
+        },
+        ckpt,
+    )
+
+    loaded, info = load_generator(
+        str(ckpt),
+        device=torch.device("cpu"),
+        prefer_ema=True,
+    )
+
+    assert info["ema_applied"] is False
+    assert torch.allclose(
+        dict(loaded.named_parameters())[first_name],
+        dict(gen.named_parameters())[first_name],
+    )
+
+
 def test_geometric_self_ensemble_is_exact_for_pointwise_op():
     # A 1x1 conv is equivariant to flips/rotations, so the x8 ensemble must
     # equal a single forward pass (up to float error), and preserve shape on a
@@ -114,3 +143,28 @@ def test_patch_inference_pads_tiny_edge_with_replicate_fallback():
     out = infer.predict(img, show_progress=False)
     assert out.shape == (1, 31, 1, 5)
     assert torch.isfinite(out).all()
+
+
+def test_patch_stitching_preserves_fp32_overlap_average():
+    infer = PatchInference(
+        torch.nn.Identity(),
+        patch_size=4,
+        overlap=2,
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+    patches = torch.stack(
+        [
+            torch.full((1, 4, 4), 0.1, dtype=torch.float16),
+            torch.full((1, 4, 4), 0.2, dtype=torch.float16),
+        ]
+    )
+    info = {
+        "original_shape": (4, 6),
+        "positions": [(0, 0, 4, 4), (0, 2, 4, 6)],
+    }
+
+    output = infer._stitch_patches(patches, info, out_channels=1)
+
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()

@@ -50,11 +50,19 @@ strict_dataset_files: true  # fail instead of silently dropping missing/corrupt 
 excluded_scene_stems: [ARAD_1K_0314]  # known-corrupt ARAD-1K scene
 validation_max_batches: null
 finite_check_interval: 100
+max_consecutive_ooms: 3
 # Score checkpoints in the same physical reflectance domain used by
 # cswin_test_ntire.py and prediction export. Keep raw MRAE as a diagnostic so
 # output-range drift remains visible without selecting a worse deployed model.
 validation_clamp_output: true
 validation_report_raw_mrae: true
+# Match checkpoint selection to cswin_test_ntire.py. This is semantically
+# important for CSWIN: a 128x128 tile uses global bottleneck attention while a
+# full ARAD frame crosses the token threshold and uses local attention instead.
+validation_tiled_inference: true
+validation_patch_size: 128
+validation_patch_overlap: 16
+validation_patch_batch_size: 4
 
 # Stop a single-resolution run after validation MRAE has genuinely plateaued.
 # For progressive training this is applied only to the final patch-size stage,

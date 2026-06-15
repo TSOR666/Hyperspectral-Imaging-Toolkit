@@ -9,15 +9,10 @@ from typing import Dict, Union, Tuple
 import numpy as np
 import torch
 
-from ...constants import (
-    VALIDATION_CENTER_CROP_START_H,
-    VALIDATION_CENTER_CROP_START_W,
-    VALIDATION_CENTER_CROP_END_H,
-    VALIDATION_CENTER_CROP_END_W,
-)
-
 logger = logging.getLogger(__name__)
 _STD_EPS = 1e-12
+_ARAD_CROP_H = 226
+_ARAD_CROP_W = 256
 
 
 def mst_to_gan_batch(
@@ -55,39 +50,29 @@ def compute_mst_center_crop_metrics(
     that mismatched value for checkpoint selection.
     """
     # Import locally to avoid circular dependencies.
-    from ...utils.metrics import compute_metrics, compute_mrae
+    from ...utils.metrics import compute_metrics, compute_mrae, crop_center_arad1k
 
-    pred_crop = pred_hsi[
-        :,
-        :,
-        VALIDATION_CENTER_CROP_START_H:VALIDATION_CENTER_CROP_END_H,
-        VALIDATION_CENTER_CROP_START_W:VALIDATION_CENTER_CROP_END_W,
-    ]
-    target_crop = target_hsi[
-        :,
-        :,
-        VALIDATION_CENTER_CROP_START_H:VALIDATION_CENTER_CROP_END_H,
-        VALIDATION_CENTER_CROP_START_W:VALIDATION_CENTER_CROP_END_W,
-    ]
-
-    if pred_crop.numel() == 0 or target_crop.numel() == 0:
-        logger.error(
-            "Center crop resulted in empty tensor! Input shape: %s, Crop shape: %s",
-            pred_hsi.shape,
-            pred_crop.shape,
+    if pred_hsi.shape != target_hsi.shape:
+        raise ValueError(
+            "Metric shape mismatch: "
+            f"pred={tuple(pred_hsi.shape)} target={tuple(target_hsi.shape)}"
         )
-        return {
-            "mrae": 999.0,
-            "psnr": 0.0,
-            "ssim": 0.0,
-            "sam": 999.0,
-        }
+
+    height, width = pred_hsi.shape[-2:]
+    if height >= _ARAD_CROP_H and width >= _ARAD_CROP_W:
+        pred_crop = crop_center_arad1k(pred_hsi, _ARAD_CROP_H, _ARAD_CROP_W)
+        target_crop = crop_center_arad1k(target_hsi, _ARAD_CROP_H, _ARAD_CROP_W)
+    else:
+        # Small synthetic/custom validation inputs cannot contain the canonical
+        # ARAD scoring window. Score the aligned full image instead of returning
+        # sentinel metrics that can accidentally affect checkpoint selection.
+        pred_crop = pred_hsi
+        target_crop = target_hsi
 
     logger.debug(
-        "MST++ center crop: %s -> %s (cropped %spx from each side)",
+        "MST++ center crop: %s -> %s",
         pred_hsi.shape,
         pred_crop.shape,
-        VALIDATION_CENTER_CROP_START_H,
     )
 
     raw_pred_crop = pred_crop.float()

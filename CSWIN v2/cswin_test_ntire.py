@@ -40,6 +40,7 @@ from hsi_model.utils.metrics import compute_metrics, crop_center_arad1k  # noqa:
 _ARAD_CROP_H = 226
 _ARAD_CROP_W = 256
 from hsi_model.utils.patch_inference import PatchInference  # noqa: E402
+from hsi_model.utils.training_setup import pick_amp_dtype  # noqa: E402
 from hsi_model.utils.data.mst_dataset import (  # noqa: E402
     _align_hyper_to_rgb,
     _load_mst_cube,
@@ -79,6 +80,7 @@ class TestConfig:
     overlap: int = 16
     patch_batch_size: int = 4
     use_fp16: bool = True
+    amp_dtype: str = "auto"
     prefer_ema: bool = True
     strict_load: bool = True
     ensemble_mode: str = "none"
@@ -365,13 +367,25 @@ class CSWINNTIRETester:
             prefer_ema=config.prefer_ema,
             strict=config.strict_load,
         )
+        inference_amp_dtype = (
+            pick_amp_dtype(
+                {
+                    "mixed_precision": config.use_fp16,
+                    "mixed_precision_dtype": (
+                        config.amp_dtype if config.use_fp16 else "fp32"
+                    ),
+                }
+            )
+            if self.device.type == "cuda"
+            else None
+        )
         self.patch_infer = PatchInference(
             model=self.generator,
             patch_size=config.patch_size,
             overlap=config.overlap,
             batch_size=config.patch_batch_size,
             device=self.device,
-            use_fp16=(config.use_fp16 and self.device.type == "cuda"),
+            amp_dtype=inference_amp_dtype,
             apply_sigmoid=False,
         )
 
@@ -554,6 +568,14 @@ def parse_args() -> TestConfig:
     parser.add_argument("--patch_batch_size", type=int, default=4)
     parser.add_argument("--use_fp16", dest="use_fp16", action="store_true", default=True)
     parser.add_argument("--no_use_fp16", dest="use_fp16", action="store_false")
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="Autocast dtype when mixed precision is enabled. auto selects BF16 "
+             "on Ampere-or-newer GPUs and FP16 on older Tensor Core GPUs.",
+    )
     parser.add_argument("--prefer_ema", dest="prefer_ema", action="store_true", default=True)
     parser.add_argument("--no_prefer_ema", dest="prefer_ema", action="store_false")
     parser.add_argument("--strict_load", dest="strict_load", action="store_true", default=True)
