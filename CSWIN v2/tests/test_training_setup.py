@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hsi_model.utils.training_setup import (
+    GeneratorEMA,
     resolve_resume_stage_position,
     resume_training_state,
     setup_paths,
@@ -251,6 +252,49 @@ def test_resume_training_state_rejects_objective_mismatch():
                 device=torch.device("cpu"),
                 expected_objective="mrae",
             )
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_resume_partial_ema_uses_loaded_model_for_missing_shadow_keys():
+    case_dir = _case_dir("resume_partial_ema")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    with torch.no_grad():
+        source.weight.fill_(2.0)
+        source.bias.fill_(3.0)
+        target.weight.fill_(-4.0)
+        target.bias.fill_(-5.0)
+    ema = GeneratorEMA(target)
+    ckpt_path = case_dir / "partial_ema_checkpoint.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "ema": {
+                    "decay": 0.9,
+                    "shadow": {"weight": torch.full_like(source.weight, 7.0)},
+                },
+            },
+            ckpt_path,
+        )
+
+        resume_training_state(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            optimizers={},
+            schedulers={},
+            scalers={},
+            device=torch.device("cpu"),
+            ema=ema,
+        )
+
+        assert torch.allclose(
+            ema.shadow["weight"],
+            torch.full_like(source.weight, 7.0),
+        )
+        assert torch.allclose(ema.shadow["bias"], source.bias)
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 

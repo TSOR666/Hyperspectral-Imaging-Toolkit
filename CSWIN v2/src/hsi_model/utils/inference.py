@@ -107,15 +107,41 @@ def load_generator(
     applied_ema = bool(ck.get("ema_applied", False))
     if prefer_ema and not applied_ema and ck.get("ema"):
         shadow = (ck["ema"] or {}).get("shadow", {})
-        own = dict(generator.named_parameters())
-        n = 0
-        with torch.no_grad():
-            for name, tensor in shadow.items():
-                if name in own and isinstance(tensor, torch.Tensor):
-                    own[name].copy_(tensor.to(own[name].device))
-                    n += 1
-        applied_ema = n > 0
-        logger.info("Applied EMA shadow to %d generator params.", n)
+        own = {
+            name: param
+            for name, param in generator.named_parameters()
+            if param.requires_grad and param.dtype.is_floating_point
+        }
+        valid_shadow = {
+            name: tensor
+            for name, tensor in shadow.items()
+            if (
+                name in own
+                and isinstance(tensor, torch.Tensor)
+                and tuple(tensor.shape) == tuple(own[name].shape)
+            )
+        }
+        missing = sorted(set(own) - set(valid_shadow))
+        if missing:
+            logger.warning(
+                "EMA shadow is incomplete (%d/%d trainable params matched); "
+                "using the complete raw checkpoint weights instead. Missing "
+                "keys (first 8): %s",
+                len(valid_shadow),
+                len(own),
+                missing[:8],
+            )
+        else:
+            with torch.no_grad():
+                for name, tensor in valid_shadow.items():
+                    own[name].copy_(
+                        tensor.to(
+                            device=own[name].device,
+                            dtype=own[name].dtype,
+                        )
+                    )
+            applied_ema = bool(valid_shadow)
+            logger.info("Applied EMA shadow to %d generator params.", len(valid_shadow))
 
     generator.eval()
     out_act = str(cfg.get("output_activation", "none")).lower()
@@ -146,6 +172,7 @@ def build_patch_inference(
     use_fp16: bool = False,
     config: Optional[Dict[str, Any]] = None,
     prefer_ema: bool = True,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> PatchInference:
     """Convenience: load the generator and wrap it in :class:`PatchInference`.
 
@@ -163,6 +190,7 @@ def build_patch_inference(
         device=device,
         use_fp16=use_fp16,
         apply_sigmoid=False,
+        amp_dtype=amp_dtype,
     )
 
 

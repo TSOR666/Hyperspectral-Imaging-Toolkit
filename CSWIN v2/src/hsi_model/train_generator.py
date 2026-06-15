@@ -61,6 +61,7 @@ from hsi_model.constants import (
     CHECKPOINT_KEEP_COUNT,
 )
 from hsi_model.utils import setup_logging, MetricsLogger
+from hsi_model.utils.patch_inference import PatchInference
 from hsi_model.utils.training_setup import (
     autocast_context,
     cleanup,
@@ -293,7 +294,12 @@ def validate_generator(
     rank: int,
 ) -> Dict[str, float]:
     """MST++-protocol validation for the bare generator (temporary DataLoader)."""
-    net.eval()
+    # DDP forward may broadcast buffers. Non-padding validation shards can have
+    # different lengths (or be empty), so forwarding through the wrapper would
+    # issue a different number of collectives per rank and can deadlock. The
+    # synchronized underlying module is sufficient for inference-only eval.
+    eval_net = net.module if hasattr(net, "module") else net
+    eval_net.eval()
     val_logger = logging.getLogger("hsi_model.validation")
 
     val_sampler = None
@@ -321,17 +327,43 @@ def validate_generator(
         shuffle=False,
         sampler=val_sampler,
         num_workers=val_num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         worker_init_fn=make_worker_init_fn(seed, rank),
         persistent_workers=False,
     )
 
-    total_loss = torch.tensor(0.0, device=device)
-    total_metrics: Dict[str, torch.Tensor] = {}
-    num_samples = 0
     amp_dtype = pick_amp_dtype(config) if device.type == "cuda" else None
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
+    clamp_prediction = bool(config.get("validation_clamp_output", False))
+    report_raw_mrae = bool(config.get("validation_report_raw_mrae", False))
+    metric_keys = ["psnr", "mrae", "rmse", "ssim", "sam", "mae"]
+    if clamp_prediction:
+        metric_keys.append("out_of_range_fraction")
+        if report_raw_mrae:
+            metric_keys.append("raw_mrae")
+
+    total_loss = torch.tensor(0.0, device=device)
+    # Keep the reduction schema identical on every rank, including ranks whose
+    # non-padding shard contains zero samples.
+    total_metrics: Dict[str, torch.Tensor] = {
+        key: torch.tensor(0.0, device=device) for key in metric_keys
+    }
+    num_samples = 0
+
+    patch_infer = None
+    if bool(config.get("validation_tiled_inference", False)):
+        patch_infer = PatchInference(
+            model=eval_net,
+            patch_size=int(
+                config.get("validation_patch_size", config.get("patch_size", 128))
+            ),
+            overlap=int(config.get("validation_patch_overlap", 16)),
+            batch_size=int(config.get("validation_patch_batch_size", 4)),
+            device=device,
+            amp_dtype=amp_dtype,
+            apply_sigmoid=False,
+        )
     validation_max_batches = config.get("validation_max_batches", None)
     if validation_max_batches is not None:
         validation_max_batches = int(validation_max_batches)
@@ -348,24 +380,37 @@ def validate_generator(
                 rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
-                with autocast_context(device.type, use_amp, autocast_dtype):
-                    pred_hsi = net(rgb_tensor)
-                    loss = criterion(pred_hsi.float(), hsi_tensor.float())
+                if patch_infer is not None:
+                    pred_hsi = torch.cat(
+                        [
+                            patch_infer.predict(
+                                rgb_tensor[index : index + 1],
+                                show_progress=False,
+                            )
+                            for index in range(int(rgb_tensor.shape[0]))
+                        ],
+                        dim=0,
+                    )
+                else:
+                    with autocast_context(device.type, use_amp, autocast_dtype):
+                        pred_hsi = eval_net(rgb_tensor)
+                loss = criterion(pred_hsi.float(), hsi_tensor.float())
                 batch_size = int(hsi_tensor.shape[0])
                 total_loss += loss * batch_size
                 metrics = compute_mst_center_crop_metrics(
                     pred_hsi,
                     hsi_tensor,
-                    clamp_prediction=bool(
-                        config.get("validation_clamp_output", False)
-                    ),
-                    report_raw_mrae=bool(
-                        config.get("validation_report_raw_mrae", False)
-                    ),
+                    clamp_prediction=clamp_prediction,
+                    report_raw_mrae=report_raw_mrae,
                 )
-                for key, value in metrics.items():
-                    if key not in total_metrics:
-                        total_metrics[key] = torch.tensor(0.0, device=device)
+                missing_metrics = set(metric_keys) - set(metrics)
+                if missing_metrics:
+                    raise RuntimeError(
+                        "Validation metric schema changed unexpectedly; missing "
+                        f"{sorted(missing_metrics)}"
+                    )
+                for key in metric_keys:
+                    value = metrics[key]
                     if not isinstance(value, torch.Tensor):
                         value = torch.tensor(value, device=device)
                     total_metrics[key] += value * batch_size
@@ -404,7 +449,13 @@ def validate_generator(
             torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
         num_samples = int(samples_t.item())
 
-    denom = max(num_samples, 1)
+    if num_samples <= 0:
+        raise RuntimeError(
+            "Validation produced zero samples. Check the validation split, "
+            "validation_max_batches, and distributed world size."
+        )
+
+    denom = num_samples
     avg = {"gen_loss": total_loss.item() / denom}
     avg.update({k: v.item() / denom for k, v in total_metrics.items()})
     val_logger.info(
@@ -434,6 +485,7 @@ def _run_stage(
     use_amp = amp_dtype is not None
     autocast_dtype = amp_dtype if amp_dtype is not None else torch.float16
     max_consecutive_nonfinite = int(config.get("max_consecutive_nonfinite_generator_outputs", 3))
+    max_consecutive_ooms = max(1, int(config.get("max_consecutive_ooms", 3)))
     finite_check_interval = max(1, int(config.get("finite_check_interval", 100)))
     ema_update_every = max(1, int(config.get("ema_update_every", 1)))
     early_stopping_patience = max(0, int(config.get("early_stopping_patience", 0)))
@@ -445,6 +497,7 @@ def _run_stage(
     epoch_losses = []
     loader_epoch = 0
     consecutive_nonfinite = 0
+    consecutive_ooms = 0
     stage_iter = start_stage_iter
     iteration = global_iter
     log_window_start = time.perf_counter()
@@ -543,6 +596,7 @@ def _run_stage(
             scaler.update()
             scheduler.step()
             consecutive_nonfinite = 0
+            consecutive_ooms = 0
             if ema is not None and (iteration + 1) % ema_update_every == 0:
                 ema.update(generator)
 
@@ -726,9 +780,21 @@ def _run_stage(
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                train_logger.error("OOM at iter %s; clearing cache", iteration)
+                consecutive_ooms += 1
+                train_logger.error(
+                    "OOM at iter %s; clearing cache (retry %s/%s)",
+                    iteration,
+                    consecutive_ooms,
+                    max_consecutive_ooms,
+                )
                 optimizer.zero_grad(set_to_none=True)
                 memory_cleanup()
+                if consecutive_ooms >= max_consecutive_ooms:
+                    raise RuntimeError(
+                        f"Training hit {consecutive_ooms} consecutive OOMs at "
+                        f"iteration {iteration}. Reduce the stage batch size or "
+                        "patch size before retrying."
+                    ) from e
                 continue
             raise
 
