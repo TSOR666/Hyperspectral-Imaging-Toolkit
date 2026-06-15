@@ -297,3 +297,35 @@ def test_generator_propagates_attention_config():
         block.relative_position_bias_table_h.dtype == torch.float16
         for block in cswin_blocks
     )
+
+
+def test_decoder_compress_first_variant_preserves_shape_and_reduces_parameters():
+    base_config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 16,
+        "split_sizes": [2, 2, 2],
+        "stage_depths": [1, 1, 1, 1, 1],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "sampling": "pixelshuffle",
+        "output_activation": "none",
+    }
+    baseline = NoiseRobustCSWinGenerator(base_config).eval()
+    lightweight = NoiseRobustCSWinGenerator(
+        {**base_config, "decoder1_compress_first": True}
+    ).eval()
+    image = torch.rand(1, 3, 20, 24)
+
+    with torch.inference_mode():
+        output = lightweight(image)
+
+    baseline_params = sum(parameter.numel() for parameter in baseline.parameters())
+    lightweight_params = sum(
+        parameter.numel() for parameter in lightweight.parameters()
+    )
+    first_decoder_block = lightweight.decoder1[0]
+
+    assert output.shape == (1, 31, 20, 24)
+    assert lightweight_params < baseline_params
+    assert first_decoder_block.norm1.norm.normalized_shape == (32,)

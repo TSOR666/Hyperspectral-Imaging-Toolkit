@@ -80,6 +80,25 @@ python src/hsi_model/train_generator.py \
 Start this objective from a fresh checkpoint. For final training, enable and
 tune `progressive_stages` in the config for the 128 -> 256 -> 512 patch schedule.
 
+## Controlled Ablations
+
+The audit findings that can change reconstruction quality remain opt-in:
+
+```bash
+# Stabilized MRAE + L1 objective
+python src/hsi_model/train_generator.py --config-name ablation_stable_mrae
+
+# Pre-compressed decoder1 and two-block full-resolution decoder
+python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
+
+# Combined loss and decoder experiment
+python src/hsi_model/train_generator.py --config-name ablation_stable_lite
+```
+
+These configurations use separate log/checkpoint directories and should start
+from random initialization. The default benchmark-compatible recipe is
+unchanged until dataset-level quality results justify promoting an ablation.
+
 ## GPU Preflight
 
 The preflight gate defaults to the active generator trainer:
@@ -124,7 +143,9 @@ python cswin_test_ntire.py \
 Patch inference uses overlap blending and inference mode. Add
 `--ensemble_mode d4` for the eight-way geometric self-ensemble.
 `--amp_dtype auto` selects BF16 on Ampere-or-newer GPUs and FP16 on older
-Tensor Core GPUs; use `--amp_dtype fp32` for full-precision inference.
+Tensor Core GPUs; use `--amp_dtype fp32` for full-precision inference. Tile
+outputs are streamed directly into the FP32 overlap accumulator, so retained
+tile memory is bounded by the configured patch batch size.
 
 ## Verification
 

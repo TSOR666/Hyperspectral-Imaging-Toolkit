@@ -92,6 +92,10 @@ mrae_epsilon: 1.0e-8     # matches validation compute_mrae denominator flooring
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
 num_heads: 4
 stage_depths: [2, 2, 2, 2, 4]    # [enc1, enc2, bottleneck, dec1, dec2] (paper: deeper final stage)
+split_sizes: [7, 7, 7]
+# Opt-in ablation: compress the first decoder skip from 4x to 2x base width
+# before its transformer blocks. False preserves existing checkpoints.
+decoder1_compress_first: false
 spectral_attention_type: s_msa   # full-res-token channel self-attn (the ablation workhorse)
 # auto keeps FP16 attention in FP32, but lets BF16 use Tensor Cores.
 spectral_attention_force_fp32: auto

@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import torch
 
 from hsi_model.utils.patch_inference import PatchInference
@@ -168,3 +170,60 @@ def test_patch_stitching_preserves_fp32_overlap_average():
 
     assert output.dtype == torch.float32
     assert torch.isfinite(output).all()
+
+
+def test_streamed_patch_inference_matches_legacy_all_tiles_path():
+    torch.manual_seed(5)
+    model = torch.nn.Conv2d(3, 5, kernel_size=3, padding=1).eval()
+    infer = PatchInference(
+        model,
+        patch_size=16,
+        overlap=4,
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+    image = torch.rand(1, 3, 40, 44)
+
+    with torch.inference_mode():
+        patches, info = infer._extract_patches(image)
+        expected = infer._stitch_patches(
+            model(patches),
+            info,
+            out_channels=5,
+        )
+
+    # The production path must stream directly into the accumulator and no
+    # longer call the legacy all-output stitching helper.
+    with patch.object(
+        infer,
+        "_stitch_patches",
+        side_effect=AssertionError("legacy all-output path used"),
+    ):
+        actual = infer.predict(image, show_progress=False)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_streamed_patch_inference_bounds_model_batch_size():
+    class BatchRecorder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.max_batch = 0
+
+        def forward(self, x):
+            self.max_batch = max(self.max_batch, int(x.shape[0]))
+            return x[:, :1]
+
+    model = BatchRecorder()
+    infer = PatchInference(
+        model,
+        patch_size=16,
+        overlap=4,
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+
+    output = infer.predict(torch.rand(1, 3, 80, 84), show_progress=False)
+
+    assert output.shape == (1, 1, 80, 84)
+    assert model.max_batch <= 3

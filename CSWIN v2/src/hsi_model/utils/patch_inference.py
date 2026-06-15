@@ -62,27 +62,26 @@ class PatchInference:
         logger.info(f"PatchInference initialized: patch_size={patch_size}, overlap={overlap}, "
                    f"stride={self.stride}, batch_size={batch_size}")
         
-    def _extract_patches(self, img: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Extract overlapping patches from image"""
+    def _patch_info(self, img: torch.Tensor) -> Dict[str, Any]:
+        """Return patch positions without materializing every patch tensor."""
         B, C, H, W = img.shape
         if B != 1:
             raise ValueError(f"Batch size must be 1 for patch extraction, got {B}")
-        
-        patches = []
+
         positions = []
-        
+
         # Calculate number of patches needed
         h_patches = max(1, (H - self.overlap) // self.stride)
         w_patches = max(1, (W - self.overlap) // self.stride)
-        
+
         # Adjust to ensure full coverage
         if (h_patches - 1) * self.stride + self.patch_size < H:
             h_patches += 1
         if (w_patches - 1) * self.stride + self.patch_size < W:
             w_patches += 1
-        
+
         logger.debug(f"Image size: {H}x{W}, will extract {h_patches}x{w_patches} patches")
-        
+
         for i in range(h_patches):
             for j in range(w_patches):
                 # Calculate position ensuring we don't go out of bounds
@@ -90,38 +89,71 @@ class PatchInference:
                 w_start = min(j * self.stride, max(0, W - self.patch_size))
                 h_end = min(h_start + self.patch_size, H)
                 w_end = min(w_start + self.patch_size, W)
-                
-                # Handle edge case where image is smaller than patch size
-                if h_end - h_start < self.patch_size or w_end - w_start < self.patch_size:
-                    # Pad the patch
-                    pad_h = self.patch_size - (h_end - h_start)
-                    pad_w = self.patch_size - (w_end - w_start)
-                    pad_mode = "reflect"
-                    if (h_end - h_start) <= pad_h or (w_end - w_start) <= pad_w:
-                        pad_mode = "replicate"
-                    patch = F.pad(
-                        img[:, :, h_start:h_end, w_start:w_end],
-                        (0, pad_w, 0, pad_h),
-                        mode=pad_mode
-                    )
-                else:
-                    patch = img[:, :, h_start:h_end, w_start:w_end]
-                
-                patches.append(patch)
                 positions.append((h_start, w_start, h_end, w_end))
-        
-        # Stack patches
-        patches = torch.cat(patches, dim=0)  # Shape: (n_patches, C, patch_size, patch_size)
-        
-        info = {
+
+        return {
             'positions': positions,
             'h_patches': h_patches,
             'w_patches': w_patches,
             'original_shape': (H, W),
-            'n_patches': len(patches)
+            'n_patches': len(positions),
         }
-        
+
+    def _extract_patch(
+        self,
+        img: torch.Tensor,
+        position: Tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        """Extract and edge-pad one patch."""
+        h_start, w_start, h_end, w_end = position
+        patch = img[:, :, h_start:h_end, w_start:w_end]
+        patch_h, patch_w = patch.shape[-2:]
+        if patch_h == self.patch_size and patch_w == self.patch_size:
+            return patch
+
+        pad_h = self.patch_size - patch_h
+        pad_w = self.patch_size - patch_w
+        pad_mode = "reflect"
+        if patch_h <= pad_h or patch_w <= pad_w:
+            pad_mode = "replicate"
+        return F.pad(patch, (0, pad_w, 0, pad_h), mode=pad_mode)
+
+    def _extract_patch_batch(
+        self,
+        img: torch.Tensor,
+        positions: list[Tuple[int, int, int, int]],
+    ) -> torch.Tensor:
+        return torch.cat(
+            [self._extract_patch(img, position) for position in positions],
+            dim=0,
+        )
+
+    def _extract_patches(self, img: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Extract all patches for compatibility and testing.
+
+        Production inference uses :meth:`_extract_patch_batch` so resident tile
+        memory is bounded by ``batch_size``.
+        """
+        info = self._patch_info(img)
+        patches = self._extract_patch_batch(img, info["positions"])
         return patches, info
+
+    def _accumulate_patch_batch(
+        self,
+        output: torch.Tensor,
+        positions: list[Tuple[int, int, int, int]],
+        accumulator: torch.Tensor,
+        weights: torch.Tensor,
+        patch_weight: torch.Tensor,
+    ) -> None:
+        """Blend one output batch directly into the full-image accumulator."""
+        for index, (h_start, w_start, h_end, w_end) in enumerate(positions):
+            h_size = h_end - h_start
+            w_size = w_end - w_start
+            patch = output[index:index + 1, :, :h_size, :w_size].float()
+            weight = patch_weight[:, :, :h_size, :w_size]
+            accumulator[:, :, h_start:h_end, w_start:w_end] += patch * weight
+            weights[:, :, h_start:h_end, w_start:w_end] += weight
     
     def _stitch_patches(
         self, 
@@ -144,18 +176,13 @@ class PatchInference:
         patch_weight = self._create_weight_mask(self.patch_size, self.overlap)
         patch_weight = patch_weight.to(device=patches.device, dtype=torch.float32)
 
-        # Place each patch
-        for idx, (h_start, w_start, h_end, w_end) in enumerate(positions):
-            h_size = h_end - h_start
-            w_size = w_end - w_start
-
-            # Get the patch and weight mask, cropping if necessary
-            patch = patches[idx:idx+1, :, :h_size, :w_size].float()
-            weight = patch_weight[:, :, :h_size, :w_size]
-
-            # Add to output with weighting
-            output[:, :, h_start:h_end, w_start:w_end] += patch * weight
-            weights[:, :, h_start:h_end, w_start:w_end] += weight
+        self._accumulate_patch_batch(
+            patches,
+            positions,
+            output,
+            weights,
+            patch_weight,
+        )
 
         # Normalize by weights. clamp_min (not +eps) so positions covered by a
         # single low-weight border tile divide by their TRUE weight - additive
@@ -236,15 +263,14 @@ class PatchInference:
 
                     return output.float()
 
-        # Extract patches
-        patches, info = self._extract_patches(img)
-        n_patches = patches.shape[0]
+        # Build patch coordinates only. Input/output patches are materialized one
+        # batch at a time so memory no longer grows with the number of tiles.
+        info = self._patch_info(img)
+        positions = info["positions"]
+        n_patches = len(positions)
         
         logger.info(f"Extracted {n_patches} patches from {info['original_shape']} image")
 
-        # Process patches in batches
-        outputs = []
-        
         # Create progress bar if requested
         if show_progress:
             pbar = tqdm(range(0, n_patches, self.batch_size), 
@@ -253,10 +279,14 @@ class PatchInference:
         else:
             pbar = range(0, n_patches, self.batch_size)
         
+        accumulator = None
+        weights = None
+        patch_weight = None
         with torch.inference_mode():
             for i in pbar:
-                batch = patches[i:i+self.batch_size].to(self.device)
-                
+                batch_positions = positions[i:i + self.batch_size]
+                batch = self._extract_patch_batch(img, batch_positions).to(self.device)
+
                 # Forward pass with mixed precision if enabled
                 with autocast_context(
                     self.device.type,
@@ -272,23 +302,40 @@ class PatchInference:
                     if self.apply_sigmoid:
                         output = torch.sigmoid(output)
 
-                # Keep tiles on-device: moving each batch to host here forced a
-                # blocking D2H copy/sync per batch, then the stitched cube was
-                # uploaded back to the device. The output tiles for an ARAD-size
-                # image are small (tens of MB), so on-device accumulation + an
-                # on-device stitch is both faster and avoids the round trip.
-                outputs.append(output)
-        
-        # Concatenate outputs
-        all_outputs = torch.cat(outputs, dim=0)
-        
-        # Determine output channels from first output
-        out_channels = all_outputs.shape[1]
-        
-        # Stitch patches back together
-        full_output = self._stitch_patches(all_outputs, info, out_channels)
-        
-        return full_output
+                if accumulator is None:
+                    out_channels = int(output.shape[1])
+                    accumulator = torch.zeros(
+                        1,
+                        out_channels,
+                        H,
+                        W,
+                        device=output.device,
+                        dtype=torch.float32,
+                    )
+                    weights = torch.zeros(
+                        1,
+                        1,
+                        H,
+                        W,
+                        device=output.device,
+                        dtype=torch.float32,
+                    )
+                    patch_weight = self._create_weight_mask(
+                        self.patch_size,
+                        self.overlap,
+                    ).to(device=output.device, dtype=torch.float32)
+
+                self._accumulate_patch_batch(
+                    output,
+                    batch_positions,
+                    accumulator,
+                    weights,
+                    patch_weight,
+                )
+
+        if accumulator is None or weights is None:
+            raise RuntimeError("Patch inference produced no output batches.")
+        return accumulator / weights.clamp_min(1e-8)
     
     def predict_dataset(
         self, 

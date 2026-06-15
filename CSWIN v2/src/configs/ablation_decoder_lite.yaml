@@ -1,0 +1,11 @@
+defaults:
+  - config
+  - _self_
+
+# Fresh-run architecture ablation. Existing checkpoints are intentionally
+# incompatible because decoder1 changes width and decoder2 changes depth.
+decoder1_compress_first: true
+stage_depths: [2, 2, 2, 2, 2]
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/ablation_decoder_lite
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/ablation_decoder_lite
