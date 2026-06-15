@@ -150,9 +150,14 @@ def load_checkpoint(
         return model, {}
     
     try:
-        # SECURITY: Use weights_only=True to prevent arbitrary code execution from malicious checkpoints
-        # This prevents pickle exploits when loading untrusted checkpoint files
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        # Resume checkpoints written by the trainers embed non-tensor state
+        # (config dict, numpy RNG tuple, val metrics), which torch's
+        # ``weights_only=True`` safe-unpickler REJECTS with UnpicklingError, so a
+        # strict resume would hard-fail on every real checkpoint. Match the
+        # rest of the codebase (``resume_training_state`` / inference
+        # ``load_generator``) and load with ``weights_only=False``. Only resume
+        # from checkpoints you produced/trust locally.
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Handle DDP module prefix mismatch
         is_model_ddp = isinstance(model, DDP)

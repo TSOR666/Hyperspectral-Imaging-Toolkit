@@ -52,13 +52,15 @@ or `uv run` fail before training starts.
 The defaults in `src/configs/config.yaml` use:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
-- AdamW with learning rate `4e-4` and cosine decay.
-- L1 plus a small stabilized MRAE correction.
+- Adam with learning rate `4e-4` and a 300k-step cosine decay.
+- Pure MRAE loss, matching the primary ARAD-1K metric and MST++ training.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
 - Local 7x7 spatial attention at high resolution and bounded global attention
   at low resolution.
 - MST++ center-crop validation.
+- Explicit exclusion of the known-corrupt `ARAD_1K_0314` scene, while other
+  missing or corrupt split entries fail dataset initialization.
 - `[0,1]` validation clamping to match NTIRE inference/export, with unclamped
   `raw_mrae` and `out_of_range_fraction` logged for diagnosis.
 
@@ -70,12 +72,12 @@ python src/hsi_model/train_generator.py \
   data_dir=/datasets/ARAD_1K \
   batch_size=16 \
   generator_lr=1e-4 \
-  objective=l1_with_mrae \
+  objective=mrae \
   memory_mode=standard
 ```
 
-For final training, enable and tune `progressive_stages` in the config for the
-128 -> 256 -> 512 patch schedule.
+Start this objective from a fresh checkpoint. For final training, enable and
+tune `progressive_stages` in the config for the 128 -> 256 -> 512 patch schedule.
 
 ## GPU Preflight
 

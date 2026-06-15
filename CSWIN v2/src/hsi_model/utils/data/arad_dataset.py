@@ -128,6 +128,16 @@ class ARAD1KDataset(Dataset):
             end_idx = min(self.start_idx + self.max_samples, len(self.file_pairs))
             self.file_pairs = self.file_pairs[self.start_idx:end_idx]
 
+        # This loader normalizes RGB by a fixed /255 (see __getitem__), which is
+        # NOT the per-image min-max normalization the MST training/NTIRE path
+        # uses. Feeding /255 RGB to a min-max-trained model is off-distribution.
+        # Use the MST_ValidDataset / cswin_test_ntire.py path to score MST/
+        # HSIFormer checkpoints; this loader is for the ARAD-1K folder layout.
+        logger.warning(
+            "ARAD1KDataset normalizes RGB by /255 (not per-image min-max). Do "
+            "NOT use it to evaluate models trained with MST min-max RGB; use "
+            "MST_ValidDataset / cswin_test_ntire.py instead."
+        )
         logger.info("ARAD1KDataset initialised with %s samples", len(self.file_pairs))
 
     # --------------------------------------------------------------------- #

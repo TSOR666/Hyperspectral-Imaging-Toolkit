@@ -276,3 +276,57 @@ def test_mst_float16_mode_reduces_resident_dtype():
         assert hsi_patch.dtype == np.float32
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_mst_train_strict_files_rejects_missing_split_scene(tmp_path):
+    spec_dir = tmp_path / "Train_Spec"
+    rgb_dir = tmp_path / "Train_RGB"
+    split_dir = tmp_path / "split_txt"
+    spec_dir.mkdir()
+    rgb_dir.mkdir()
+    split_dir.mkdir()
+    (split_dir / "train_list.txt").write_text(
+        "ARAD_1K_0314\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="ARAD_1K_0314"):
+        MST_TrainDataset(
+            data_root=str(tmp_path),
+            crop_size=2,
+            stride=1,
+            arg=False,
+            strict_files=True,
+        )
+
+
+def test_mst_train_allows_explicit_known_corrupt_scene_exclusion(tmp_path):
+    spec_dir = tmp_path / "Train_Spec"
+    rgb_dir = tmp_path / "Train_RGB"
+    split_dir = tmp_path / "split_txt"
+    spec_dir.mkdir()
+    rgb_dir.mkdir()
+    split_dir.mkdir()
+    (split_dir / "train_list.txt").write_text(
+        "ARAD_1K_0314\nscene_valid\n", encoding="utf-8"
+    )
+
+    with h5py.File(spec_dir / "scene_valid.mat", "w") as mat:
+        mat.create_dataset(
+            "cube", data=np.random.rand(31, 4, 4).astype(np.float32)
+        )
+    assert cv2.imwrite(
+        str(rgb_dir / "scene_valid.jpg"),
+        np.random.randint(0, 255, (4, 4, 3), dtype=np.uint8),
+    )
+
+    dataset = MST_TrainDataset(
+        data_root=str(tmp_path),
+        crop_size=2,
+        stride=1,
+        arg=False,
+        strict_files=True,
+        excluded_scene_stems=["ARAD_1K_0314"],
+    )
+
+    assert dataset.img_num == 1
+    assert len(dataset) == 9

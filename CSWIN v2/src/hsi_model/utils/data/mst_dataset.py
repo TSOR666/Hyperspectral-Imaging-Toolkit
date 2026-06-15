@@ -29,6 +29,31 @@ from ...constants import ARAD1K_NUM_BANDS, DEFAULT_PATCH_SIZE, DEFAULT_STRIDE
 
 logger = logging.getLogger(__name__)
 
+_WARNED_FLOAT16_TARGET = False
+
+
+def _warn_float16_target_quantization(memory_mode: str) -> None:
+    """Warn once that ``memory_mode='float16'`` quantizes the HSI target.
+
+    The HSI cube is the *supervised target* and is stored in ``[0, 1]``
+    reflectance with no normalization. Casting it to float16 (mst_dataset
+    load loop) injects a ~6e-4 relative quantization step into the values the
+    MRAE objective divides by, putting a small but real noise floor on the
+    optimized/reported MRAE. RGB (input) tolerates this; the target should not
+    be quantized for benchmark-accurate runs. Use ``memory_mode='lazy'`` when
+    host RAM is the constraint — it keeps fp32 targets and reads on demand.
+    """
+    global _WARNED_FLOAT16_TARGET
+    if memory_mode == "float16" and not _WARNED_FLOAT16_TARGET:
+        _WARNED_FLOAT16_TARGET = True
+        logger.warning(
+            "memory_mode='float16' stores the HSI TARGET in float16 (~6e-4 "
+            "relative quantization). This adds a small noise floor to MRAE and "
+            "makes metrics non-comparable with standard/lazy runs. Prefer "
+            "memory_mode='lazy' for RAM-limited benchmark-accurate training."
+        )
+
+
 _VALID_SPEC_DIRS = (
     "Valid_Spec",
     "Validation_Spec",
@@ -44,6 +69,15 @@ _VALID_RGB_DIRS = (
     "Train_RGB",
 )
 _RGB_SUFFIXES = (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def _normalize_scene_stems(values: Optional[Sequence[str]]) -> set[str]:
+    """Normalize configured scene exclusions to extension-free stems."""
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    return {Path(str(value)).stem for value in values}
 
 
 @dataclass(frozen=True)
@@ -237,6 +271,8 @@ class MST_TrainDataset(Dataset):
         stride: int = DEFAULT_STRIDE,
         memory_mode: str = "standard",
         lazy_cache_size: int = 3,
+        strict_files: bool = False,
+        excluded_scene_stems: Optional[Sequence[str]] = None,
         **_: object,
     ):
         self.crop_size = crop_size
@@ -249,7 +285,9 @@ class MST_TrainDataset(Dataset):
                 "memory_mode must be 'standard', 'float16', or 'lazy', "
                 f"got {memory_mode!r}"
             )
+        _warn_float16_target_quantization(self.memory_mode)
         self.lazy_cache_size = max(1, int(lazy_cache_size))
+        self.strict_files = bool(strict_files)
         self._bgr2rgb = bool(bgr2rgb)
         self._scene_refs: list[_MSTSceneRef] = []
         self._scene_hw: list[Tuple[int, int]] = []
@@ -272,6 +310,22 @@ class MST_TrainDataset(Dataset):
 
         hyper_list.sort()
         bgr_list.sort()
+        excluded = _normalize_scene_stems(excluded_scene_stems)
+        if excluded:
+            pairs = [
+                (hyper_name, bgr_name)
+                for hyper_name, bgr_name in zip(hyper_list, bgr_list)
+                if Path(hyper_name).stem not in excluded
+            ]
+            skipped = len(hyper_list) - len(pairs)
+            hyper_list = [pair[0] for pair in pairs]
+            bgr_list = [pair[1] for pair in pairs]
+            if skipped:
+                logger.warning(
+                    "Intentionally excluded %d configured training scene(s): %s",
+                    skipped,
+                    ", ".join(sorted(excluded)),
+                )
 
         logger.info(f"MST++ Train Dataset - Loading {len(hyper_list)} scenes")
 
@@ -301,6 +355,8 @@ class MST_TrainDataset(Dataset):
             try:
                 hyper = _load_mst_cube(Path(hyper_path))
             except Exception as exc:
+                if self.strict_files:
+                    raise RuntimeError(f"Failed to load training HSI {hyper_path}") from exc
                 logger.warning(f"Failed to load {hyper_path}: {exc}")
                 continue
 
@@ -313,16 +369,25 @@ class MST_TrainDataset(Dataset):
             try:
                 bgr = _load_normalized_rgb(Path(bgr_path), self._bgr2rgb)
             except Exception as exc:
+                if self.strict_files:
+                    raise RuntimeError(f"Failed to load training RGB {bgr_path}") from exc
                 logger.warning("%s", exc)
                 continue
 
             if hyper.ndim != 3 or bgr.ndim != 3:
+                if self.strict_files:
+                    raise ValueError(
+                        f"Unexpected training shapes for {hyper_path}: "
+                        f"hyper={hyper.shape} rgb={bgr.shape}"
+                    )
                 logger.warning("Unexpected shapes for %s: hyper=%s rgb=%s", hyper_path, hyper.shape, bgr.shape)
                 continue
             bgr_hw = (bgr.shape[1], bgr.shape[2])
             try:
                 hyper = _align_hyper_to_rgb(hyper, bgr_hw, Path(hyper_path))
             except ValueError as exc:
+                if self.strict_files:
+                    raise
                 logger.warning(str(exc))
                 continue
 
@@ -380,6 +445,8 @@ class MST_TrainDataset(Dataset):
                         raise KeyError(f"Missing 'cube' dataset in {hyper_path}")
                     _validate_cube_hw(tuple(mat["cube"].shape), rgb_hw, hyper_path)
             except Exception as exc:
+                if self.strict_files:
+                    raise RuntimeError(f"Failed to index lazy training scene {hyper_path}") from exc
                 logger.warning("Failed to index lazy scene %s: %s", hyper_path, exc)
                 continue
 
@@ -576,6 +643,8 @@ class MST_ValidDataset(Dataset):
         bgr2rgb: bool = True,
         memory_mode: str = "standard",
         lazy_cache_size: int = 1,
+        strict_files: bool = False,
+        excluded_scene_stems: Optional[Sequence[str]] = None,
         **_: Any,
     ):
         data_root_path = Path(data_root)
@@ -587,7 +656,9 @@ class MST_ValidDataset(Dataset):
                 "memory_mode must be 'standard', 'float16', or 'lazy', "
                 f"got {memory_mode!r}"
             )
+        _warn_float16_target_quantization(self.memory_mode)
         self.lazy_cache_size = max(1, int(lazy_cache_size))
+        self.strict_files = bool(strict_files)
         self._bgr2rgb = bool(bgr2rgb)
         self._scene_refs: list[_MSTSceneRef] = []
         self._rgb_cache: OrderedDict[int, np.ndarray] = OrderedDict()
@@ -598,6 +669,17 @@ class MST_ValidDataset(Dataset):
         if not split_path.exists():
             split_path = data_root_path / "split_txt" / "val_list.txt"
         scene_stems = sorted(_read_split_stems(split_path))
+        excluded = _normalize_scene_stems(excluded_scene_stems)
+        if excluded:
+            original_count = len(scene_stems)
+            scene_stems = [stem for stem in scene_stems if stem not in excluded]
+            skipped = original_count - len(scene_stems)
+            if skipped:
+                logger.warning(
+                    "Intentionally excluded %d configured validation scene(s): %s",
+                    skipped,
+                    ", ".join(sorted(excluded)),
+                )
 
         logger.info(f"MST++ Valid Dataset - Loading {len(scene_stems)} scenes")
 
@@ -610,6 +692,11 @@ class MST_ValidDataset(Dataset):
                 (".mat",),
             )
             if hyper_path is None:
+                if self.strict_files:
+                    raise FileNotFoundError(
+                        f"Validation HSI for {scene_stem} not found in "
+                        f"{', '.join(_VALID_SPEC_DIRS)}"
+                    )
                 logger.warning(
                     "Failed to load validation %s: .mat file not found in %s",
                     scene_stem,
@@ -625,6 +712,11 @@ class MST_ValidDataset(Dataset):
                 _RGB_SUFFIXES,
             )
             if bgr_path is None:
+                if self.strict_files:
+                    raise FileNotFoundError(
+                        f"Validation RGB for {scene_stem} not found in "
+                        f"{', '.join(_VALID_RGB_DIRS)}"
+                    )
                 logger.warning(
                     "Failed to load validation %s: RGB file not found in %s",
                     scene_stem,
@@ -658,6 +750,10 @@ class MST_ValidDataset(Dataset):
                 hyper = _load_mst_cube(hyper_path)
                 hyper = _align_hyper_to_rgb(hyper, rgb_hw, hyper_path)
             except Exception as exc:
+                if self.strict_files:
+                    raise RuntimeError(
+                        f"Failed to load validation scene {scene_stem}"
+                    ) from exc
                 logger.warning("Failed to load validation %s: %s", hyper_path, exc)
                 continue
 

@@ -244,6 +244,45 @@ def pick_amp_dtype(config: Dict[str, Any]) -> Optional[torch.dtype]:
     return None
 
 
+def autocast_context(
+    device_type: str,
+    enabled: bool,
+    dtype: Optional[torch.dtype] = None,
+):
+    """``torch.amp.autocast`` across torch API generations.
+
+    Uses the non-deprecated ``torch.amp.autocast(device_type, ...)`` on
+    torch>=2.4 (the old ``torch.cuda.amp.autocast`` emits a ``FutureWarning``
+    every call), falling back to the legacy API on older builds. ``enabled=
+    False`` is a no-op context regardless of device, so callers can pass the
+    real ``device.type`` and rely on ``enabled`` to gate it.
+    """
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast(
+                device_type=device_type, dtype=dtype, enabled=enabled
+            )
+        except TypeError:
+            pass
+    if device_type == "cuda" and hasattr(torch.cuda, "amp"):
+        return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+    return contextlib.nullcontext()
+
+
+def make_grad_scaler(device_type: str = "cuda", enabled: bool = True):
+    """``torch.amp.GradScaler`` across torch API generations.
+
+    Avoids the deprecated ``torch.cuda.amp.GradScaler`` constructor warning on
+    torch>=2.4 while still constructing a working scaler on older builds.
+    """
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler(device_type, enabled=enabled)
+        except TypeError:
+            pass
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def _normalize_cuda_rng_state_all(cuda_rng_state_all: Any) -> list[torch.Tensor]:
     """Return CUDA RNG states as CPU uint8 tensors for torch.cuda restore."""
     if isinstance(cuda_rng_state_all, torch.Tensor):
@@ -425,6 +464,8 @@ def resume_training_state(
     scalers: Dict[str, Any],
     device: torch.device,
     ema: Optional["GeneratorEMA"] = None,
+    expected_objective: Optional[str] = None,
+    allow_objective_mismatch: bool = False,
 ) -> Dict[str, Any]:
     """Restore full training state from a checkpoint saved by either trainer.
 
@@ -449,6 +490,25 @@ def resume_training_state(
         raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
 
     ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_config = ck.get("config")
+    checkpoint_objective = (
+        checkpoint_config.get("objective")
+        if hasattr(checkpoint_config, "get")
+        else None
+    )
+    if (
+        expected_objective is not None
+        and checkpoint_objective is not None
+        and str(checkpoint_objective).strip().lower()
+        != str(expected_objective).strip().lower()
+        and not allow_objective_mismatch
+    ):
+        raise ValueError(
+            "Resume objective mismatch: checkpoint uses "
+            f"{checkpoint_objective!r}, current run uses {expected_objective!r}. "
+            "Start a fresh run or set allow_objective_mismatch_resume=true "
+            "only if this change is intentional."
+        )
 
     # Model state. Tolerate both 'state_dict' (trainer schema) and
     # 'model_state_dict' (utils.checkpoint schema).
@@ -542,6 +602,8 @@ __all__ = [
     "setup_seed",
     "cleanup",
     "pick_amp_dtype",
+    "autocast_context",
+    "make_grad_scaler",
     "resume_training_state",
     "resolve_resume_stage_position",
     "GeneratorEMA",

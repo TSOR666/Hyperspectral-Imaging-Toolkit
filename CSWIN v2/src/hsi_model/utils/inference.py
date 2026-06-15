@@ -197,6 +197,14 @@ def geometric_self_ensemble(
     are untouched). ``predict_fn`` maps ``(1, Cin, H, W) -> (1, Cout, H, W)`` and
     must tolerate swapped H/W (rot90 transposes non-square inputs); the generator
     does, via its internal pad/crop.
+
+    Note: when ``predict_fn`` is a patch-tiling inferencer, odd-``k`` (transposed)
+    members are re-tiled on a different patch grid than the even members, so the
+    8 reconstructions are not produced by a strictly identical tiling. The effect
+    is confined to tile seams / the padded outer ring (sub-mdB); each member is
+    still inverted back to canonical orientation before averaging, so the result
+    is geometrically correct. For exact grid parity, pad to a common size before
+    tiling or apply D4 per tile.
     """
     outputs = []
     for flip in (False, True):
