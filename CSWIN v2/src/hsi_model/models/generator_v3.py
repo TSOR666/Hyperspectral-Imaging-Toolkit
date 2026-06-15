@@ -501,8 +501,20 @@ class NoiseRobustCSWinGenerator(nn.Module):
 
         # Decoder
         self.up1 = UpBlock(base_channels*4, base_channels*2, config=config)
-        self.decoder1 = make_stage(base_channels*4, split_sizes[1], stage_depths[3])
         self.compressor1 = nn.Conv2d(base_channels*4, base_channels*2, kernel_size=1)
+        self._decoder1_compress_first = bool(
+            config.get("decoder1_compress_first", False)
+        )
+        decoder1_channels = (
+            base_channels * 2
+            if self._decoder1_compress_first
+            else base_channels * 4
+        )
+        self.decoder1 = make_stage(
+            decoder1_channels,
+            split_sizes[1],
+            stage_depths[3],
+        )
 
         self.up2 = UpBlock(base_channels*2, base_channels, config=config)
         self.compressor2 = nn.Conv2d(base_channels*2, base_channels, kernel_size=1)
@@ -602,8 +614,12 @@ class NoiseRobustCSWinGenerator(nn.Module):
                 raise ValueError(f"Invalid spatial size for encoder stage e2: {e2.shape}")
             x = F.interpolate(x, size=e2.shape[2:], mode='bilinear', align_corners=False)
         x = torch.cat([x, e2], dim=1)
-        x = self.decoder1(x)
-        x = self.compressor1(x)
+        if self._decoder1_compress_first:
+            x = self.compressor1(x)
+            x = self.decoder1(x)
+        else:
+            x = self.decoder1(x)
+            x = self.compressor1(x)
         
         x = self.up2(x)
         if x.shape[2:] != e1.shape[2:]:

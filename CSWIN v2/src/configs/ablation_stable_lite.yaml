@@ -1,0 +1,14 @@
+defaults:
+  - config
+  - _self_
+
+# Combined high-impact ablation. Start from random initialization.
+objective: mrae_l1
+mrae_epsilon: 1.0e-2
+l1_weight: 0.3
+decoder1_compress_first: true
+stage_depths: [2, 2, 2, 2, 2]
+allow_objective_mismatch_resume: false
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/ablation_stable_lite
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/ablation_stable_lite
