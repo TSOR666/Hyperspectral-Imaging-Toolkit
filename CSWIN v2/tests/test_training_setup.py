@@ -226,6 +226,35 @@ def test_resume_training_state_preserves_early_stopping_state():
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
+def test_resume_training_state_rejects_objective_mismatch():
+    case_dir = _case_dir("resume_objective_mismatch")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    ckpt_path = case_dir / "hybrid_checkpoint.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "config": {"objective": "l1_with_mrae"},
+            },
+            ckpt_path,
+        )
+
+        with pytest.raises(ValueError, match="Resume objective mismatch"):
+            resume_training_state(
+                checkpoint_path=str(ckpt_path),
+                model=target,
+                optimizers={},
+                schedulers={},
+                scalers={},
+                device=torch.device("cpu"),
+                expected_objective="mrae",
+            )
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
 def test_resolve_resume_stage_position_derives_single_stage_legacy_iteration():
     stages = [{"iterations": 100_000}]
 

@@ -7,6 +7,8 @@ from typing import Tuple, Optional, Dict, Any
 import logging
 from tqdm import tqdm
 
+from .training_setup import autocast_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,7 +211,7 @@ class PatchInference:
         if H <= self.patch_size and W <= self.patch_size:
             logger.info(f"Image size {H}x{W} is smaller than patch size, processing directly")
             with torch.inference_mode():
-                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                with autocast_context(self.device.type, self.use_fp16, torch.float16):
                     if hasattr(self.model, 'generator'):
                         output = self.model.generator(img.to(self.device))
                     else:
@@ -243,17 +245,22 @@ class PatchInference:
                 batch = patches[i:i+self.batch_size].to(self.device)
                 
                 # Forward pass with mixed precision if enabled
-                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                with autocast_context(self.device.type, self.use_fp16, torch.float16):
                     if hasattr(self.model, 'generator'):
                         output = self.model.generator(batch)
                     else:
                         output = self.model(batch)
-                    
+
                     # Apply sigmoid if requested (for models that output logits)
                     if self.apply_sigmoid:
                         output = torch.sigmoid(output)
-                
-                outputs.append(output.cpu())
+
+                # Keep tiles on-device: moving each batch to host here forced a
+                # blocking D2H copy/sync per batch, then the stitched cube was
+                # uploaded back to the device. The output tiles for an ARAD-size
+                # image are small (tens of MB), so on-device accumulation + an
+                # on-device stitch is both faster and avoids the round trip.
+                outputs.append(output)
         
         # Concatenate outputs
         all_outputs = torch.cat(outputs, dim=0)

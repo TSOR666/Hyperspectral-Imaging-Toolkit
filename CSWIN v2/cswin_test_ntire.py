@@ -34,7 +34,11 @@ from hsi_model.utils.inference import (  # noqa: E402
     geometric_self_ensemble,
     load_generator,
 )
-from hsi_model.utils.metrics import compute_metrics  # noqa: E402
+from hsi_model.utils.metrics import compute_metrics, crop_center_arad1k  # noqa: E402
+
+# ARAD-1K / MST++ center-crop window (NTIRE-2022 scoring region).
+_ARAD_CROP_H = 226
+_ARAD_CROP_W = 256
 from hsi_model.utils.patch_inference import PatchInference  # noqa: E402
 from hsi_model.utils.data.mst_dataset import (  # noqa: E402
     _align_hyper_to_rgb,
@@ -81,6 +85,12 @@ class TestConfig:
     bgr2rgb: bool = True
     rgb_normalization: str = "mst"
     crop_border: int = 128
+    # 'arad1k' = fixed 226x256 center window (the NTIRE-2022 / MST++ scoring
+    # region; size-robust and leaderboard-comparable). 'border' = strip
+    # crop_border px from each side (only equals the 226x256 window at the
+    # canonical 482x512 ARAD size). Default 'arad1k' is bit-identical to
+    # border@128 on 482x512 images but correct for any other size.
+    crop_mode: str = "arad1k"
     compute_all_metrics: bool = True
     save_predictions: bool = False
     save_format: str = "mat"
@@ -273,9 +283,27 @@ def _crop_for_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
     crop_border: int,
+    crop_mode: str = "border",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if pred.shape != target.shape:
         raise ValueError(f"Metric shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}")
+
+    mode = str(crop_mode).strip().lower()
+    if mode in ("arad1k", "arad", "mst", "center", "centre"):
+        _, _, height, width = pred.shape
+        if height >= _ARAD_CROP_H and width >= _ARAD_CROP_W:
+            # Fixed 226x256 center window — identical to border-crop 128 at the
+            # canonical 482x512 ARAD size, protocol-correct at any other size.
+            return (
+                crop_center_arad1k(pred, _ARAD_CROP_H, _ARAD_CROP_W),
+                crop_center_arad1k(target, _ARAD_CROP_H, _ARAD_CROP_W),
+            )
+        LOGGER.warning(
+            "Image %dx%d is smaller than the ARAD-1K crop %dx%d; falling back "
+            "to border crop.",
+            height, width, _ARAD_CROP_H, _ARAD_CROP_W,
+        )
+
     if crop_border <= 0:
         return pred, target
 
@@ -439,6 +467,7 @@ class CSWINNTIRETester:
                     pred_for_metrics,
                     target_for_metrics,
                     self.config.crop_border,
+                    self.config.crop_mode,
                 )
                 metrics = compute_metrics(
                     pred_for_metrics,
@@ -460,7 +489,10 @@ class CSWINNTIRETester:
 
             per_sample.append(sample_result)
 
-            if torch.cuda.is_available():
+            # Releasing the allocator cache every image forces a device sync and
+            # a re-cudaMalloc on the next image (allocator thrash). Steady-state
+            # tile inference does not grow memory, so reclaim only periodically.
+            if torch.cuda.is_available() and (idx + 1) % 25 == 0:
                 torch.cuda.empty_cache()
 
         results: Dict[str, Any] = {
@@ -532,6 +564,11 @@ def parse_args() -> TestConfig:
     parser.add_argument("--no_bgr2rgb", dest="bgr2rgb", action="store_false")
     parser.add_argument("--rgb_normalization", type=str, default="mst", choices=["mst", "uint8"])
     parser.add_argument("--crop_border", type=int, default=128)
+    parser.add_argument(
+        "--crop_mode", type=str, default="arad1k", choices=["arad1k", "border"],
+        help="arad1k: fixed 226x256 center window (leaderboard protocol); "
+             "border: strip crop_border px each side (legacy).",
+    )
     parser.add_argument("--compute_all_metrics", dest="compute_all_metrics", action="store_true", default=True)
     parser.add_argument("--essential_metrics_only", dest="compute_all_metrics", action="store_false")
 

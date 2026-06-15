@@ -11,15 +11,15 @@ CSWIN v2 performs RGB-to-hyperspectral reconstruction:
 
 The generator combines CBAM channel gating, full-resolution spectral MSA,
 GDFN/SGFN blocks, bounded local/global spatial attention, skip connections,
-and PixelUnshuffle/PixelShuffle sampling. The configured objective is L1 plus a
-small stabilized MRAE term.
+and PixelUnshuffle/PixelShuffle sampling. The configured objective is pure MRAE,
+matching MST++ training and the primary ARAD-1K metric.
 
 # 2. Critical Paths & Profiling Plan
 
 Training:
 
 `MST/HF dataset -> paired crop/augmentation -> DataLoader -> generator ->
-L1/MRAE loss -> AMP backward -> AdamW -> cosine schedule -> EMA ->
+MRAE loss -> AMP backward -> Adam -> cosine schedule -> EMA ->
 center-crop validation -> atomic checkpoint`
 
 Inference:
@@ -50,7 +50,7 @@ Audit execution:
 | HIGH | Training | `train_generator.py:320-334` | Validation failures previously could become valid-looking zero metrics | Corrupt checkpoint selection | Verified fixed: fail-fast, distributed-aware rejection |
 | HIGH | Architecture/Memory | `models/attention.py:477`, `:550` | Legacy axial attention scaled quadratically along full image axes | High activation memory and latency | Verified fixed: bounded local windows and low-resolution global attention |
 | HIGH | Data/Memory | `utils/data/mst_dataset.py:246-329` | Resident-only scene loading duplicated large arrays across workers | Host-RAM pressure and slow startup | Verified fixed: standard, float16, and lazy modes |
-| MEDIUM | Training | `train_generator.py:876` | AdamW applies weight decay to biases, normalization scales, and attention temperatures | May over-regularize sensitive scale parameters | Run no-decay ablation; preserve old optimizer-group resume compatibility |
+| RESOLVED | Training | `config.yaml`, `train_generator.py:878` | The active recipe previously used AdamW decay unlike MST++ | Could over-regularize sensitive scale parameters | Switched the active MRAE recipe to Adam with zero weight decay |
 | MEDIUM | Speed/Maintenance | `train_generator.py:297`, `utils/patch_inference.py:246` | Deprecated `torch.cuda.amp` API remains | Warnings and future compatibility risk | Migrate through a version-compatible AMP helper |
 | BLOCKER | Environment | `.venv` | Default environment contains incomplete Torch/NumPy package metadata | `uv run` cannot repair or launch reliably | Recreate `.venv`; `.venv-audit` is healthy |
 
@@ -108,7 +108,7 @@ Evidence:
 Fix:
 
 - Generator-only preflight is now the default.
-- It runs the active L1/MRAE criterion and AdamW step.
+- It runs the active pure-MRAE criterion and Adam step.
 - Legacy `sinkhorn` and `optimized` modes remain explicit.
 - README and Quick Start now document the active path and actual defaults.
 
@@ -130,15 +130,11 @@ Remaining architecture risk:
 - The 31-band output is modeled directly rather than through a low-rank
   spectral basis.
 
-## 4.5 Optimizer grouping
+## 4.5 Optimizer
 
-The active 7.02M-parameter model has about 55.7K one-dimensional/bias/temperature
-parameters (0.79%) that currently receive AdamW decay.
-
-Minimal alternative:
-
-- Separate decay and no-decay groups for biases, norm parameters, and learned
-  temperatures.
+The active pure-MRAE recipe uses Adam with zero weight decay, matching the
+official MST++ training optimizer and avoiding decay on biases, normalization
+scales, and learned attention temperatures.
 
 Why not enabled by default in this audit:
 

@@ -99,7 +99,7 @@ python src/hsi_model/train_generator.py \
     batch_size=16 \
     epochs=500 \
     generator_lr=1e-4 \
-    objective=l1_with_mrae \
+    objective=mrae \
     mixed_precision=true
 ```
 
@@ -158,14 +158,15 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 | `batch_size` | 32 | Batch size for training |
 | `val_batch_size` | 1 | Batch size for validation |
 | `patch_size` | 128 | Size of image patches |
-| `epochs` | 40 | Number of single-stage training epochs |
+| `epochs` | 300 | Number of single-stage training epochs |
 | `generator_lr` | 0.0004 | Generator learning rate |
-| `optimizer` | `adamw` | Generator optimizer |
-| `weight_decay` | 0.01 | AdamW weight decay |
-| `objective` | `l1_with_mrae` | Active reconstruction objective |
-| `mrae_weight` | 0.1 | Stabilized MRAE correction weight |
+| `optimizer` | `adam` | MST++-aligned generator optimizer |
+| `weight_decay` | 0.0 | No weight decay |
+| `objective` | `mrae` | Pure benchmark-aligned reconstruction objective |
+| `mrae_epsilon` | 1e-8 | Denominator floor shared with validation MRAE |
 | `mixed_precision` | true | Use automatic mixed precision |
 | `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
+| `excluded_scene_stems` | `[ARAD_1K_0314]` | Known-corrupt scenes omitted intentionally |
 
 See `src/configs/config.yaml` for all parameters.
 
@@ -210,9 +211,9 @@ print('✅ Installation verified!')
 - Tune `lazy_cache_size` to trade RAM for random-access speed. Keep `memory_mode=standard` when throughput matters more than resident memory.
 
 ### For Better Quality:
-- Increase `epochs=500`
-- Compare `objective=l1`, `objective=mrae`, and `objective=l1_with_mrae`
-- Enable the documented progressive 128 -> 256 -> 512 stages
+- Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
+- Start a fresh run after changing the objective to `mrae`
+- Enable the documented progressive 128 -> 256 -> 512 stages after the initial run
 - Track both deployed `mrae` and diagnostic `raw_mrae`
 
 ---
@@ -249,7 +250,7 @@ export HSI_CKPT_DIR=./experiments/run1/checkpoints
 python src/hsi_model/train_generator.py \
     --config-name config \
     batch_size=16 \
-    epochs=40 \
+    epochs=300 \
     generator_lr=4e-4
 
 # 3. Monitor (in another terminal)

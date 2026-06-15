@@ -28,17 +28,17 @@ batch_size: 32   # paper batch size (HSIFormer Sec 4.2)
 val_batch_size: 1
 patch_size: 128
 stride: 8
-# Cosine LR horizon = epochs * iterations_per_epoch. Keep this equal to the
-# number of epochs you ACTUALLY train. It was 300 while real runs stopped near
-# 64, so the LR had only annealed ~10% (still ~90% of initial) at epoch 64 -
-# the model never settled, which is the noisy plateau you saw. Set this to your
-# real wall-clock budget. The previous 100k-step run still had LR=2.9e-4 at
-# epoch 36, so it never entered a low-LR settling phase. A 40k horizon reaches
-# eta_min within the observed useful window.
-epochs: 40
+# MST++ trains for 300 epochs with 1000 updates per epoch. Keep the full 300k
+# cosine horizon for the benchmark-aligned MRAE run; an evaluation at 28k steps
+# is only about 9% through training and should not be treated as converged.
+epochs: 300
 iterations_per_epoch: 1000
 gradient_accumulation_steps: 2
 num_workers: 8   # was 2; raise toward (CPU cores - 2) to speed up patch loading
+# Validation rebuilds its DataLoader every epoch; with persistent_workers off,
+# a high worker count re-spawns processes (and re-pickles resident scenes under
+# spawn) each time for a tiny val set. null -> min(num_workers, 2).
+val_num_workers: null
 n_critic: 1
 mixed_precision: true
 mixed_precision_dtype: auto
@@ -46,6 +46,8 @@ deterministic: false
 allow_tf32: true
 memory_mode: standard
 lazy_cache_size: 3  # per-worker RGB scene + open-HDF5 handle LRU when memory_mode=lazy
+strict_dataset_files: true  # fail instead of silently dropping missing/corrupt split scenes
+excluded_scene_stems: [ARAD_1K_0314]  # known-corrupt ARAD-1K scene
 validation_max_batches: null
 finite_check_interval: 100
 # Score checkpoints in the same physical reflectance domain used by
@@ -57,32 +59,26 @@ validation_report_raw_mrae: true
 # Stop a single-resolution run after validation MRAE has genuinely plateaued.
 # For progressive training this is applied only to the final patch-size stage,
 # so an intermediate stage cannot prevent the higher-resolution fine-tuning.
-early_stopping_patience: 10
+early_stopping_patience: 0  # disabled for the full benchmark-aligned 300k run
 early_stopping_min_delta: 1.0e-4
 early_stopping_warmup_epochs: 10
 early_stopping_final_stage_only: true
 
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
-# Architecture aligned to HSIFormer; the loss is adapted to the observed
-# validation behavior by adding a small leaderboard-aligned MRAE term:
-# L1-primary hybrid loss on [0,1] targets, an efficient SSTB generator (CBAM channel gate ->
-# S-MSA + GDFN -> CSwin + SGFN), AdamW lr 4e-4 cosine. The sinkhorn_* /
+# Architecture aligned to HSIFormer with the same single MRAE objective used by
+# MST++ benchmark training: an efficient SSTB generator (CBAM channel gate ->
+# S-MSA + GDFN -> CSwin + SGFN), Adam lr 4e-4 cosine. The sinkhorn_* /
 # lambda_* / discriminator_* / r1 / n_critic / gradient_accumulation_steps keys
 # below are LEGACY (read only by the deprecated GAN trainers).
 # ===========================================================================
-# Start a fresh run for this objective/schedule combination. Resuming the old
-# 100k pure-L1 optimizer state would immediately place the new run near its end.
-# NOTE: l1_with_mrae is a deliberate deviation from the pure-L1 paper recipe
-# and from MRAE-only MST++ training. Runs with this objective are NOT
-# loss-protocol-comparable with MST++ baselines; use `objective: l1` (paper)
-# or `objective: mrae` (MST++) for strict benchmark comparisons.
-objective: l1_with_mrae  # L1 + small stabilized MRAE; keeps the target metric moving
-optimizer: adamw         # adamw regularizes the small dataset | adam
-weight_decay: 1.0e-2     # was 0.0; the regularization the 44.8M overfit run lacked
-mrae_epsilon: 1.0e-2     # only used if objective involves MRAE
-mrae_weight: 0.1
-l1_weight: 1.0
+# Start a fresh run. Do not resume an L1 or hybrid-loss optimizer state into
+# this MRAE-only experiment.
+objective: mrae
+allow_objective_mismatch_resume: false
+optimizer: adam          # matches MST++ training
+weight_decay: 0.0
+mrae_epsilon: 1.0e-8     # matches validation compute_mrae denominator flooring
 
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
@@ -105,11 +101,11 @@ use_noise_block: false           # NoiseAwareBlock is not in the paper
 thick_output_head: false         # paper ToOut is a single conv
 ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
 
-# Progressive training (HSIFormer Sec 4.2): fine-tune at growing patch sizes
-# 128 -> 256 -> 512. UNCOMMENT for the final SOTA-recipe run; leave commented
+# Progressive training: fine-tune at growing patch sizes 128 -> 256 -> 512.
+# UNCOMMENT for a final multi-resolution run; leave commented
 # for single-resolution ablations (then training uses patch_size + epochs *
 # iterations_per_epoch above). Reduce batch_size at larger patches to fit
-# memory; tune iteration counts to your wall-clock budget.
+# memory. The first stage keeps the benchmark-aligned 300k cosine horizon.
 # progressive_stages:
 #   - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 32}
 #   - {patch_size: 256, iterations: 50000,  init_lr: 4.0e-5, batch_size: 8}
@@ -140,10 +136,7 @@ use_ema: true
 ema_decay: 0.999
 ema_update_every: 10
 
-# Loss = true L1 (main) + small MRAE (keeps the ARAD-1K leaderboard metric in
-# the objective) + small Sinkhorn-OT adversarial term. SAM and perceptual are
-# dropped. Weights are FIXED (use_adaptive_weights: false) so the reconstruction
-# term never decays and the adversarial term never ramps up during training.
+# Legacy GAN-only loss keys below are ignored by train_generator.py.
 use_adaptive_weights: false
 reconstruction_loss: l1   # main fidelity term: true L1 (was Charbonnier)
 lambda_rec: 1.0

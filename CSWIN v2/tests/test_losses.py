@@ -6,12 +6,14 @@ import torch
 from hsi_model.models.losses_consolidated import (
     CharbonnierLoss,
     L1PlusMRAELoss,
+    MRAELoss,
     RelativeMRAELoss,
     SAMLoss,
     SinkhornDivergence,
     NoiseRobustLoss,
     ComputeSinkhornDiscriminatorLoss,
 )
+from hsi_model.train_generator import build_criterion
 
 
 def test_cost_matrix_matches_cdist():
@@ -72,6 +74,21 @@ def test_l1_plus_mrae_loss_uses_configured_weights():
     value.backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
+
+
+def test_build_criterion_mrae_is_pure_metric_matching_mrae():
+    criterion = build_criterion({"objective": "mrae", "mrae_epsilon": 1e-8})
+    assert type(criterion) is MRAELoss
+    assert criterion.epsilon == pytest.approx(1e-8)
+
+    pred = torch.tensor([[[[0.3, 0.1]]]])
+    target = torch.tensor([[[[0.2, 0.05]]]])
+    expected = torch.mean(torch.abs(pred - target) / target.abs().clamp_min(1e-8))
+    assert torch.allclose(criterion(pred, target), expected)
+
+
+def test_build_criterion_defaults_to_mrae():
+    assert type(build_criterion({})) is MRAELoss
 
 
 def test_sam_loss_finite():

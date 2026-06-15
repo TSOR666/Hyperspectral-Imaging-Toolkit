@@ -88,6 +88,8 @@ def create_training_datasets(
     data_root = config.get("data_dir", DEFAULT_DATA_DIR)
     crop_size = config.get("patch_size", DEFAULT_PATCH_SIZE)
     stride = config.get("stride", DEFAULT_STRIDE)
+    strict_files = bool(config.get("strict_dataset_files", True))
+    excluded_scene_stems = config.get("excluded_scene_stems", ())
 
     train_dataset = MST_TrainDataset(
         data_root=data_root,
@@ -97,6 +99,8 @@ def create_training_datasets(
         stride=stride,
         memory_mode=memory_mode,
         lazy_cache_size=lazy_cache_size,
+        strict_files=strict_files,
+        excluded_scene_stems=excluded_scene_stems,
     )
 
     val_dataset = MST_ValidDataset(
@@ -104,6 +108,8 @@ def create_training_datasets(
         bgr2rgb=True,
         memory_mode=memory_mode,
         lazy_cache_size=max(1, int(config.get("lazy_val_cache_size", 1))),
+        strict_files=strict_files,
+        excluded_scene_stems=excluded_scene_stems,
     )
 
     return train_dataset, val_dataset

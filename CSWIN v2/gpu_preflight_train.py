@@ -146,10 +146,8 @@ def tiny_config() -> dict[str, object]:
         "num_heads": 2,
         "norm_groups": 4,
         "output_activation": "none",
-        "objective": "l1_with_mrae",
-        "mrae_epsilon": 1e-2,
-        "mrae_weight": 0.1,
-        "l1_weight": 1.0,
+        "objective": "mrae",
+        "mrae_epsilon": 1e-8,
         "sampling": "pixelshuffle",
         "spectral_attention_type": "s_msa",
         "cswin_attention_mode": "local_global",
@@ -300,7 +298,7 @@ def assert_training_step(context: dict[str, object]) -> str:
     if context.get("generator_only", False):
         generator_criterion = context["generator_criterion"]
         assert isinstance(generator_criterion, torch.nn.Module)
-        optimizer = torch.optim.AdamW(model.generator.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(model.generator.parameters(), lr=1e-4)
         optimizer.zero_grad(set_to_none=True)
         pred = model.generator(rgb)
         loss = generator_criterion(pred.float(), hsi.float())
@@ -353,7 +351,7 @@ def assert_amp_step(context: dict[str, object], enabled: bool) -> str:
 
     model.train()
     optimizer = (
-        torch.optim.AdamW(model.generator.parameters(), lr=1e-4)
+        torch.optim.Adam(model.generator.parameters(), lr=1e-4)
         if context.get("generator_only", False)
         else torch.optim.Adam(model.generator.parameters(), lr=1e-4)
     )

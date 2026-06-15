@@ -4,9 +4,8 @@ Generator-only (no-GAN) training for CSWin RGB->HSI reconstruction.
 
 This is the post-GAN trainer: the discriminator, Sinkhorn-OT adversarial loss,
 and R1 regularization are gone. The objective is a configurable reconstruction
-loss (see ``objective`` in config.yaml; the active recipe uses L1 plus a small
-MRAE term — note that any compound objective is NOT loss-comparable with
-MRAE-only MST++ benchmark training, only the evaluation metric is).
+loss (see ``objective`` in config.yaml; the active benchmark recipe uses only
+MRAE, matching MST++ training and the primary ARAD-1K evaluation metric).
 
 Dropping the GAN removes 4 discriminator forwards + a discriminator backward +
 the per-batch Sinkhorn loop per iteration, which frees most of the compute
@@ -35,7 +34,10 @@ import torch
 import torch.nn as nn
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from torch.cuda.amp import GradScaler, autocast
+try:  # torch>=2.3 exposes the non-deprecated GradScaler here (typing only).
+    from torch.amp import GradScaler
+except ImportError:  # pragma: no cover - very old torch
+    from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -60,8 +62,10 @@ from hsi_model.constants import (
 )
 from hsi_model.utils import setup_logging, MetricsLogger
 from hsi_model.utils.training_setup import (
+    autocast_context,
     cleanup,
     GeneratorEMA,
+    make_grad_scaler,
     pick_amp_dtype,
     resume_training_state,
     resolve_resume_stage_position,
@@ -151,8 +155,8 @@ def _sync_early_stopping_state(
 
 
 def build_criterion(config: Dict[str, Any]) -> nn.Module:
-    """Build the configured reconstruction criterion (L1 by default)."""
-    objective = str(config.get("objective", "l1")).lower()
+    """Build the configured reconstruction criterion (MRAE by default)."""
+    objective = str(config.get("objective", "mrae")).lower()
     if objective in ("l1", "mae"):
         # HSIFormer/SS-Transformer (paper Sec 4.2) trains with L1 on [0,1]
         # targets; this is the validated objective for this architecture.
@@ -217,6 +221,43 @@ def _resolve_stages(config: Dict[str, Any]) -> list:
     }]
 
 
+_WARNED_RESIDENT_SPAWN = False
+
+
+def _warn_resident_workers_under_spawn(config, num_workers):
+    """Warn when resident scenes get copied into each spawn worker.
+
+    In ``standard``/``float16`` memory modes the dataset holds every scene in
+    RAM. Under the *fork* start method (Linux default) workers inherit those
+    arrays copy-on-write and read-only access never duplicates them. Under
+    *spawn* (Windows/macOS, or an explicit context) the whole resident set is
+    pickled into every worker -> host RAM scales with ``num_workers`` and
+    startup is slow. ``memory_mode=lazy`` keeps fp32 targets and reads on
+    demand, avoiding both.
+    """
+    global _WARNED_RESIDENT_SPAWN
+    if _WARNED_RESIDENT_SPAWN or num_workers <= 0:
+        return
+    memory_mode = str(config.get("memory_mode", "standard")).strip().lower()
+    if memory_mode not in ("standard", "float16"):
+        return
+    try:
+        import multiprocessing as _mp
+
+        start_method = _mp.get_start_method(allow_none=True) or _mp.get_start_method()
+    except (ValueError, RuntimeError):
+        start_method = None
+    if start_method == "spawn":
+        _WARNED_RESIDENT_SPAWN = True
+        logging.getLogger("hsi_model.training").warning(
+            "memory_mode=%r with num_workers=%d under the 'spawn' start method "
+            "pickles the full resident scene set into EVERY worker (host RAM "
+            "scales with num_workers, slow startup). Use memory_mode='lazy' to "
+            "read scenes on demand, or num_workers=0.",
+            memory_mode, num_workers,
+        )
+
+
 def _build_train_loader(dataset, batch_size, config, distributed, seed, rank):
     """Build a training DataLoader for a given dataset/batch_size."""
     seed_base = seed + rank * 1000
@@ -226,6 +267,7 @@ def _build_train_loader(dataset, batch_size, config, distributed, seed, rank):
     # Rank-dependent augmentation randomness comes from worker_init_fn_mst.
     sampler = DistributedSampler(dataset, shuffle=True, seed=seed) if distributed else None
     num_workers = int(config.get("num_workers", 8))
+    _warn_resident_workers_under_spawn(config, num_workers)
     return DataLoader(
         dataset=dataset,
         batch_size=int(batch_size),
@@ -261,12 +303,24 @@ def validate_generator(
             num_replicas=torch.distributed.get_world_size(),
             rank=torch.distributed.get_rank(),
         )
+    # This loader is rebuilt and torn down at EVERY validation (per
+    # ``iterations_per_epoch``), and ``persistent_workers=False`` means each
+    # rebuild spawns ``num_workers`` fresh processes. Under spawn (Windows) /
+    # standard|float16 memory modes that also re-pickles the whole resident
+    # scene set into every worker — dozens of GB copied per validation. The
+    # val set is tiny (val_batch_size=1, full-frame forward dominates), so cap
+    # workers low. ``val_num_workers`` overrides; default min(num_workers, 2).
+    train_num_workers = int(config.get("num_workers", 8))
+    val_num_workers = config.get("val_num_workers", None)
+    if val_num_workers is None:
+        val_num_workers = min(train_num_workers, 2)
+    val_num_workers = max(0, int(val_num_workers))
     val_loader = DataLoader(
         dataset=val_dataset,
         batch_size=config.get("val_batch_size", 1),
         shuffle=False,
         sampler=val_sampler,
-        num_workers=config.get("num_workers", 8),
+        num_workers=val_num_workers,
         pin_memory=True,
         worker_init_fn=make_worker_init_fn(seed, rank),
         persistent_workers=False,
@@ -294,7 +348,7 @@ def validate_generator(
                 rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
                 rgb_tensor = rgb_tensor.to(device, non_blocking=True)
                 hsi_tensor = hsi_tensor.to(device, non_blocking=True)
-                with autocast(enabled=use_amp, dtype=autocast_dtype):
+                with autocast_context(device.type, use_amp, autocast_dtype):
                     pred_hsi = net(rgb_tensor)
                     loss = criterion(pred_hsi.float(), hsi_tensor.float())
                 batch_size = int(hsi_tensor.shape[0])
@@ -424,7 +478,7 @@ def _run_stage(
                 generator.set_iteration(iteration)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=use_amp, dtype=autocast_dtype):
+            with autocast_context(device.type, use_amp, autocast_dtype):
                 pred = net(rgb_tensor)
 
             if check_finite and not torch.isfinite(pred).all():
@@ -449,7 +503,7 @@ def _run_stage(
             # (consecutive_nonfinite is reset only after a successful optimizer
             # step below, so repeated NaN losses/grads cannot loop forever.)
 
-            with autocast(enabled=use_amp, dtype=autocast_dtype):
+            with autocast_context(device.type, use_amp, autocast_dtype):
                 loss = criterion(pred.float(), hsi_tensor.float())
 
             # A non-finite loss is caught below via the grad-norm check (NaN
@@ -539,7 +593,7 @@ def _run_stage(
                 avg_train_loss = (
                     torch.stack(epoch_losses).mean().item() if epoch_losses else 0.0
                 )
-                objective_name = str(config.get("objective", "l1")).upper()
+                objective_name = str(config.get("objective", "mrae")).upper()
                 train_logger.info(
                     "Iter[%06d] Epoch[%06d] TrainLoss[%s]: %.6f ValMRAE: %.6f",
                     iteration, epoch_num, objective_name, avg_train_loss, current_mrae,
@@ -842,7 +896,7 @@ def main(config: DictConfig) -> None:
             main_logger.info("=" * 60)
             main_logger.info("GENERATOR-ONLY (NO-GAN) RECONSTRUCTION TRAINING")
             main_logger.info("objective=%s, sampling=%s, spectral=%s, base_channels=%s, blocks/stage=%s",
-                             cfg.get("objective", "l1"), cfg.get("sampling"),
+                             cfg.get("objective", "mrae"), cfg.get("sampling"),
                              cfg.get("spectral_attention_type"), cfg.get("base_channels"),
                              cfg.get("blocks_per_stage"))
             main_logger.info("=" * 60)
@@ -878,7 +932,7 @@ def main(config: DictConfig) -> None:
             optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=weight_decay)
 
         # Schedulers are built PER progressive stage inside train_generator_only.
-        scaler = GradScaler(enabled=(_amp_dtype == torch.float16))
+        scaler = make_grad_scaler(device.type, enabled=(_amp_dtype == torch.float16))
 
         criterion = build_criterion(cfg)
 
@@ -920,6 +974,10 @@ def main(config: DictConfig) -> None:
                 scalers={"scaler": scaler},
                 device=device,
                 ema=ema,
+                expected_objective=str(cfg.get("objective", "mrae")),
+                allow_objective_mismatch=bool(
+                    cfg.get("allow_objective_mismatch_resume", False)
+                ),
             )
 
         metrics_logger = MetricsLogger(cfg["log_dir"], rank)
