@@ -191,6 +191,7 @@ Runtime, precision, EMA, and stopping options:
 | `--ema_decay` | float | 0.999 | EMA decay factor. |
 | `--ema_start_epoch` | int | 5 | Delays EMA updates until this epoch. |
 | `--ema_eval_mode` | `ema`, `model`, `both` | `ema` | Weight set used for validation metrics. |
+| `--selection_source` | `auto`, `ema`, `model` | `auto` | Best-checkpoint source when raw and EMA are both validated. |
 | `--early_stopping_mode` | `off`, `min`, `max` | `off` | Disabled by default. |
 | `--early_stopping_patience` | int | 50 | Patience once early stopping is active. |
 | `--early_stopping_warmup` | int | 5 | Epochs skipped before early stopping can trigger. |

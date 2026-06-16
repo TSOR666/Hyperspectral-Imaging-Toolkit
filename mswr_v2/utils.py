@@ -185,6 +185,48 @@ class Loss_PSNR(nn.Module):
         psnr = 10.0 * torch.log10(data_range_sq / err.clamp_min(1e-6))
         return torch.mean(psnr)
 
+class Loss_SSIM(nn.Module):
+    """
+    Structural Similarity metric for hyperspectral tensors.
+
+    Computes SSIM independently over each channel using grouped average pooling
+    semantics from PyTorch's per-channel pooling, then averages over batch,
+    channel, and spatial positions.
+    """
+    def __init__(self, window_size: int = 11, data_range: float = 1.0) -> None:
+        super(Loss_SSIM, self).__init__()
+        self.window_size = int(window_size)
+        self.data_range = float(data_range)
+
+    def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        outputs, label = _metric_tensors(outputs, label)
+
+        if outputs.shape[-2] < self.window_size or outputs.shape[-1] < self.window_size:
+            return torch.ones((), device=outputs.device, dtype=outputs.dtype)
+
+        padding = self.window_size // 2
+        mu1 = torch.nn.functional.avg_pool2d(outputs, self.window_size, 1, padding)
+        mu2 = torch.nn.functional.avg_pool2d(label, self.window_size, 1, padding)
+
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = torch.nn.functional.avg_pool2d(outputs * outputs, self.window_size, 1, padding) - mu1_sq
+        sigma2_sq = torch.nn.functional.avg_pool2d(label * label, self.window_size, 1, padding) - mu2_sq
+        sigma12 = torch.nn.functional.avg_pool2d(outputs * label, self.window_size, 1, padding) - mu1_mu2
+
+        sigma1_sq = sigma1_sq.clamp_min(0.0)
+        sigma2_sq = sigma2_sq.clamp_min(0.0)
+
+        c1 = (0.01 * self.data_range) ** 2
+        c2 = (0.03 * self.data_range) ** 2
+        numerator = (2.0 * mu1_mu2 + c1) * (2.0 * sigma12 + c2)
+        denominator = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+        eps = torch.finfo(outputs.dtype).eps
+        ssim_map = numerator / denominator.clamp_min(eps)
+        return ssim_map.clamp(-1.0, 1.0).mean()
+
 # Additional loss functions for enhanced training
 class Loss_SAM(nn.Module):
     """
@@ -464,7 +506,8 @@ def get_model_size(model: nn.Module) -> float:
 
 def calculate_metrics(outputs: torch.Tensor, 
                      labels: torch.Tensor,
-                     include_sam: bool = True) -> Dict[str, float]:
+                     include_sam: bool = True,
+                     include_ssim: bool = False) -> Dict[str, float]:
     """
     Calculate multiple evaluation metrics
     
@@ -495,6 +538,10 @@ def calculate_metrics(outputs: torch.Tensor,
         # PSNR
         psnr_loss = Loss_PSNR()
         metrics['psnr'] = psnr_loss(outputs, labels, data_range=1.0).item()
+
+        if include_ssim:
+            ssim_loss = Loss_SSIM(data_range=1.0)
+            metrics['ssim'] = ssim_loss(outputs, labels).item()
         
         # SAM (for hyperspectral)
         if include_sam and outputs.shape[1] > 3:  # More than RGB channels

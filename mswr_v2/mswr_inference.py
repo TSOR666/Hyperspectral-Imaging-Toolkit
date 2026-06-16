@@ -66,6 +66,24 @@ MODEL_REGISTRY = {
     'large': create_mswr_large
 }
 
+
+def _resolve_eval_amp_dtype(requested: str = 'auto') -> torch.dtype:
+    """Resolve autocast dtype for inference (bf16 on Ampere+, else fp16).
+
+    Mirrors the trainer's resolve_amp_dtype so a bf16-trained model is not
+    silently run under fp16 by a bare autocast() call.
+    """
+    bf16_ok = bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+    if requested == 'fp16':
+        return torch.float16
+    if requested in ('auto', 'bf16'):
+        return torch.bfloat16 if bf16_ok else torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {requested!r}")
+
 @dataclass
 class InferenceConfig:
     """Comprehensive inference configuration"""
@@ -84,6 +102,9 @@ class InferenceConfig:
     tile_size: int = 256
     tile_overlap: int = 32
     use_amp: bool = True
+    # 'auto' -> bf16 on Ampere+, else fp16 (matches the trainer). A bare
+    # autocast() defaults to fp16 even for bf16-trained checkpoints.
+    amp_dtype: str = 'auto'
     num_workers: int = 4
     
     # Advanced settings
@@ -472,16 +493,30 @@ class MSWRInference:
             else:
                 raise ValueError(f"Unknown model size: {self.config.model_size}")
 
-        # Prefer EMA weights when the checkpoint provides them: EMA is what the
-        # trainer evaluates and reports "best_mrae" against (see
-        # train_mswr_v212_logging.py validate() with ema_eval_mode='ema'), so
-        # inference must mirror that to reproduce headline numbers. The base
-        # state_dict trails the EMA by the EMA decay window and produces worse
-        # outputs in practice.
+        # Modern best checkpoints carry the exact selected weights. Load those
+        # first so a raw-model win is not accidentally evaluated with the EMA
+        # shadow just because EMA is present in the training checkpoint.
+        selected_state = checkpoint.get('selected_state_dict')
+        selected_used = False
+        incompatible = None
+        if isinstance(selected_state, dict) and selected_state:
+            incompatible = model.load_state_dict(selected_state, strict=False)
+            selected_used = True
+            logger.info(
+                "Loaded selected checkpoint weights (source=%s).",
+                checkpoint.get('weights_source', 'unknown'),
+            )
+
+        # Legacy fallback: prefer EMA weights when the checkpoint provides them:
+        # EMA was historically what the trainer evaluated and reported
+        # "best_mrae" against, so inference mirrored that to reproduce headline
+        # numbers.
         ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
         ema_used = False
-        incompatible = None
-        if ema_state and isinstance(ema_state, dict):
+        requested_source = str(checkpoint.get('weights_source', '')).lower()
+        force_base = requested_source in {'model', 'raw', 'base'}
+        force_ema = requested_source == 'ema'
+        if not selected_used and not force_base and ema_state and isinstance(ema_state, dict):
             # Normalize the trainer's EMA container formats (mirrors
             # mswr_test_ntire.py): full checkpoints store
             # {'decay': ..., 'ema_state': <model state_dict>}; legacy formats
@@ -506,7 +541,10 @@ class MSWRInference:
                     incompatible = None
                     ema_used = False
 
-        if not ema_used:
+        if force_ema and not selected_used and not ema_used:
+            raise RuntimeError("Checkpoint requested EMA weights but no loadable EMA state was found.")
+
+        if not selected_used and not ema_used:
             if 'state_dict' in checkpoint:
                 incompatible = model.load_state_dict(checkpoint['state_dict'], strict=False)
             else:
@@ -715,7 +753,7 @@ class MSWRInference:
         # Inference
         with torch.inference_mode():
             if self.config.use_amp and self.device.type == 'cuda':
-                with autocast():
+                with autocast(dtype=_resolve_eval_amp_dtype(getattr(self.config, 'amp_dtype', 'auto'))):
                     if self.ensemble_processor:
                         output = self.ensemble_processor.process(self.model, input_tensor)
                     else:
@@ -741,7 +779,7 @@ class MSWRInference:
             
             with torch.inference_mode():
                 if self.config.use_amp and self.device.type == 'cuda':
-                    with autocast():
+                    with autocast(dtype=_resolve_eval_amp_dtype(getattr(self.config, 'amp_dtype', 'auto'))):
                         if self.ensemble_processor:
                             output = self.ensemble_processor.process(self.model, tile_tensor)
                         else:

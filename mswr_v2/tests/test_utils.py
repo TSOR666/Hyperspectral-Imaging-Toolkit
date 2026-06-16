@@ -14,6 +14,7 @@ try:
         Loss_PSNR,
         Loss_RMSE,
         Loss_SAM,
+        Loss_SSIM,
         calculate_metrics,
         count_parameters,
         get_model_size,
@@ -200,6 +201,14 @@ class TestLossFunctions:
         loss = loss_fn(pred, target)
         assert 0 <= loss.item() <= np.pi
 
+    def test_ssim_score_identical_tensors(self):
+        """SSIM should be near one for identical tensors."""
+        tensor = torch.rand(1, 31, 32, 32)
+        score = Loss_SSIM()(tensor, tensor)
+
+        assert torch.isfinite(score)
+        assert score.item() == pytest.approx(1.0, abs=1e-5)
+
 
 class TestCalculateMetrics:
     """Tests for calculate_metrics function."""
@@ -227,6 +236,13 @@ class TestCalculateMetrics:
         target = torch.rand(1, 31, 64, 64)
         metrics = calculate_metrics(pred, target, include_sam=False)
         assert "sam" not in metrics
+
+    def test_calculate_metrics_can_include_ssim(self):
+        """Test SSIM can be included for validation summaries."""
+        pred = torch.rand(1, 31, 32, 32)
+        target = torch.rand(1, 31, 32, 32)
+        metrics = calculate_metrics(pred, target, include_ssim=True)
+        assert "ssim" in metrics
 
 
 class TestModelUtilities:

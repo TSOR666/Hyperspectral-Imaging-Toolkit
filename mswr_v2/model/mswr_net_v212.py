@@ -235,6 +235,11 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
         self.forward_transform = OptimizedCNNWaveletTransform(J=1, wave=wave, mode=mode)
         self._filter_cache = {}
         self._cache_access_count = defaultdict(int)
+        # Bound the cache exactly like the forward transform. Without this the
+        # inverse cache grew without limit across distinct (channels, device,
+        # dtype) keys; benign for the canonical config but a latent leak for
+        # multi-resolution / multi-dtype inference.
+        self._cache_size_limit = 16
     
     def _get_conv_filters(self, channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Get cached inverse convolution filters"""
@@ -256,10 +261,22 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
         
         filters = torch.stack([h0_2d, h0h1_2d, h1h0_2d, h1_2d], dim=0)  # (4, K, K)
         filters = filters.unsqueeze(1).repeat(channels, 1, 1, 1)  # (4, 1, K, K) -> (4*C, 1, K, K)
-        
+
+        # Evict least-recently-used entries before inserting (mirror forward).
+        if len(self._filter_cache) >= self._cache_size_limit:
+            valid_keys = set(self._filter_cache.keys()) & set(self._cache_access_count.keys())
+            if valid_keys:
+                sorted_keys = sorted(valid_keys, key=lambda k: self._cache_access_count[k])
+                for key in sorted_keys[:len(self._filter_cache) - self._cache_size_limit + 1]:
+                    self._filter_cache.pop(key, None)
+                    self._cache_access_count.pop(key, None)
+            else:
+                self._filter_cache.clear()
+                self._cache_access_count.clear()
+
         self._filter_cache[cache_key] = filters
         self._cache_access_count[cache_key] = 1
-        
+
         return filters
     
     def forward(self, coeffs: Tuple[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
