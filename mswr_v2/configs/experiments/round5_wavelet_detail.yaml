@@ -1,0 +1,85 @@
+# Round-5 wavelet-detail experiment (capacity-light).
+#
+# Starts from the canonical configs/train.yaml recipe (MRAE-only, so it stays
+# MST++/ARAD-1K-comparable) and turns on the ONE round-5 architecture lever most
+# directly tied to the quality ceiling, without inflating capacity:
+#
+#   wavelet_detail_processing: true  -> a lightweight per-channel depthwise
+#       residual on the LH/HL/HH detail bands (vs gate-only). Today the wavelet
+#       branch applies attention/FFN to the LL band only, so high-frequency
+#       structure is under-modeled. The block is zero-init (exact identity at
+#       start), checkpoint-safe, and adds only ~+0.17% params (+4,480 on base).
+#
+# Landmark pooling is left at the default 'learned' ON PURPOSE: the 'adaptive'
+# alternative roughly DOUBLES the parameter count (3.04M -> 6.50M), and this
+# model already overfits ~epoch 70 on ARAD's 900 scenes and is not
+# capacity-bound, so adding capacity is the wrong lever here.
+#
+# cache_dtype: float16 halves the host-RAM dataset cache (~28 -> ~14 GB).
+# CAVEAT: training patches are upcast to float32 (parity-exact), but the
+# in-training VALIDATION cube is fp16-rounded (~1e-3 relative), so checkpoint
+# *selection* uses a marginally perturbed MRAE. The FINAL leaderboard number
+# from mswr_test_ntire.py is unaffected (it reads the validation set fresh at
+# float32). Set cache_dtype: float32 if you want bit-exact selection.
+#
+# Train from scratch (do NOT pass --pretrained_model_path): wavelet_detail_processing
+# changes the learned function, so other configs' checkpoints are not comparable.
+
+experiment_name: mswr_v212_round5_wavelet_detail
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (canonical + the single wavelet-detail lever) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+# landmark_pooling intentionally omitted -> default 'learned' (capacity-flat)
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true     # the round-5 architecture lever
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float16                # ~28 -> ~14 GB (see CAVEAT above)
+
+# ---- LOSS: MRAE only (keeps the metric MST++-comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule (canonical) ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA + selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"
