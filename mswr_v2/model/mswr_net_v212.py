@@ -342,6 +342,37 @@ class OptimizedCNNInverseWaveletTransform(nn.Module):
 
         return current
 
+class WaveletDetailBlock(nn.Module):
+    """Lightweight depthwise residual for the high-frequency wavelet bands.
+
+    Operates on a (B, C, 3, H, W) detail tensor (the LH/HL/HH subbands) by
+    folding the 3 orientations into the batch dim and applying a per-channel
+    (depthwise) 3x3 convolution, added as a residual. Zero-initialized so the
+    block is an exact identity at start: enabling it does not perturb a freshly
+    initialized model or destabilize from-scratch training, and existing
+    checkpoints (which simply lack these params) are unaffected when it is off.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=True)
+        self.reset_identity()
+
+    def reset_identity(self) -> None:
+        nn.init.zeros_(self.dw.weight)
+        if self.dw.bias is not None:
+            nn.init.zeros_(self.dw.bias)
+
+    def forward(self, yh_level: torch.Tensor) -> torch.Tensor:
+        """yh_level: (B, C, 3, H, W) -> same shape, with a near-identity residual."""
+        B, C, n, H, W = yh_level.shape  # (B, C, 3, H, W)
+        # Fold the orientation axis into the batch so depthwise conv stays per-channel.
+        x = yh_level.permute(0, 2, 1, 3, 4).reshape(B * n, C, H, W)  # (B*3, C, H, W)
+        x = self.dw(x)  # (B*3, C, H, W)
+        x = x.reshape(B, n, C, H, W).permute(0, 2, 1, 3, 4)  # (B, C, 3, H, W)
+        return yh_level + x
+
+
 # ===================== ENHANCED PERFORMANCE MONITORING =====================
 
 class PerformanceMonitor:
@@ -461,6 +492,13 @@ class MSWRDualConfig:
     use_wavelet: bool = True
     wavelet_type: str = 'db1'
     wavelet_levels: Optional[List[int]] = None
+    # When True, the high-frequency detail subbands (LH/HL/HH) are processed by a
+    # lightweight depthwise residual block instead of being only multiplicatively
+    # gated. The original wavelet path applies attention/FFN to the LL band only,
+    # leaving detail bands under-modeled (audit ROUND5). The block is zero-init
+    # (near-identity at start) and OFF by default, so it is checkpoint-safe and
+    # changes nothing unless explicitly enabled for an ablation.
+    wavelet_detail_processing: bool = False
     # NOTE: wavelet_gate_reuse caches a *content-dependent* gate keyed only by
     # spatial dims + stage. Reusing a cached gate across samples is a
     # correctness bug (wrong gate content, wrong batch size on reuse) and
@@ -1218,9 +1256,18 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             # Better initialization for wavelet gate
             nn.init.zeros_(self.wavelet_gate[-2].weight)
             nn.init.constant_(self.wavelet_gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
+
+            # Optional high-frequency detail processing (audit ROUND5). Default
+            # off => exact legacy behavior (detail bands only gated).
+            self.wavelet_detail = (
+                WaveletDetailBlock(dim)
+                if getattr(config, 'wavelet_detail_processing', False)
+                else None
+            )
         else:
             self.dwt = None
             self.wavelet_level = 0
+            self.wavelet_detail = None
         
         # Core transformer components
         self.attn = EnhancedDualAttention2D(dim, config)
@@ -1313,6 +1360,12 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             # Apply gate with proper broadcasting
             gate_expanded = gate_resized.unsqueeze(2)  # (B, C, H_level, W_level) -> (B, C, 1, H_level, W_level)
             h_gated = h_coeffs * gate_expanded  # (B, C, 3, H_level, W_level), broadcast along band dim
+
+            # Optional lightweight detail-band processing (near-identity residual
+            # at init). When disabled this branch is skipped entirely.
+            if self.wavelet_detail is not None:
+                h_gated = self.wavelet_detail(h_gated)  # (B, C, 3, H_level, W_level)
+
             yh_gated.append(h_gated)
 
         # Process low-frequency component with attention
@@ -1664,6 +1717,11 @@ class IntegratedMSWRNet(nn.Module):
             if gate is not None:
                 nn.init.zeros_(gate[-2].weight)
                 nn.init.constant_(gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
+            # Restore the zero (identity) init of any wavelet detail block, which
+            # the global Kaiming apply() above would otherwise overwrite.
+            detail = getattr(module, "wavelet_detail", None)
+            if isinstance(detail, WaveletDetailBlock):
+                detail.reset_identity()
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):

@@ -422,6 +422,7 @@ class TrainingConfig:
         self.weight_decay = args.weight_decay
         self.patch_size = args.patch_size
         self.stride = args.stride
+        self.cache_dtype = getattr(args, 'cache_dtype', 'float32')
         self.gpu_id = args.gpu_id
         
         # Model parameters
@@ -441,6 +442,7 @@ class TrainingConfig:
         self.use_wavelet = args.use_wavelet
         self.wavelet_type = args.wavelet_type
         self.wavelet_levels = getattr(args, 'wavelet_levels', None)
+        self.wavelet_detail_processing = getattr(args, 'wavelet_detail_processing', False)
 
         # Regularization knobs (None = keep the model's defaults). These are
         # the comparability-safe anti-overfitting levers (architecture-internal
@@ -556,6 +558,11 @@ def parse_arguments():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="weight decay")
     parser.add_argument("--patch_size", type=int, default=128, help="patch size")
     parser.add_argument("--stride", type=int, default=8, help="stride")
+    parser.add_argument("--cache_dtype", type=str, default='float32',
+                       choices=['float32', 'float16'],
+                       help="Host-RAM precision for the cached dataset. 'float16' halves "
+                            "RAM (~27GB->13.5GB on ARAD) with no training-parity loss; "
+                            "patches are upcast to float32 in __getitem__.")
     parser.add_argument("--gpu_id", type=str, default='0', help='GPU ID(s)')
     
     # Model parameters
@@ -581,6 +588,9 @@ def parse_arguments():
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
     parser.add_argument("--wavelet_levels", type=int, nargs='+', default=None,
                        help='Wavelet levels for each stage')
+    parser.add_argument("--wavelet_detail_processing", action='store_true', default=False,
+                       help="Process high-frequency wavelet detail bands with a lightweight "
+                            "depthwise residual instead of gating only (near-identity at init).")
     # Regularization (None keeps the model defaults: drop_path 0.1, dropout 0)
     parser.add_argument("--drop_path", type=float, default=None,
                        help='Stochastic-depth rate (model default 0.1); the main '
@@ -1215,6 +1225,7 @@ class EnhancedTrainer:
                 'use_flash_attn': self.config.use_flash_attn,
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
+                'wavelet_detail_processing': self.config.wavelet_detail_processing,
                 'landmark_pooling': self.config.landmark_pooling,
                 'use_spectral_attn': self.config.use_spectral_attn,
                 # The model's per-forward PerformanceMonitor is consumed ONLY by
@@ -1252,6 +1263,7 @@ class EnhancedTrainer:
                 use_wavelet=self.config.use_wavelet,
                 wavelet_type=self.config.wavelet_type,
                 wavelet_levels=self.config.wavelet_levels,
+                wavelet_detail_processing=self.config.wavelet_detail_processing,
                 use_spectral_attn=self.config.use_spectral_attn,
                 # See note above: only --profile_model consumes this monitor.
                 performance_monitoring=self.config.profile_model,
@@ -1373,12 +1385,14 @@ class EnhancedTrainer:
             bgr2rgb=True,
             arg=True,
             stride=self.config.stride,
+            cache_dtype=getattr(self.config, 'cache_dtype', 'float32'),
             logger=self.logger
         )
-        
+
         self.val_dataset = ValidDataset(
             data_root=self.config.data_root,
             bgr2rgb=True,
+            cache_dtype=getattr(self.config, 'cache_dtype', 'float32'),
             logger=self.logger
         )
         

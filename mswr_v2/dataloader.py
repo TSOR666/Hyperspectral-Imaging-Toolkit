@@ -69,6 +69,18 @@ _TEST_HSI_DIRS = (
 )
 _RGB_SUFFIXES = (".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff")
 
+_CACHE_DTYPES = {"float32": np.float32, "float16": np.float16, "fp32": np.float32, "fp16": np.float16}
+
+
+def _resolve_cache_dtype(cache_dtype: str) -> np.dtype:
+    """Map a cache-precision name to a numpy dtype for the host-RAM sample cache."""
+    key = str(cache_dtype).strip().lower()
+    if key not in _CACHE_DTYPES:
+        raise ValueError(
+            f"cache_dtype must be one of {sorted(set(_CACHE_DTYPES))}, got {cache_dtype!r}"
+        )
+    return np.dtype(_CACHE_DTYPES[key])
+
 
 @dataclass
 class DatasetConfig:
@@ -177,6 +189,7 @@ class TrainDataset(Dataset):
         bgr2rgb: bool = True,
         arg: bool = True,
         stride: int = 8,
+        cache_dtype: str = "float32",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
@@ -191,6 +204,11 @@ class TrainDataset(Dataset):
         self.crop_size = int(crop_size)
         self.stride = int(stride)
         self.augment = bool(arg)
+        # Host-RAM cache precision. 'float16' roughly halves the resident
+        # footprint of the eagerly-cached ARAD cubes (~27 GB -> ~13.5 GB) with no
+        # training-parity loss: __getitem__ upcasts each patch back to float32
+        # before returning it. Default 'float32' preserves the legacy behavior.
+        self._cache_np_dtype = _resolve_cache_dtype(cache_dtype)
 
         split_file = _first_existing_split(data_root_path, ("train_list.txt",))
         stems = _read_split_file(split_file)
@@ -230,8 +248,8 @@ class TrainDataset(Dataset):
                     "Padded image to (%d, %d) for crop_size=%d", h, w, self.crop_size
                 )
 
-            self.rgb_images.append(rgb)
-            self.hsi_cubes.append(hsi)
+            self.rgb_images.append(rgb.astype(self._cache_np_dtype, copy=False))
+            self.hsi_cubes.append(hsi.astype(self._cache_np_dtype, copy=False))
 
             patches_h = max(1, (h - self.crop_size) // self.stride + 1)
             patches_w = max(1, (w - self.crop_size) // self.stride + 1)
@@ -317,6 +335,7 @@ class ValidDataset(Dataset):
         *,
         split: str = "valid",
         bgr2rgb: bool = True,
+        cache_dtype: str = "float32",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
@@ -328,6 +347,9 @@ class ValidDataset(Dataset):
             logger=logger or logging.getLogger(__name__),
             bgr2rgb=bgr2rgb,
         )
+        # Optional fp16 host cache (see TrainDataset). __getitem__ upcasts to
+        # float32 so validation metrics are computed in full precision regardless.
+        self._cache_np_dtype = _resolve_cache_dtype(cache_dtype)
 
         split_key = split.lower()
         if split_key == "valid":
@@ -383,8 +405,12 @@ class ValidDataset(Dataset):
                     self.config.logger.warning("Skipping %s due to load failure: %s", stem, exc)
                     continue
 
-                self.rgb_images.append(torch.from_numpy(np.ascontiguousarray(rgb)))
-                self.hsi_cubes.append(torch.from_numpy(np.ascontiguousarray(hsi)))
+                self.rgb_images.append(
+                    torch.from_numpy(np.ascontiguousarray(rgb, dtype=self._cache_np_dtype))
+                )
+                self.hsi_cubes.append(
+                    torch.from_numpy(np.ascontiguousarray(hsi, dtype=self._cache_np_dtype))
+                )
                 self.stems.append(stem)
 
             if self.rgb_images:
@@ -405,4 +431,6 @@ class ValidDataset(Dataset):
         return len(self.rgb_images)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.rgb_images[index], self.hsi_cubes[index]
+        # .float() is a no-op when the cache is already float32, and upcasts a
+        # float16 cache so downstream metrics/model see full-precision inputs.
+        return self.rgb_images[index].float(), self.hsi_cubes[index].float()

@@ -35,9 +35,9 @@ Profiling and audit plan executed:
 |---|---|---|---|---|---|
 | MED, fixed | Speed/Inference | `mswr_inference.py:101,792-807` | `InferenceConfig.batch_size` existed, but tiled inference processed one tile per model call | One launch and one CPU transfer per tile; low GPU occupancy on large images | Batch tiles with `batch_size`, share model execution helper, postprocess batched BCHW outputs |
 | MED, fixed | Numerical/Inference | `mswr_inference.py:104-107,1109-1115` | CLI default disabled AMP despite config default `use_amp=True`; CLI also could not set `amp_dtype` | Command-line inference could silently run a different precision path from training/validation | Make CLI AMP default match config, add `--no_amp`, add `--amp_dtype auto|fp16|bf16` |
-| MED, open | Memory/Data | `dataloader.py:202-234,386-387` | Train and validation samples are eagerly cached as float32 | ARAD-sized runs can spend tens of GB of host RAM before training starts | Add opt-in fp16 host cache or mmap/on-demand mode with fp32 cast at `__getitem__` |
-| MED, open | Architecture/Quality | `model/mswr_net_v212.py:876-887` | Default `learned` landmarks are static K/V vectors, not content-pooled spatial landmarks | Weak global spatial mixing; can cap quality despite extra attention cost | Ablate `uniform`/`adaptive`; consider content-dependent low-rank landmark pooling |
-| MED, open | Architecture/Quality | `model/mswr_net_v212.py:1288-1315` | Wavelet branch runs attention/FFN on LL while high-frequency bands are only gated | Detail bands may be under-modeled; likely retraining-sensitive | Process details with light depthwise blocks or redesign wavelet path as high-frequency residual |
+| MED, addressed (§10) | Memory/Data | `dataloader.py` | Train and validation samples are eagerly cached as float32 | ARAD-sized runs can spend tens of GB of host RAM before training starts | **DONE:** opt-in `cache_dtype=float16` (default float32; `__getitem__` upcasts) — ~28.1 GB → ~14.1 GB, parity-exact |
+| MED, addressed (§10) | Architecture/Quality | `model/mswr_net_v212.py` | Default `learned` landmarks are static K/V vectors, not content-pooled spatial landmarks | Weak global spatial mixing; can cap quality despite extra attention cost | **ENABLED:** ablation config `ablation_landmark_adaptive.yaml` + regression test proving `adaptive` gives global mixing vs `learned`; default unchanged pending retrain |
+| MED, addressed (§10) | Architecture/Quality | `model/mswr_net_v212.py` | Wavelet branch runs attention/FFN on LL while high-frequency bands are only gated | Detail bands may be under-modeled; likely retraining-sensitive | **ENABLED:** opt-in `wavelet_detail_processing` (zero-init depthwise residual, +0.17% params, checkpoint-safe) + `ablation_wavelet_detail.yaml`; default off pending retrain |
 
 ## 4. Detailed Findings
 
@@ -209,3 +209,44 @@ round-5 patch removes a concrete tiled-inference inefficiency without changing
 model outputs. The remaining limits are mostly host-memory strategy and
 architecture choices that require real ARAD retraining or CUDA profiling before
 they should be changed by default.
+
+## 10. Round-5 Follow-up — open items addressed (2026-06-16)
+
+All three open items are now actionable. The two architecture items are
+retraining-sensitive, so they are delivered as opt-in / ablation-ready levers
+with the default behavior unchanged (no blind benchmark-affecting flip), each
+guarded by a regression test. Suite: **206 → 214 passed, 2 skipped** (+8 tests,
+`tests/test_audit5_fixes.py`). No parameters added to the default model.
+
+**A — fp16 host cache (DONE, default-safe).** `TrainDataset`/`ValidDataset`
+gained `cache_dtype` (`'float32'` default, `'float16'` opt-in), plumbed through
+`TrainingConfig` and a new `--cache_dtype` CLI flag. `__getitem__` upcasts each
+sample to float32, so training/validation precision is unchanged. Verified
+parity-exact (fp16 output == float32 quantized to fp16). Footprint: ARAD 900-scene
+train cache ~28.1 GB → ~14.1 GB. Files: `dataloader.py`,
+`train_mswr_v212_logging.py`.
+
+**B — landmark pooling (ENABLED for ablation).** `landmark_pooling` was already
+plumbed; added `configs/experiments/ablation_landmark_adaptive.yaml` (canonical
+recipe, only `landmark_pooling: adaptive` differs) and a regression test that
+demonstrates the gap concretely: a single-pixel input perturbation changes only
+~1 output position under `learned` (static dictionary) but ≥50% of positions
+under `adaptive` (content-pooled → genuine global mixing). The default stays
+`learned` pending a head-to-head retraining result.
+
+**C — wavelet detail-band processing (ENABLED, opt-in, checkpoint-safe).** Added
+`WaveletDetailBlock` (a per-channel depthwise 3×3 residual on the LH/HL/HH detail
+bands) gated by a new `wavelet_detail_processing` config flag (default `False`),
+plumbed through the trainer and `--wavelet_detail_processing`. The block is
+zero-initialized → exact identity at start, so enabling it does not perturb a
+fresh model or destabilize training, and existing checkpoints load cleanly
+(`strict=False` missing keys are only the zero-init detail blocks). Cost: +4,480
+params (+0.17% on base). Ablation config `configs/experiments/ablation_wavelet_detail.yaml`.
+The default keeps the original LL-only attention path until an ARAD retrain
+confirms the benefit. Files: `model/mswr_net_v212.py`,
+`train_mswr_v212_logging.py`.
+
+Still genuinely deferred (need CUDA / real ARAD data, cannot be done in this
+CPU-only workspace): measuring the bf16-vs-fp16 MRAE delta, peak GPU memory, and
+the actual MRAE impact of the landmark/wavelet ablations — i.e., deciding
+whether B/C should become the new defaults.
