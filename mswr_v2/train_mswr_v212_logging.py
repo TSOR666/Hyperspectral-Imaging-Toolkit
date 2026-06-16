@@ -127,6 +127,7 @@ try:
         Loss_MRAE, 
         Loss_RMSE, 
         Loss_PSNR,
+        Loss_SSIM,
         Loss_SAM,  # Added SAM import
         mrae_diagnostics,
     )
@@ -364,11 +365,16 @@ class EnhancedMSWRLoss(nn.Module):
             total_loss = total_loss + self.l1_weight * l1_loss
             loss_dict['l1'] = l1_loss.detach()
 
-        # MRAE loss (using fixed version from utils)
+        # MRAE loss (using fixed version from utils). MRAE is a PRIMARY signal
+        # (the benchmark objective), so — like L1 above — it is NOT warmup-scaled.
+        # Previously MRAE was multiplied by warmup_scale while L1 was not, which
+        # let a constant L1 transiently outweigh the "primary" MRAE term during
+        # the warmup window (e.g. at epoch 0: effective MRAE = 1.00*0.1 = 0.10 <
+        # L1 0.20 in sota_mrae_ssim.yaml). Only the genuinely auxiliary terms
+        # (SSIM/SAM/gradient) are warmed.
         if self.mrae_weight > 0:
-            mrae_weight = self.mrae_weight * warmup_scale
             mrae_loss = self.mrae_loss(pred, target)
-            total_loss = total_loss + mrae_weight * mrae_loss
+            total_loss = total_loss + self.mrae_weight * mrae_loss
             loss_dict['mrae'] = mrae_loss.detach()
 
         # SSIM loss (with warmup)
@@ -451,6 +457,7 @@ class TrainingConfig:
         self.sam_weight = args.sam_weight
         self.gradient_weight = args.gradient_weight
         self.loss_warmup_epochs = args.loss_warmup_epochs
+        self.selection_source = getattr(args, 'selection_source', 'auto')
         
         # Advanced training parameters
         self.use_amp = args.use_amp
@@ -646,6 +653,9 @@ def parse_arguments():
     parser.add_argument("--ema_eval_mode", type=str, default='ema',
                        choices=['ema', 'model', 'both'],
                        help="Which weights to use during validation ('ema' recommended)")
+    parser.add_argument("--selection_source", type=str, default='auto',
+                       choices=['auto', 'ema', 'model'],
+                       help="Checkpoint-selection source when both EMA and raw model are evaluated")
     
     # Optimization parameters
     parser.add_argument("--optimizer", type=str, default='adamw', 
@@ -859,28 +869,50 @@ def create_logger(log_dir: str, name: str = 'mswr_train', rank: int = 0) -> logg
 def create_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Optimizer:
     """Create optimizer with enhanced parameter grouping"""
     # Separate parameters by type for optimal training
-    norm_params = []
+    no_decay_params = []
     transformer_params = []
     other_params = []
-    
+
+    # Parameters that must be EXEMPT from weight decay regardless of the 'attn'
+    # substring: matching their last name component is robust because they live
+    # inside attention modules (so the old 'attn' rule sent them to the DECAYED
+    # group). These are scale/bias-like and standard practice (Swin/MST++) is to
+    # leave them undecayed:
+    #   - gamma / gamma2 : LayerScale on the attention and FFN residual branches
+    #   - rescale        : per-head temperature of the spectral S-MSA
+    #   - landmarks      : learned landmark K/V dictionary (a learned prior, not a weight)
+    #   - relative_position_bias_table : Swin-style relative position bias (2-D, so an
+    #     ndim<=1 filter alone would miss it)
+    no_decay_leaf_names = {
+        'gamma', 'gamma2', 'rescale', 'landmarks', 'relative_position_bias_table',
+    }
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        
-        if 'norm' in name or 'bias' in name:
-            norm_params.append(param)
+
+        leaf = name.split('.')[-1]
+        is_no_decay = (
+            param.ndim <= 1                 # all norms, biases, 1-D scales/temperatures
+            or 'norm' in name
+            or 'bias' in name
+            or leaf in no_decay_leaf_names
+        )
+
+        if is_no_decay:
+            no_decay_params.append(param)
         elif any(x in name for x in ['attn', 'attention', 'transformer']):
             transformer_params.append(param)
         else:
             other_params.append(param)
-    
+
     # Note: CNN wavelets use buffers, not parameters, so no wavelet param group
     param_groups = [
-        {'params': transformer_params, 'weight_decay': config.weight_decay, 
+        {'params': transformer_params, 'weight_decay': config.weight_decay,
          'lr': config.init_lr},
-        {'params': other_params, 'weight_decay': config.weight_decay, 
+        {'params': other_params, 'weight_decay': config.weight_decay,
          'lr': config.init_lr},
-        {'params': norm_params, 'weight_decay': 0.0, 'lr': config.init_lr}
+        {'params': no_decay_params, 'weight_decay': 0.0, 'lr': config.init_lr}
     ]
     
     # Filter out empty groups
@@ -1120,6 +1152,20 @@ class EnhancedTrainer:
         else:
             self.logger.info("EMA is disabled.")
 
+        # selection_source only takes effect when BOTH the raw model and EMA are
+        # validated each round (ema_eval_mode == 'both'); otherwise a single
+        # source is evaluated and a cross-source request cannot be honored. Warn
+        # rather than fail so existing configs keep working.
+        selection_source = getattr(self.config, 'selection_source', 'auto')
+        if selection_source != 'auto' and self.config.ema_eval_mode != 'both':
+            self.logger.warning(
+                "selection_source=%r is ignored because ema_eval_mode=%r (not 'both'); "
+                "only the %s weights are validated, so the best checkpoint is selected on "
+                "that source regardless of selection_source. Set ema_eval_mode='both' to honor it.",
+                selection_source, self.config.ema_eval_mode,
+                'EMA' if (self.config.use_ema and self.config.ema_eval_mode != 'model') else 'raw-model',
+            )
+
         if config.early_stopping_mode != 'off':
             self.early_stopping = EarlyStoppingMonitor(
                 patience=config.early_stopping_patience,
@@ -1171,7 +1217,13 @@ class EnhancedTrainer:
                 'wavelet_type': self.config.wavelet_type,
                 'landmark_pooling': self.config.landmark_pooling,
                 'use_spectral_attn': self.config.use_spectral_attn,
-                'performance_monitoring': self.config.memory_monitoring
+                # The model's per-forward PerformanceMonitor is consumed ONLY by
+                # _profile_model() (gated on --profile_model). Driving it from
+                # memory_monitoring meant it ran on every training forward with
+                # its output never read. Tie it to profile_model so the hot loop
+                # pays zero monitoring overhead by default; per-epoch CUDA peak
+                # logging still uses memory_monitoring independently.
+                'performance_monitoring': self.config.profile_model
             }
             
             if self.config.wavelet_levels:
@@ -1201,7 +1253,8 @@ class EnhancedTrainer:
                 wavelet_type=self.config.wavelet_type,
                 wavelet_levels=self.config.wavelet_levels,
                 use_spectral_attn=self.config.use_spectral_attn,
-                performance_monitoring=self.config.memory_monitoring,
+                # See note above: only --profile_model consumes this monitor.
+                performance_monitoring=self.config.profile_model,
                 **{
                     reg_key: float(getattr(self.config, reg_key))
                     for reg_key in ('drop_path', 'dropout', 'attention_dropout')
@@ -1470,6 +1523,7 @@ class EnhancedTrainer:
         self.criterion_mrae = Loss_MRAE().to(self.device)
         self.criterion_rmse = Loss_RMSE().to(self.device)
         self.criterion_psnr = Loss_PSNR().to(self.device)
+        self.criterion_ssim = Loss_SSIM(data_range=1.0).to(self.device)
         self.criterion_sam = Loss_SAM().to(self.device)  # Add SAM for validation
 
     def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1909,7 +1963,11 @@ class EnhancedTrainer:
                 new_best = selection_mrae < self.best_mrae
                 if new_best:
                     self.best_mrae = selection_mrae
-                    self.save_checkpoint('best.pth', is_best=True)
+                    self.save_checkpoint(
+                        'best.pth',
+                        is_best=True,
+                        weights_source=evaluation_source,
+                    )
                     self.logger.info(
                         f"New best validation MRAE: {self.best_mrae:.6f} "
                         f"(weights={evaluation_source})"
@@ -1947,7 +2005,8 @@ class EnhancedTrainer:
                     f"Train Loss: {losses.avg:.4f}, "
                     f"Val MRAE: {val_metrics['mrae']:.6f}, "
                     f"Val RMSE: {val_metrics['rmse']:.6f}, "
-                    f"Val PSNR: {val_metrics['psnr']:.2f}dB"
+                    f"Val PSNR: {val_metrics['psnr']:.2f}dB, "
+                    f"Val SSIM: {val_metrics['ssim']:.4f}"
                 )
                 if 'sam' in val_metrics:
                     log_msg += f", Val SAM: {val_metrics['sam']:.2f}deg"
@@ -1980,6 +2039,7 @@ class EnhancedTrainer:
             'mrae_unclamped': AverageMeter(),
             'rmse': AverageMeter(),
             'psnr': AverageMeter(),
+            'ssim': AverageMeter(),
             'sam': AverageMeter()
         }
         diag_meters: Dict[str, AverageMeter] = {}
@@ -2018,11 +2078,13 @@ class EnhancedTrainer:
             mrae = self.criterion_mrae(output_crop, labels_crop)
             rmse = self.criterion_rmse(output_crop, labels_crop)
             psnr = self.criterion_psnr(output_crop, labels_crop, data_range=1.0)
+            ssim = self.criterion_ssim(output_crop, labels_crop)
 
             metrics['mrae_unclamped'].update(mrae_unclamped.item())
             metrics['mrae'].update(mrae.item())
             metrics['rmse'].update(rmse.item())
             metrics['psnr'].update(psnr.item())
+            metrics['ssim'].update(ssim.item())
             
             if output_crop.shape[1] > 3:
                 sam = self.criterion_sam(output_crop, labels_crop)
@@ -2038,7 +2100,8 @@ class EnhancedTrainer:
             postfix = {
                 'MRAE': f'{metrics["mrae"].avg:.6f}',
                 'RMSE': f'{metrics["rmse"].avg:.6f}',
-                'PSNR': f'{metrics["psnr"].avg:.2f}dB'
+                'PSNR': f'{metrics["psnr"].avg:.2f}dB',
+                'SSIM': f'{metrics["ssim"].avg:.4f}',
             }
             if output_crop.shape[1] > 3:
                 postfix['SAM'] = f'{metrics["sam"].avg:.2f}deg'
@@ -2061,13 +2124,20 @@ class EnhancedTrainer:
         if eval_mode == 'both' and ema_ready:
             ema_results = self._validation_pass(self.ema.ema_model, desc='Validation (EMA)')
             model_results = self._validation_pass(self.model, desc='Validation (model)')
-            
-            results = dict(ema_results)
-            results['evaluation_model'] = 'ema'
+
+            results = {}
             for key, value in ema_results.items():
                 results[f'ema_{key}'] = value
             for key, value in model_results.items():
                 results[f'model_{key}'] = value
+            selected_source = self._select_validation_source(
+                results,
+                requested=getattr(self.config, 'selection_source', 'auto'),
+                fallback='ema',
+            )
+            selected_results = ema_results if selected_source == 'ema' else model_results
+            results.update(selected_results)
+            results['evaluation_model'] = selected_source
         else:
             use_ema = ema_ready and eval_mode != 'model'
             model_to_eval = self.ema.ema_model if use_ema else self.model
@@ -2075,10 +2145,12 @@ class EnhancedTrainer:
             results = self._validation_pass(model_to_eval, desc=desc)
             results['evaluation_model'] = 'ema' if use_ema else 'model'
 
-        # Official MST++ validation selects checkpoints on raw model outputs.
+        # Official MST++ validation selects checkpoints on unclamped model outputs.
         # Keep clamped metrics for reflectance-domain reporting, but use the
         # unclamped MRAE for benchmark-comparable model selection.
-        results['selection_mrae'] = results['mrae_unclamped']
+        results['selection_mrae'] = self._source_mrae(results, results['evaluation_model'])
+        if not math.isfinite(results['selection_mrae']):
+            results['selection_mrae'] = results['mrae_unclamped']
         
         if self.wandb is not None:
             log_dict = {
@@ -2087,6 +2159,7 @@ class EnhancedTrainer:
                 'val/selection_mrae': results['selection_mrae'],
                 'val/rmse': results['rmse'],
                 'val/psnr': results['psnr'],
+                'val/ssim': results['ssim'],
                 'val/epoch': self.epoch,
                 'val/evaluation_model': results['evaluation_model']
             }
@@ -2101,11 +2174,14 @@ class EnhancedTrainer:
                     log_dict[f'val_{prefix}/mrae'] = results[key_mrae]
                     key_rmse = f'{prefix}_rmse'
                     key_psnr = f'{prefix}_psnr'
+                    key_ssim = f'{prefix}_ssim'
                     key_sam = f'{prefix}_sam'
                     if key_rmse in results:
                         log_dict[f'val_{prefix}/rmse'] = results[key_rmse]
                     if key_psnr in results:
                         log_dict[f'val_{prefix}/psnr'] = results[key_psnr]
+                    if key_ssim in results:
+                        log_dict[f'val_{prefix}/ssim'] = results[key_ssim]
                     if key_sam in results:
                         log_dict[f'val_{prefix}/sam_deg'] = results[key_sam]
             self.wandb.log(log_dict)
@@ -2114,7 +2190,17 @@ class EnhancedTrainer:
         return results
 
     @staticmethod
+    def _normalize_weight_source(source: Any) -> str:
+        source_str = str(source or 'model').strip().lower()
+        if source_str in {'raw', 'base'}:
+            source_str = 'model'
+        if source_str not in {'model', 'ema'}:
+            raise ValueError(f"Unknown checkpoint weight source: {source!r}")
+        return source_str
+
+    @staticmethod
     def _source_mrae(val_metrics: Dict[str, float], source: str) -> float:
+        source = EnhancedTrainer._normalize_weight_source(source)
         source_unclamped_key = f'{source}_mrae_unclamped'
         if source_unclamped_key in val_metrics:
             return float(val_metrics[source_unclamped_key])
@@ -2130,10 +2216,43 @@ class EnhancedTrainer:
                 return float(val_metrics['mrae'])
         return float('inf')
 
+    @staticmethod
+    def _select_validation_source(
+        val_metrics: Dict[str, float],
+        requested: str = 'auto',
+        fallback: str = 'model',
+    ) -> str:
+        requested = str(requested or 'auto').strip().lower()
+        fallback = EnhancedTrainer._normalize_weight_source(fallback)
+
+        if requested in {'ema', 'model', 'raw', 'base'}:
+            source = EnhancedTrainer._normalize_weight_source(requested)
+            if math.isfinite(EnhancedTrainer._source_mrae(val_metrics, source)):
+                return source
+            return fallback
+
+        candidates = []
+        for source in ('ema', 'model'):
+            mrae = EnhancedTrainer._source_mrae(val_metrics, source)
+            if math.isfinite(mrae):
+                candidates.append((mrae, source))
+        if not candidates:
+            return fallback
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _state_dict_for_source(self, source: str) -> Dict[str, torch.Tensor]:
+        source = self._normalize_weight_source(source)
+        if source == 'ema':
+            if self.ema is None:
+                raise RuntimeError("EMA weights requested but EMA is not initialized.")
+            return self.ema.ema_model.state_dict()
+        return unwrap_model(self.model).state_dict()
+
     def _save_source_weights(self, source: str, mrae: float) -> None:
         """Save a lightweight checkpoint containing exactly the evaluated weights."""
         if self.rank != 0:
             return
+        source = self._normalize_weight_source(source)
         if source == 'ema':
             if self.ema is None:
                 return
@@ -2148,6 +2267,7 @@ class EnhancedTrainer:
         model_config = source_model.config.to_dict() if hasattr(source_model, 'config') else {}
         checkpoint = {
             'state_dict': source_model.state_dict(),
+            'selected_state_dict': source_model.state_dict(),
             'model_config': model_config,
             'best_mrae': float(mrae),
             'epoch': self.epoch,
@@ -2179,7 +2299,12 @@ class EnhancedTrainer:
             self.best_ema_epoch = self.epoch
             self._save_source_weights('ema', ema_mrae)
 
-    def save_checkpoint(self, filename: str, is_best: bool = False):
+    def save_checkpoint(
+        self,
+        filename: str,
+        is_best: bool = False,
+        weights_source: str = 'model',
+    ):
         """Enhanced checkpoint saving with metadata"""
         if self.rank != 0:
             return
@@ -2188,6 +2313,10 @@ class EnhancedTrainer:
         model_for_state = unwrap_model(self.model)
         model_state = model_for_state.state_dict()
         model_config = model_for_state.config.to_dict() if hasattr(model_for_state, 'config') else {}
+        selected_source = self._normalize_weight_source(weights_source)
+        selected_state = None
+        if is_best:
+            selected_state = self._state_dict_for_source(selected_source)
         
         # Track optional states
         early_state = None
@@ -2225,6 +2354,9 @@ class EnhancedTrainer:
         # Add scaler state if using AMP
         if self.scaler is not None:
             checkpoint['scaler'] = self.scaler.state_dict()
+        if selected_state is not None:
+            checkpoint['weights_source'] = selected_source
+            checkpoint['selected_state_dict'] = selected_state
         
         filepath = os.path.join(self.checkpoint_dir, filename)
         
@@ -2239,14 +2371,16 @@ class EnhancedTrainer:
                 
                 # Save lightweight version (model only)
                 lightweight_checkpoint = {
-                    'state_dict': model_state,
+                    'state_dict': selected_state if selected_state is not None else model_state,
                     'model_config': model_config,
                     'best_mrae': self.best_mrae,
                     'epoch': self.epoch,
+                    'weights_source': selected_source,
                     'timestamp': datetime.now().isoformat()
                 }
-                if self.ema is not None:
-                    lightweight_checkpoint['ema_state_dict'] = self.ema.ema_model.state_dict()
+                if selected_state is not None:
+                    lightweight_checkpoint['selected_state_dict'] = selected_state
+                if self.ema is not None and selected_source == 'ema':
                     lightweight_checkpoint['ema_decay'] = self.config.ema_decay
                 lightweight_path = os.path.join(self.checkpoint_dir, 'best_model_lightweight.pth')
                 torch.save(lightweight_checkpoint, lightweight_path)
@@ -2305,7 +2439,11 @@ class EnhancedTrainer:
                     self.best_mrae = selection_mrae
                     best_epoch = epoch
                     best_eval_source = val_metrics.get('evaluation_model', 'model')
-                    self.save_checkpoint('best_epoch.pth', is_best=True)
+                    self.save_checkpoint(
+                        'best_epoch.pth',
+                        is_best=True,
+                        weights_source=best_eval_source,
+                    )
                 
                 # Epoch timing
                 epoch_time = time.time() - epoch_start_time
@@ -2337,9 +2475,10 @@ class EnhancedTrainer:
                 
                 log_msg += (
                     f" | Val MRAE: {val_metrics['mrae']:.6f} "
-                    f"| Val MRAE (raw): {selection_mrae:.6f} "
+                    f"| Val MRAE (unclamped): {selection_mrae:.6f} "
                     f"| Val RMSE: {val_metrics['rmse']:.6f} "
-                    f"| Val PSNR: {val_metrics['psnr']:.2f}dB"
+                    f"| Val PSNR: {val_metrics['psnr']:.2f}dB "
+                    f"| Val SSIM: {val_metrics['ssim']:.4f}"
                 )
                 
                 if 'sam' in val_metrics:

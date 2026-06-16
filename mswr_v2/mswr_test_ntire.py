@@ -82,6 +82,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _resolve_eval_amp_dtype(requested: str = 'auto') -> torch.dtype:
+    """Resolve the autocast dtype for scoring/inference.
+
+    Mirrors ``resolve_amp_dtype`` in train_mswr_v212_logging.py so the test
+    engine scores under the SAME numeric regime the trainer measured
+    ``best_mrae`` in (bf16 on Ampere+, else fp16). A bare ``autocast()`` would
+    silently default to fp16 even on bf16-trained runs.
+    """
+    bf16_ok = bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+    if requested == 'fp16':
+        return torch.float16
+    if requested in ('auto', 'bf16'):
+        return torch.bfloat16 if bf16_ok else torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {requested!r}")
+
+
 @dataclass
 class TestConfig:
     """NTIRE 2022 Testing Configuration"""
@@ -102,6 +123,11 @@ class TestConfig:
     # PREDICTION (and the matching GT) before computing metrics. 482x512 -> 226x256.
     crop_border: int = 128
     use_amp: bool = True
+    # Autocast dtype for scoring. 'auto' resolves to bf16 on Ampere+ (matching
+    # the trainer's default), else fp16. Scoring under a DIFFERENT precision than
+    # the trainer measured 'best_mrae' in can shift the headline number, so this
+    # must mirror resolve_amp_dtype('auto') in the trainer.
+    amp_dtype: str = 'auto'
     
     # Metrics
     calculate_sam: bool = True
@@ -155,7 +181,15 @@ class MetricsCalculator:
     def reset(self):
         """Reset all metrics"""
         self.metrics = {
+            # 'mrae' is computed on the clamped[0,1] prediction (reflectance
+            # reporting domain). 'mrae_unclamped' is computed on the raw model
+            # output and is the MST++ / NTIRE-comparable leaderboard quantity:
+            # it matches the trainer's selection_mrae (unclamped) that best
+            # checkpoints are selected on. Clamping can only ever lower MRAE,
+            # so reporting only the clamped value is optimistically biased and
+            # not apples-to-apples with the published ARAD-1K numbers.
             'mrae': AverageMeter(),
+            'mrae_unclamped': AverageMeter(),
             'rmse': AverageMeter(),
             'psnr': AverageMeter(),
             'sam': AverageMeter() if self.calculate_sam else None,
@@ -169,62 +203,78 @@ class MetricsCalculator:
     
     def calculate_ssim_metric(self, pred: torch.Tensor, target: torch.Tensor, 
                               data_range: float = 1.0) -> torch.Tensor:
-        """Calculate SSIM for hyperspectral images"""
-        # Calculate SSIM per band and average
-        ssim_values = []
-        
-        for i in range(pred.shape[1]):  # Iterate over channels
-            pred_band = pred[:, i:i+1, :, :]
-            target_band = target[:, i:i+1, :, :]
-            
-            # Simple SSIM implementation
-            mu1 = F.avg_pool2d(pred_band, 11, 1, 5)
-            mu2 = F.avg_pool2d(target_band, 11, 1, 5)
-            
-            mu1_sq = mu1.pow(2)
-            mu2_sq = mu2.pow(2)
-            mu1_mu2 = mu1 * mu2
-            
-            sigma1_sq = F.avg_pool2d(pred_band * pred_band, 11, 1, 5) - mu1_sq
-            sigma2_sq = F.avg_pool2d(target_band * target_band, 11, 1, 5) - mu2_sq
-            sigma12 = F.avg_pool2d(pred_band * target_band, 11, 1, 5) - mu1_mu2
+        """Calculate SSIM for hyperspectral images.
 
-            # NUMERICAL STABILITY FIX: Use dtype-aware epsilon to handle fp16 underflow
-            # In fp16 mode, eps=1e-8 is too small and can cause underflow
-            eps = torch.finfo(pred.dtype).eps * 10  # Safety margin for the dtype
-            sigma1_sq = torch.clamp(sigma1_sq, min=eps)
-            sigma2_sq = torch.clamp(sigma2_sq, min=eps)
+        Vectorized over all 31 bands in one pass: F.avg_pool2d is a per-channel
+        box filter, so running it on the full (B, C, H, W) tensor is
+        mathematically identical to the old per-band loop (every channel has the
+        same H*W element count, so the global mean equals the mean of per-band
+        means). This removes ~31 small-kernel launches and host syncs per image.
+        """
+        # Per-channel box-filter statistics in a single multi-channel pass.
+        mu1 = F.avg_pool2d(pred, 11, 1, 5)
+        mu2 = F.avg_pool2d(target, 11, 1, 5)
 
-            C1 = (0.01 * data_range) ** 2
-            C2 = (0.03 * data_range) ** 2
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
 
-            # SSIM formula with clamped denominator for stability
-            numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
-            denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-            ssim_map = numerator / torch.clamp(denominator, min=eps)
+        sigma1_sq = F.avg_pool2d(pred * pred, 11, 1, 5) - mu1_sq
+        sigma2_sq = F.avg_pool2d(target * target, 11, 1, 5) - mu2_sq
+        sigma12 = F.avg_pool2d(pred * target, 11, 1, 5) - mu1_mu2
 
-            ssim_values.append(ssim_map.mean())
-        
-        return torch.stack(ssim_values).mean()
+        # NUMERICAL STABILITY FIX: Use dtype-aware epsilon to handle fp16 underflow
+        # In fp16 mode, eps=1e-8 is too small and can cause underflow
+        eps = torch.finfo(pred.dtype).eps * 10  # Safety margin for the dtype
+        sigma1_sq = torch.clamp(sigma1_sq, min=eps)
+        sigma2_sq = torch.clamp(sigma2_sq, min=eps)
+
+        C1 = (0.01 * data_range) ** 2
+        C2 = (0.03 * data_range) ** 2
+
+        # SSIM formula with clamped denominator for stability
+        numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+        denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = numerator / torch.clamp(denominator, min=eps)
+
+        return ssim_map.mean()
     
-    def update(self, pred: torch.Tensor, target: torch.Tensor, 
-              calculate_per_band: bool = False, calculate_per_pixel: bool = False):
-        """Update metrics with new predictions"""
+    def update(self, pred: torch.Tensor, target: torch.Tensor,
+              calculate_per_band: bool = False, calculate_per_pixel: bool = False,
+              pred_unclamped: Optional[torch.Tensor] = None):
+        """Update metrics with new predictions.
+
+        Args:
+            pred: prediction used for reflectance-domain metrics (typically
+                clamped to [0, 1] by the caller).
+            target: ground-truth cube.
+            pred_unclamped: the RAW (un-clamped) prediction. When provided, an
+                MST++/NTIRE-comparable unclamped MRAE is recorded under
+                'mrae_unclamped'. When omitted it defaults to ``pred`` so the
+                metric is always populated (degenerating to the clamped value).
+        """
         # Ensure same device
         if pred.device != target.device:
             target = target.to(pred.device)
-        
+        if pred_unclamped is None:
+            pred_unclamped = pred
+        elif pred_unclamped.device != target.device:
+            pred_unclamped = pred_unclamped.to(target.device)
+
         # Basic metrics
         mrae = self.mrae_fn(pred, target)
+        mrae_unclamped = self.mrae_fn(pred_unclamped, target)
         rmse = self.rmse_fn(pred, target)
         psnr = self.psnr_fn(pred, target, data_range=1.0)
         sample_metrics = {
             'mrae': mrae.item(),
+            'mrae_unclamped': mrae_unclamped.item(),
             'rmse': rmse.item(),
             'psnr': psnr.item(),
         }
-        
+
         self.metrics['mrae'].update(mrae.item())
+        self.metrics['mrae_unclamped'].update(mrae_unclamped.item())
         self.metrics['rmse'].update(rmse.item())
         self.metrics['psnr'].update(psnr.item())
         
@@ -267,21 +317,42 @@ class MetricsCalculator:
         return sample_metrics
     
     def _calculate_per_band_metrics(self, pred: torch.Tensor, target: torch.Tensor):
-        """Calculate metrics for each spectral band"""
+        """Calculate metrics for each spectral band.
+
+        Vectorized over all bands at once instead of 31 separate metric-fn calls
+        (each of which triggered a host sync via .item()). The per-band values
+        are bit-equivalent to Loss_MRAE/Loss_RMSE/Loss_PSNR applied band-by-band:
+          * MRAE/RMSE are plain spatial+batch means and reduce directly.
+          * PSNR is NON-linear (10*log10 of a per-image MSE, then mean over the
+            batch), so it is computed as per-image-per-band MSE -> log -> mean,
+            NOT as a single mean of an error volume.
+        """
         n_bands = pred.shape[1]
-        
+        eps = float(getattr(self.mrae_fn, "epsilon", 1e-6))
+
+        p = pred.to(torch.float32)
+        t = target.to(torch.float32)
+        sq_err = (p - t) ** 2
+
+        # MRAE per band: |p - t| / clamp(|t|, eps), averaged over (B, H, W).
+        denom = torch.clamp_min(t.abs(), eps)
+        mrae_band = (p - t).abs().div(denom).mean(dim=(0, 2, 3))           # (C,)
+        # RMSE per band: sqrt of mean squared error over (B, H, W).
+        rmse_band = torch.sqrt(sq_err.mean(dim=(0, 2, 3)))                 # (C,)
+        # PSNR per band: clamp to [0,1] (Loss_PSNR convention, data_range=1.0),
+        # per-image-per-band MSE, 10*log10(1/MSE), then mean over the batch.
+        mse_bc = ((t.clamp(0.0, 1.0) - p.clamp(0.0, 1.0)) ** 2).mean(dim=(2, 3))  # (B, C)
+        psnr_bc = 10.0 * torch.log10(1.0 / mse_bc.clamp_min(1e-6))         # (B, C)
+        psnr_band = psnr_bc.mean(dim=0)                                    # (C,)
+
+        # Single host transfer for all bands instead of 3*n_bands .item() syncs.
+        mrae_list = mrae_band.tolist()
+        rmse_list = rmse_band.tolist()
+        psnr_list = psnr_band.tolist()
         for band_idx in range(n_bands):
-            pred_band = pred[:, band_idx:band_idx+1, :, :]
-            target_band = target[:, band_idx:band_idx+1, :, :]
-            
-            # Calculate metrics for this band
-            mrae_band = self.mrae_fn(pred_band, target_band).item()
-            rmse_band = self.rmse_fn(pred_band, target_band).item()
-            psnr_band = self.psnr_fn(pred_band, target_band, data_range=1.0).item()
-            
-            self.per_band_metrics['mrae'][band_idx].append(mrae_band)
-            self.per_band_metrics['rmse'][band_idx].append(rmse_band)
-            self.per_band_metrics['psnr'][band_idx].append(psnr_band)
+            self.per_band_metrics['mrae'][band_idx].append(mrae_list[band_idx])
+            self.per_band_metrics['rmse'][band_idx].append(rmse_list[band_idx])
+            self.per_band_metrics['psnr'][band_idx].append(psnr_list[band_idx])
     
     def _calculate_per_pixel_metrics(self, pred: torch.Tensor, target: torch.Tensor):
         """Calculate metrics for each pixel"""
@@ -731,9 +802,9 @@ class NTIRETestEngine:
             }
             model = model_registry[self.config.model_size]()
 
-        # Prefer EMA weights when present (the trainer evaluates and reports
-        # against EMA by default, so testing the base state_dict trails the
-        # headline numbers).
+        selected_state = checkpoint.get('selected_state_dict')
+        selected_used = False
+
         def _load_checked(state: Dict[str, Any], label: str) -> None:
             """Load weights and FAIL LOUDLY on a large key mismatch.
 
@@ -763,6 +834,17 @@ class NTIRETestEngine:
                     f"(e.g. use_spectral_attn) and that the EMA dict format is unwrapped."
                 )
 
+        if isinstance(selected_state, dict) and selected_state:
+            _load_checked(
+                selected_state,
+                f"selected weights ({checkpoint.get('weights_source', 'unknown')})",
+            )
+            selected_used = True
+            logger.info(
+                "Loaded selected checkpoint weights (source=%s).",
+                checkpoint.get('weights_source', 'unknown'),
+            )
+
         # The trainer's full checkpoints wrap EMA weights as ModelEMA.state_dict()
         # = {'decay':..., 'ema_state': <weights>}; the lightweight checkpoint
         # stores the raw weights under 'ema_state_dict'. Normalize both to an
@@ -771,6 +853,9 @@ class NTIRETestEngine:
         # loaded NOTHING and left the model fully random.
         ema_container = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
         ema_weights = None
+        requested_source = str(checkpoint.get('weights_source', '')).lower()
+        force_base = requested_source in {'model', 'raw', 'base'}
+        force_ema = requested_source == 'ema'
         if isinstance(ema_container, dict) and ema_container:
             if isinstance(ema_container.get('ema_state'), dict):
                 ema_weights = ema_container['ema_state']          # full checkpoint wrapper
@@ -780,12 +865,15 @@ class NTIRETestEngine:
                 ema_weights = ema_container                       # already a raw state_dict
 
         ema_used = False
-        if ema_weights:
+        if not selected_used and not force_base and ema_weights:
             _load_checked(ema_weights, "EMA weights")
             ema_used = True
             logger.info("Loaded EMA weights for testing (preferred over base state_dict).")
 
-        if not ema_used:
+        if force_ema and not selected_used and not ema_used:
+            raise RuntimeError("Checkpoint requested EMA weights but no loadable EMA state was found.")
+
+        if not selected_used and not ema_used:
             if 'state_dict' in checkpoint:
                 _load_checked(checkpoint['state_dict'], "base state_dict")
             else:
@@ -805,11 +893,15 @@ class NTIRETestEngine:
         """Test single image"""
         rgb = rgb.to(self.device)
 
-        # Inference (full image; border crop is applied below to (pred, gt))
+        # Inference (full image; border crop is applied below to (pred, gt)).
+        # Gate AMP on CUDA (autocast on CPU is a no-op at best, a slowdown at
+        # worst) and use the trainer-matched dtype (bf16 on Ampere+) so the
+        # headline MRAE is scored in the same precision best_mrae was measured.
         with torch.no_grad():
-            if self.config.use_amp:
+            if self.config.use_amp and self.device.type == 'cuda':
                 from torch.cuda.amp import autocast
-                with autocast():
+                amp_dtype = _resolve_eval_amp_dtype(getattr(self.config, 'amp_dtype', 'auto'))
+                with autocast(dtype=amp_dtype):
                     pred = self._run_inference(rgb)
             else:
                 pred = self._run_inference(rgb)
@@ -846,16 +938,21 @@ class NTIRETestEngine:
             else:
                 pred_for_metrics, gt_for_metrics = pred, gt
 
-            # Clamp predictions to [0, 1]. Loss_PSNR clamps internally but
+            # Keep the RAW (un-clamped, border-cropped) prediction for the
+            # MST++/NTIRE-comparable MRAE, which is the quantity the trainer
+            # selects best checkpoints on. Then clamp to [0, 1] for the
+            # reflectance-domain metrics: Loss_PSNR clamps internally but
             # Loss_MRAE/Loss_RMSE/Loss_SAM do not — out-of-range outputs would
-            # otherwise inflate the reported errors relative to the leaderboard.
+            # otherwise inflate those reported errors relative to the leaderboard.
+            pred_unclamped = pred_for_metrics
             pred_for_metrics = pred_for_metrics.clamp(0.0, 1.0)
 
             # Update metrics
             result['metrics'] = self.metrics_calculator.update(
                 pred_for_metrics, gt_for_metrics,
                 calculate_per_band=self.config.per_band_metrics,
-                calculate_per_pixel=self.config.per_pixel_metrics
+                calculate_per_pixel=self.config.per_pixel_metrics,
+                pred_unclamped=pred_unclamped,
             )
             
             # Store for visualization
@@ -1154,13 +1251,13 @@ class NTIRETestEngine:
             baseline = json.load(f)
         
         # Compare main metrics
-        for metric in ['mrae', 'rmse', 'psnr', 'sam', 'ssim']:
+        for metric in ['mrae', 'mrae_unclamped', 'rmse', 'psnr', 'sam', 'ssim']:
             if metric in results and metric in baseline:
                 our_value = results[metric]['mean']
                 baseline_value = baseline[metric]['mean']
-                
-                improvement = ((baseline_value - our_value) / baseline_value * 100 
-                             if metric in ['mrae', 'rmse', 'sam'] else
+
+                improvement = ((baseline_value - our_value) / baseline_value * 100
+                             if metric in ['mrae', 'mrae_unclamped', 'rmse', 'sam'] else
                              (our_value - baseline_value) / baseline_value * 100)
                 
                 comparison[metric] = {
@@ -1192,13 +1289,16 @@ class NTIRETestEngine:
         print("TEST RESULTS SUMMARY - NTIRE 2022 Protocol")
         print("="*60)
         
-        # Main metrics
+        # Main metrics. mrae_unclamped is the MST++/NTIRE leaderboard-comparable
+        # headline (raw output); mrae is the clamped reflectance-domain view.
         print("\nMain Metrics:")
         print("-"*30)
-        for metric in ['mrae', 'rmse', 'psnr', 'sam', 'ssim']:
+        for metric in ['mrae_unclamped', 'mrae', 'rmse', 'psnr', 'sam', 'ssim']:
             if metric in results:
                 value = results[metric]['mean']
-                print(f"{metric.upper():8s}: {value:.6f}")
+                label = 'MRAE*' if metric == 'mrae_unclamped' else metric.upper()
+                print(f"{label:14s}: {value:.6f}")
+        print("  (* MRAE* = unclamped, MST++/NTIRE-comparable headline)")
         
         # Statistical summary
         if 'statistical' in results and 'error_stats' in results['statistical']:

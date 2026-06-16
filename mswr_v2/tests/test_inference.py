@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import sys
 import torch
 
 # Conditional import to handle missing dependencies
@@ -209,3 +210,126 @@ class TestEnsembleProcessor:
         """Test full augmentations."""
         processor = EnsembleProcessor(mode="full")
         assert len(processor.transforms) == 8
+
+
+class _CountingTileModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.batch_sizes = []
+
+    def forward(self, x):
+        self.calls += 1
+        self.batch_sizes.append(x.shape[0])
+        return x.mean(dim=1, keepdim=True).repeat(1, 31, 1, 1)
+
+
+def _make_tiled_engine(batch_size, model):
+    engine = object.__new__(MSWRInference)
+    engine.config = InferenceConfig(
+        model_path="unused.pth",
+        batch_size=batch_size,
+        tile_size=64,
+        tile_overlap=16,
+        use_amp=False,
+        verbose=False,
+        post_processing=False,
+    )
+    engine.device = torch.device("cpu")
+    engine.tiled_processor = TiledProcessor(tile_size=64, overlap=16)
+    engine.ensemble_processor = None
+    engine.model = model
+    return engine
+
+
+class TestBatchedTiledInference:
+    def test_tiled_inference_uses_configured_batch_size(self):
+        image = np.linspace(0, 1, 144 * 144 * 3, dtype=np.float32).reshape(144, 144, 3)
+        sequential_model = _CountingTileModel()
+        batched_model = _CountingTileModel()
+
+        sequential = _make_tiled_engine(batch_size=1, model=sequential_model)
+        batched = _make_tiled_engine(batch_size=4, model=batched_model)
+
+        sequential_output = sequential._process_tiled(image)
+        batched_output = batched._process_tiled(image)
+
+        np.testing.assert_allclose(batched_output, sequential_output, rtol=1e-6, atol=1e-6)
+        assert sequential_model.calls == 9
+        assert batched_model.calls == 3
+        assert batched_model.batch_sizes == [4, 4, 1]
+
+    def test_postprocess_batch_returns_hwc_float32_samples(self):
+        engine = _make_tiled_engine(batch_size=2, model=_CountingTileModel())
+        output = torch.rand(2, 31, 8, 6)
+
+        samples = engine.postprocess_batch(output)
+
+        assert len(samples) == 2
+        assert samples[0].shape == (8, 6, 31)
+        assert samples[0].dtype == np.float32
+        assert 0.0 <= float(samples[0].min()) <= float(samples[0].max()) <= 1.0
+
+    def test_main_cli_defaults_amp_and_forwards_amp_dtype(self, monkeypatch, workspace_tmp_dir):
+        import mswr_inference as inference_module
+
+        captured = {}
+
+        class DummyEngine:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def run(self):
+                captured["ran"] = True
+
+        monkeypatch.setattr(inference_module, "MSWRInference", DummyEngine)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mswr_inference.py",
+                "--model_path",
+                "checkpoint.pth",
+                "--input_path",
+                str(workspace_tmp_dir / "input.npy"),
+                "--amp_dtype",
+                "bf16",
+            ],
+        )
+
+        inference_module.main()
+
+        assert captured["ran"] is True
+        assert captured["config"].use_amp is True
+        assert captured["config"].amp_dtype == "bf16"
+
+    def test_main_cli_can_disable_amp(self, monkeypatch, workspace_tmp_dir):
+        import mswr_inference as inference_module
+
+        captured = {}
+
+        class DummyEngine:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def run(self):
+                captured["ran"] = True
+
+        monkeypatch.setattr(inference_module, "MSWRInference", DummyEngine)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mswr_inference.py",
+                "--model_path",
+                "checkpoint.pth",
+                "--input_path",
+                str(workspace_tmp_dir / "input.npy"),
+                "--no_amp",
+            ],
+        )
+
+        inference_module.main()
+
+        assert captured["ran"] is True
+        assert captured["config"].use_amp is False

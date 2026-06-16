@@ -1,0 +1,78 @@
+# SOTA-targeted MSWR recipe after the 2026-06-16 regression trace.
+#
+# ⚠️ NOT MST++/ARAD-1K leaderboard-comparable. This recipe uses use_enhanced_loss
+#    (L1 + SSIM + SAM + gradient auxiliary terms), whereas the published MST++
+#    benchmark optimizes MRAE only. Numbers from this config must NOT be reported
+#    head-to-head against MST++; use configs/train.yaml (MRAE-only) for that.
+#    This file is for exploration of the quality ceiling, not benchmark claims.
+#
+# What this changes from the failed run:
+#   - Selects the better source automatically when both raw and EMA are evaluated.
+#   - Keeps MRAE as the dominant objective, but adds light SSIM/SAM/L1 terms so
+#     the SSIM regression has a direct optimization signal.
+#   - Adds mild stochastic regularization to fight the observed train/val split.
+#   - Shortens the cosine horizon to the useful window seen in the log; the
+#     failed run's second half mostly lowered train loss while validation MRAE
+#     oscillated back toward 0.30.
+
+experiment_name: mswr_v212_sota_mrae_ssim
+model_size: base
+gpu_id: "0"
+
+# Data / iteration
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# Architecture
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+drop_path: 0.15
+dropout: 0.03
+attention_dropout: 0.02
+
+# Objective: MRAE remains primary; the auxiliary weights are intentionally small.
+use_enhanced_loss: true
+l1_weight: 0.20
+mrae_weight: 1.00
+ssim_weight: 0.05
+sam_weight: 0.02
+gradient_weight: 0.02
+loss_warmup_epochs: 10
+
+# Optimizer / schedule
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# Precision / memory
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# Evaluate raw and EMA, then checkpoint whichever has lower unclamped MRAE.
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+early_stopping_mode: "off"

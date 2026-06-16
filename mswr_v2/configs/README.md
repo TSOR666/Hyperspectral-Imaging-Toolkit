@@ -19,6 +19,7 @@ The files under `experiments/` are frozen comparison recipes:
 | `baseline_mstpp.yaml` | Strict MST++-style optimizer and no-EMA control. |
 | `ablation_regularized_spatial.yaml` | Regularization/EMA ablation without spectral attention. |
 | `ablation_spectral_default_wavelets.yaml` | Spectral attention with the older `[1, 2, 3]` wavelet schedule. |
+| `sota_mrae_ssim.yaml` | MRAE-primary multi-objective recipe with light SSIM/SAM regularization and auto raw/EMA selection. |
 
 Do not choose an experiment config for ordinary training unless you are
 reproducing that specific comparison.

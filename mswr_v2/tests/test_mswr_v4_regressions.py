@@ -119,6 +119,27 @@ def test_source_best_prefers_unclamped_mrae():
     assert EnhancedTrainer._source_mrae(metrics, "ema") == pytest.approx(0.27)
 
 
+def test_auto_selection_prefers_raw_model_when_it_has_lower_unclamped_mrae():
+    metrics = {
+        "evaluation_model": "ema",
+        "ema_mrae": 0.20,
+        "ema_mrae_unclamped": 0.253,
+        "model_mrae": 0.19,
+        "model_mrae_unclamped": 0.246,
+    }
+
+    assert EnhancedTrainer._select_validation_source(metrics, "auto", "ema") == "model"
+
+
+def test_forced_selection_source_is_respected_when_available():
+    metrics = {
+        "ema_mrae_unclamped": 0.253,
+        "model_mrae_unclamped": 0.246,
+    }
+
+    assert EnhancedTrainer._select_validation_source(metrics, "ema", "model") == "ema"
+
+
 def test_training_resume_rejects_large_checkpoint_mismatch():
     class Incompatible:
         missing_keys = [f"missing_{i}" for i in range(30)]

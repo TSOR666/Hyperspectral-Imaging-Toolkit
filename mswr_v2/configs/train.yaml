@@ -53,6 +53,7 @@ use_ema: true
 ema_decay: 0.999
 ema_start_epoch: 5
 ema_eval_mode: both
+selection_source: auto
 
 # Quote YAML 1.1 boolean-like strings explicitly.
 early_stopping_mode: "off"

@@ -66,6 +66,24 @@ MODEL_REGISTRY = {
     'large': create_mswr_large
 }
 
+
+def _resolve_eval_amp_dtype(requested: str = 'auto') -> torch.dtype:
+    """Resolve autocast dtype for inference (bf16 on Ampere+, else fp16).
+
+    Mirrors the trainer's resolve_amp_dtype so a bf16-trained model is not
+    silently run under fp16 by a bare autocast() call.
+    """
+    bf16_ok = bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+    if requested == 'fp16':
+        return torch.float16
+    if requested in ('auto', 'bf16'):
+        return torch.bfloat16 if bf16_ok else torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {requested!r}")
+
 @dataclass
 class InferenceConfig:
     """Comprehensive inference configuration"""
@@ -84,6 +102,9 @@ class InferenceConfig:
     tile_size: int = 256
     tile_overlap: int = 32
     use_amp: bool = True
+    # 'auto' -> bf16 on Ampere+, else fp16 (matches the trainer). A bare
+    # autocast() defaults to fp16 even for bf16-trained checkpoints.
+    amp_dtype: str = 'auto'
     num_workers: int = 4
     
     # Advanced settings
@@ -472,16 +493,30 @@ class MSWRInference:
             else:
                 raise ValueError(f"Unknown model size: {self.config.model_size}")
 
-        # Prefer EMA weights when the checkpoint provides them: EMA is what the
-        # trainer evaluates and reports "best_mrae" against (see
-        # train_mswr_v212_logging.py validate() with ema_eval_mode='ema'), so
-        # inference must mirror that to reproduce headline numbers. The base
-        # state_dict trails the EMA by the EMA decay window and produces worse
-        # outputs in practice.
+        # Modern best checkpoints carry the exact selected weights. Load those
+        # first so a raw-model win is not accidentally evaluated with the EMA
+        # shadow just because EMA is present in the training checkpoint.
+        selected_state = checkpoint.get('selected_state_dict')
+        selected_used = False
+        incompatible = None
+        if isinstance(selected_state, dict) and selected_state:
+            incompatible = model.load_state_dict(selected_state, strict=False)
+            selected_used = True
+            logger.info(
+                "Loaded selected checkpoint weights (source=%s).",
+                checkpoint.get('weights_source', 'unknown'),
+            )
+
+        # Legacy fallback: prefer EMA weights when the checkpoint provides them:
+        # EMA was historically what the trainer evaluated and reported
+        # "best_mrae" against, so inference mirrored that to reproduce headline
+        # numbers.
         ema_state = checkpoint.get('ema') or checkpoint.get('ema_state_dict')
         ema_used = False
-        incompatible = None
-        if ema_state and isinstance(ema_state, dict):
+        requested_source = str(checkpoint.get('weights_source', '')).lower()
+        force_base = requested_source in {'model', 'raw', 'base'}
+        force_ema = requested_source == 'ema'
+        if not selected_used and not force_base and ema_state and isinstance(ema_state, dict):
             # Normalize the trainer's EMA container formats (mirrors
             # mswr_test_ntire.py): full checkpoints store
             # {'decay': ..., 'ema_state': <model state_dict>}; legacy formats
@@ -506,7 +541,10 @@ class MSWRInference:
                     incompatible = None
                     ema_used = False
 
-        if not ema_used:
+        if force_ema and not selected_used and not ema_used:
+            raise RuntimeError("Checkpoint requested EMA weights but no loadable EMA state was found.")
+
+        if not selected_used and not ema_used:
             if 'state_dict' in checkpoint:
                 incompatible = model.load_state_dict(checkpoint['state_dict'], strict=False)
             else:
@@ -713,9 +751,16 @@ class MSWRInference:
         input_tensor = self.preprocess(image).to(self.device)
         
         # Inference
+        output = self._run_model(input_tensor)
+
+        # Postprocess
+        return self.postprocess(output)
+
+    def _run_model(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        """Run the model/ensemble under the configured inference precision."""
         with torch.inference_mode():
             if self.config.use_amp and self.device.type == 'cuda':
-                with autocast():
+                with autocast(dtype=_resolve_eval_amp_dtype(getattr(self.config, 'amp_dtype', 'auto'))):
                     if self.ensemble_processor:
                         output = self.ensemble_processor.process(self.model, input_tensor)
                     else:
@@ -725,34 +770,41 @@ class MSWRInference:
                     output = self.ensemble_processor.process(self.model, input_tensor)
                 else:
                     output = self.model(input_tensor)
-        
-        # Postprocess
-        return self.postprocess(output)
+
+        return output
+
+    def postprocess_batch(self, output: torch.Tensor) -> List[np.ndarray]:
+        """Postprocess a BCHW/NCHW tensor into HWC float32 numpy samples."""
+        if output.dim() == 3:
+            output = output.unsqueeze(0)
+        if output.dim() != 4:
+            raise ValueError(f"Expected 3D/4D model output, got shape {tuple(output.shape)}")
+
+        output_np = output.float().clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
+        if output_np.shape[1] == 31:
+            output_np = output_np.transpose(0, 2, 3, 1)
+
+        samples = [np.clip(sample, 0, 1).astype(np.float32, copy=False) for sample in output_np]
+        if self.config.post_processing:
+            samples = [self._apply_post_processing(sample.copy()) for sample in samples]
+        return samples
     
     def _process_tiled(self, image: np.ndarray) -> np.ndarray:
         """Process image using tiling"""
         # Split into tiles
         tiles, metadata = self.tiled_processor.split_image(image)
         
-        # Process each tile
+        # Process tiles in batches. The pre-existing InferenceConfig.batch_size
+        # was parsed but unused here, causing one launch and one CPU transfer per
+        # tile on large images.
         processed_tiles = []
-        for tile in tqdm(tiles, desc="Processing tiles", disable=not self.config.verbose):
-            tile_tensor = self.preprocess(tile).to(self.device)
-            
-            with torch.inference_mode():
-                if self.config.use_amp and self.device.type == 'cuda':
-                    with autocast():
-                        if self.ensemble_processor:
-                            output = self.ensemble_processor.process(self.model, tile_tensor)
-                        else:
-                            output = self.model(tile_tensor)
-                else:
-                    if self.ensemble_processor:
-                        output = self.ensemble_processor.process(self.model, tile_tensor)
-                    else:
-                        output = self.model(tile_tensor)
-
-            processed_tiles.append(self.postprocess(output))
+        tile_batch_size = max(1, int(getattr(self.config, 'batch_size', 1) or 1))
+        tile_batches = range(0, len(tiles), tile_batch_size)
+        for start in tqdm(tile_batches, desc="Processing tile batches", disable=not self.config.verbose):
+            batch_tiles = tiles[start:start + tile_batch_size]
+            batch_tensor = torch.cat([self.preprocess(tile) for tile in batch_tiles], dim=0).to(self.device)
+            output = self._run_model(batch_tensor)
+            processed_tiles.extend(self.postprocess_batch(output))
         
         # Merge tiles
         return self.tiled_processor.merge_tiles(processed_tiles, metadata)
@@ -1054,8 +1106,13 @@ def main():
                        help='Tile size for large images')
     parser.add_argument('--tile_overlap', type=int, default=32,
                        help='Overlap between tiles')
-    parser.add_argument('--use_amp', action='store_true',
-                       help='Use automatic mixed precision')
+    parser.add_argument('--use_amp', dest='use_amp', action='store_true',
+                       default=True, help='Use automatic mixed precision')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                       help='Disable automatic mixed precision')
+    parser.add_argument('--amp_dtype', type=str, default='auto',
+                       choices=['auto', 'fp16', 'bf16'],
+                       help='CUDA autocast dtype; auto prefers bf16 when supported')
     
     # Advanced settings
     parser.add_argument('--ensemble_mode', type=str, default=None,
@@ -1092,6 +1149,7 @@ def main():
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
         use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
         ensemble_mode=args.ensemble_mode,
         post_processing=args.post_processing,
         save_visualization=args.save_visualization,
