@@ -1,0 +1,70 @@
+# Ablation: content-dependent (adaptive) landmark pooling.
+#
+# Addresses audit ROUND5 open item: the default `learned` landmark pooling
+# expands a STATIC L x C parameter tensor as K/V, so the "global" branch is a
+# per-pixel lookup against a fixed dictionary — it does not summarize the
+# current image and provides weak global spatial mixing (a single-pixel input
+# perturbation changes only ~1/L output positions; see
+# tests/test_audit5_fixes.py).
+#
+# `adaptive` pooling instead computes content-dependent landmarks
+# (softmax-weighted pools of the actual image tokens), restoring genuine
+# image-wide context. This is otherwise IDENTICAL to configs/train.yaml so the
+# comparison isolates the pooling mode. Still MRAE-only -> MST++-comparable.
+#
+# Run head-to-head against train.yaml (learned) under the same seed/schedule.
+# Expect a modest parameter increase from the landmark projection MLP.
+
+experiment_name: mswr_v212_ablation_landmark_adaptive
+model_size: base
+gpu_id: "0"
+
+# Data / iteration
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# Architecture — only landmark_pooling differs from train.yaml
+attention_type: dual
+landmark_pooling: adaptive      # <-- the ablation knob (default is 'learned')
+use_flash_attn: true
+use_spectral_attn: true
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+
+# MRAE-only benchmark objective (keeps the metric MST++-comparable)
+use_enhanced_loss: false
+
+# Optimizer / schedule
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# Precision / memory
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# EMA
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+early_stopping_mode: "off"
