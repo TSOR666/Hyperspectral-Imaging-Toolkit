@@ -22,6 +22,7 @@ The files under `experiments/` are frozen comparison recipes:
 | `sota_mrae_ssim.yaml` | MRAE-primary multi-objective recipe with light SSIM/SAM regularization and auto raw/EMA selection. |
 | `ablation_landmark_adaptive.yaml` | Canonical recipe with `landmark_pooling: adaptive` (content-dependent global mixing) vs the default static `learned`. |
 | `ablation_wavelet_detail.yaml` | Canonical recipe with `wavelet_detail_processing: true` (lightweight depthwise residual on the LH/HL/HH detail bands). |
+| `round5_wavelet_detail.yaml` | Canonical MRAE-only recipe + `wavelet_detail_processing` (capacity-flat, +0.17% params) + fp16 host cache. The param-light round-5 quality-ceiling experiment. |
 
 Do not choose an experiment config for ordinary training unless you are
 reproducing that specific comparison.
