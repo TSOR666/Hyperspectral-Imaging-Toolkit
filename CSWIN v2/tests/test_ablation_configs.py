@@ -14,9 +14,9 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "src" / "configs"
 @pytest.mark.parametrize(
     ("config_name", "objective", "compress_first", "decoder2_depth"),
     [
-        ("ablation_stable_mrae", "mrae_l1", False, 4),
-        ("ablation_decoder_lite", "mrae", True, 2),
-        ("ablation_stable_lite", "mrae_l1", True, 2),
+        ("ablation_stable_mrae", "mrae_stable", False, 4),
+        ("ablation_decoder_lite", "mrae_stable", True, 2),
+        ("ablation_stable_lite", "mrae_stable", True, 2),
     ],
 )
 def test_ablation_config_composes(

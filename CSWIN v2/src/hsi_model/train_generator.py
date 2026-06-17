@@ -4,8 +4,8 @@ Generator-only (no-GAN) training for CSWin RGB->HSI reconstruction.
 
 This is the post-GAN trainer: the discriminator, Sinkhorn-OT adversarial loss,
 and R1 regularization are gone. The objective is a configurable reconstruction
-loss (see ``objective`` in config.yaml; the active benchmark recipe uses only
-MRAE, matching MST++ training and the primary ARAD-1K evaluation metric).
+loss (see ``objective`` in config.yaml; the active recipe uses stabilized
+MRAE-only training while validation still reports exact MRAE).
 
 Dropping the GAN removes 4 discriminator forwards + a discriminator backward +
 the per-batch Sinkhorn loop per iteration, which frees most of the compute
@@ -162,7 +162,7 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
         # HSIFormer/SS-Transformer (paper Sec 4.2) trains with L1 on [0,1]
         # targets; this is the validated objective for this architecture.
         return nn.L1Loss()
-    if objective in ("mrae", "mst", "mst++"):
+    if objective in ("mrae", "mst", "mst++", "mrae_stable", "stable_mrae"):
         return MRAELoss(epsilon=float(config.get("mrae_epsilon", 1e-8)))
     if objective in ("mrae_l1", "mrae+l1", "l1_mrae"):
         return MRAEPlusL1Loss(
@@ -180,7 +180,7 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
             denominator_epsilon=float(config.get("relative_mrae_epsilon", 1e-2))
         )
     raise ValueError(
-        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_l1, "
+        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_stable, mrae_l1, "
         "l1_with_mrae, relative_mrae (a typo here silently changed the training "
         "objective in earlier versions; failing loudly instead)."
     )
@@ -394,15 +394,18 @@ def validate_generator(
                 else:
                     with autocast_context(device.type, use_amp, autocast_dtype):
                         pred_hsi = eval_net(rgb_tensor)
-                loss = criterion(pred_hsi.float(), hsi_tensor.float())
                 batch_size = int(hsi_tensor.shape[0])
-                total_loss += loss * batch_size
                 metrics = compute_mst_center_crop_metrics(
                     pred_hsi,
                     hsi_tensor,
+                    criterion=criterion,
                     clamp_prediction=clamp_prediction,
                     report_raw_mrae=report_raw_mrae,
                 )
+                if "loss" not in metrics:
+                    raise RuntimeError("Validation criterion did not produce a loss.")
+                loss = torch.tensor(float(metrics["loss"]), device=device)
+                total_loss += loss * batch_size
                 missing_metrics = set(metric_keys) - set(metrics)
                 if missing_metrics:
                     raise RuntimeError(

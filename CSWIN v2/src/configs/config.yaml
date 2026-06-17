@@ -74,19 +74,20 @@ early_stopping_final_stage_only: true
 
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
-# Architecture aligned to HSIFormer with the same single MRAE objective used by
-# MST++ benchmark training: an efficient SSTB generator (CBAM channel gate ->
+# Architecture aligned to HSIFormer with a stabilized MRAE-only objective:
+# an efficient SSTB generator (CBAM channel gate ->
 # S-MSA + GDFN -> CSwin + SGFN), Adam lr 4e-4 cosine. The sinkhorn_* /
 # lambda_* / discriminator_* / r1 / n_critic / gradient_accumulation_steps keys
 # below are LEGACY (read only by the deprecated GAN trainers).
 # ===========================================================================
-# Start a fresh run. Do not resume an L1 or hybrid-loss optimizer state into
-# this MRAE-only experiment.
-objective: mrae
+# Start a fresh run. ``mrae_stable`` is still pure MRAE, but raises the
+# denominator floor so near-zero reflectance pixels do not dominate the optimizer.
+# Use objective=mrae and mrae_epsilon=1e-8 only for exact MST++ loss reproduction.
+objective: mrae_stable
 allow_objective_mismatch_resume: false
 optimizer: adam          # matches MST++ training
 weight_decay: 0.0
-mrae_epsilon: 1.0e-8     # matches validation compute_mrae denominator flooring
+mrae_epsilon: 1.0e-3
 
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
@@ -150,18 +151,16 @@ ema_update_every: 10
 
 # Legacy GAN-only loss keys below are ignored by train_generator.py.
 use_adaptive_weights: false
-reconstruction_loss: l1   # main fidelity term: true L1 (was Charbonnier)
+reconstruction_loss: l1   # legacy GAN-only key
 lambda_rec: 1.0
 lambda_mrae: 0.1          # was 0.2; small so MRAE stays directly optimized
 relative_mrae_epsilon: 0.01
 lambda_perceptual: 0.0
 use_sinkhorn_adversarial: true   # keep optimal-transport adversarial loss
 lambda_adversarial: 0.01
-lambda_sam: 0.0           # was 0.10; dropped for the L1 + adversarial objective
+lambda_sam: 0.0           # legacy GAN-only key
 
-# Linear output head (no activation), matching the paper: L1 is trained on
-# [0,1] targets with no output squashing (the RGB INPUT is rescaled, not the
-# output). 'none' keeps a training-time soft-clamp (+/-clamp_range) for
+# Linear output head (no activation). 'none' keeps a training-time soft-clamp (+/-clamp_range) for
 # stability; the eval output is unbounded reflectance. NOTE: changing the
 # output head requires a FRESH run.
 output_activation: none
