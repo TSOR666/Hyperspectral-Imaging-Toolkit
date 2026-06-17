@@ -91,6 +91,12 @@ def test_build_criterion_defaults_to_mrae():
     assert type(build_criterion({})) is MRAELoss
 
 
+def test_build_criterion_stable_mrae_is_mrae_with_configured_floor():
+    criterion = build_criterion({"objective": "mrae_stable", "mrae_epsilon": 1e-3})
+    assert type(criterion) is MRAELoss
+    assert criterion.epsilon == pytest.approx(1e-3)
+
+
 def test_sam_loss_finite():
     loss = SAMLoss()
     pred = torch.zeros(1, 3, 2, 2)

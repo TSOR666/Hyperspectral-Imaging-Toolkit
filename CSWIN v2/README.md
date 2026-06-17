@@ -53,7 +53,8 @@ The defaults in `src/configs/config.yaml` use:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
 - Adam with learning rate `4e-4` and a 300k-step cosine decay.
-- Pure MRAE loss, matching the primary ARAD-1K metric and MST++ training.
+- Stabilized pure-MRAE loss (`objective=mrae_stable`, no L1 term), with exact
+  MRAE still used for validation metrics.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
 - Local 7x7 spatial attention at high resolution and bounded global attention
@@ -73,25 +74,27 @@ python src/hsi_model/train_generator.py \
   data_dir=/datasets/ARAD_1K \
   batch_size=16 \
   generator_lr=1e-4 \
-  objective=mrae \
+  objective=mrae_stable \
   memory_mode=standard
 ```
 
-Start this objective from a fresh checkpoint. For final training, enable and
-tune `progressive_stages` in the config for the 128 -> 256 -> 512 patch schedule.
+Start this objective from a fresh checkpoint. Use `objective=mrae
+mrae_epsilon=1e-8` only to reproduce exact MST++ loss behavior. For final
+training, enable and tune `progressive_stages` in the config for the 128 -> 256
+-> 512 patch schedule.
 
 ## Controlled Ablations
 
 The audit findings that can change reconstruction quality remain opt-in:
 
 ```bash
-# Stabilized MRAE + L1 objective
+# Stabilized pure-MRAE objective
 python src/hsi_model/train_generator.py --config-name ablation_stable_mrae
 
 # Pre-compressed decoder1 and two-block full-resolution decoder
 python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 
-# Combined loss and decoder experiment
+# Combined stabilized-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
 ```
 
