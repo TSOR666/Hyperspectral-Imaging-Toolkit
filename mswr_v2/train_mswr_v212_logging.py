@@ -437,7 +437,8 @@ class TrainingConfig:
         self.num_landmarks = args.num_landmarks
         self.landmark_pooling = args.landmark_pooling
         self.use_spectral_attn = getattr(args, 'use_spectral_attn', False)
-        
+        self.spectral_attn_heads = getattr(args, 'spectral_attn_heads', 0)
+
         # CNN Wavelet parameters (no external dependencies)
         self.use_wavelet = args.use_wavelet
         self.wavelet_type = args.wavelet_type
@@ -583,6 +584,10 @@ def parse_arguments():
     # CNN Wavelet parameters (always available, no dependencies)
     parser.add_argument("--use_spectral_attn", action='store_true', default=False,
                        help="Add MST++-style spectral (band-to-band) self-attention branch to each dual-attention block")
+    parser.add_argument("--spectral_attn_heads", type=int, default=0,
+                       help="Heads for the spectral S-MSA branch only (decoupled from --num_heads). "
+                            "0 = reuse num_heads (legacy block-diagonal); 1 = full-rank C x C "
+                            "band-to-band attention. Must divide every stage channel width.")
     parser.add_argument("--use_wavelet", action='store_true', default=True)
     parser.add_argument("--wavelet_type", type=str, default='db2',
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
@@ -1228,6 +1233,7 @@ class EnhancedTrainer:
                 'wavelet_detail_processing': self.config.wavelet_detail_processing,
                 'landmark_pooling': self.config.landmark_pooling,
                 'use_spectral_attn': self.config.use_spectral_attn,
+                'spectral_attn_heads': self.config.spectral_attn_heads,
                 # The model's per-forward PerformanceMonitor is consumed ONLY by
                 # _profile_model() (gated on --profile_model). Driving it from
                 # memory_monitoring meant it ran on every training forward with
@@ -1265,6 +1271,7 @@ class EnhancedTrainer:
                 wavelet_levels=self.config.wavelet_levels,
                 wavelet_detail_processing=self.config.wavelet_detail_processing,
                 use_spectral_attn=self.config.use_spectral_attn,
+                spectral_attn_heads=self.config.spectral_attn_heads,
                 # See note above: only --profile_model consumes this monitor.
                 performance_monitoring=self.config.profile_model,
                 **{

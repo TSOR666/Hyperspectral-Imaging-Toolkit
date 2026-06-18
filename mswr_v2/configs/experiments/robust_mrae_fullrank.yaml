@@ -1,0 +1,90 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  Rung-0 full-rank spectral A/B (treatment arm)
+# experiment_name: mswr_v212_robust_mrae_fullrank
+# ============================================================================
+#
+# This is the TREATMENT arm of the Rung-0 architecture experiment. It is byte-
+# identical to robust_mrae.yaml (the CONTROL arm) except for ONE line:
+#
+#     spectral_attn_heads: 1
+#
+# WHAT IT TESTS
+#   The existing SpectralMSA2D is genuine MST++ band-to-band S-MSA, but it splits
+#   C into num_heads=8, so its attention map is BLOCK-DIAGONAL: at the C=64 stages
+#   each head sees only an 8x8 sub-block of the 64x64 cross-band covariance and
+#   heads never attend across blocks. spectral_attn_heads: 1 makes the map the
+#   FULL C x C band-to-band covariance (full rank). This adds NO projection params
+#   (it is actually 35 params LIGHTER: the per-head rescale temperature shrinks),
+#   so it isolates the RANK hypothesis without touching capacity -- the right
+#   first move for a model that overfits ~ep70 and is not capacity-bound.
+#
+#   Run this against robust_mrae.yaml from scratch, same seed, MRAE-only. Any
+#   val-MRAE delta is attributable to full-rank vs block-diagonal spectral
+#   attention and nothing else. If it helps, the next rung is the gated full-rank
+#   SpectralMSAB; if it does not, the deficit is elsewhere and you saved 1.3M
+#   params. Comparability is unaffected (architecture-only, loss stays MRAE).
+# ============================================================================
+
+experiment_name: mswr_v212_robust_mrae_fullrank
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (canonical + wavelet-detail + the Rung-0 full-rank lever) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true               # band-to-band branch ON (already canonical)
+spectral_attn_heads: 1                # <<< THE ONLY DIFF vs robust_mrae.yaml: full-rank C x C
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"

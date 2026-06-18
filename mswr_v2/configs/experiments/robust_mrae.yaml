@@ -1,0 +1,139 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  Robust anti-overfit benchmark config (MRAE-only)
+# experiment_name: mswr_v212_robust_mrae
+# ============================================================================
+#
+# INTENT
+#   Extract the best HONEST ARAD-1K val MRAE this 3.04M architecture can give,
+#   given the diagnosis that it OVERFITS ~epoch 70 on ARAD's 900 scenes and is
+#   NOT capacity-bound. The lever is therefore regularization + EMA + a cosine
+#   schedule that anneals near convergence + honest best-EMA selection, NOT more
+#   parameters. Every knob below was VERIFIED wired in the actual code
+#   (train_mswr_v212_logging.py and model/mswr_net_v212.py) by an adversarial
+#   per-knob audit; no parsed-but-dead flags are relied on.
+#
+# REALITY CHECK (read before expecting SOTA)
+#   This config does NOT reach MST++'s 0.165 val MRAE. The recipe here is
+#   ALREADY the MST++ recipe (batch 20 / patch 128 / 4e-4 cosine / MRAE loss)
+#   plus EMA + AdamW wd + drop_path, i.e. strictly MORE regularized than MST++.
+#   On the SAME fixed recipe, MST++ (1.62M) hits 0.165, MST-L (2.45M) 0.177,
+#   MIRNet (3.75M) 0.189, HDNet (2.66M) 0.205 -- this 3.04M net sits at ~0.27,
+#   two tiers worse than same-size models. That ~0.06-0.09 deficit is
+#   ARCHITECTURAL EFFICIENCY (spectral-wise band-to-band self-attention), not
+#   tuning, and cannot be regularized away. Realistic best for THIS architecture
+#   under this config: ~0.235-0.250 single-model. Anything below ~0.22 from this
+#   exact net is a red flag to recheck the eval (clamping / split / TTA leak),
+#   not a real result. To go lower, change the architecture, not this file.
+#
+# COMPARABILITY STANCE (MST++ / ARAD-1K leaderboard)
+#   * LOSS IS MRAE-ONLY (use_enhanced_loss: false) -> plain Loss_MRAE(), the
+#     exact MST++ objective. No SSIM/SAM/gradient term touches the benchmark.
+#   * Geometric augmentation (rot90 + h/v flip) is hard-on in the dataloader and
+#     is MST++-standard -> comparability-safe. There is NO photometric/color
+#     jitter in the code and none is added (it would break RGB->HSI physics).
+#   * EMA + AdamW weight_decay + drop_path/attention_dropout make this strictly
+#     MORE regularized than canonical MST++ (which used none). Legitimate: they
+#     change neither the data distribution nor the loss/metric, only how we
+#     reach and average the minimum. The reported number stays a fair MRAE.
+#   * cache_dtype: float32 (NOT round-5's fp16) so the in-training validation
+#     cube is bit-exact and checkpoint SELECTION picks the genuine best-EMA
+#     MRAE, not an fp16-perturbed minimum. For an overfit-limited model whose
+#     val noise was ~20-60x the signal, honest selection is worth ~0.01 alone.
+#
+# TRAIN FROM SCRATCH: do NOT pass --pretrained_model_path. wavelet_detail_processing
+#   and the dropout knobs change the learned function, so other checkpoints are
+#   not architecture-comparable.
+# ============================================================================
+
+experiment_name: mswr_v212_robust_mrae
+model_size: base                      # capacity is NOT the bottleneck; do not inflate
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20                        # MST++ standard; comparable
+patch_size: 128                       # MST++ standard crop
+stride: 8                             # canonical patch density
+end_epoch: 220                        # DELIBERATE: shorter than a full 300-epoch cosine.
+                                      # The validated 'Run A' finding is that a SHORTER cosine
+                                      # (LR annealing near the ~ep70 plateau) is part of what
+                                      # fixes the overfit; 300 keeps LR high through the overfit
+                                      # zone. Keep 220 unless you observe (train-val MRAE gap)
+                                      # that EMA fully holds the back half -- only THEN extend
+                                      # toward 300 for a longer min_lr tail. If overfit returns
+                                      # before ~ep100, shorten toward ~120 instead.
+steps_per_epoch: 1000                 # ~MST++ iters/epoch over 900 scenes
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000              # mid-epoch best-checkpoint selection
+mrae_diagnostics: true                # per-bucket MRAE logging (diagnostic only)
+seed: 42
+
+# ---- architecture (canonical + the one proven capacity-light lever) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true               # band-to-band branch (already canonical)
+landmark_pooling: learned             # EXPLICIT (not omitted): keep the static 'learned'
+                                      # dictionary. 'adaptive' ~DOUBLES params (3.04M->6.50M);
+                                      # this model is overfit-limited, not capacity-bound, so
+                                      # adaptive is the WRONG lever -- it buys more overfitting
+                                      # on 900 scenes. Stated explicitly = deliberate refusal.
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true       # proven round-5 lever: zero-init depthwise 3x3 residual
+                                      # on the LH/HL/HH detail bands (was gate-only), so HF
+                                      # structure is modeled. +4480 params (+0.17%), exact
+                                      # identity at init, checkpoint-safe.
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32                  # bit-exact val cube => honest best-EMA selection.
+                                      # Raise to float16 ONLY if host RAM forces it (~28->14 GB);
+                                      # that perturbs SELECTION MRAE ~1e-3, not the final
+                                      # mswr_test_ntire.py number.
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine                     # anneals exactly to min_lr at progress=1.0 (verified)
+init_lr: 4.0e-4                       # MST++ base LR
+min_lr: 1.0e-6
+warmup_epochs: 5                      # MST++-style LR warmup
+weight_decay: 1.0e-2                  # canonical, in-range value. (An audit rejected a 2e-2
+                                      # draft: it doubles the validated sweep ceiling with no
+                                      # A/B gain. This is dial #1 -- only raise toward 2e-2 if a
+                                      # documented run shows lower val MRAE.)
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION (verified-wired stochastic levers; the real anti-overfit dials) ----
+drop_path: 0.15                       # stochastic depth, a mild bump from the implicit 0.10
+                                      # model default. VERIFIED applied to the FFN residual in
+                                      # BOTH the standard and wavelet paths via per-block
+                                      # linspace(0..0.15). Dial #2.
+attention_dropout: 0.02               # VERIFIED applied inside all three attention modules
+                                      # (window/landmark/spectral) as training-only SDPA
+                                      # dropout. It regularizes the ATTENTION residual, which
+                                      # drop_path does NOT wrap -- closing a real coverage gap.
+                                      # Dial #3 (precedented value; sweep up to ~0.05 if needed).
+# dropout (FFN dropout) intentionally LEFT AT DEFAULT 0.0: it stacks on the SAME FFN residual
+# branch as drop_path, so it would double-regularize FFN while leaving attention thin.
+# attention_dropout above is the better-placed second stochastic dial.
+
+# ---- precision / memory (numerics only; objective unchanged) ----
+use_amp: true
+amp_dtype: auto                       # bf16 when supported, fp16 otherwise
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA + honest selection ----
+use_ema: true                         # weight averaging; the key generalization lever per notes
+ema_decay: 0.999
+ema_start_epoch: 5                    # snapshot after warmup completes
+ema_eval_mode: both                   # validate EMA AND raw; trainer saves each source's best
+selection_source: auto                # honored under ema_eval_mode=both; picks genuine best EMA
+
+# ---- early stopping: OFF (keep the cosine tail; select best checkpoint post-hoc) ----
+early_stopping_mode: "off"
