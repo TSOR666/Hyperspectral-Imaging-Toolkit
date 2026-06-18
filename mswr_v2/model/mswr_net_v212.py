@@ -487,7 +487,16 @@ class MSWRDualConfig:
     # RGB->HSI. Default off preserves the original architecture and lets existing
     # checkpoints load unchanged.
     use_spectral_attn: bool = False
-    
+    # Number of heads for the spectral (band-to-band) S-MSA branch ONLY, decoupled
+    # from num_heads. The shared num_heads=8 makes the spectral attention map
+    # block-diagonal (per-head C/heads x C/heads), so at C=64 each of 8 heads sees
+    # only an 8x8 sub-block of the 64x64 cross-band covariance. 0 = fall back to
+    # num_heads (exact legacy behavior); 1 = FULL-RANK C x C band-to-band attention.
+    # Must divide every stage channel width when nonzero. No projection/FFN params
+    # are added; only the per-head rescale temperature changes shape (heads,1,1), so
+    # full-rank (heads=1) is actually a few params LIGHTER than the 8-head default.
+    spectral_attn_heads: int = 0
+
     # CNN Wavelet Configuration
     use_wavelet: bool = True
     wavelet_type: str = 'db1'
@@ -555,6 +564,12 @@ class MSWRDualConfig:
                     f"num_heads ({self.num_heads}); base_channels={self.base_channels}, "
                     f"channel_expansion={self.channel_expansion}."
                 )
+            if self.spectral_attn_heads and channels % self.spectral_attn_heads != 0:
+                raise ValueError(
+                    f"stage {stage_idx} channels ({channels}) must be divisible by "
+                    f"spectral_attn_heads ({self.spectral_attn_heads}); set 0 to reuse "
+                    f"num_heads, or 1 for full-rank band-to-band attention."
+                )
             if stage_idx < self.num_stages - 1:
                 channels = int(channels * self.channel_expansion)
 
@@ -588,6 +603,7 @@ class MSWRDualConfig:
         assert 0.0 <= self.attention_dropout <= 1.0, "attention_dropout must be in [0, 1]"
         assert 0.0 <= self.drop_path <= 1.0, "drop_path must be in [0, 1]"
         assert self.num_heads > 0, "num_heads must be positive"
+        assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
         assert self.base_channels > 0, "base_channels must be positive"
         assert self.num_stages > 0, "num_stages must be positive"
     
@@ -1077,7 +1093,12 @@ class EnhancedDualAttention2D(nn.Module):
             or getattr(config, 'use_spectral_attn', False)
         )
         if self.use_spectral_attn:
-            self.spectral_attn = SpectralMSA2D(dim, config.num_heads, config.attention_dropout)
+            # Spectral head count is decoupled from the spatial num_heads: 0 reuses
+            # num_heads (legacy block-diagonal map), 1 gives a full-rank C x C
+            # band-to-band attention map. No added projection params (only the
+            # per-head rescale temperature changes size).
+            spectral_heads = getattr(config, 'spectral_attn_heads', 0) or config.num_heads
+            self.spectral_attn = SpectralMSA2D(dim, spectral_heads, config.attention_dropout)
 
         # Enhanced fusion mechanisms
         if self.use_window_attn and self.use_landmark_attn and config.local_global_fusion == 'adaptive':
