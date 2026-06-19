@@ -11,7 +11,7 @@ CSWIN v2 performs RGB-to-hyperspectral reconstruction:
 
 The generator combines CBAM channel gating, full-resolution spectral MSA,
 GDFN/SGFN blocks, bounded local/global spatial attention, skip connections,
-and PixelUnshuffle/PixelShuffle sampling. The configured objective is stabilized
+and PixelUnshuffle/PixelShuffle sampling. The configured objective is annealed
 pure MRAE, with exact MRAE retained as the primary validation metric.
 
 # 2. Critical Paths & Profiling Plan

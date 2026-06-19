@@ -74,20 +74,23 @@ early_stopping_final_stage_only: true
 
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
-# Architecture aligned to HSIFormer with a stabilized MRAE-only objective:
+# Architecture aligned to HSIFormer with an annealed MRAE-only objective:
 # an efficient SSTB generator (CBAM channel gate ->
 # S-MSA + GDFN -> CSwin + SGFN), Adam lr 4e-4 cosine. The sinkhorn_* /
 # lambda_* / discriminator_* / r1 / n_critic / gradient_accumulation_steps keys
 # below are LEGACY (read only by the deprecated GAN trainers).
 # ===========================================================================
-# Start a fresh run. ``mrae_stable`` is still pure MRAE, but raises the
-# denominator floor so near-zero reflectance pixels do not dominate the optimizer.
-# Use objective=mrae and mrae_epsilon=1e-8 only for exact MST++ loss reproduction.
-objective: mrae_stable
+# Start a fresh run. ``mrae_annealed`` is still pure MRAE: it starts with a
+# stabilized denominator floor so near-zero reflectance pixels do not dominate
+# early optimization, then decays to exact MST++/leaderboard MRAE.
+objective: mrae_annealed
 allow_objective_mismatch_resume: false
 optimizer: adam          # matches MST++ training
 weight_decay: 0.0
-mrae_epsilon: 1.0e-3
+mrae_epsilon: 1.0e-3      # compatibility alias for the initial floor
+mrae_epsilon_start: 1.0e-3
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 50000
 
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model

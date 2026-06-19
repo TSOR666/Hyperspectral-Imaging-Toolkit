@@ -3,9 +3,12 @@ defaults:
   - _self_
 
 # Combined high-impact ablation. Start from random initialization.
-# Pure MRAE with a denominator floor; no L1 term.
-objective: mrae_stable
+# Pure MRAE with an annealed denominator floor; no L1 term.
+objective: mrae_annealed
 mrae_epsilon: 1.0e-3
+mrae_epsilon_start: 1.0e-3
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 50000
 decoder1_compress_first: true
 stage_depths: [2, 2, 2, 2, 2]
 allow_objective_mismatch_resume: false

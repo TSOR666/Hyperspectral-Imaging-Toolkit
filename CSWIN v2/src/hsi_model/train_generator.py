@@ -4,7 +4,7 @@ Generator-only (no-GAN) training for CSWin RGB->HSI reconstruction.
 
 This is the post-GAN trainer: the discriminator, Sinkhorn-OT adversarial loss,
 and R1 regularization are gone. The objective is a configurable reconstruction
-loss (see ``objective`` in config.yaml; the active recipe uses stabilized
+loss (see ``objective`` in config.yaml; the active recipe uses annealed
 MRAE-only training while validation still reports exact MRAE).
 
 Dropping the GAN removes 4 discriminator forwards + a discriminator backward +
@@ -93,6 +93,8 @@ from hsi_model.train_optimized import (
 
 logger = logging.getLogger(__name__)
 
+_ANNEALED_MRAE_OBJECTIVES = ("mrae_annealed", "annealed_mrae")
+
 
 def _update_early_stopping(
     current_mrae: float,
@@ -162,6 +164,12 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
         # HSIFormer/SS-Transformer (paper Sec 4.2) trains with L1 on [0,1]
         # targets; this is the validated objective for this architecture.
         return nn.L1Loss()
+    if objective in _ANNEALED_MRAE_OBJECTIVES:
+        return MRAELoss(
+            epsilon=float(
+                config.get("mrae_epsilon_start", config.get("mrae_epsilon", 1e-3))
+            )
+        )
     if objective in ("mrae", "mst", "mst++", "mrae_stable", "stable_mrae"):
         return MRAELoss(epsilon=float(config.get("mrae_epsilon", 1e-8)))
     if objective in ("mrae_l1", "mrae+l1", "l1_mrae"):
@@ -180,10 +188,45 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
             denominator_epsilon=float(config.get("relative_mrae_epsilon", 1e-2))
         )
     raise ValueError(
-        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_stable, mrae_l1, "
+        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_stable, "
+        "mrae_annealed, mrae_l1, "
         "l1_with_mrae, relative_mrae (a typo here silently changed the training "
         "objective in earlier versions; failing loudly instead)."
     )
+
+
+def _resolve_annealed_mrae_epsilon(config: Dict[str, Any], iteration: int) -> float:
+    """Log-linearly decay the MRAE denominator floor toward the exact metric."""
+    start = max(
+        float(config.get("mrae_epsilon_start", config.get("mrae_epsilon", 1e-3))),
+        1e-12,
+    )
+    end = max(float(config.get("mrae_epsilon_end", 1e-8)), 1e-12)
+    anneal_iters = max(int(config.get("mrae_epsilon_anneal_iters", 50_000)), 1)
+    progress = min(max(float(iteration), 0.0), float(anneal_iters)) / float(anneal_iters)
+    log_epsilon = math.log(start) + progress * (math.log(end) - math.log(start))
+    return float(math.exp(log_epsilon))
+
+
+def update_mrae_epsilon_schedule(
+    criterion: nn.Module,
+    config: Dict[str, Any],
+    iteration: int,
+) -> Optional[float]:
+    """Update scheduled MRAE epsilon in-place and return the active value."""
+    objective = str(config.get("objective", "mrae")).lower()
+    if objective not in _ANNEALED_MRAE_OBJECTIVES:
+        return None
+
+    epsilon = _resolve_annealed_mrae_epsilon(config, iteration)
+    updated = False
+    for module in criterion.modules():
+        if isinstance(module, MRAELoss):
+            module.epsilon = epsilon
+            updated = True
+    if not updated:
+        raise TypeError("objective=mrae_annealed requires a criterion containing MRAELoss.")
+    return epsilon
 
 
 def _resolve_stages(config: Dict[str, Any]) -> list:
@@ -294,6 +337,7 @@ def validate_generator(
     rank: int,
 ) -> Dict[str, float]:
     """MST++-protocol validation for the bare generator (temporary DataLoader)."""
+    update_mrae_epsilon_schedule(criterion, config, iteration)
     # DDP forward may broadcast buffers. Non-padding validation shards can have
     # different lengths (or be empty), so forwarding through the wrapper would
     # issue a different number of collectives per rank and can deadlock. The
@@ -560,6 +604,7 @@ def _run_stage(
             # step below, so repeated NaN losses/grads cannot loop forever.)
 
             with autocast_context(device.type, use_amp, autocast_dtype):
+                update_mrae_epsilon_schedule(criterion, config, iteration)
                 loss = criterion(pred.float(), hsi_tensor.float())
 
             # A non-finite loss is caught below via the grad-norm check (NaN
@@ -651,12 +696,18 @@ def _run_stage(
                     torch.stack(epoch_losses).mean().item() if epoch_losses else 0.0
                 )
                 objective_name = str(config.get("objective", "mrae")).upper()
+                scheduled_epsilon = update_mrae_epsilon_schedule(
+                    criterion, config, iteration
+                )
                 train_logger.info(
                     "Iter[%06d] Epoch[%06d] TrainLoss[%s]: %.6f ValMRAE: %.6f",
                     iteration, epoch_num, objective_name, avg_train_loss, current_mrae,
                 )
+                train_scalars = {"train_loss": avg_train_loss, "lr": lr}
+                if scheduled_epsilon is not None:
+                    train_scalars["mrae_epsilon"] = scheduled_epsilon
                 metrics_logger.log_scalars(
-                    {"train_loss": avg_train_loss, "lr": lr}, epoch_num, "train"
+                    train_scalars, epoch_num, "train"
                 )
                 metrics_logger.log_scalars(val_metrics, epoch_num, "val")
 
