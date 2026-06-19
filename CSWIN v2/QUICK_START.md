@@ -99,7 +99,7 @@ python src/hsi_model/train_generator.py \
     batch_size=16 \
     epochs=500 \
     generator_lr=1e-4 \
-    objective=mrae_stable \
+    objective=mrae_annealed \
     mixed_precision=true
 ```
 
@@ -162,8 +162,10 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 | `generator_lr` | 0.0004 | Generator learning rate |
 | `optimizer` | `adam` | MST++-aligned generator optimizer |
 | `weight_decay` | 0.0 | No weight decay |
-| `objective` | `mrae_stable` | Pure MRAE with a stabilized denominator |
-| `mrae_epsilon` | 1e-3 | Training denominator floor; validation still reports exact MRAE |
+| `objective` | `mrae_annealed` | Pure MRAE with a denominator floor annealed to exact MRAE |
+| `mrae_epsilon_start` | 1e-3 | Initial denominator floor for stable early optimization |
+| `mrae_epsilon_end` | 1e-8 | Final MST++/leaderboard MRAE denominator floor |
+| `mrae_epsilon_anneal_iters` | 50000 | Updates used to decay the floor |
 | `mixed_precision` | true | Use automatic mixed precision |
 | `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
 | `excluded_scene_stems` | `[ARAD_1K_0314]` | Known-corrupt scenes omitted intentionally |
@@ -212,7 +214,7 @@ print('✅ Installation verified!')
 
 ### For Better Quality:
 - Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
-- Start a fresh run after changing the objective to `mrae_stable`
+- Start a fresh run after changing the objective to `mrae_annealed`
 - Enable the documented progressive 128 -> 256 -> 512 stages after the initial run
 - Track both deployed `mrae` and diagnostic `raw_mrae`
 

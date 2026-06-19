@@ -3,9 +3,12 @@ defaults:
   - _self_
 
 # Fresh-run loss ablation for the dark-target gradient issue.
-# Pure MRAE with a denominator floor; no L1 term.
-objective: mrae_stable
+# Pure MRAE with an annealed denominator floor; no L1 term.
+objective: mrae_annealed
 mrae_epsilon: 1.0e-3
+mrae_epsilon_start: 1.0e-3
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 50000
 allow_objective_mismatch_resume: false
 
 log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/ablation_stable_mrae

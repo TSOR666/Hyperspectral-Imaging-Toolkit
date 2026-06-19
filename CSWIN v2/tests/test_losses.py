@@ -13,7 +13,7 @@ from hsi_model.models.losses_consolidated import (
     NoiseRobustLoss,
     ComputeSinkhornDiscriminatorLoss,
 )
-from hsi_model.train_generator import build_criterion
+from hsi_model.train_generator import build_criterion, update_mrae_epsilon_schedule
 
 
 def test_cost_matrix_matches_cdist():
@@ -95,6 +95,27 @@ def test_build_criterion_stable_mrae_is_mrae_with_configured_floor():
     criterion = build_criterion({"objective": "mrae_stable", "mrae_epsilon": 1e-3})
     assert type(criterion) is MRAELoss
     assert criterion.epsilon == pytest.approx(1e-3)
+
+
+def test_build_criterion_annealed_mrae_decays_to_exact_metric_floor():
+    config = {
+        "objective": "mrae_annealed",
+        "mrae_epsilon_start": 1e-3,
+        "mrae_epsilon_end": 1e-8,
+        "mrae_epsilon_anneal_iters": 50_000,
+    }
+    criterion = build_criterion(config)
+
+    assert type(criterion) is MRAELoss
+    assert criterion.epsilon == pytest.approx(1e-3)
+    assert update_mrae_epsilon_schedule(criterion, config, 25_000) == pytest.approx(
+        10 ** -5.5
+    )
+    assert criterion.epsilon == pytest.approx(10 ** -5.5)
+    assert update_mrae_epsilon_schedule(criterion, config, 50_000) == pytest.approx(
+        1e-8
+    )
+    assert criterion.epsilon == pytest.approx(1e-8)
 
 
 def test_sam_loss_finite():
