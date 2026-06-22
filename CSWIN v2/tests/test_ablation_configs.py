@@ -17,6 +17,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "src" / "configs"
         ("ablation_stable_mrae", "mrae_annealed", False, 4),
         ("ablation_decoder_lite", "mrae_annealed", True, 2),
         ("ablation_stable_lite", "mrae_annealed", True, 2),
+        ("finetune_progressive_annealed", "mrae_annealed", False, 4),
     ],
 )
 def test_ablation_config_composes(
@@ -62,3 +63,17 @@ def test_stable_lite_config_builds_finite_train_step():
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
+
+
+def test_progressive_finetune_config_switches_after_saturated_128_stage():
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(CONFIG_DIR),
+    ):
+        config = compose(config_name="finetune_progressive_annealed")
+
+    stages = list(config.progressive_stages)
+    assert [int(stage.patch_size) for stage in stages] == [128, 256, 512]
+    assert int(stages[0].iterations) == 70_000
+    assert int(stages[1].batch_size) == 8
+    assert int(stages[2].batch_size) == 2

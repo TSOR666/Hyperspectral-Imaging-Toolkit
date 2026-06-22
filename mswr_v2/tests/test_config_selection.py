@@ -40,3 +40,25 @@ def test_all_shipped_config_keys_are_recognized(monkeypatch):
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         unknown = set(config) - known_keys
         assert not unknown, f"{config_path.name} has unknown keys: {sorted(unknown)}"
+
+
+def test_spectralffn_experiment_plumbs_architecture_knobs(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_mswr_v212_logging.py",
+            "--config",
+            str(ROOT / "configs" / "experiments" / "robust_mrae_spectralffn.yaml"),
+        ],
+    )
+
+    args = trainer.load_config(trainer.parse_arguments())
+
+    assert args.use_spectral_attn is True
+    assert args.spectral_attn_heads == 1
+    assert args.spectral_ffn is True
+    assert args.spectral_ffn_mult == 2
+    assert args.wavelet_detail_processing is True
+    assert args.cache_dtype == "float32"
+    assert args.use_enhanced_loss is False

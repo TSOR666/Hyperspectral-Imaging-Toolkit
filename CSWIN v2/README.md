@@ -96,11 +96,18 @@ python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 
 # Combined annealed-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
+
+# Resume a saturated 128x128 annealed-MRAE run into 256/512 fine-tuning
+python src/hsi_model/train_generator.py \
+  --config-name finetune_progressive_annealed \
+  resume_checkpoint=/path/to/latest_checkpoint.pth
 ```
 
 These configurations use separate log/checkpoint directories and should start
-from random initialization. The active config now uses the annealed-MRAE loss;
-the lite ablations additionally change decoder capacity.
+from random initialization except the progressive fine-tune recipe, which is
+designed to resume an existing annealed-MRAE checkpoint. The active config now
+uses the annealed-MRAE loss; the lite ablations additionally change decoder
+capacity.
 
 ## GPU Preflight
 
