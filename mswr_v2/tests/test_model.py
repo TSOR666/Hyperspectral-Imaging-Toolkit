@@ -211,6 +211,71 @@ class TestSpectralAttention:
         assert all(g is not None for g in spectral_grads)
         assert all(not torch.isnan(g).any() for g in spectral_grads)
 
+    def test_spectral_ffn_checkpoint_safe_identity(self):
+        """Adding spectral FFN must not perturb old weights before training."""
+        torch.manual_seed(123)
+        base = create_mswr_tiny(
+            use_spectral_attn=True,
+            spectral_attn_heads=1,
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+        augmented = create_mswr_tiny(
+            use_spectral_attn=True,
+            spectral_attn_heads=1,
+            spectral_ffn=True,
+            spectral_ffn_mult=2,
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+        incompatible = augmented.load_state_dict(base.state_dict(), strict=False)
+
+        assert incompatible.missing_keys
+        assert all("spectral_ffn" in key for key in incompatible.missing_keys)
+        assert incompatible.unexpected_keys == []
+
+        base.eval()
+        augmented.eval()
+        x = torch.randn(1, 3, 64, 64)
+        with torch.no_grad():
+            base_out = base(x)
+            augmented_out = augmented(x)
+
+        assert torch.max(torch.abs(base_out - augmented_out)).item() == pytest.approx(0.0, abs=1e-7)
+
+    def test_spectral_ffn_gate_initialization_and_gradient(self):
+        """The new branch starts gated off, but its gate can learn."""
+        model = create_mswr_tiny(
+            use_spectral_attn=True,
+            spectral_attn_heads=1,
+            spectral_ffn=True,
+            spectral_ffn_mult=2,
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+        gates = [
+            p for name, p in model.named_parameters()
+            if name.endswith("spectral_ffn.gate")
+        ]
+        assert gates
+        assert all(torch.count_nonzero(gate).item() == 0 for gate in gates)
+
+        model.train()
+        x = torch.randn(1, 3, 64, 64)
+        target = torch.randn(1, 31, 64, 64)
+        output = model(x)
+        loss = torch.nn.functional.l1_loss(output, target)
+        loss.backward()
+
+        assert all(gate.grad is not None for gate in gates)
+        assert all(torch.isfinite(gate.grad).all() for gate in gates)
+        assert any(gate.grad.abs().sum().item() > 0 for gate in gates)
+
+    def test_spectral_ffn_multiplier_validation(self):
+        """Invalid FFN expansion should fail early at config creation."""
+        with pytest.raises(AssertionError):
+            MSWRDualConfig(spectral_ffn=True, spectral_ffn_mult=0)
+
 
 class TestWaveletLevelConfiguration:
     """Wavelet-depth ablations must reach the encoder blocks unchanged."""

@@ -373,6 +373,51 @@ class WaveletDetailBlock(nn.Module):
         return yh_level + x
 
 
+class SpectralGatedFFNBlock(nn.Module):
+    """Zero-init-gated GDFN spectral feed-forward residual (the MSAB FFN the
+    spectral branch lacks).
+
+    The spectral S-MSA branch (SpectralMSA2D) models band-to-band attention but
+    has no dedicated feed-forward stage, so per-band non-linear channel mixing
+    is under-modeled. This adds one as a SELF-GATED residual:
+        out = x + gate * FFN(LN(x))
+    where FFN is a depthwise-conv GDFN (Conv1x1 -> GELU -> depthwise 3x3 ->
+    GELU -> Conv1x1). `gate` is a per-channel parameter initialized to ZERO, so
+    the block is an EXACT identity at start: enabling it does not perturb a
+    fresh model or destabilize from-scratch training, and existing checkpoints
+    (which simply lack these params) load unchanged under strict=False when off.
+    reset_identity() re-zeros the gate so it survives the global Kaiming apply().
+
+    Added params per block ~ 2*mult*C^2 (the two 1x1 convs); at mult=2 this is
+    the non-redundant lever once SpectralMSA2D is already full-rank (heads=1),
+    where a second attention would merely duplicate the existing one.
+    """
+
+    def __init__(self, dim: int, mult: int = 2) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        hidden = dim * mult
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, hidden, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden, dim, 1, bias=False),
+        )
+        self.gate = nn.Parameter(torch.zeros(1, dim, 1, 1))  # (1, C, 1, 1)
+        self.reset_identity()
+
+    def reset_identity(self) -> None:
+        nn.init.zeros_(self.gate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # LayerNorm over the channel (spectral) axis: NCHW -> NHWC -> norm -> NCHW.
+        x_n = x.permute(0, 2, 3, 1)           # (B, H, W, C)
+        x_n = self.norm(x_n)                  # (B, H, W, C)
+        x_n = x_n.permute(0, 3, 1, 2)         # (B, C, H, W)
+        return x + self.gate * self.net(x_n)  # gate=0 at init -> exact identity
+
+
 # ===================== ENHANCED PERFORMANCE MONITORING =====================
 
 class PerformanceMonitor:
@@ -508,6 +553,14 @@ class MSWRDualConfig:
     # (near-identity at start) and OFF by default, so it is checkpoint-safe and
     # changes nothing unless explicitly enabled for an ablation.
     wavelet_detail_processing: bool = False
+    # Spectral gated-FFN (post-Rung-0 lever). SpectralMSA2D gives band-to-band
+    # ATTENTION but no feed-forward; when True, each block gets a zero-init-gated
+    # GDFN spectral FFN residual (SpectralGatedFFNBlock) -> exact identity at init,
+    # checkpoint-safe. spectral_ffn_mult sets the hidden expansion (2 ~ +0.44M on
+    # base, 4 ~ +0.85M). This is the non-redundant addition once spectral_attn_heads=1
+    # (a second attention would just duplicate the now-full-rank SpectralMSA2D).
+    spectral_ffn: bool = False
+    spectral_ffn_mult: int = 2
     # NOTE: wavelet_gate_reuse caches a *content-dependent* gate keyed only by
     # spatial dims + stage. Reusing a cached gate across samples is a
     # correctness bug (wrong gate content, wrong batch size on reuse) and
@@ -604,6 +657,7 @@ class MSWRDualConfig:
         assert 0.0 <= self.drop_path <= 1.0, "drop_path must be in [0, 1]"
         assert self.num_heads > 0, "num_heads must be positive"
         assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
+        assert self.spectral_ffn_mult >= 1, "spectral_ffn_mult must be >= 1"
         assert self.base_channels > 0, "base_channels must be positive"
         assert self.num_stages > 0, "num_stages must be positive"
     
@@ -1308,7 +1362,15 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.gamma2 = nn.Parameter(torch.ones(1, dim, 1, 1) * config.layer_scale_init)  # (1, C, 1, 1)
-    
+
+        # Optional spectral gated-FFN (the MSAB feed-forward the spectral branch
+        # lacks). Zero-init gated residual => exact identity at init, checkpoint-safe.
+        self.spectral_ffn = (
+            SpectralGatedFFNBlock(dim, mult=getattr(config, 'spectral_ffn_mult', 2))
+            if getattr(config, 'spectral_ffn', False)
+            else None
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Transformer block over NCHW input with optional wavelet branch.
@@ -1334,6 +1396,8 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         # Standard transformer path
         x = self.attn(x)  # (B, C, H, W)
         x = x + self.drop_path(self.gamma2 * self._ffn_forward(x))  # gamma2 (1, C, 1, 1) broadcast
+        if self.spectral_ffn is not None:
+            x = self.spectral_ffn(x)  # zero-init gated -> identity at start
         return x
     
     def _wavelet_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1392,6 +1456,8 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         # Process low-frequency component with attention
         yl_processed = self.attn(yl)  # (B, C, H_low, W_low)
         yl_processed = yl_processed + self.drop_path(self.gamma2 * self._ffn_forward(yl_processed))  # gamma2 broadcast
+        if self.spectral_ffn is not None:
+            yl_processed = self.spectral_ffn(yl_processed)  # refine LL band, identity at start
 
         # Reconstruct signal
         x_reconstructed = self.idwt((yl_processed, yh_gated))  # (B, C, H, W)
@@ -1743,6 +1809,10 @@ class IntegratedMSWRNet(nn.Module):
             detail = getattr(module, "wavelet_detail", None)
             if isinstance(detail, WaveletDetailBlock):
                 detail.reset_identity()
+            # Same for the zero-init spectral gated-FFN gate.
+            sffn = getattr(module, "spectral_ffn", None)
+            if isinstance(sffn, SpectralGatedFFNBlock):
+                sffn.reset_identity()
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):

@@ -215,7 +215,8 @@ print('✅ Installation verified!')
 ### For Better Quality:
 - Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
 - Start a fresh run after changing the objective to `mrae_annealed`
-- Enable the documented progressive 128 -> 256 -> 512 stages after the initial run
+- If validation saturates around 60k-70k at 128x128 patches, resume with
+  `--config-name finetune_progressive_annealed`
 - Track both deployed `mrae` and diagnostic `raw_mrae`
 
 ---

@@ -1,0 +1,21 @@
+defaults:
+  - config
+  - _self_
+
+# Resume-oriented follow-up for an annealed-MRAE run that has saturated at
+# 128x128 patches. Use with:
+#
+#   python src/hsi_model/train_generator.py \
+#     --config-name finetune_progressive_annealed \
+#     resume_checkpoint=/path/to/latest_checkpoint.pth
+#
+# If resumed from a 60k-70k single-stage checkpoint, the trainer derives the
+# current position from the checkpoint's global iteration, finishes the short
+# 128 stage, then rebuilds the loader for larger patches.
+progressive_stages:
+  - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 32, warmup_steps: 1000}
+  - {patch_size: 256, iterations: 60000, init_lr: 4.0e-5, batch_size: 8, warmup_steps: 0}
+  - {patch_size: 512, iterations: 40000, init_lr: 2.0e-5, batch_size: 2, warmup_steps: 0}
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/finetune_progressive_annealed
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/finetune_progressive_annealed
