@@ -120,9 +120,51 @@ def _cube_to_chw(cube: np.ndarray, source: Path) -> np.ndarray:
     )
 
 
+# ARAD-1K / NTIRE .mat files store the HSI cube under the variable name
+# ``cube``. Some redistributed or re-exported files store the same data under a
+# different name; mirror the tolerant key resolution already used by
+# ``hsi_benchmark.data`` and ``arad_dataset`` instead of hard-failing.
+_CUBE_DATASET_KEYS = ("cube", "reflectance", "rad", "hsi", "hyper", "data", "image")
+
+
+def _resolve_cube_key(mat: h5py.File, source: Path) -> str:
+    """Return the name of the HDF5 dataset holding the HSI cube.
+
+    Prefers the canonical ``cube`` key, then known aliases (case-insensitive),
+    then any 3D dataset with a 31-band axis, then a lone 3D dataset. Raises a
+    descriptive ``KeyError`` listing the available datasets when none qualifies,
+    so a wrong/empty file is diagnosable instead of opaque.
+    """
+    available = [
+        key
+        for key in mat.keys()
+        if not key.startswith("#") and isinstance(mat[key], h5py.Dataset)
+    ]
+    by_lower = {key.lower(): key for key in available}
+    for candidate in _CUBE_DATASET_KEYS:
+        if candidate in by_lower:
+            return by_lower[candidate]
+    banded = [
+        key
+        for key in available
+        if mat[key].ndim == 3
+        and ARAD1K_NUM_BANDS in tuple(int(s) for s in mat[key].shape)
+    ]
+    if banded:
+        return banded[0]
+    cubes = [key for key in available if mat[key].ndim == 3]
+    if len(cubes) == 1:
+        return cubes[0]
+    raise KeyError(
+        f"No HSI cube dataset found in {source}. Expected a variable named "
+        f"'cube' (ARAD-1K/NTIRE convention) or one of {_CUBE_DATASET_KEYS}; "
+        f"available datasets: {available or '<none>'}."
+    )
+
+
 def _load_mst_cube(path: Path) -> np.ndarray:
     with h5py.File(path, "r") as mat:
-        cube = np.array(mat["cube"])
+        cube = np.array(mat[_resolve_cube_key(mat, path)])
     cube_chw = _cube_to_chw(cube, path)
     # MST++ ARAD files are commonly stored as C,W,H; this converts them to C,H,W.
     return np.transpose(cube_chw, [0, 2, 1])
@@ -441,9 +483,8 @@ class MST_TrainDataset(Dataset):
                 rgb = _load_normalized_rgb(bgr_path, self._bgr2rgb)
                 rgb_hw = (int(rgb.shape[1]), int(rgb.shape[2]))
                 with h5py.File(hyper_path, "r") as mat:
-                    if "cube" not in mat:
-                        raise KeyError(f"Missing 'cube' dataset in {hyper_path}")
-                    _validate_cube_hw(tuple(mat["cube"].shape), rgb_hw, hyper_path)
+                    cube_key = _resolve_cube_key(mat, hyper_path)
+                    _validate_cube_hw(tuple(mat[cube_key].shape), rgb_hw, hyper_path)
             except Exception as exc:
                 if self.strict_files:
                     raise RuntimeError(f"Failed to index lazy training scene {hyper_path}") from exc
@@ -493,17 +534,17 @@ class MST_TrainDataset(Dataset):
         return rgb
 
     def _get_lazy_cube(self, scene_idx: int) -> Any:
+        scene = self._scene_refs[scene_idx]
         cached = self._h5_files.get(scene_idx)
         if cached is not None:
             self._h5_files.move_to_end(scene_idx)
-            return cached["cube"]
-        scene = self._scene_refs[scene_idx]
+            return cached[_resolve_cube_key(cached, scene.hyper_path)]
         handle = h5py.File(scene.hyper_path, "r")
         self._h5_files[scene_idx] = handle
         while len(self._h5_files) > self.lazy_cache_size:
             _, evicted = self._h5_files.popitem(last=False)
             evicted.close()
-        return handle["cube"]
+        return handle[_resolve_cube_key(handle, scene.hyper_path)]
 
     def close(self) -> None:
         for handle in getattr(self, "_h5_files", {}).values():
@@ -729,9 +770,8 @@ class MST_ValidDataset(Dataset):
                 rgb_hw = (int(bgr.shape[1]), int(bgr.shape[2]))
                 if self.memory_mode == "lazy":
                     with h5py.File(hyper_path, "r") as mat:
-                        if "cube" not in mat:
-                            raise KeyError(f"Missing 'cube' dataset in {hyper_path}")
-                        _validate_cube_hw(tuple(mat["cube"].shape), rgb_hw, hyper_path)
+                        cube_key = _resolve_cube_key(mat, hyper_path)
+                        _validate_cube_hw(tuple(mat[cube_key].shape), rgb_hw, hyper_path)
                     self._scene_refs.append(
                         _MSTSceneRef(
                             hyper_path,
@@ -781,17 +821,17 @@ class MST_ValidDataset(Dataset):
         return rgb
 
     def _get_lazy_cube(self, scene_idx: int) -> Any:
+        scene = self._scene_refs[scene_idx]
         cached = self._h5_files.get(scene_idx)
         if cached is not None:
             self._h5_files.move_to_end(scene_idx)
-            return cached["cube"]
-        scene = self._scene_refs[scene_idx]
+            return cached[_resolve_cube_key(cached, scene.hyper_path)]
         handle = h5py.File(scene.hyper_path, "r")
         self._h5_files[scene_idx] = handle
         while len(self._h5_files) > self.lazy_cache_size:
             _, evicted = self._h5_files.popitem(last=False)
             evicted.close()
-        return handle["cube"]
+        return handle[_resolve_cube_key(handle, scene.hyper_path)]
 
     def close(self) -> None:
         for handle in getattr(self, "_h5_files", {}).values():
