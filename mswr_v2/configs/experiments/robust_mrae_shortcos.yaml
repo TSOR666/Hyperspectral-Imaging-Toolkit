@@ -1,0 +1,98 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  Overfit attack: shorter cosine (single-variable)
+# experiment_name: mswr_v212_robust_mrae_shortcos
+# ============================================================================
+#
+# Builds on the current working baseline (robust_mrae_spectralffn.yaml:
+# full-rank spectral_attn_heads:1 + spectral_ffn). That baseline still OVERFITS
+# after ~ep70 (train loss keeps dropping, val MRAE drifts up; best checkpoint
+# clusters ~ep115-160 then degrades). This config changes ONE thing:
+#
+#     end_epoch: 220  ->  140
+#
+# i.e. it SHORTENS the cosine so LR anneals to min_lr at ~ep140 instead of 220.
+# This is the validated "Run A" overfit lever (EMA + AdamW wd + shorter cosine);
+# the baseline already has EMA + wd, so the shorter cosine is the only missing
+# ingredient. Annealing LR down through the ep70-120 overfit window lets the
+# model settle into a better-timed minimum near where it currently peaks (~ep130)
+# rather than running high-LR steps deep into the overfit regime.
+#
+# WHY SINGLE-VARIABLE: run-to-run noise here is ~0.015-0.02 MRAE (two identical
+# fullrank runs differed that much), so only the schedule changes vs the baseline
+# -> if it wins we can trust the mechanism. Do NOT also bump wd/drop_path in this
+# arm; that would confound an already noise-limited comparison.
+#
+# HONEST EXPECTATION: best-checkpoint selection already captures the pre-drift
+# minimum, so the upside on the REPORTED best is bounded and may land inside the
+# noise floor. The clearer wins are (a) a possibly better-timed/deeper minimum
+# and (b) a more stable, less-drifting best. Decision rule: adopt 140 if it beats
+# the 220 baseline best by >~0.02 MRAE (clears noise) OR matches it while clearly
+# flattening the train/val gap. Tunables if needed: 120 (more aggressive, clamps
+# LR right at the ~ep70 overfit onset) or 160 (if 140 under-converges).
+# ============================================================================
+
+experiment_name: mswr_v212_robust_mrae_shortcos
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 140                        # <<< THE ONLY DIFF vs robust_mrae_spectralffn.yaml (was 220)
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (current working baseline: fullrank spectral + spectral FFN) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+spectral_attn_heads: 1
+spectral_ffn: true
+spectral_ffn_mult: 2
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule (cosine T_max follows end_epoch -> anneals to min_lr at ep140) ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION (held at baseline values -> single-variable A/B) ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"
