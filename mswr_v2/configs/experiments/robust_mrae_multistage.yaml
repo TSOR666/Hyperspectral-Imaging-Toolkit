@@ -1,0 +1,102 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  Rung-2: full-rank spectral + spectral-FFN + multistage refine
+# experiment_name: mswr_v212_robust_mrae_multistage
+# ============================================================================
+#
+# Builds on the current working baseline (robust_mrae_spectralffn.yaml). The
+# overfit route is exhausted (shorter cosine was refuted -- the model needs the
+# long high-LR schedule and is plateau-limited ~0.24 EMA, not overfit-limited),
+# so this returns to the productive axis -- architecture -- with ONE additive
+# lever:
+#
+#     multistage_refine: true     # + refine_hidden: 64
+#
+# WHAT IT TESTS
+#   An MPRNet-style coarse-to-fine second stage on the final reconstruction: a
+#   small conv stage (SpectralRefinementStage) takes the stage-1 31-band output
+#   concatenated with the ORIGINAL RGB and predicts a zero-init-gated residual
+#   correction. Conditioning on the RGB lets the refinement re-inject
+#   high-frequency spatial detail the U-net may have smoothed. ~+47K params
+#   (+1.4% on 3.48M) at refine_hidden=64. Exact identity at init, checkpoint-safe.
+#
+#   Run from scratch, same seed, MRAE-only, against robust_mrae_spectralffn.yaml
+#   (multistage_refine: false). Single variable = the refinement stage, so any
+#   val-MRAE delta is attributable to it. KEEP end_epoch: 220 -- the 140-ep
+#   shorter cosine was refuted (~0.03 worse); this model reaches its 0.24 minimum
+#   only on the long schedule.
+#
+# DECISION RULE (noise floor ~0.015-0.02 MRAE): adopt if it beats the spectral-
+# FFN baseline best-EMA by >~0.02 (clears noise). A sub-0.02 gain is ~1 sigma
+# given run-to-run variance -- treat as inconclusive and replicate before
+# shipping. This is the last item on the architecture Rung ladder; if it lands
+# in the noise, the cheap single-pair-A/B vein is tapped out and the honest next
+# step is replication (2-3 seeds) or a larger structural change, not more guesses.
+# ============================================================================
+
+experiment_name: mswr_v212_robust_mrae_multistage
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220                        # KEEP 220 -- shorter cosine refuted (model needs the long schedule)
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (spectral-FFN baseline + the Rung-2 multistage-refine lever) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+spectral_attn_heads: 1                # Rung-0 win: full-rank C x C band-to-band attention
+spectral_ffn: true                    # Rung-1 win: spectral gated-FFN
+spectral_ffn_mult: 2
+multistage_refine: true               # <<< THE ONLY DIFF vs robust_mrae_spectralffn.yaml
+refine_hidden: 64                     # refinement width (~+47K params)
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"

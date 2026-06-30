@@ -440,6 +440,8 @@ class TrainingConfig:
         self.spectral_attn_heads = getattr(args, 'spectral_attn_heads', 0)
         self.spectral_ffn = getattr(args, 'spectral_ffn', False)
         self.spectral_ffn_mult = getattr(args, 'spectral_ffn_mult', 2)
+        self.multistage_refine = getattr(args, 'multistage_refine', False)
+        self.refine_hidden = getattr(args, 'refine_hidden', 64)
 
         # CNN Wavelet parameters (no external dependencies)
         self.use_wavelet = args.use_wavelet
@@ -596,6 +598,12 @@ def parse_arguments():
                             "The non-redundant lever once --spectral_attn_heads 1 makes attention full-rank.")
     parser.add_argument("--spectral_ffn_mult", type=int, default=2,
                        help="Hidden expansion for the spectral gated-FFN (2 ~ +0.44M, 4 ~ +0.85M on base).")
+    parser.add_argument("--multistage_refine", action='store_true', default=False,
+                       help="Add an MPRNet-style multistage refinement stage on the final output: a small "
+                            "conv stage refines the stage-1 reconstruction conditioned on the original RGB. "
+                            "Zero-init-gated (identity at init), checkpoint-safe; ~+47K params at default width.")
+    parser.add_argument("--refine_hidden", type=int, default=64,
+                       help="Hidden width of the multistage refinement stage (64 ~ +47K params on base).")
     parser.add_argument("--use_wavelet", action='store_true', default=True)
     parser.add_argument("--wavelet_type", type=str, default='db2',
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
@@ -1244,6 +1252,8 @@ class EnhancedTrainer:
                 'spectral_attn_heads': self.config.spectral_attn_heads,
                 'spectral_ffn': self.config.spectral_ffn,
                 'spectral_ffn_mult': self.config.spectral_ffn_mult,
+                'multistage_refine': self.config.multistage_refine,
+                'refine_hidden': self.config.refine_hidden,
                 # The model's per-forward PerformanceMonitor is consumed ONLY by
                 # _profile_model() (gated on --profile_model). Driving it from
                 # memory_monitoring meant it ran on every training forward with
@@ -1284,6 +1294,8 @@ class EnhancedTrainer:
                 spectral_attn_heads=self.config.spectral_attn_heads,
                 spectral_ffn=self.config.spectral_ffn,
                 spectral_ffn_mult=self.config.spectral_ffn_mult,
+                multistage_refine=self.config.multistage_refine,
+                refine_hidden=self.config.refine_hidden,
                 # See note above: only --profile_model consumes this monitor.
                 performance_monitoring=self.config.profile_model,
                 **{

@@ -12,13 +12,17 @@ import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 from torch.utils.data import DataLoader
 
 from .checkpoint import load_checkpoint_payload
 from .data import ARAD1KDataset
 from .losses import SpectralReconstructionLoss
-from .ntire import evaluate_loader, resolve_device
+from .ntire import autocast_dtype, evaluate_loader, resolve_device
 from .presets import build_model, get_config
 
 
@@ -68,7 +72,10 @@ class TrainingConfig:
     validation_manifest: str | None = None
     seed: int = 42
     amp: bool = True
-    grad_clip_norm: float | None = None
+    amp_dtype: str = "bf16"
+    grad_clip_norm: float | None = 1.0
+    warmup_steps: int = 0
+    max_consecutive_nonfinite: int = 100
 
     def __post_init__(self) -> None:
         if not self.data_root:
@@ -85,6 +92,12 @@ class TrainingConfig:
             raise ValueError("validation_tile_size must be positive.")
         if self.grad_clip_norm is not None and self.grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be positive.")
+        if self.amp_dtype not in {"bf16", "fp16"}:
+            raise ValueError("amp_dtype must be 'bf16' or 'fp16'.")
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps cannot be negative.")
+        if self.max_consecutive_nonfinite < 1:
+            raise ValueError("max_consecutive_nonfinite must be positive.")
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> TrainingConfig:
@@ -144,9 +157,17 @@ def train(
         mrae_weight=config.loss.mrae_weight,
         sam_weight=config.loss.sam_weight,
     )
-    scaler = _make_grad_scaler(
-        enabled=config.amp and selected_device.type == "cuda"
+    amp_enabled = config.amp and selected_device.type == "cuda"
+    amp_compute_dtype = (
+        autocast_dtype(selected_device, config.amp_dtype)
+        if amp_enabled
+        else torch.float32
     )
+    # GradScaler only matters for fp16, whose narrow range needs gradients
+    # rescaled around it. bf16 keeps the float32 exponent range, so the scaler
+    # stays disabled (a passthrough) yet remains in the checkpoint for resume.
+    use_grad_scaler = amp_enabled and amp_compute_dtype == torch.float16
+    scaler = _make_grad_scaler(enabled=use_grad_scaler)
 
     start_stage = 0
     start_stage_step = 0
@@ -164,6 +185,12 @@ def train(
                 "Resume checkpoint architecture does not match this training config."
             )
         model.load_state_dict(loaded["model"])
+        # Refuse to resume a NaN/Inf-poisoned checkpoint: a run that already
+        # collapsed saves non-finite weights (and Adam moments), and resuming
+        # them re-poisons the model on the first step with no path to recover.
+        # The user must restart from a pre-collapse checkpoint (best.pt or an
+        # earlier step_*.pt) instead of the post-collapse latest.pt.
+        _require_finite_resume_state(model, loaded.get("optimizer"))
         scaler_state = loaded.get("scaler")
         if scaler_state:
             scaler.load_state_dict(scaler_state)
@@ -186,11 +213,7 @@ def train(
             betas=(0.9, 0.999),
             eps=1e-8,
         )
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=stage.iterations,
-            eta_min=config.min_learning_rate,
-        )
+        scheduler = _build_scheduler(optimizer, stage, config)
         if resume_payload is not None and stage_index == start_stage:
             if resume_payload.get("optimizer"):
                 optimizer.load_state_dict(resume_payload["optimizer"])
@@ -206,6 +229,8 @@ def train(
         train_iterator = iter(train_loader)
         running_loss = torch.zeros((), device=selected_device)
         running_count = 0
+        nonfinite_skips = 0
+        consecutive_skips = 0
         model.train()
         print(
             f"stage={stage_index + 1}/{len(config.stages)} "
@@ -225,32 +250,58 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=selected_device.type,
-                enabled=config.amp and selected_device.type == "cuda",
+                dtype=amp_compute_dtype if amp_enabled else None,
+                enabled=amp_enabled,
             ):
                 prediction = model(rgb)
                 loss = criterion(prediction, target)
 
-            scaler.scale(loss).backward()
-            if config.grad_clip_norm is not None:
-                scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            stepped = _optimization_step(
+                loss,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                grad_clip_norm=config.grad_clip_norm,
+                use_grad_scaler=use_grad_scaler,
+            )
             scheduler.step()
 
             stage_step += 1
             global_step += 1
-            running_loss.add_(loss.detach())
-            running_count += 1
+            if stepped:
+                running_loss.add_(loss.detach())
+                running_count += 1
+                consecutive_skips = 0
+            else:
+                nonfinite_skips += 1
+                consecutive_skips += 1
+                print(
+                    f"warning: non-finite loss/gradient at step {global_step}; "
+                    f"optimizer update skipped (cumulative skips={nonfinite_skips})"
+                )
+                if consecutive_skips >= config.max_consecutive_nonfinite:
+                    raise RuntimeError(
+                        f"Aborting: {consecutive_skips} consecutive non-finite "
+                        f"optimizer steps at global step {global_step}. Training "
+                        "is not recovering (e.g. a corrupt sample or an unstable "
+                        "configuration). Inspect the data and reduce the learning "
+                        "rate before retrying."
+                    )
 
             if global_step % config.log_every == 0:
+                mean_loss = (
+                    float((running_loss / running_count).item())
+                    if running_count
+                    else float("nan")
+                )
                 train_record = {
                     "type": "train",
                     "global_step": global_step,
                     "stage_index": stage_index,
                     "stage_step": stage_step,
-                    "loss": float((running_loss / running_count).item()),
+                    "loss": mean_loss,
                     "learning_rate": optimizer.param_groups[0]["lr"],
+                    "nonfinite_skips": nonfinite_skips,
                 }
                 _append_jsonl(metrics_path, train_record)
                 print(
@@ -451,3 +502,116 @@ def _make_grad_scaler(*, enabled: bool) -> Any:
         return torch.amp.GradScaler("cuda", enabled=enabled)
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _build_scheduler(
+    optimizer: Adam,
+    stage: TrainingStage,
+    config: TrainingConfig,
+) -> Any:
+    """Cosine decay, optionally preceded by a short linear LR warmup.
+
+    Warmup is off by default (``warmup_steps == 0``) so the schedule and its
+    ``state_dict`` shape are identical to the published recipe and remain
+    resume-compatible with existing checkpoints.
+    """
+    warmup = min(config.warmup_steps, max(0, stage.iterations - 1))
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, stage.iterations - warmup),
+        eta_min=config.min_learning_rate,
+    )
+    if warmup <= 0:
+        return cosine
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=1e-2,
+        end_factor=1.0,
+        total_iters=warmup,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine],
+        milestones=[warmup],
+    )
+
+
+def _optimization_step(
+    loss: torch.Tensor,
+    *,
+    model: nn.Module,
+    optimizer: Adam,
+    scaler: Any,
+    grad_clip_norm: float | None,
+    use_grad_scaler: bool,
+) -> bool:
+    """Run one scaled backward + optimizer step, skipping non-finite updates.
+
+    Returns ``True`` if the optimizer stepped and ``False`` if the step was
+    skipped because the loss or gradients were non-finite. Skipping a bad batch
+    (rather than stepping on NaN/Inf gradients) is what keeps a single overflow
+    from poisoning the Adam moments and weights — the failure that turned a
+    transient spike into the permanent, unrecoverable collapse in the logs.
+    """
+    if not torch.isfinite(loss):
+        return False
+
+    scaler.scale(loss).backward()
+
+    grads_finite = True
+    if grad_clip_norm is not None:
+        # unscale_ is a no-op when the scaler is disabled (bf16); the grads are
+        # already at scale 1, so clipping operates on the true gradient norm.
+        scaler.unscale_(optimizer)
+        total_norm = clip_grad_norm_(model.parameters(), grad_clip_norm)
+        grads_finite = bool(torch.isfinite(total_norm))
+    elif not use_grad_scaler:
+        # No clipping and no scaler to guard the step — check explicitly.
+        grads_finite = _gradients_are_finite(model)
+
+    if grads_finite or use_grad_scaler:
+        # Under fp16 the GradScaler skips the step itself on inf/NaN grads and
+        # update() lowers the loss scale; always drive both for it.
+        scaler.step(optimizer)
+    scaler.update()
+    return grads_finite
+
+
+def _gradients_are_finite(model: nn.Module) -> bool:
+    for param in model.parameters():
+        grad = param.grad
+        if grad is not None and not bool(torch.isfinite(grad).all()):
+            return False
+    return True
+
+
+def _require_finite_resume_state(
+    model: nn.Module,
+    optimizer_state: dict[str, Any] | None,
+) -> None:
+    """Reject resuming from a checkpoint whose weights or Adam moments are NaN.
+
+    A collapsed run persists non-finite parameters (and optimizer moments); the
+    fp32 master weights and Adam state would re-poison a fresh run on step one.
+    Fail loudly so the user resumes from a pre-collapse checkpoint instead.
+    """
+    for name, param in model.named_parameters():
+        if not bool(torch.isfinite(param).all()):
+            raise ValueError(
+                f"Resume checkpoint parameter '{name}' is non-finite. This "
+                "checkpoint is from a collapsed run; resume from an earlier, "
+                "finite checkpoint (best.pt or a pre-collapse step_*.pt)."
+            )
+    if not optimizer_state:
+        return
+    for state in optimizer_state.get("state", {}).values():
+        for key, value in state.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and not bool(torch.isfinite(value).all())
+            ):
+                raise ValueError(
+                    f"Resume checkpoint optimizer moment '{key}' is non-finite. "
+                    "This checkpoint is from a collapsed run; resume from an "
+                    "earlier, finite checkpoint."
+                )

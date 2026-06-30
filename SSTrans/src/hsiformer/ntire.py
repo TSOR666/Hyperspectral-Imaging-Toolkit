@@ -92,9 +92,11 @@ def evaluate_loader(
             rgb = _require_tensor(batch, "cond").to(device, non_blocking=True)
             target = _require_tensor(batch, "label").to(device, non_blocking=True)
             scene_ids = _scene_ids(batch["scene_id"], rgb.shape[0])
+            amp_enabled = amp and device.type == "cuda"
             with torch.autocast(
                 device_type=device.type,
-                enabled=amp and device.type == "cuda",
+                dtype=autocast_dtype(device) if amp_enabled else None,
+                enabled=amp_enabled,
             ):
                 prediction = predict_hsi(
                     model,
@@ -149,9 +151,11 @@ def infer_loader(
         for batch in loader:
             rgb = _require_tensor(batch, "cond").to(device, non_blocking=True)
             batch_scene_ids = _scene_ids(batch["scene_id"], rgb.shape[0])
+            amp_enabled = amp and device.type == "cuda"
             with torch.autocast(
                 device_type=device.type,
-                enabled=amp and device.type == "cuda",
+                dtype=autocast_dtype(device) if amp_enabled else None,
+                enabled=amp_enabled,
             ):
                 prediction = predict_hsi(
                     model,
@@ -201,6 +205,27 @@ def resolve_device(value: str = "auto") -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
     return device
+
+
+def autocast_dtype(device: torch.device, preferred: str = "bf16") -> torch.dtype:
+    """Resolve the autocast compute dtype, preferring overflow-safe bf16.
+
+    fp16 autocast (max ~65504) overflows in the model's unbounded depthwise
+    convolutions and deep residual stack, which is the dominant source of NaN
+    activations. bfloat16 carries the float32 exponent range and removes that
+    failure class entirely, so it is preferred whenever the GPU supports it.
+    fp16 is used only as a fallback on hardware without bf16.
+    """
+    if device.type != "cuda":
+        return torch.float32
+    if preferred == "fp16":
+        return torch.float16
+    try:
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except (AssertionError, RuntimeError):
+        pass
+    return torch.float16
 
 
 def _predict_single_tiled(

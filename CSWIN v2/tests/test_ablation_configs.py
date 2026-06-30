@@ -17,6 +17,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "src" / "configs"
         ("ablation_stable_mrae", "mrae_annealed", False, 4),
         ("ablation_decoder_lite", "mrae_annealed", True, 2),
         ("ablation_stable_lite", "mrae_annealed", True, 2),
+        ("finetune_128_polish_annealed", "mrae_annealed", False, 4),
         ("finetune_progressive_annealed", "mrae_annealed", False, 4),
     ],
 )
@@ -77,3 +78,19 @@ def test_progressive_finetune_config_switches_after_saturated_128_stage():
     assert int(stages[0].iterations) == 70_000
     assert int(stages[1].batch_size) == 8
     assert int(stages[2].batch_size) == 2
+    assert int(config.early_stopping_patience) == 3
+    assert bool(config.early_stopping_final_stage_only) is False
+
+
+def test_128_polish_config_does_not_switch_patch_geometry():
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(CONFIG_DIR),
+    ):
+        config = compose(config_name="finetune_128_polish_annealed")
+
+    stages = list(config.progressive_stages)
+    assert [int(stage.patch_size) for stage in stages] == [128]
+    assert int(stages[0].iterations) == 72_000
+    assert int(config.validation_patch_size) == 128
+    assert int(config.early_stopping_patience) == 3

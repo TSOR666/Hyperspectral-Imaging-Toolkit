@@ -41,5 +41,7 @@
   "rgb_normalization": "scale_255",
   "seed": 42,
   "amp": true,
-  "grad_clip_norm": null
+  "amp_dtype": "bf16",
+  "grad_clip_norm": 1.0,
+  "warmup_steps": 0
 }
