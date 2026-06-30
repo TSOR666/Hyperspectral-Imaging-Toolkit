@@ -42,6 +42,35 @@ def test_scaled_cosine_attention_matches_reference_on_cpu() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_scaled_cosine_attention_clamps_runaway_scale() -> None:
+    """An exploded temperature must not produce NaNs; it saturates at the ceiling."""
+    torch.manual_seed(0)
+    query = torch.randn(2, 3, 7, 8)
+    key = torch.randn(2, 3, 5, 8)
+    value = torch.randn(2, 3, 5, 6)
+    runaway = torch.full((3, 1, 1), 1e6)
+    ceiling = torch.full((3, 1, 1), 100.0)
+
+    clamped = _scaled_cosine_attention(query, key, value, runaway)
+    saturated = _scaled_cosine_attention(query, key, value, ceiling)
+
+    assert torch.isfinite(clamped).all()
+    torch.testing.assert_close(clamped, saturated)
+
+
+def test_scaled_cosine_attention_is_bit_exact_below_ceiling() -> None:
+    """Normal temperatures (<100) pass through unclamped, preserving checkpoints."""
+    torch.manual_seed(0)
+    query = torch.randn(2, 3, 7, 8)
+    key = torch.randn(2, 3, 5, 8)
+    value = torch.randn(2, 3, 5, 6)
+    scale = torch.full((3, 1, 1), 50.0)
+
+    expected = _reference_attention(query, key, value, scale)
+    actual = _scaled_cosine_attention(query, key, value, scale)
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("stripe_index", [0, 1])
 def test_cross_attention_supports_rectangular_features(
     stripe_index: int,

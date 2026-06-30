@@ -2,8 +2,11 @@ defaults:
   - config
   - _self_
 
-# Resume-oriented follow-up for an annealed-MRAE run that has saturated at
-# 128x128 patches. Use with:
+# Experimental follow-up for an annealed-MRAE run that has saturated at
+# 128x128 patches. The 2026-06-25 run showed that switching to 256 patches while
+# validating/deploying with 128-tile inference can severely worsen MRAE
+# (0.274 -> 0.39). Prefer finetune_128_polish_annealed unless you are explicitly
+# sweeping inference patch_size as part of the experiment. Use with:
 #
 #   python src/hsi_model/train_generator.py \
 #     --config-name finetune_progressive_annealed \
@@ -16,6 +19,11 @@ progressive_stages:
   - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 32, warmup_steps: 1000}
   - {patch_size: 256, iterations: 60000, init_lr: 4.0e-5, batch_size: 8, warmup_steps: 0}
   - {patch_size: 512, iterations: 40000, init_lr: 2.0e-5, batch_size: 2, warmup_steps: 0}
+
+early_stopping_patience: 3
+early_stopping_min_delta: 5.0e-5
+early_stopping_warmup_epochs: 0
+early_stopping_final_stage_only: false
 
 log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/finetune_progressive_annealed
 checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/finetune_progressive_annealed

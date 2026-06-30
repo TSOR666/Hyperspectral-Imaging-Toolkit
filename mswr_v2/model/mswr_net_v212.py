@@ -418,6 +418,55 @@ class SpectralGatedFFNBlock(nn.Module):
         return x + self.gate * self.net(x_n)  # gate=0 at init -> exact identity
 
 
+class SpectralRefinementStage(nn.Module):
+    """MPRNet-style coarse-to-fine multistage refinement (zero-init-gated).
+
+    Takes the stage-1 HSI reconstruction (output_channels bands) concatenated
+    with the original RGB and predicts a residual correction added back to the
+    stage-1 output:  out = hsi + gate * Refine([hsi, rgb]). Conditioning on the
+    original RGB lets the second stage re-inject high-frequency spatial detail
+    the encoder/decoder U-net may have smoothed -- the coarse-to-fine idea in
+    MPRNet. `gate` is a per-band parameter initialized to ZERO, so the stage is
+    an EXACT identity at start: enabling it does not perturb a fresh model or
+    destabilize from-scratch training, and existing checkpoints (which simply
+    lack these params) load unchanged under strict=False when off.
+    reset_identity() re-zeros the gate so it survives the global Kaiming apply().
+
+    Added params ~ hidden*(in_ch+out_ch)*9 + n_blocks*hidden*(hidden+9); at
+    hidden=64 / n_blocks=2 on 31-band output this is ~+47K (+1.4% on base).
+    """
+
+    def __init__(self, hsi_channels: int = 31, rgb_channels: int = 3,
+                 hidden: int = 64, n_blocks: int = 2) -> None:
+        super().__init__()
+        in_ch = hsi_channels + rgb_channels
+        self.head = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 3, padding=1, bias=True),
+            nn.GELU(),
+        )
+        # Lightweight residual depthwise-separable refinement blocks.
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=True),  # depthwise
+                nn.GELU(),
+                nn.Conv2d(hidden, hidden, 1, bias=True),                            # pointwise
+            )
+            for _ in range(n_blocks)
+        ])
+        self.tail = nn.Conv2d(hidden, hsi_channels, 3, padding=1, bias=True)
+        self.gate = nn.Parameter(torch.zeros(1, hsi_channels, 1, 1))  # (1, C_out, 1, 1)
+        self.reset_identity()
+
+    def reset_identity(self) -> None:
+        nn.init.zeros_(self.gate)
+
+    def forward(self, hsi: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
+        feat = self.head(torch.cat([hsi, rgb], dim=1))
+        for blk in self.blocks:
+            feat = feat + blk(feat)             # residual DS-conv block
+        return hsi + self.gate * self.tail(feat)  # gate=0 at init -> exact identity
+
+
 # ===================== ENHANCED PERFORMANCE MONITORING =====================
 
 class PerformanceMonitor:
@@ -561,6 +610,14 @@ class MSWRDualConfig:
     # (a second attention would just duplicate the now-full-rank SpectralMSA2D).
     spectral_ffn: bool = False
     spectral_ffn_mult: int = 2
+    # MPRNet-style multistage refinement on the final output-channel reconstruction.
+    # When True, a small conv stage (SpectralRefinementStage) takes the stage-1
+    # reconstruction concatenated with the original RGB and predicts a zero-init-
+    # gated residual correction -> exact identity at init, checkpoint-safe.
+    # refine_hidden sets its width (64 ~ +47K params). Off by default so existing
+    # checkpoints load unchanged.
+    multistage_refine: bool = False
+    refine_hidden: int = 64
     # NOTE: wavelet_gate_reuse caches a *content-dependent* gate keyed only by
     # spatial dims + stage. Reusing a cached gate across samples is a
     # correctness bug (wrong gate content, wrong batch size on reuse) and
@@ -658,6 +715,7 @@ class MSWRDualConfig:
         assert self.num_heads > 0, "num_heads must be positive"
         assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
         assert self.spectral_ffn_mult >= 1, "spectral_ffn_mult must be >= 1"
+        assert self.refine_hidden >= 1, "refine_hidden must be >= 1"
         assert self.base_channels > 0, "base_channels must be positive"
         assert self.num_stages > 0, "num_stages must be positive"
     
@@ -1780,6 +1838,18 @@ class IntegratedMSWRNet(nn.Module):
         # Learnable input skip connection
         self.input_skip = nn.Conv2d(config.input_channels, config.output_channels, 1)
 
+        # Optional MPRNet-style multistage refinement on the final reconstruction.
+        # Zero-init-gated -> exact identity at init, checkpoint-safe, off by default.
+        self.refine_stage = (
+            SpectralRefinementStage(
+                hsi_channels=config.output_channels,
+                rgb_channels=config.input_channels,
+                hidden=getattr(config, 'refine_hidden', 64),
+            )
+            if getattr(config, 'multistage_refine', False)
+            else None
+        )
+
         # Apply enhanced (Kaiming) initialization FIRST so it does not overwrite
         # the per-layer soft-identity inits applied below. Previously this call
         # ran AFTER EnhancedOutputProjection.__init__ had set proj2.weight=0.01
@@ -1813,6 +1883,9 @@ class IntegratedMSWRNet(nn.Module):
             sffn = getattr(module, "spectral_ffn", None)
             if isinstance(sffn, SpectralGatedFFNBlock):
                 sffn.reset_identity()
+            # Same for the zero-init multistage refinement stage.
+            if isinstance(module, SpectralRefinementStage):
+                module.reset_identity()
         
         # Model compilation for optimization
         if config.compile_model and hasattr(torch, 'compile'):
@@ -1937,6 +2010,9 @@ class IntegratedMSWRNet(nn.Module):
         orig_H, orig_W = H, W
         x, (pad_h, pad_w) = self._pad_to_required_multiple(x)
         H, W = x.shape[-2:]
+
+        # Keep the padded RGB for the optional multistage refinement stage.
+        rgb_in = x
         
         # Clear cache for new forward pass
         if self.wavelet_gate_cache is not None:
@@ -2015,6 +2091,17 @@ class IntegratedMSWRNet(nn.Module):
             )  # (B, C_out, H_in, W_in) -> (B, C_out, H, W)
         
         x = x + input_skip  # (B, C_out, H, W)
+
+        # Optional multistage refinement: residual correction on the stage-1 HSI,
+        # conditioned on the original RGB (gate=0 at init -> exact identity).
+        if self.refine_stage is not None:
+            rgb_ref = rgb_in
+            if rgb_ref.shape[-2:] != x.shape[-2:]:
+                rgb_ref = F.interpolate(
+                    rgb_ref, size=x.shape[-2:], mode='bilinear', align_corners=False
+                )
+            x = self.refine_stage(x, rgb_ref)
+
         if pad_h or pad_w:
             x = x[:, :, :orig_H, :orig_W].contiguous()
 

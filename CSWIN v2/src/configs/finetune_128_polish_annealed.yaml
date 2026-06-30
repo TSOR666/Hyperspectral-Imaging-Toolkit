@@ -1,0 +1,26 @@
+defaults:
+  - config
+  - _self_
+
+# Low-LR continuation for an annealed-MRAE checkpoint that has saturated around
+# 60k-70k updates. The 256/512 progressive jump hurt validation MRAE in the
+# 2026-06-25 run, so this recipe keeps the deployed 128x128 training/validation
+# geometry and only gives the model a short cosine-tail polish.
+#
+# Use with a pre-progressive checkpoint, preferably the best checkpoint from the
+# 128x128 run:
+#
+#   python src/hsi_model/train_generator.py \
+#     --config-name finetune_128_polish_annealed \
+#     resume_checkpoint=/path/to/best_model.pth
+#
+progressive_stages:
+  - {patch_size: 128, iterations: 72000, init_lr: 4.0e-4, batch_size: 32, warmup_steps: 1000}
+
+early_stopping_patience: 3
+early_stopping_min_delta: 5.0e-5
+early_stopping_warmup_epochs: 0
+early_stopping_final_stage_only: true
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/finetune_128_polish_annealed
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/finetune_128_polish_annealed

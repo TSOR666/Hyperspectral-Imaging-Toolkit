@@ -9,6 +9,22 @@ from torch.nn import functional as F
 
 RPEMode = Literal["none", "legacy_post_softmax", "pre_softmax"]
 
+# Upper bound on the learnable cosine-attention temperature/scale, applied at
+# forward time (Swin-V2 clamps its logit_scale identically). Because q and k are
+# L2-normalised, the pre-softmax logits live in [-scale, scale]; an unbounded
+# scale lets a single bad optimiser step drive the logits — and the resulting
+# activations — to magnitudes that overflow fp16 and never recover. A ceiling of
+# 100 keeps softmax well-conditioned yet is far above any value reached in
+# healthy training, so it is a no-op for existing trained checkpoints (their
+# temperatures are ~1) and preserves their bit-exact behaviour.
+_MAX_COSINE_LOGIT_SCALE = 100.0
+
+# Denominator floor for the cosine L2-normalisation. The PyTorch default
+# (1e-12) underflows to 0 in fp16, turning a dead/near-zero token into 0/0 = NaN;
+# a dtype-safe floor removes that source while staying bit-identical for any real
+# activation (whose norm is far above this floor).
+_NORMALIZE_EPS = 1e-6
+
 
 def _scaled_cosine_attention(
     query: torch.Tensor,
@@ -21,8 +37,9 @@ def _scaled_cosine_attention(
     training: bool = False,
 ) -> torch.Tensor:
     """Run cosine attention through PyTorch's memory-efficient SDPA kernels."""
-    query = F.normalize(query, dim=-1)
-    key = F.normalize(key, dim=-1)
+    scale = scale.clamp(max=_MAX_COSINE_LOGIT_SCALE)
+    query = F.normalize(query, dim=-1, eps=_NORMALIZE_EPS)
+    key = F.normalize(key, dim=-1, eps=_NORMALIZE_EPS)
     if not query.is_cuda:
         attention = (query @ key.transpose(-2, -1)) * scale
         if attention_bias is not None:
@@ -294,10 +311,11 @@ class Spectral_MSA(nn.Module):
         if self.rpe_mode != "none":
             bias = self.relative_bias[self.coords].unsqueeze(0).unsqueeze(0)
         if self.rpe_mode == "legacy_post_softmax":
+            temperature = self.temperature.clamp(max=_MAX_COSINE_LOGIT_SCALE)
             logits = (
-                F.normalize(q, dim=-1)
-                @ F.normalize(k, dim=-1).transpose(-2, -1)
-            ) * self.temperature
+                F.normalize(q, dim=-1, eps=_NORMALIZE_EPS)
+                @ F.normalize(k, dim=-1, eps=_NORMALIZE_EPS).transpose(-2, -1)
+            ) * temperature
             out = (logits.softmax(dim=-1) + bias) @ value
         else:
             out = _scaled_cosine_attention(
