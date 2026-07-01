@@ -1,0 +1,110 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  Rung-3: full-resolution spectral MSAB + depth
+# experiment_name: mswr_v212_sota_spectral_depth
+# ============================================================================
+#
+# The Rung-0..2 ladder (full-rank spectral, spectral-FFN, multistage refine)
+# established that the config-reachable floor is ~0.235-0.250 MRAE and that the
+# remaining gap to MST++ (0.165 val) is STRUCTURAL, not tunable. The 2026-07
+# architecture review identified the two structural deficits vs MST++:
+#
+#   1. PLACEMENT: the spectral branch runs only on the wavelet LL band inside
+#      the dual-attention fusion, scaled by the shared 1e-4 layer-scale. Band
+#      mixing never sees full-resolution tokens. MST++ applies S-MSA + FFN
+#      (MSAB) on the full token grid of every block. The measured plateau
+#      (~0.24 MRAE, PSNR ~31, SSIM ~0.9, SAM near-SOTA) matches the
+#      "S-MSA missing/weak" ablation regime (HSIFormer ablation: 0.2204
+#      without S-MSA vs 0.1497 with it).
+#   2. DEPTH: exactly ONE transformer block per stage (5 total at num_stages=3)
+#      vs MST++'s ~21 MSABs. Width scaling was already refuted; depth was never
+#      reachable from config.
+#
+# THE TWO NEW LEVERS (both zero-init gated, exact identity at init):
+#
+#     spectral_prelayer: true    # MST++-style MSAB (S-MSA + gated FFN) at each
+#                                # block's INPUT resolution, before the DWT
+#     blocks_per_stage: 2        # 10 transformer blocks instead of 5
+#                                # (state_dict layout changes -> FRESH RUN ONLY)
+#
+# Everything else matches the Rung-2 recipe (MRAE-only loss, AdamW + wd
+# exemptions, EMA, drop_path 0.15). end_epoch restored to the full MST++ 300
+# because capacity roughly doubles (~3.5M -> ~8M params) and the shorter-cosine
+# experiment was already refuted at lower capacity; watch the overfit onset via
+# EMA-vs-raw divergence in the logs.
+#
+# DECISION RULE: adopt if best-EMA val MRAE beats the Rung-2 baseline by >0.02.
+# Expected trajectory based on the ablation lineage: 0.24 -> sub-0.20 from the
+# prelayer alone; depth closes further. If this lands sub-0.19, the next rung is
+# blocks_per_stage: 3 and/or wavelet_levels [1,1,2].
+# ============================================================================
+
+experiment_name: mswr_v212_sota_spectral_depth
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration (MST++ protocol) ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 300                        # full MST++ horizon; capacity ~2x Rung-2
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture: Rung-2 baseline + the two structural levers ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+spectral_attn_heads: 1                # full-rank C x C band-to-band attention
+spectral_ffn: true
+spectral_ffn_mult: 2
+multistage_refine: true
+refine_hidden: 64
+spectral_prelayer: true               # <<< NEW: full-res MSAB before every block
+blocks_per_stage: 2                   # <<< NEW: depth (fresh run only)
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+use_checkpoint: true                  # 10 blocks + prelayers: keep activations in budget
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"

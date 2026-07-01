@@ -418,6 +418,46 @@ class SpectralGatedFFNBlock(nn.Module):
         return x + self.gate * self.net(x_n)  # gate=0 at init -> exact identity
 
 
+class SpectralMSABlock(nn.Module):
+    """Full-resolution MST++-style MSAB (S-MSA + spectral gated-FFN), zero-init gated.
+
+    The legacy architecture applies spectral (band-to-band) attention only on
+    the wavelet LL band inside the dual-attention fusion, where its output is
+    scaled by the shared 1e-4 layer-scale gamma -- band mixing never sees the
+    block's full-resolution tokens and its contribution starts four orders of
+    magnitude down. This block is the structural fix: a dedicated pre-layer at
+    the block's INPUT resolution,
+
+        x = x + gate * S-MSA(LN(x));   x = SpectralGatedFFN(x)
+
+    with the S-MSA gate (per-channel) initialized to ZERO and the FFN already
+    zero-init gated -> the whole unit is an EXACT identity at init. Enabling it
+    does not perturb a fresh model, and existing checkpoints (which simply lack
+    these params) load unchanged under strict=False when off. reset_identity()
+    re-zeros both gates so they survive the global Kaiming apply().
+    """
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0,
+                 ffn_mult: int = 2) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = SpectralMSA2D(dim, num_heads, dropout)
+        self.gate = nn.Parameter(torch.zeros(1, dim, 1, 1))  # (1, C, 1, 1)
+        self.ffn = SpectralGatedFFNBlock(dim, mult=ffn_mult)
+        self.reset_identity()
+
+    def reset_identity(self) -> None:
+        nn.init.zeros_(self.gate)
+        self.ffn.reset_identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, C, H, W) -> (B, C, H, W); exact identity while gates are zero."""
+        x_n = x.permute(0, 2, 3, 1)            # (B, H, W, C)
+        x_n = self.norm(x_n).permute(0, 3, 1, 2)  # (B, C, H, W)
+        x = x + self.gate * self.attn(x_n)     # gate=0 at init -> identity
+        return self.ffn(x)                     # zero-init gated -> identity
+
+
 class SpectralRefinementStage(nn.Module):
     """MPRNet-style coarse-to-fine multistage refinement (zero-init-gated).
 
@@ -618,6 +658,22 @@ class MSWRDualConfig:
     # checkpoints load unchanged.
     multistage_refine: bool = False
     refine_hidden: int = 64
+    # Full-resolution spectral MSAB pre-layer (the structural fix for the
+    # wavelet-LL-only spectral path). The legacy spectral branch runs only on
+    # the wavelet LL band inside the dual-attention fusion and is scaled by the
+    # shared 1e-4 layer-scale, so band-to-band mixing never sees the block's
+    # full-resolution tokens. When True, every transformer block is preceded by
+    # an MST++-style MSAB (SpectralMSA2D + spectral gated-FFN) operating at the
+    # block's INPUT resolution, zero-init gated -> exact identity at init,
+    # checkpoint-safe. Head count follows spectral_attn_heads (0 = num_heads,
+    # 1 = full-rank C x C); FFN expansion follows spectral_ffn_mult.
+    spectral_prelayer: bool = False
+    # Transformer blocks per encoder/decoder stage. The legacy architecture has
+    # exactly ONE block per stage (5 blocks total at num_stages=3) versus the
+    # ~21 MSABs of MST++ -- depth, not width, is the missing capacity axis.
+    # 1 = exact legacy module tree (old checkpoints load unchanged); >1 stacks
+    # blocks in nn.Sequential (state_dict keys gain a block index -> fresh runs).
+    blocks_per_stage: int = 1
     # NOTE: wavelet_gate_reuse caches a *content-dependent* gate keyed only by
     # spatial dims + stage. Reusing a cached gate across samples is a
     # correctness bug (wrong gate content, wrong batch size on reuse) and
@@ -716,6 +772,7 @@ class MSWRDualConfig:
         assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
         assert self.spectral_ffn_mult >= 1, "spectral_ffn_mult must be >= 1"
         assert self.refine_hidden >= 1, "refine_hidden must be >= 1"
+        assert self.blocks_per_stage >= 1, "blocks_per_stage must be >= 1"
         assert self.base_channels > 0, "base_channels must be positive"
         assert self.num_stages > 0, "num_stages must be positive"
     
@@ -1429,6 +1486,18 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             else None
         )
 
+        # Optional full-resolution spectral MSAB pre-layer: band-to-band S-MSA +
+        # gated FFN at the block's input resolution, BEFORE the wavelet branch
+        # halves it. Zero-init gated -> exact identity at init, checkpoint-safe.
+        if getattr(config, 'spectral_prelayer', False):
+            prelayer_heads = getattr(config, 'spectral_attn_heads', 0) or config.num_heads
+            self.spectral_pre = SpectralMSABlock(
+                dim, prelayer_heads, config.attention_dropout,
+                ffn_mult=getattr(config, 'spectral_ffn_mult', 2),
+            )
+        else:
+            self.spectral_pre = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Transformer block over NCHW input with optional wavelet branch.
@@ -1444,7 +1513,12 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         # Input validation
         if C != self.dim:
             raise ValueError(f"Expected {self.dim} channels, got {C}")
-        
+
+        # Full-resolution spectral MSAB pre-layer: mixes bands on the block's
+        # full token grid before the wavelet branch reduces it to the LL band.
+        if self.spectral_pre is not None:
+            x = self.spectral_pre(x)  # exact identity at init (zero gates)
+
         # Wavelet processing branch
         if self.dwt is not None:
             min_size = 2 ** self.wavelet_level
@@ -1766,21 +1840,32 @@ class IntegratedMSWRNet(nn.Module):
         # Build optimized encoder
         self.encoder_stages = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        
+
         channels = config.base_channels
         dpr = [x.item() for x in torch.linspace(0, config.drop_path, config.num_stages * 2)]  # (2*num_stages,)
-        
+
+        # Stage builder honoring blocks_per_stage. n_blocks == 1 keeps the exact
+        # legacy module tree (encoder_stages.<i>.attn...) so old checkpoints
+        # load unchanged; n_blocks > 1 stacks blocks in nn.Sequential (blocks
+        # within a stage share the stage's drop-path rate).
+        n_blocks = max(1, int(getattr(config, 'blocks_per_stage', 1)))
+
+        def _build_stage(dim: int, stage_idx: int, dp: float) -> nn.Module:
+            blocks = [
+                EnhancedWaveletDualTransformerBlock(
+                    dim, config, stage_idx=stage_idx, drop_path=dp,
+                    wavelet_gate_cache=self.wavelet_gate_cache
+                )
+                for _ in range(n_blocks)
+            ]
+            stage: nn.Module = blocks[0] if n_blocks == 1 else nn.Sequential(*blocks)
+            # Intelligent gradient checkpointing (whole stage)
+            if config.use_checkpoint and stage_idx in (config.checkpoint_blocks or []):
+                stage = _wrap_block_with_checkpoint(stage)
+            return stage
+
         for i in range(config.num_stages):
-            block = EnhancedWaveletDualTransformerBlock(
-                channels, config, stage_idx=i, drop_path=dpr[i],
-                wavelet_gate_cache=self.wavelet_gate_cache
-            )
-            
-            # Intelligent gradient checkpointing
-            if config.use_checkpoint and i in (config.checkpoint_blocks or []):
-                block = _wrap_block_with_checkpoint(block)
-            
-            self.encoder_stages.append(block)
+            self.encoder_stages.append(_build_stage(channels, i, dpr[i]))
             
             # CRITICAL FIX: Downsampling layers with proper normalization for CNN context
             if i < config.num_stages - 1:
@@ -1820,16 +1905,9 @@ class IntegratedMSWRNet(nn.Module):
             
             # Decoder blocks
             decoder_idx = config.num_stages + i
-            block = EnhancedWaveletDualTransformerBlock(
-                out_ch, config, stage_idx=decoder_idx,
-                drop_path=dpr[decoder_idx],
-                wavelet_gate_cache=self.wavelet_gate_cache
+            self.decoder_stages.append(
+                _build_stage(out_ch, decoder_idx, dpr[decoder_idx])
             )
-            
-            if config.use_checkpoint and decoder_idx in (config.checkpoint_blocks or []):
-                block = _wrap_block_with_checkpoint(block)
-            
-            self.decoder_stages.append(block)
             channels = out_ch
         
         # Enhanced output projection
@@ -1883,6 +1961,10 @@ class IntegratedMSWRNet(nn.Module):
             sffn = getattr(module, "spectral_ffn", None)
             if isinstance(sffn, SpectralGatedFFNBlock):
                 sffn.reset_identity()
+            # Same for the zero-init full-resolution spectral MSAB pre-layer
+            # (re-zeros both its S-MSA gate and its internal FFN gate).
+            if isinstance(module, SpectralMSABlock):
+                module.reset_identity()
             # Same for the zero-init multistage refinement stage.
             if isinstance(module, SpectralRefinementStage):
                 module.reset_identity()
@@ -2202,7 +2284,8 @@ def create_mswr_large(**kwargs: Any) -> IntegratedMSWRNet:
 # Public API
 __all__ = [
     'MSWRDualConfig',
-    'IntegratedMSWRNet', 
+    'IntegratedMSWRNet',
+    'SpectralMSABlock',
     'OptimizedCNNWaveletTransform',
     'OptimizedCNNInverseWaveletTransform',
     'create_mswr_tiny',

@@ -1,0 +1,39 @@
+defaults:
+  - config
+  - _self_
+
+# ============================================================================
+# SOTA push: paper-faithful spatial attention + weight-tied cascade + clean
+# S-MSA residual branch. FRESH RUN ONLY (module set differs from the active
+# config's checkpoints).
+#
+# Rationale (2026-07 architecture review):
+#   The plateau signature (MRAE 0.24-0.27, PSNR ~31, SSIM ~0.9, SAM near-SOTA)
+#   matches the HSIFormer "weak/absent S-MSA" ablation regime (0.2204 without
+#   S-MSA vs 0.1497 with it): spectral DIRECTION is learned, per-pixel
+#   MAGNITUDE is not. Three levers address it:
+#
+#   1. smsa_output_norm: false — remove the non-standard GroupNorm after the
+#      S-MSA projection. GN subtracts per-group spatial means inside the
+#      residual branch, stripping exactly the low-frequency intensity
+#      corrections MRAE/PSNR need (SAM is scale-invariant, hence unaffected).
+#      Restormer-MDTA / MST++ end the branch at the projection.
+#   2. cswin_attention_mode: axial — restore the paper's cross-shaped stripe
+#      attention (with the audited translation-invariant long-axis bias). The
+#      bounded 7x7 local_global mode was a memory optimization for full-frame
+#      inference; the deployed path is 128-tile training AND 128-tile
+#      validation/inference, where axial stripes are <=128 tokens and cheap.
+#   3. cascade_stages: 2 — MST++-style coarse-to-fine multi-stage refinement,
+#      weight-tied so parameters stay ~7M (the 44.8M run overfit ARAD's ~900
+#      scenes). Zero-init gate: exact identity at init. ~2x train compute.
+#
+# Loss/protocol unchanged: annealed pure-MRAE, Adam 4e-4, 300k cosine,
+# patch 128 / stride 8, EMA, center-crop 226x256 validation.
+# ============================================================================
+
+cswin_attention_mode: axial
+cascade_stages: 2
+smsa_output_norm: false
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_cascade
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_cascade

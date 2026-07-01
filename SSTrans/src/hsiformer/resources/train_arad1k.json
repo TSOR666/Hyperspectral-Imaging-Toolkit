@@ -26,8 +26,8 @@
     }
   ],
   "loss": {
-    "mrae_weight": 0.0,
-    "l1_weight": 1.0,
+    "mrae_weight": 1.0,
+    "l1_weight": 0.0,
     "sam_weight": 0.0
   },
   "min_learning_rate": 0.000001,
@@ -43,5 +43,5 @@
   "amp": true,
   "amp_dtype": "bf16",
   "grad_clip_norm": 1.0,
-  "warmup_steps": 0
+  "warmup_steps": 2000
 }

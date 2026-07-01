@@ -531,6 +531,25 @@ class NoiseRobustCSWinGenerator(nn.Module):
         else:
             self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
 
+        # Weight-tied coarse-to-fine cascade (MST++-style multi-stage
+        # refinement without MST++'s per-stage parameter growth, which the
+        # 44.8M overfit run showed ARAD's ~900 scenes cannot support). When
+        # cascade_stages > 1 the SAME U-Net body re-runs on features
+        # conditioned on the previous spectral estimate, and a zero-init-gated
+        # residual correction is added:
+        #     emb_k = emb + feedback(out_{k-1});  out_k = out_{k-1} +
+        #             gate * to_spectral(body(emb_k) + emb_k)
+        # feedback conv and gate are ZERO-initialized -> out_k == out_1 at
+        # init (exact identity to the single pass) and checkpoint-safe: the
+        # modules only exist when the flag is enabled.
+        self.cascade_stages = max(1, int(config.get("cascade_stages", 1)))
+        if self.cascade_stages > 1:
+            self.cascade_feedback = nn.Conv2d(out_channels, base_channels, kernel_size=1)
+            nn.init.zeros_(self.cascade_feedback.weight)
+            if self.cascade_feedback.bias is not None:
+                nn.init.zeros_(self.cascade_feedback.bias)
+            self.cascade_gate = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
+
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
         result = super().load_state_dict(state_dict, strict)
         try:
@@ -556,6 +575,66 @@ class NoiseRobustCSWinGenerator(nn.Module):
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             with torch.no_grad():
                 self.iteration_count.fill_(iteration)
+
+    def _forward_body(self, feat: torch.Tensor) -> torch.Tensor:
+        """Run the U-Net encoder/decoder body on embedded features.
+
+        Args:
+            feat: Embedded feature tensor (B, base_channels, H, W).
+
+        Returns:
+            Decoder output features (B, base_channels, H, W), spatially aligned
+            to ``feat`` (pre-head, pre-residual).
+        """
+        # Encoder
+        e1 = self.encoder1(feat)
+        x = self.down1(e1)
+
+        e2 = self.encoder2(x)
+        x = self.down2(e2)
+
+        # Bottleneck
+        x = self.bottleneck(x)
+
+        # Decoder with skip connections
+        x = self.up1(x)
+        if x.shape[2:] != e2.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
+            if e2.shape[2] < 1 or e2.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size for encoder stage e2: {e2.shape}")
+            x = F.interpolate(x, size=e2.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, e2], dim=1)
+        if self._decoder1_compress_first:
+            x = self.compressor1(x)
+            x = self.decoder1(x)
+        else:
+            x = self.decoder1(x)
+            x = self.compressor1(x)
+
+        x = self.up2(x)
+        if x.shape[2:] != e1.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
+            if e1.shape[2] < 1 or e1.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size for encoder stage e1: {e1.shape}")
+            x = F.interpolate(x, size=e1.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, e1], dim=1)
+        x = self.compressor2(x)  # Apply before decoder2
+        x = self.decoder2(x)
+
+        # Handle dynamic spatial dimensions for the residual connection
+        if x.shape[2:] != feat.shape[2:]:
+            # Validate both tensors before interpolation
+            if x.shape[2] < 1 or x.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
+            if feat.shape[2] < 1 or feat.shape[3] < 1:
+                raise ValueError(f"Invalid spatial size for embedding residual: {feat.shape}")
+            x = F.interpolate(x, size=feat.shape[2:], mode='bilinear', align_corners=False)
+
+        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Auto-increment fallback for callers that do not invoke
@@ -591,59 +670,19 @@ class NoiseRobustCSWinGenerator(nn.Module):
         x = x + x_denoised
         
         # Embedding
-        x = self.embedding(x)
-        emb = x
-        
-        # Encoder
-        e1 = self.encoder1(x)
-        x = self.down1(e1)
-        
-        e2 = self.encoder2(x)
-        x = self.down2(e2)
-        
-        # Bottleneck
-        x = self.bottleneck(x)
-        
-        # Decoder with skip connections
-        x = self.up1(x)
-        if x.shape[2:] != e2.shape[2:]:
-            # Validate both tensors before interpolation
-            if x.shape[2] < 1 or x.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
-            if e2.shape[2] < 1 or e2.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size for encoder stage e2: {e2.shape}")
-            x = F.interpolate(x, size=e2.shape[2:], mode='bilinear', align_corners=False)
-        x = torch.cat([x, e2], dim=1)
-        if self._decoder1_compress_first:
-            x = self.compressor1(x)
-            x = self.decoder1(x)
-        else:
-            x = self.decoder1(x)
-            x = self.compressor1(x)
-        
-        x = self.up2(x)
-        if x.shape[2:] != e1.shape[2:]:
-            # Validate both tensors before interpolation
-            if x.shape[2] < 1 or x.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
-            if e1.shape[2] < 1 or e1.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size for encoder stage e1: {e1.shape}")
-            x = F.interpolate(x, size=e1.shape[2:], mode='bilinear', align_corners=False)
-        x = torch.cat([x, e1], dim=1)
-        x = self.compressor2(x)  # Apply before decoder2
-        x = self.decoder2(x)
-        
-        # Handle dynamic spatial dimensions for residual connection
-        if x.shape[2:] != emb.shape[2:]:
-            # Validate both tensors before interpolation
-            if x.shape[2] < 1 or x.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size before interpolation: {x.shape}")
-            if emb.shape[2] < 1 or emb.shape[3] < 1:
-                raise ValueError(f"Invalid spatial size for embedding residual: {emb.shape}")
-            x = F.interpolate(x, size=emb.shape[2:], mode='bilinear', align_corners=False)
-        
-        # Output with residual connection
-        x = self.to_spectral(x + emb)
+        emb = self.embedding(x)
+
+        # U-Net body + output head with feature residual
+        feat = self._forward_body(emb)
+        x = self.to_spectral(feat + emb)
+
+        # Weight-tied cascade refinement: re-run the same body on features
+        # conditioned on the previous spectral estimate and add a zero-init-
+        # gated correction (exact identity at init; see __init__).
+        for _ in range(self.cascade_stages - 1):
+            emb_k = emb + self.cascade_feedback(x)
+            feat = self._forward_body(emb_k)
+            x = x + self.cascade_gate * self.to_spectral(feat + emb_k)
         
         # Apply output activation based on configuration
         delayed_sigmoid_active = (
