@@ -1114,7 +1114,17 @@ class SpectralMSA(nn.Module):
             groups=channels * 3, bias=bias,
         )
         self.project_out = nn.Conv2d(channels, channels, kernel_size=1, bias=bias)
-        self.norm = _adaptive_group_norm(channels, norm_groups)
+        # The GroupNorm after project_out is NON-standard: Restormer-MDTA and
+        # MST++ S-MSA end the branch at the projection. GN subtracts per-group
+        # spatial means, which strips low-frequency intensity corrections out
+        # of the residual branch — the per-pixel magnitude signal MRAE/PSNR
+        # depend on (SAM is scale-invariant and unaffected). Default keeps it
+        # for checkpoint compatibility; set smsa_output_norm: false for fresh
+        # runs to match the reference S-MSA formulation.
+        use_out_norm = bool(config.get("smsa_output_norm", True)) if config else True
+        self.norm = (
+            _adaptive_group_norm(channels, norm_groups) if use_out_norm else nn.Identity()
+        )
 
         # Local positional context (depthwise), matching EfficientSpectralAttention.
         self.pos_embed = nn.Sequential(

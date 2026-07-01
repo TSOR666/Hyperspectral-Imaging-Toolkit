@@ -50,7 +50,7 @@ def test_default_training_config_enables_stability_guards() -> None:
     config = TrainingConfig.from_json("configs/train_arad1k.json")
     assert config.grad_clip_norm == 1.0
     assert config.amp_dtype == "bf16"
-    assert config.warmup_steps == 0
+    assert config.warmup_steps == 2000
 
 
 def test_autocast_dtype_is_float32_on_cpu() -> None:
@@ -229,10 +229,12 @@ def test_packaged_training_config_matches_repository_config() -> None:
     assert packaged == repository
 
 
-def test_published_training_config_uses_l1_loss() -> None:
+def test_published_training_config_uses_mrae_loss() -> None:
+    # The benchmark objective is MRAE-only (matching how SST's target number was
+    # reached); training on the scored metric is what closes the L1/MRAE gap.
     config = TrainingConfig.from_json("configs/train_arad1k.json")
-    assert config.loss.l1_weight == 1.0
-    assert config.loss.mrae_weight == 0.0
+    assert config.loss.mrae_weight == 1.0
+    assert config.loss.l1_weight == 0.0
     assert config.loss.sam_weight == 0.0
 
 

@@ -442,6 +442,8 @@ class TrainingConfig:
         self.spectral_ffn_mult = getattr(args, 'spectral_ffn_mult', 2)
         self.multistage_refine = getattr(args, 'multistage_refine', False)
         self.refine_hidden = getattr(args, 'refine_hidden', 64)
+        self.spectral_prelayer = getattr(args, 'spectral_prelayer', False)
+        self.blocks_per_stage = getattr(args, 'blocks_per_stage', 1)
 
         # CNN Wavelet parameters (no external dependencies)
         self.use_wavelet = args.use_wavelet
@@ -604,6 +606,16 @@ def parse_arguments():
                             "Zero-init-gated (identity at init), checkpoint-safe; ~+47K params at default width.")
     parser.add_argument("--refine_hidden", type=int, default=64,
                        help="Hidden width of the multistage refinement stage (64 ~ +47K params on base).")
+    parser.add_argument("--spectral_prelayer", action='store_true', default=False,
+                       help="Add a full-resolution MST++-style MSAB (S-MSA + spectral gated-FFN) BEFORE "
+                            "each transformer block, so band-to-band attention sees the block's full "
+                            "token grid instead of only the wavelet LL band. Zero-init gated (exact "
+                            "identity at init), checkpoint-safe. Heads follow --spectral_attn_heads.")
+    parser.add_argument("--blocks_per_stage", type=int, default=1,
+                       help="Transformer blocks per encoder/decoder stage. 1 = legacy layout "
+                            "(old checkpoints load unchanged); >1 stacks blocks per stage "
+                            "(depth is the missing capacity axis vs MST++'s ~21 MSABs; "
+                            "state_dict keys change -> fresh runs only).")
     parser.add_argument("--use_wavelet", action='store_true', default=True)
     parser.add_argument("--wavelet_type", type=str, default='db2',
                        choices=['haar', 'db1', 'db2', 'db3', 'db4'])
@@ -1254,6 +1266,8 @@ class EnhancedTrainer:
                 'spectral_ffn_mult': self.config.spectral_ffn_mult,
                 'multistage_refine': self.config.multistage_refine,
                 'refine_hidden': self.config.refine_hidden,
+                'spectral_prelayer': self.config.spectral_prelayer,
+                'blocks_per_stage': self.config.blocks_per_stage,
                 # The model's per-forward PerformanceMonitor is consumed ONLY by
                 # _profile_model() (gated on --profile_model). Driving it from
                 # memory_monitoring meant it ran on every training forward with
@@ -1296,6 +1310,8 @@ class EnhancedTrainer:
                 spectral_ffn_mult=self.config.spectral_ffn_mult,
                 multistage_refine=self.config.multistage_refine,
                 refine_hidden=self.config.refine_hidden,
+                spectral_prelayer=self.config.spectral_prelayer,
+                blocks_per_stage=self.config.blocks_per_stage,
                 # See note above: only --profile_model consumes this monitor.
                 performance_monitoring=self.config.profile_model,
                 **{
