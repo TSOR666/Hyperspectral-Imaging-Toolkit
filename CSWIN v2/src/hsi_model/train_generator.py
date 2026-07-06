@@ -1015,10 +1015,20 @@ def main(config: DictConfig) -> None:
         if rank == 0:
             main_logger.info("=" * 60)
             main_logger.info("GENERATOR-ONLY (NO-GAN) RECONSTRUCTION TRAINING")
-            main_logger.info("objective=%s, sampling=%s, spectral=%s, base_channels=%s, blocks/stage=%s",
-                             cfg.get("objective", "mrae"), cfg.get("sampling"),
-                             cfg.get("spectral_attention_type"), cfg.get("base_channels"),
-                             cfg.get("blocks_per_stage"))
+            main_logger.info(
+                "objective=%s, sampling=%s, spectral=%s, cswin=%s, "
+                "base_channels=%s, stage_depths=%s, cascade=%s, "
+                "input_skip=%s, refinement_blocks=%s",
+                cfg.get("objective", "mrae"),
+                cfg.get("sampling"),
+                cfg.get("spectral_attention_type"),
+                cfg.get("cswin_attention_mode"),
+                cfg.get("base_channels"),
+                cfg.get("stage_depths", cfg.get("blocks_per_stage")),
+                cfg.get("cascade_stages", 1),
+                cfg.get("use_spectral_input_skip", False),
+                cfg.get("refinement_blocks", 0),
+            )
             main_logger.info("=" * 60)
 
         setup_seed(

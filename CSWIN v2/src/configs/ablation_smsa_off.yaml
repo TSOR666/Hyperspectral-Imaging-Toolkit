@@ -1,0 +1,30 @@
+defaults:
+  - config
+  - _self_
+
+# ============================================================================
+# ABLATION: remove the non-standard S-MSA output GroupNorm ONLY. FRESH RUN.
+#
+# Changes ONLY smsa_output_norm vs config.yaml (attention mode stays
+# local_global, cascade_stages stays 1). Tests whether this lever -- bundled
+# untested into sota_cascade -- is a genuine co-culprit or (as the 2026-07
+# diagnosis predicts) benign-to-beneficial in isolation.
+#
+# Rationale: the GroupNorm after S-MSA project_out is non-standard; Restormer-
+# MDTA and MST++ end the branch at the projection. GN subtracts per-group
+# spatial means, stripping the low-frequency per-pixel MAGNITUDE corrections
+# MRAE/PSNR reward (SAM is scale-invariant, unaffected). The branch is pre-
+# normed (norm1) and every downstream sub-block is pre-normed, so removing this
+# post-projection norm only rescales the residual branch (Adam rescales
+# project_out within hundreds of steps) -- expected safe.
+#
+# EXPECTED: reaches ~0.24 (or better). If it instead regresses materially,
+# smsa_output_norm:false is a real co-culprit. This is the single most
+# promising CHEAP lever to push the baseline past its 0.24 plateau -- run this
+# one first alongside ablation_axial.
+# ============================================================================
+
+smsa_output_norm: false
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/ablation_smsa_off
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/ablation_smsa_off

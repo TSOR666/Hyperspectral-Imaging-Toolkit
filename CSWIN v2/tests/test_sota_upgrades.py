@@ -97,3 +97,50 @@ class TestSmsaOutputNorm:
             out = gen(x)
         assert out.shape == (1, 31, 16, 16)
         assert torch.isfinite(out).all()
+
+
+class TestSpectralPriorAndRefinement:
+    def test_disabled_by_default_adds_no_parameters(self):
+        gen = _build()
+        state_keys = list(gen.state_dict().keys())
+
+        assert not any(key.startswith("spectral_input_skip") for key in state_keys)
+        assert not any(key.startswith("refinement") for key in state_keys)
+
+    def test_refinement_is_identity_at_init(self):
+        base = _build()
+        refined = _build(refinement_blocks=2, refinement_channels=16)
+
+        result = refined.load_state_dict(base.state_dict(), strict=False)
+        assert result.unexpected_keys == []
+        assert all(key.startswith("refinement.") for key in result.missing_keys)
+
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            torch.testing.assert_close(refined(x), base(x), rtol=0.0, atol=0.0)
+
+    def test_spectral_input_skip_and_refinement_gradients_flow(self):
+        gen = _build(
+            use_spectral_input_skip=True,
+            spectral_input_skip_init=0.03,
+            refinement_blocks=1,
+            refinement_channels=16,
+        )
+        gen.train()
+        x = torch.randn(1, 3, 16, 16)
+
+        out = gen(x)
+        out.square().mean().backward()
+
+        skip_grads = [
+            parameter.grad
+            for parameter in gen.spectral_input_skip.parameters()
+            if parameter.requires_grad
+        ]
+        refinement_out = gen.refinement[0].out_proj
+
+        assert out.shape == (1, 31, 16, 16)
+        assert skip_grads
+        assert all(grad is not None and torch.isfinite(grad).all() for grad in skip_grads)
+        assert refinement_out.weight.grad is not None
+        assert torch.isfinite(refinement_out.weight.grad).all()

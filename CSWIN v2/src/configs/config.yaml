@@ -116,6 +116,15 @@ sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (paper us
 use_noise_block: false           # NoiseAwareBlock is not in the paper
 thick_output_head: false         # paper ToOut is a single conv
 ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
+# Fresh-run SOTA levers, disabled in the base config for strict legacy
+# checkpoint compatibility. Enable in a fresh experiment config when pushing
+# beyond the local_global baseline.
+use_spectral_input_skip: false   # shallow RGB->HSI prior added to the transformer prediction
+spectral_input_skip_hidden: 0    # 0 = direct 1x1 RGB->HSI lift
+spectral_input_skip_init: 0.03   # small positive start; the path learns quickly from MRAE
+refinement_blocks: 0             # output-space RGB-conditioned residual correction blocks
+refinement_channels: null        # null -> base_channels
+refinement_ffn_expansion: 2.0
 
 # Progressive training: fine-tune at growing patch sizes 128 -> 256 -> 512.
 # UNCOMMENT for a final multi-resolution run; leave commented

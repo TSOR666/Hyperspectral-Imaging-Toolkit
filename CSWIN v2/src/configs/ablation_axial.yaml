@@ -1,0 +1,37 @@
+defaults:
+  - config
+  - _self_
+
+# ============================================================================
+# ABLATION: axial spatial attention ONLY. FRESH RUN.
+#
+# Isolates the single lever most likely responsible for the sota_cascade
+# regression (val MRAE plateaued ~0.56 vs the local_global baseline ~0.24-0.27).
+# This run changes ONLY cswin_attention_mode vs the known-good config.yaml
+# baseline (smsa_output_norm stays true, cascade_stages stays 1), so any
+# regression is unambiguously attributable to the axial row/column stripe path.
+#
+# Hypothesis (2026-07 diagnosis): axial replaces the tuned bounded 7x7 local
+# windows (+ the dense 32x32 global bottleneck attention, which only exists in
+# local_global) with full-length criss-cross stripe attention whose long-axis
+# relative-position bias is ZERO-initialized (attention.py ~L328-340, no
+# trunc_normal_) -> no locality/positional prior at init -> optimization-
+# difficulty ceiling. Note axial was the ORIGINAL default, demoted for
+# full-frame memory (not quality) and rewritten but never re-validated to 0.24.
+#
+# EXPECTED: if this alone plateaus near ~0.5-0.6, axial is confirmed the sole
+# primary culprit. The decision is clear by ~40-60k iters (a healthy baseline
+# is well under 0.4 long before then) -- watch val MRAE and kill early; no need
+# to run the full 300k to confirm a regression. Cosine horizon is kept at 300k
+# for LR-schedule comparability with the baseline.
+#
+# FOLLOW-UP IF CONFIRMED (recoverability test): re-run axial with the long-axis
+# bias tables trunc_normal_-initialized and/or an attention/LR warmup. Recovery
+# toward 0.24 => the failure was fixable optimization difficulty, not a
+# fundamental limitation.
+# ============================================================================
+
+cswin_attention_mode: axial
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/ablation_axial
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/ablation_axial
