@@ -15,6 +15,8 @@ v5.1 Fixes:
 Key architectural features:
 - U-Net structure with CSWin transformer blocks
 - Dual attention (spectral + spatial)
+- Optional shallow RGB-to-HSI spectral prior skip
+- Optional output-space spectral refinement blocks
 - Noise-aware processing
 - Dynamic up/downsampling for flexible resolutions
 """
@@ -394,6 +396,102 @@ class PixelShuffleUpsample(nn.Module):
         return x
 
 
+class SpectralInputSkip(nn.Module):
+    """Shallow RGB-to-HSI prior added directly to the reconstruction.
+
+    The transformer body should spend its capacity on hard residual spectral
+    corrections, not on relearning the simplest linear color-to-spectrum lift
+    from scratch. This path is opt-in for fresh runs so legacy checkpoints keep
+    strict state-dict compatibility when it is disabled.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int = 0,
+        init_scale: float = 0.03,
+    ) -> None:
+        super().__init__()
+        hidden_channels = max(0, int(hidden_channels))
+        if hidden_channels > 0:
+            self.net = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+            )
+            final = self.net[-1]
+            if isinstance(final, nn.Conv2d):
+                nn.init.constant_(final.weight, init_scale / max(hidden_channels, 1))
+                if final.bias is not None:
+                    nn.init.zeros_(final.bias)
+        else:
+            self.net = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            nn.init.constant_(self.net.weight, init_scale / max(in_channels, 1))
+            if self.net.bias is not None:
+                nn.init.zeros_(self.net.bias)
+
+    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        return self.net(rgb)
+
+
+class SpectralRefinementBlock(nn.Module):
+    """Output-space residual refinement conditioned on RGB and current HSI.
+
+    This is a lightweight MPRNet-style correction stage. The final projection is
+    zero-initialized, so enabling the block is an exact identity at init while
+    its last layer receives gradients immediately.
+    """
+
+    def __init__(
+        self,
+        spectral_channels: int,
+        rgb_channels: int,
+        hidden_channels: int,
+        config: ConfigDict,
+    ) -> None:
+        super().__init__()
+        hidden_channels = max(8, int(hidden_channels))
+        base_groups = int(config.get("norm_groups", 8))
+        expansion = float(config.get("refinement_ffn_expansion", 2.0))
+
+        self.in_proj = nn.Sequential(
+            nn.Conv2d(
+                spectral_channels + rgb_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            adaptive_group_norm(hidden_channels, base_groups),
+            nn.GELU(),
+        )
+        self.body = nn.Sequential(
+            DepthwiseConvBlock(hidden_channels, hidden_channels, config),
+            GDFN(hidden_channels, expansion=expansion),
+        )
+        self.out_proj = nn.Conv2d(
+            hidden_channels,
+            spectral_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, spectral: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
+        if rgb.shape[2:] != spectral.shape[2:]:
+            rgb = F.interpolate(
+                rgb,
+                size=spectral.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        feat = self.in_proj(torch.cat([spectral, rgb], dim=1))
+        feat = feat + self.body(feat)
+        return spectral + self.out_proj(feat)
+
+
 class NoiseRobustCSWinGenerator(nn.Module):
     """
     Noise-Robust U-Net Generator with CSWin transformer blocks.
@@ -531,6 +629,38 @@ class NoiseRobustCSWinGenerator(nn.Module):
         else:
             self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
 
+        # Optional direct spectral prior: a shallow RGB->HSI path added to the
+        # transformer prediction. Disabled by default for strict compatibility.
+        self.spectral_input_skip: Optional[nn.Module] = None
+        if bool(config.get("use_spectral_input_skip", False)):
+            self.spectral_input_skip = SpectralInputSkip(
+                int(in_channels),
+                int(out_channels),
+                hidden_channels=int(config.get("spectral_input_skip_hidden", 0) or 0),
+                init_scale=float(config.get("spectral_input_skip_init", 0.03)),
+            )
+
+        # Optional output-space refinement. This is cheaper than re-running the
+        # full U-Net cascade and gives MRAE/PSNR a direct residual correction
+        # path at the final 31-band resolution.
+        refinement_blocks = max(0, int(config.get("refinement_blocks", 0) or 0))
+        self.refinement: Optional[nn.ModuleList] = None
+        if refinement_blocks > 0:
+            refinement_channels = int(config.get("refinement_channels", 0) or 0)
+            if refinement_channels <= 0:
+                refinement_channels = int(base_channels)
+            self.refinement = nn.ModuleList(
+                [
+                    SpectralRefinementBlock(
+                        int(out_channels),
+                        int(in_channels),
+                        refinement_channels,
+                        config,
+                    )
+                    for _ in range(refinement_blocks)
+                ]
+            )
+
         # Weight-tied coarse-to-fine cascade (MST++-style multi-stage
         # refinement without MST++'s per-stage parameter growth, which the
         # 44.8M overfit run showed ARAD's ~900 scenes cannot support). When
@@ -664,6 +794,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
             if (pad_h and in_h <= pad_h) or (pad_w and in_w <= pad_w):
                 pad_mode = "replicate"
             x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
+        rgb_input = x
 
         # Initial denoising with residual connection
         x_denoised = self.denoising(x)
@@ -683,6 +814,13 @@ class NoiseRobustCSWinGenerator(nn.Module):
             emb_k = emb + self.cascade_feedback(x)
             feat = self._forward_body(emb_k)
             x = x + self.cascade_gate * self.to_spectral(feat + emb_k)
+
+        if self.spectral_input_skip is not None:
+            x = x + self.spectral_input_skip(rgb_input)
+
+        if self.refinement is not None:
+            for block in self.refinement:
+                x = block(x, rgb_input)
         
         # Apply output activation based on configuration
         delayed_sigmoid_active = (
