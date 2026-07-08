@@ -1,0 +1,117 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  ABLATION: blocks_per_stage:2 ONLY (depth)
+# experiment_name: mswr_v212_ablation_depth
+# ============================================================================
+#
+# WHY THIS EXISTS
+#   Companion to ablation_prelayer.yaml. sota_spectral_depth.yaml stacked TWO new
+#   levers (spectral_prelayer + blocks_per_stage:2) plus use_checkpoint:true and
+#   underfit catastrophically (train MRAE stuck ~0.78 on 128px crops, val ~0.69,
+#   flat from ~ep3). Audit verdict: optimization stall, no single code bug,
+#   neither lever individually convicted. This config isolates the DEPTH lever.
+#
+# WHAT IT TESTS
+#   robust_mrae_multistage.yaml (known-good ~0.24 EMA) + blocks_per_stage:2 and
+#   NOTHING else architectural. spectral_prelayer stays false. use_checkpoint is
+#   pinned FALSE to match the baseline and neutralize the third confound.
+#
+#   Depth is the more mechanically implicated lever: the audit proved the prelayer
+#   is EXACT identity at init, so a stall present from step 0 must come from a
+#   lever with ACTIVE-at-init computation -- which the second stacked wavelet
+#   block is (its wavelet gate runs at sigmoid(4)~0.98, live, not zero-gated).
+#   RUN THIS ONE FIRST if GPU time is limited.
+#
+# READ THE RESULT AT EPOCHS 3-8, NOT AT THE END. KILL if train MRAE is still
+# >~0.6 and flat by ep8.
+#
+# DECISION RULE
+#   * If this STALLS but ablation_prelayer.yaml descends -> blocks_per_stage:2 is
+#     the culprit. Depth-doubling with 1e-4 layer-scale on one 4e-4 LR is a known
+#     under-training trap; before abandoning depth, retry with a LONGER warmup
+#     (warmup_epochs 5 -> 15-20) and/or a larger layer_scale_init (1e-4 -> 1e-2)
+#     so the added blocks are not born frozen.
+#   * If BOTH ablations descend normally -> the stall is the two-lever INTERACTION
+#     or the checkpoint confound. Confirm by re-running the ORIGINAL failing config
+#     (sota_spectral_depth.yaml) with ONLY use_checkpoint flipped to false; if that
+#     alone fixes it, checkpointing was the cause.
+#   * If BOTH stall alone -> a global recipe issue (LR/init/warmup); unlikely,
+#     since the baseline shares the exact recipe.
+#
+# MEMORY NOTE: blocks_per_stage:2 with use_checkpoint:false doubles activation
+#   memory. If this OOMs, prefer HALVING batch_size to 10 over enabling checkpoint
+#   (keeps the checkpoint variable pinned across both ablations). Checkpointing
+#   with use_reentrant=False is gradient-exact, so if you must enable it here it
+#   will not change the learning outcome -- only note it in the run log.
+# ============================================================================
+
+experiment_name: mswr_v212_ablation_depth
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20                        # drop to 10 if blocks_per_stage:2 OOMs at checkpoint:false
+patch_size: 128
+stride: 8
+end_epoch: 220
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (Rung-2 baseline + the ONE lever under test) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+spectral_attn_heads: 1
+spectral_ffn: true
+spectral_ffn_mult: 2
+multistage_refine: true
+refine_hidden: 64
+# spectral_prelayer: intentionally UNSET -> false. Do not add here.
+blocks_per_stage: 2                   # <<< THE ONLY DELTA vs robust_mrae_multistage.yaml
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+use_checkpoint: false                 # PINNED false to match baseline + remove the confound.
+                                      # See MEMORY NOTE above if this OOMs.
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"
