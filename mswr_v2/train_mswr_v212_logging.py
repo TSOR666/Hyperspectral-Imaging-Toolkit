@@ -923,11 +923,15 @@ def create_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Op
     # leave them undecayed:
     #   - gamma / gamma2 : LayerScale on the attention and FFN residual branches
     #   - rescale        : per-head temperature of the spectral S-MSA
+    #   - gate           : zero-init residual gates on the spectral prelayer / spectral
+    #     gated-FFN / multistage-refine branches. Shape (1,C,1,1) => ndim==4, so the
+    #     ndim<=1 filter misses them and the wd=1e-2 group would decay them. They are
+    #     ReZero-style scale gates (same class as gamma), so exempt them explicitly.
     #   - landmarks      : learned landmark K/V dictionary (a learned prior, not a weight)
     #   - relative_position_bias_table : Swin-style relative position bias (2-D, so an
     #     ndim<=1 filter alone would miss it)
     no_decay_leaf_names = {
-        'gamma', 'gamma2', 'rescale', 'landmarks', 'relative_position_bias_table',
+        'gamma', 'gamma2', 'rescale', 'gate', 'landmarks', 'relative_position_bias_table',
     }
 
     for name, param in model.named_parameters():

@@ -1,0 +1,109 @@
+# ============================================================================
+# MSWR-Net v2.1.2  -  ABLATION: spectral_prelayer ONLY
+# experiment_name: mswr_v212_ablation_prelayer
+# ============================================================================
+#
+# WHY THIS EXISTS
+#   sota_spectral_depth.yaml (spectral_prelayer:true + blocks_per_stage:2 +
+#   use_checkpoint:true) UNDERFIT catastrophically: train MRAE stuck ~0.78 on
+#   128px crops, val ~0.69, flat from ~epoch 3 (a 300-epoch run frozen near the
+#   linear-head floor). Adversarial audit confirmed pure underfitting/optimization
+#   stall (train ~= val ~= 0.7-0.8), NOT overfitting, and found NO single code
+#   bug. The failing config differed from the known-good ~0.24 baseline
+#   (robust_mrae_multistage.yaml) in THREE places: spectral_prelayer,
+#   blocks_per_stage, AND use_checkpoint. This config isolates ONE.
+#
+# WHAT IT TESTS
+#   robust_mrae_multistage.yaml (known-good ~0.24 EMA) + spectral_prelayer:true
+#   and NOTHING else architectural. blocks_per_stage stays 1 (legacy depth).
+#   use_checkpoint is pinned FALSE to match the baseline and neutralize the
+#   third confound (checkpointing was OFF in the 0.24 run; --use_checkpoint is a
+#   store_true default-False flag the baseline never set).
+#
+# READ THE RESULT AT EPOCHS 3-8, NOT AT THE END. A healthy run leaves the ~0.78
+# linear-head floor within a few epochs (baseline descends below ~0.5 by ep5,
+# toward ~0.3 by ep15). KILL this run if train MRAE is still >~0.6 and flat by
+# ep8 -- do not burn the full 220-epoch schedule.
+#
+# DECISION RULE
+#   * If this STALLS (train MRAE >~0.6 flat through ep5-8) but the depth ablation
+#     (ablation_depth.yaml) descends normally -> spectral_prelayer is the culprit;
+#     drop it, ship depth.
+#   * If this DESCENDS normally toward ~0.3 -> the prelayer is safe in isolation;
+#     the stall is the depth lever, the two-lever interaction, or the checkpoint
+#     confound (see ablation_depth.yaml decision rule).
+# ============================================================================
+
+experiment_name: mswr_v212_ablation_prelayer
+model_size: base
+gpu_id: "0"
+
+# ---- data / iteration ----
+batch_size: 20
+patch_size: 128
+stride: 8
+end_epoch: 220                        # KEEP 220 -- the 300 vs 220 delta shifts cosine LR ~2%
+                                      # at ep34 and is irrelevant to an early-epoch stall.
+steps_per_epoch: 1000
+num_workers: 4
+pin_memory: true
+save_frequency: 5000
+validate_frequency: 1000
+mrae_diagnostics: true
+seed: 42
+
+# ---- architecture (Rung-2 baseline + the ONE lever under test) ----
+attention_type: dual
+use_flash_attn: true
+use_spectral_attn: true
+spectral_attn_heads: 1                # full-rank C x C band-to-band (Rung-0 win)
+spectral_ffn: true                    # Rung-1 win
+spectral_ffn_mult: 2
+multistage_refine: true               # Rung-2 win
+refine_hidden: 64
+spectral_prelayer: true               # <<< THE ONLY DELTA vs robust_mrae_multistage.yaml
+# blocks_per_stage: intentionally UNSET -> 1 (legacy depth). Do not add here.
+landmark_pooling: learned
+use_wavelet: true
+wavelet_type: db2
+wavelet_levels: [1, 1, 1]
+wavelet_detail_processing: true
+
+# ---- host-RAM dataset cache ----
+cache_dtype: float32
+
+# ---- LOSS: MRAE ONLY (MST++/ARAD-1K comparable) ----
+use_enhanced_loss: false
+
+# ---- optimizer / schedule ----
+optimizer: adamw
+scheduler: cosine
+init_lr: 4.0e-4
+min_lr: 1.0e-6
+warmup_epochs: 5
+weight_decay: 1.0e-2
+gradient_clip: 1.0
+gradient_accumulation_steps: 1
+
+# ---- REGULARIZATION ----
+drop_path: 0.15
+attention_dropout: 0.02
+
+# ---- precision / memory ----
+use_amp: true
+amp_dtype: auto
+channels_last: true
+memory_monitoring: true
+use_checkpoint: false                 # PINNED false to match the 0.24 baseline and remove the
+                                      # checkpoint confound. One prelayer added to 5 blocks fits
+                                      # in budget without checkpointing at batch 20.
+
+# ---- EMA + honest selection ----
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
+ema_eval_mode: both
+selection_source: auto
+
+# ---- early stopping: OFF ----
+early_stopping_mode: "off"
