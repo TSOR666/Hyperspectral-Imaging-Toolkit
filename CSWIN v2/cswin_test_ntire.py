@@ -44,6 +44,7 @@ from hsi_model.utils.training_setup import pick_amp_dtype  # noqa: E402
 from hsi_model.utils.data.mst_dataset import (  # noqa: E402
     _align_hyper_to_rgb,
     _load_mst_cube,
+    _normalize_mst_rgb_hwc,
 )
 
 
@@ -180,14 +181,7 @@ def _load_rgb(path: Path, bgr2rgb: bool, normalization: str) -> np.ndarray:
 
     rgb = image.astype(np.float32)
     if normalization == "mst":
-        rgb_min = float(np.min(rgb))
-        rgb_max = float(np.max(rgb))
-        rgb_range = rgb_max - rgb_min
-        if np.isfinite(rgb_range) and rgb_range >= 1e-12:
-            rgb = (rgb - rgb_min) / rgb_range
-        else:
-            LOGGER.warning("Degenerate RGB range for %s; using zeros.", path)
-            rgb = np.zeros_like(rgb, dtype=np.float32)
+        rgb = _normalize_mst_rgb_hwc(rgb, path)
     elif normalization == "uint8":
         rgb = rgb / 255.0
     else:

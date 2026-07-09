@@ -72,6 +72,13 @@ python src/hsi_model/train_generator.py \
     data_dir=/path/to/ARAD_1K
 ```
 
+### Fresh SOTA Recovery Training
+```bash
+python src/hsi_model/train_generator.py \
+    --config-name sota_cascade \
+    data_dir=/path/to/ARAD_1K
+```
+
 ### Legacy Sinkhorn-GAN Training
 ```bash
 python src/hsi_model/training_script_fixed.py \
@@ -215,8 +222,9 @@ print('✅ Installation verified!')
 ### For Better Quality:
 - Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
 - Start a fresh run after changing the objective to `mrae_annealed`
-- If validation saturates around 60k-70k at 128x128 patches, prefer
-  `--config-name finetune_128_polish_annealed`
+- If a local/global run saturates around 60k-70k at roughly 0.64 MRAE, start a
+  fresh `--config-name sota_cascade` run; the old polish recipe preserves the
+  saturated architecture.
 - Treat 256/512 progressive fine-tuning as experimental unless a patch-size
   sweep shows it improves the deployed inference path
 - Track both deployed `mrae` and diagnostic `raw_mrae`
@@ -283,6 +291,6 @@ ls -lh experiments/run1/checkpoints/
 Just run:
 ```bash
 python src/hsi_model/train_generator.py \
-    --config-name config \
+    --config-name sota_cascade \
     data_dir=/path/to/ARAD_1K
 ```

@@ -202,3 +202,41 @@ def test_cswin_local_global_switches_to_global_below_threshold(monkeypatch):
 
     assert out.shape == (1, 8, 8, 12)
     assert sequence_lengths == [96, 96]
+
+
+def test_cswin_mode_uses_head_split_cross_stripes(monkeypatch):
+    block = CSWinAttentionBlock(
+        dim=8,
+        num_heads=4,
+        split_size=2,
+        config={
+            "cswin_attention_mode": "cswin",
+            "ckpt_min_tokens": 10**9,
+        },
+    ).eval()
+    sequence_lengths = []
+    head_counts = []
+    original = block._scaled_attention
+
+    def capture(q, k, v, bias=None):
+        sequence_lengths.append(q.shape[-2])
+        head_counts.append(q.shape[1])
+        return original(q, k, v, bias)
+
+    monkeypatch.setattr(block, "_scaled_attention", capture)
+    with torch.inference_mode():
+        out = block(torch.randn(1, 8, 6, 8))
+
+    assert out.shape == (1, 8, 6, 8)
+    assert sequence_lengths == [16, 12]
+    assert head_counts == [2, 2]
+
+
+def test_cswin_mode_rejects_odd_head_count():
+    with pytest.raises(ValueError, match="even num_heads"):
+        CSWinAttentionBlock(
+            dim=12,
+            num_heads=3,
+            split_size=2,
+            config={"cswin_attention_mode": "cswin"},
+        )

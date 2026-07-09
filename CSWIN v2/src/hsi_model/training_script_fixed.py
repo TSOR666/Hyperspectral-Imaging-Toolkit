@@ -476,7 +476,7 @@ def train_sinkhorn_gan(
     total_iteration = per_epoch_iteration * total_epochs
     batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
     num_workers = config.get("num_workers", DEFAULT_NUM_WORKERS)
-    accumulation_steps = config.get("gradient_accumulation_steps", 2)
+    accumulation_steps = config.get("gradient_accumulation_steps", 1)
     effective_batch_size = batch_size * accumulation_steps
     
     optimizer_g = optimizers['optimizer_g']
@@ -1015,7 +1015,7 @@ def main(config: DictConfig) -> None:
     cfg.setdefault("num_workers", DEFAULT_NUM_WORKERS)
     cfg.setdefault("memory_mode", "standard")
     cfg.setdefault("n_critic", 1)
-    cfg.setdefault("gradient_accumulation_steps", 2)
+    cfg.setdefault("gradient_accumulation_steps", 1)
     cfg.setdefault("warmup_steps", DEFAULT_WARMUP_STEPS)
     cfg.setdefault("validation_max_batches", None)
     cfg.setdefault("use_r1_regularization", True)

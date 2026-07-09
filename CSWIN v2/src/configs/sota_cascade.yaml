@@ -3,47 +3,57 @@ defaults:
   - _self_
 
 # ============================================================================
-# SOTA recovery/push recipe. FRESH RUN ONLY (module set differs from older
-# checkpoints).
+# SOTA-oriented CSWIN recovery recipe. FRESH RUN ONLY.
 #
-# Rationale (2026-07 architecture review after train_generator 8.log):
-#   The failed run forced cswin_attention_mode=axial and plateaued at
-#   ValMRAE 0.560568 by iter 79k. The repo's own axial ablation note predicts
-#   exactly this 0.5-0.6 regime, while the local_global baseline was around
-#   0.24-0.27. So this recipe first removes the known-bad axial path, then adds
-#   real capacity where MRAE/PSNR need it:
+# Evidence from the 2026-07-08/09 pasted training log:
+#   The previous "sota_cascade" recipe used local_global attention, base=64,
+#   smsa_output_norm=false, a thick output head, RGB input skip, two refinement
+#   blocks, and cascade_stages=1. It was still at ValMRAE 0.644970 / PSNR
+#   19.292 after 64k iterations. That is not a recovery recipe; it is a
+#   slow-underfitting recipe.
 #
-#   1. cswin_attention_mode: local_global - recover the validated bounded
-#      window + global-bottleneck spatial path.
-#   2. smsa_output_norm: false - remove the non-standard GroupNorm after the
-#      S-MSA projection. GN subtracts per-group spatial means inside the
-#      residual branch, stripping exactly the low-frequency intensity
-#      corrections MRAE/PSNR need (SAM is scale-invariant, hence unaffected).
-#      Restormer-MDTA / MST++ end the branch at the projection.
-#   3. use_spectral_input_skip: true - give the model a direct RGB->HSI
-#      spectral prior so the transformer body learns residual spectral detail
-#      instead of the whole color-to-spectrum lift.
-#   4. refinement_blocks: 2 - cheap RGB-conditioned output-space residual
-#      correction blocks. The final convs are zero-init, so the blocks start as
-#      exact identities but their last layers receive gradients immediately.
-#   5. base_channels: 64 - recovers moderate capacity while staying far below
-#      the old 96-channel/44.8M overfit run; compute is offset by disabling the
-#      expensive full-body cascade.
+# This config removes the unverified output-head/refinement bundle and moves
+# the model toward the two reference ideas it was named after:
+#   1. cswin_attention_mode=cswin uses true CSWin-style head-split
+#      horizontal/vertical stripe attention instead of two full-channel local
+#      windows averaged together.
+#   2. split_sizes=[1,2,7] keeps CSWin stripe sequences bounded at full
+#      resolution; the old [7,7,7] is appropriate for local windows but makes
+#      early CSWin stripes unnecessarily huge.
+#   3. stage_num_heads=[2,4,8,8,2] keeps each attention head near 32 channels
+#      as the feature width grows/shrinks through the hierarchy. Decoder1 is
+#      still 4*base_channels because decoder1_compress_first=false, so it needs
+#      8 heads like the bottleneck rather than 4.
+#   4. use_feature_norm=false removes legacy GroupNorm after embedding and
+#      sampling convolutions. The transformer blocks are already pre-normed;
+#      repeated feature GroupNorm erases radiometric offsets that MRAE/PSNR
+#      depend on.
+#   5. use_input_denoising=false removes a legacy random RGB perturbation before
+#      the embedding. ARAD/NTIRE RGB inputs are clean; this block is robustness
+#      baggage from the old GAN path, not part of the reference architecture.
+#   6. cascade_stages=3 restores MST++-style coarse-to-fine refinement. The
+#      extra passes are zero-gated at init, so a fresh run starts as a
+#      single-pass model and learns to open the cascade only if useful.
 #
-# Loss/protocol unchanged: annealed pure-MRAE, Adam 4e-4, 300k cosine,
-# patch 128 / stride 8, EMA, center-crop 226x256 validation.
+# Keep the loss/protocol benchmark-aligned: annealed pure MRAE, Adam 4e-4,
+# 300k cosine, 128 patches, stride 8, EMA, and deployment-matched tiled
+# validation. Run ablations by turning on one lever at a time if this recipe is
+# too slow for a first diagnostic.
 # ============================================================================
 
 base_channels: 64
-cswin_attention_mode: local_global
-cascade_stages: 1
+cswin_attention_mode: cswin
+split_sizes: [1, 2, 7]
+stage_num_heads: [2, 4, 8, 8, 2]
+cswin_global_tokens: 0
+use_feature_norm: false
+use_input_denoising: false
 smsa_output_norm: false
-thick_output_head: true
+cascade_stages: 3
+thick_output_head: false
 use_spectral_input_skip: true
 spectral_input_skip_init: 0.03
-refinement_blocks: 2
-refinement_channels: 64
-refinement_ffn_expansion: 2.0
+refinement_blocks: 0
 
 log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_cascade
 checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_cascade

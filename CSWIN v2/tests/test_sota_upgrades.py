@@ -144,3 +144,135 @@ class TestSpectralPriorAndRefinement:
         assert all(grad is not None and torch.isfinite(grad).all() for grad in skip_grads)
         assert refinement_out.weight.grad is not None
         assert torch.isfinite(refinement_out.weight.grad).all()
+
+
+class TestFeatureNormToggle:
+    def test_default_keeps_feature_groupnorm(self):
+        gen = _build()
+
+        assert isinstance(gen.embedding[1], torch.nn.GroupNorm)
+        assert isinstance(gen.down1.norm, torch.nn.GroupNorm)
+        assert isinstance(gen.up1.norm, torch.nn.GroupNorm)
+
+    def test_fresh_run_can_disable_feature_groupnorm(self):
+        gen = _build(use_feature_norm=False, refinement_blocks=1)
+
+        assert isinstance(gen.embedding[1], torch.nn.Identity)
+        assert isinstance(gen.down1.norm, torch.nn.Identity)
+        assert isinstance(gen.down2.norm, torch.nn.Identity)
+        assert isinstance(gen.up1.norm, torch.nn.Identity)
+        assert isinstance(gen.up2.norm, torch.nn.Identity)
+        assert isinstance(gen.refinement[0].in_proj[1], torch.nn.Identity)
+
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            out = gen(x)
+        assert out.shape == (1, 31, 16, 16)
+        assert torch.isfinite(out).all()
+
+
+class TestInputDenoisingToggle:
+    def test_default_keeps_legacy_input_denoising(self):
+        gen = _build()
+
+        assert gen.denoising is not None
+        assert any(key.startswith("denoising.") for key in gen.state_dict())
+
+    def test_fresh_run_can_disable_input_denoising(self):
+        gen = _build(use_input_denoising=False)
+
+        assert gen.denoising is None
+        assert not any(key.startswith("denoising.") for key in gen.state_dict())
+
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            out = gen(x)
+        assert out.shape == (1, 31, 16, 16)
+        assert torch.isfinite(out).all()
+
+    def test_legacy_noise_block_flag_fails_loudly(self):
+        with pytest.raises(ValueError, match="use_noise_block"):
+            _build(use_noise_block=True)
+
+
+class TestStageHeadSchedule:
+    def test_default_reuses_scalar_num_heads(self):
+        gen = _build(stage_depths=[1, 1, 1, 1, 1], num_heads=4)
+
+        assert gen._stage_num_heads == [4, 4, 4, 4, 4]
+
+    def test_stage_num_heads_reaches_nested_attention_blocks(self):
+        gen = _build(
+            cswin_attention_mode="cswin",
+            stage_depths=[1, 1, 1, 1, 1],
+            stage_num_heads=[2, 4, 8, 8, 2],
+            cswin_bias_mode="window_cyclic",
+        )
+        blocks = [
+            gen.encoder1[0],
+            gen.encoder2[0],
+            gen.bottleneck[0],
+            gen.decoder1[0],
+            gen.decoder2[0],
+        ]
+
+        assert gen._stage_num_heads == [2, 4, 8, 8, 2]
+        assert [
+            block.spectral_attn.attention.num_heads for block in blocks
+        ] == [2, 4, 8, 8, 2]
+        assert [
+            block.spatial_attn.attention.num_heads for block in blocks
+        ] == [2, 4, 8, 8, 2]
+        assert [
+            block.spatial_attn.attention.head_dim for block in blocks
+        ] == [8, 8, 8, 8, 8]
+
+        x = torch.randn(1, 3, 16, 16)
+        with torch.no_grad():
+            out = gen(x)
+        assert out.shape == (1, 31, 16, 16)
+        assert torch.isfinite(out).all()
+
+
+class TestCswinGradientCoverage:
+    def test_true_cswin_mode_has_no_unreachable_trainable_parameters(self):
+        gen = _build(
+            cswin_attention_mode="cswin",
+            split_sizes=[7, 7, 7],
+            stage_depths=[1, 1, 1, 1, 1],
+            stage_num_heads=[2, 4, 8, 8, 2],
+            cswin_bias_mode="window_cyclic",
+            use_feature_norm=False,
+            use_input_denoising=False,
+            cascade_stages=3,
+            use_spectral_input_skip=True,
+            spectral_input_skip_init=0.03,
+            smsa_output_norm=False,
+            sampling="pixelshuffle",
+        )
+        gen.train()
+
+        x = torch.randn(1, 3, 16, 16)
+        out = gen(x)
+        out.square().mean().backward()
+
+        missing_grads = [
+            name
+            for name, parameter in gen.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        frozen_legacy = [
+            name
+            for name, parameter in gen.named_parameters()
+            if (
+                ".qkv_h." in name
+                or ".qkv_v." in name
+                or ".lepe_h." in name
+                or ".lepe_v." in name
+                or ".relative_position_bias_table_" in name
+            )
+            and not parameter.requires_grad
+        ]
+
+        assert missing_grads == []
+        assert frozen_legacy

@@ -2,8 +2,8 @@
 
 CSWIN v2 reconstructs a 31-band hyperspectral cube from an RGB image. The
 active model is a hierarchical U-Net/Transformer hybrid with spectral
-self-attention, bounded local/global spatial attention, and learned
-PixelShuffle sampling.
+self-attention, learned PixelShuffle sampling, and a fresh-run CSWin recovery
+recipe that uses head-split cross-shaped stripe attention.
 
 ## Active Entry Point
 
@@ -12,6 +12,15 @@ Use the generator-only trainer:
 ```bash
 python src/hsi_model/train_generator.py \
   --config-name config \
+  data_dir=/path/to/ARAD_1K
+```
+
+For a fresh SOTA-oriented recovery run, start from the explicit recovery
+config:
+
+```bash
+python src/hsi_model/train_generator.py \
+  --config-name sota_cascade \
   data_dir=/path/to/ARAD_1K
 ```
 
@@ -49,7 +58,10 @@ or `uv run` fail before training starts.
 
 ## Active Recipe
 
-The defaults in `src/configs/config.yaml` use:
+The defaults in `src/configs/config.yaml` use the checkpoint-compatible
+baseline. The fresh-run recovery recipe in `src/configs/sota_cascade.yaml`
+switches to true CSWin-style cross-shaped attention and removes legacy
+normalization/denoising baggage. The shared training protocol uses:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
 - Adam with learning rate `4e-4` and a 300k-step cosine decay.
@@ -57,8 +69,8 @@ The defaults in `src/configs/config.yaml` use:
   denominator floor starts stable, then decays to exact MST++/leaderboard MRAE.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
-- Local 7x7 spatial attention at high resolution and bounded global attention
-  at low resolution.
+- Deployment-matched spatial attention: checkpoint-compatible local/global in
+  `config.yaml`, true head-split CSWin stripes in `sota_cascade.yaml`.
 - Deployment-matched 128x128 tiled validation with FP32 overlap blending and
   the fixed centered 226x256 ARAD-1K scoring window.
 - Explicit exclusion of the known-corrupt `ARAD_1K_0314` scene, while other
@@ -96,6 +108,9 @@ python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 
 # Combined annealed-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
+
+# Fresh-run SOTA recovery after the old local_global recipe saturates
+python src/hsi_model/train_generator.py --config-name sota_cascade
 
 # Resume a saturated 128x128 annealed-MRAE run for a short 128-only polish
 python src/hsi_model/train_generator.py \

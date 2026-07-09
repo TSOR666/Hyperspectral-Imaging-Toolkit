@@ -243,14 +243,9 @@ def _load_mst_cube_patch(
     return patch
 
 
-def _load_normalized_rgb(path: Path, bgr2rgb: bool) -> np.ndarray:
-    bgr = cv2.imread(str(path))
-    if bgr is None:
-        raise FileNotFoundError(f"Failed to read RGB image: {path}")
-    if bgr2rgb:
-        bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    bgr = np.float32(bgr)
+def _normalize_mst_rgb_hwc(image: np.ndarray, source: Optional[Path] = None) -> np.ndarray:
+    """Apply the MST++ per-image RGB min-max normalization to an HWC image."""
+    bgr = np.float32(image)
     bgr_min = float(np.min(bgr))
     bgr_max = float(np.max(bgr))
     bgr_range = bgr_max - bgr_min
@@ -259,11 +254,22 @@ def _load_normalized_rgb(path: Path, bgr2rgb: bool) -> np.ndarray:
             "Degenerate RGB dynamic range (min=%.6f, max=%.6f) for %s; using zeros",
             bgr_min,
             bgr_max,
-            path,
+            source if source is not None else "<array>",
         )
         bgr = np.zeros_like(bgr, dtype=np.float32)
     else:
         bgr = (bgr - bgr_min) / bgr_range
+    return np.nan_to_num(bgr, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _load_normalized_rgb(path: Path, bgr2rgb: bool) -> np.ndarray:
+    bgr = cv2.imread(str(path))
+    if bgr is None:
+        raise FileNotFoundError(f"Failed to read RGB image: {path}")
+    if bgr2rgb:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    bgr = _normalize_mst_rgb_hwc(bgr, path)
     bgr = np.nan_to_num(bgr, nan=0.0, posinf=1.0, neginf=0.0)
     return np.transpose(bgr, (2, 0, 1))
 
