@@ -43,6 +43,27 @@ def test_ntire_dataset_auto_prefers_test_rgb_without_gt(tmp_path):
     assert np.isfinite(sample.rgb.numpy()).all()
 
 
+def test_ntire_mst_rgb_normalization_matches_training_loader(tmp_path):
+    tool = _load_tool_module()
+    from hsi_model.utils.data.mst_dataset import _load_normalized_rgb
+
+    rgb_path = tmp_path / "scene.png"
+    rgb = np.array(
+        [
+            [[0, 20, 40], [60, 80, 100], [120, 140, 160]],
+            [[180, 200, 220], [240, 250, 255], [10, 30, 50]],
+        ],
+        dtype=np.uint8,
+    )
+    assert cv2.imwrite(str(rgb_path), rgb)
+
+    ntire_rgb = tool._load_rgb(rgb_path, bgr2rgb=True, normalization="mst")
+    train_rgb = _load_normalized_rgb(rgb_path, bgr2rgb=True)
+
+    assert ntire_rgb.dtype == np.float32
+    assert np.array_equal(ntire_rgb, train_rgb)
+
+
 def test_ntire_dataset_valid_loads_mst_hsi_orientation(tmp_path):
     tool = _load_tool_module()
     case_dir = tmp_path / f"case_{uuid.uuid4().hex}"

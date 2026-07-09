@@ -142,16 +142,24 @@ def tiny_config() -> dict[str, object]:
         "in_channels": 3,
         "out_channels": 31,
         "base_channels": 16,
-        "split_sizes": [2, 2, 2],
+        "split_sizes": [1, 2, 7],
         "num_heads": 2,
+        "stage_num_heads": [2, 4, 8, 8, 2],
         "norm_groups": 4,
         "output_activation": "none",
         "objective": "mrae",
         "mrae_epsilon": 1e-8,
         "sampling": "pixelshuffle",
         "spectral_attention_type": "s_msa",
-        "cswin_attention_mode": "local_global",
-        "cswin_global_tokens": 1024,
+        "cswin_attention_mode": "cswin",
+        "cswin_global_tokens": 0,
+        "smsa_output_norm": False,
+        "use_feature_norm": False,
+        "use_input_denoising": False,
+        "cascade_stages": 3,
+        "use_spectral_input_skip": True,
+        "spectral_input_skip_init": 0.03,
+        "refinement_blocks": 0,
         "stage_depths": [1, 1, 1, 1, 1],
         "lambda_rec": 1.0,
         "lambda_perceptual": 0.0,
@@ -305,9 +313,18 @@ def assert_training_step(context: dict[str, object]) -> str:
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite generator-only loss: {loss}")
         loss.backward()
+        missing_grads = [
+            name
+            for name, parameter in model.generator.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        if missing_grads:
+            preview = ", ".join(missing_grads[:5])
+            suffix = "" if len(missing_grads) <= 5 else f", ... (+{len(missing_grads) - 5})"
+            raise RuntimeError(f"trainable generator parameters received no gradient: {preview}{suffix}")
         optimizer.step()
         context["pred_train"] = pred.detach()
-        return f"generator_loss={loss.item():.6f}"
+        return f"generator_loss={loss.item():.6f} grad_params=ok"
 
     optimizer_g = torch.optim.Adam(model.generator.parameters(), lr=1e-4)
     optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=1e-4)

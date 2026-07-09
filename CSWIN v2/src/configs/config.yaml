@@ -33,7 +33,10 @@ stride: 8
 # is only about 9% through training and should not be treated as converged.
 epochs: 300
 iterations_per_epoch: 1000
-gradient_accumulation_steps: 2
+# train_generator.py performs one optimizer update per loaded batch. Keep this
+# at 1 so the config's batch_size is the true optimizer-step batch size; the
+# legacy GAN trainers had their own accumulation paths.
+gradient_accumulation_steps: 1
 num_workers: 8   # was 2; raise toward (CPU cores - 2) to speed up patch loading
 # Validation rebuilds its DataLoader every epoch; with persistent_workers off,
 # a high worker count re-spawns processes (and re-pickles resident scenes under
@@ -95,6 +98,7 @@ mrae_epsilon_anneal_iters: 50000
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):
 base_channels: 48                # was 96 (44.8M -> overfit); ~paper-scale efficient model
 num_heads: 4
+stage_num_heads: null            # optional [enc1, enc2, bottleneck, dec1, dec2]
 stage_depths: [2, 2, 2, 2, 4]    # [enc1, enc2, bottleneck, dec1, dec2] (paper: deeper final stage)
 split_sizes: [7, 7, 7]
 # Opt-in ablation: compress the first decoder skip from 4x to 2x base width
@@ -110,12 +114,24 @@ spectral_attention_sanitize_nonfinite: false
 # second offset grid for cross-window mixing; switch to true global attention
 # only when a feature map has at most 1024 tokens. This replaces the legacy
 # row/column axial path whose cost remained quadratic along the full image axis.
+#
+# Modes:
+#   local_global: legacy scalable local-window path used by existing checkpoints.
+#   axial: legacy full row/column stripe path.
+#   cswin: fresh-run true CSWin-style head-split horizontal/vertical stripes.
 cswin_attention_mode: local_global
 cswin_global_tokens: 1024
 sampling: pixelshuffle           # learned PixelUnshuffle/PixelShuffle (paper uses pixel shuffle)
-use_noise_block: false           # NoiseAwareBlock is not in the paper
+use_noise_block: false           # legacy unsupported flag; true now fails loudly
+# Legacy clean-input perturbation before embedding. Keep true for old
+# checkpoints; disable in fresh SOTA runs to match RGB->HSI reference models.
+use_input_denoising: true
 thick_output_head: false         # paper ToOut is a single conv
 ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
+# Legacy stabilizer. Disable only in a fresh run: the transformer blocks are
+# already pre-normed, and extra GroupNorm after embedding/down/up convolutions
+# can erase low-frequency radiometric offsets that MRAE/PSNR need.
+use_feature_norm: true
 # Fresh-run SOTA levers, disabled in the base config for strict legacy
 # checkpoint compatibility. Enable in a fresh experiment config when pushing
 # beyond the local_global baseline.

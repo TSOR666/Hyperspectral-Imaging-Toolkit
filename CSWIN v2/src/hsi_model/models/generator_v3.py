@@ -41,6 +41,24 @@ def adaptive_group_norm(channels: int, base_groups: int = 8) -> nn.GroupNorm:
     return nn.GroupNorm(1, channels)
 
 
+def feature_norm_or_identity(
+    channels: int,
+    base_groups: int,
+    config: Optional[ConfigDict] = None,
+    key: str = "use_feature_norm",
+) -> nn.Module:
+    """Return the legacy GroupNorm or Identity for fresh radiometric runs.
+
+    The transformer blocks already use pre-norm LayerNorm. Extra GroupNorm
+    after embedding/down/up convolutions is a legacy stabilizer, but it removes
+    per-sample low-frequency intensity offsets that RGB-to-HSI reconstruction
+    needs for MRAE/PSNR. Keep it on by default for old checkpoints; disable via
+    config for reference-aligned fresh runs.
+    """
+    enabled = True if config is None else bool(config.get(key, True))
+    return adaptive_group_norm(channels, base_groups) if enabled else nn.Identity()
+
+
 class NaNSafeAttention(nn.Module):
     """Wrapper for attention modules with NaN protection.
 
@@ -89,7 +107,7 @@ class DepthwiseConvBlock(nn.Module):
         
         # Use adaptive GroupNorm
         base_groups = config.get("norm_groups", 8)
-        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.norm = feature_norm_or_identity(out_channels, base_groups, config)
         self.activation = nn.GELU()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -304,7 +322,7 @@ class DynamicDownsampleBlock(nn.Module):
         
         # Adaptive normalization
         base_groups = config.get("norm_groups", 8) if config else 8
-        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.norm = feature_norm_or_identity(out_channels, base_groups, config)
         self.act = nn.GELU()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -336,7 +354,7 @@ class DynamicUpsampleBlock(nn.Module):
         
         # Adaptive normalization
         base_groups = config.get("norm_groups", 8) if config else 8
-        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.norm = feature_norm_or_identity(out_channels, base_groups, config)
         self.act = nn.GELU()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -363,7 +381,7 @@ class PixelUnshuffleDownsample(nn.Module):
         base_groups = config.get("norm_groups", 8) if config else 8
         self.unshuffle = nn.PixelUnshuffle(2)
         self.conv = nn.Conv2d(in_channels * 4, out_channels, kernel_size=3, padding=1)
-        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.norm = feature_norm_or_identity(out_channels, base_groups, config)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -385,7 +403,7 @@ class PixelShuffleUpsample(nn.Module):
         self.expand = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, padding=1)
         self.shuffle = nn.PixelShuffle(2)
         self.smooth = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.norm = adaptive_group_norm(out_channels, base_groups)
+        self.norm = feature_norm_or_identity(out_channels, base_groups, config)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -462,7 +480,7 @@ class SpectralRefinementBlock(nn.Module):
                 kernel_size=3,
                 padding=1,
             ),
-            adaptive_group_norm(hidden_channels, base_groups),
+            feature_norm_or_identity(hidden_channels, base_groups, config),
             nn.GELU(),
         )
         self.body = nn.Sequential(
@@ -515,6 +533,13 @@ class NoiseRobustCSWinGenerator(nn.Module):
         out_channels = config.get("out_channels", 31)
         base_channels = config.get("base_channels", 64)
         split_sizes = list(config.get("split_sizes", [7, 7, 7]))
+        if bool(config.get("use_noise_block", False)):
+            raise ValueError(
+                "use_noise_block is a legacy GAN-era flag that is not wired "
+                "into NoiseRobustCSWinGenerator. Use use_input_denoising for "
+                "the shallow input denoising residual, or leave both disabled "
+                "for clean RGB->HSI benchmark runs."
+            )
         if len(split_sizes) == 0:
             raise ValueError("split_sizes must contain at least one value")
         # Keep backward compatibility with older 1-2 stage configs used in tests/scripts.
@@ -523,7 +548,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
         elif len(split_sizes) > 3:
             split_sizes = split_sizes[:3]
         base_groups = config.get("norm_groups", 8)
-        num_heads = config.get("num_heads", 4)
+        num_heads = int(config.get("num_heads", 4))
         
         # Output activation configuration
         self.output_activation = config.get("output_activation", "none")
@@ -538,19 +563,25 @@ class NoiseRobustCSWinGenerator(nn.Module):
         # ``set_iteration`` (legacy/test scripts).
         self._iteration_externally_managed: bool = False
         
-        # Initial denoising
-        self.denoising = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels//2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(base_channels//2, base_channels//2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(base_channels//2, in_channels, kernel_size=3, padding=1)
-        )
+        # Legacy input denoising residual. This is useful for noisy-image
+        # robustness, but it is not part of the reference RGB->HSI transformer
+        # recipe and starts as a random RGB perturbation on clean ARAD inputs.
+        # Keep it enabled by default for checkpoint compatibility; disable via
+        # ``use_input_denoising: false`` for fresh benchmark-oriented runs.
+        self.denoising: Optional[nn.Module] = None
+        if bool(config.get("use_input_denoising", True)):
+            self.denoising = nn.Sequential(
+                nn.Conv2d(in_channels, base_channels//2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(base_channels//2, base_channels//2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(base_channels//2, in_channels, kernel_size=3, padding=1)
+            )
         
         # Input embedding
         self.embedding = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
-            adaptive_group_norm(base_channels, base_groups),
+            feature_norm_or_identity(base_channels, base_groups, config),
             nn.GELU()
         )
         
@@ -568,9 +599,24 @@ class NoiseRobustCSWinGenerator(nn.Module):
             stage_depths = (list(stage_depths) + [default_depth] * 5)[:5]
         self._stage_depths = stage_depths
 
-        def make_stage(ch: int, split: int, n_blocks: int) -> nn.Sequential:
+        # Optional per-stage attention heads in the same order as stage_depths:
+        # [encoder1, encoder2, bottleneck, decoder1, decoder2]. A fixed
+        # num_heads under-splits the wider bottleneck/decoder features; a
+        # hierarchical schedule keeps per-head width consistent as channels
+        # grow, matching CSWin/MST-style scaling while defaulting to legacy
+        # checkpoint-compatible behavior.
+        stage_num_heads = config.get("stage_num_heads", config.get("stage_heads", None))
+        if stage_num_heads is None:
+            stage_num_heads = [num_heads] * 5
+        else:
+            stage_num_heads = [max(1, int(h)) for h in stage_num_heads]
+            if len(stage_num_heads) != 5:
+                stage_num_heads = (list(stage_num_heads) + [num_heads] * 5)[:5]
+        self._stage_num_heads = stage_num_heads
+
+        def make_stage(ch: int, split: int, n_blocks: int, heads: int) -> nn.Sequential:
             return nn.Sequential(*[
-                DualTransformerBlock(ch, split_size=split, num_heads=num_heads, config=config)
+                DualTransformerBlock(ch, split_size=split, num_heads=heads, config=config)
                 for _ in range(n_blocks)
             ])
 
@@ -588,14 +634,20 @@ class NoiseRobustCSWinGenerator(nn.Module):
             self._size_multiple = 1
 
         # Encoder
-        self.encoder1 = make_stage(base_channels, split_sizes[0], stage_depths[0])
+        self.encoder1 = make_stage(
+            base_channels, split_sizes[0], stage_depths[0], stage_num_heads[0]
+        )
         self.down1 = DownBlock(base_channels, base_channels*2, config=config)
 
-        self.encoder2 = make_stage(base_channels*2, split_sizes[1], stage_depths[1])
+        self.encoder2 = make_stage(
+            base_channels*2, split_sizes[1], stage_depths[1], stage_num_heads[1]
+        )
         self.down2 = DownBlock(base_channels*2, base_channels*4, config=config)
 
         # Bottleneck
-        self.bottleneck = make_stage(base_channels*4, split_sizes[2], stage_depths[2])
+        self.bottleneck = make_stage(
+            base_channels*4, split_sizes[2], stage_depths[2], stage_num_heads[2]
+        )
 
         # Decoder
         self.up1 = UpBlock(base_channels*4, base_channels*2, config=config)
@@ -612,11 +664,14 @@ class NoiseRobustCSWinGenerator(nn.Module):
             decoder1_channels,
             split_sizes[1],
             stage_depths[3],
+            stage_num_heads[3],
         )
 
         self.up2 = UpBlock(base_channels*2, base_channels, config=config)
         self.compressor2 = nn.Conv2d(base_channels*2, base_channels, kernel_size=1)
-        self.decoder2 = make_stage(base_channels, split_sizes[0], stage_depths[4])
+        self.decoder2 = make_stage(
+            base_channels, split_sizes[0], stage_depths[4], stage_num_heads[4]
+        )
 
         # Output head. Optional nonlinear lift (3x3 -> GELU -> 1x1) for a
         # richer spectral mapping than a single linear conv.
@@ -796,9 +851,9 @@ class NoiseRobustCSWinGenerator(nn.Module):
             x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
         rgb_input = x
 
-        # Initial denoising with residual connection
-        x_denoised = self.denoising(x)
-        x = x + x_denoised
+        # Optional initial denoising with residual connection.
+        if self.denoising is not None:
+            x = x + self.denoising(x)
         
         # Embedding
         emb = self.embedding(x)

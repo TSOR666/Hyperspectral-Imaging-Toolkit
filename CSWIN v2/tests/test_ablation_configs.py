@@ -73,11 +73,16 @@ def test_sota_cascade_config_uses_recovery_architecture():
     ):
         config = compose(config_name="sota_cascade")
 
-    assert config.cswin_attention_mode == "local_global"
-    assert int(config.cascade_stages) == 1
+    assert config.cswin_attention_mode == "cswin"
+    assert list(config.split_sizes) == [1, 2, 7]
+    assert list(config.stage_num_heads) == [2, 4, 8, 8, 2]
+    assert bool(config.use_feature_norm) is False
+    assert bool(config.use_input_denoising) is False
+    assert int(config.cascade_stages) == 3
     assert bool(config.use_spectral_input_skip) is True
-    assert int(config.refinement_blocks) == 2
+    assert int(config.refinement_blocks) == 0
     assert int(config.base_channels) == 64
+    assert int(config.gradient_accumulation_steps) == 1
 
 
 def test_progressive_finetune_config_switches_after_saturated_128_stage():

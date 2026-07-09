@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -26,6 +28,19 @@ def test_scheduler_steps_match_optimizer_updates_under_accumulation():
     assert scheduler_steps_for_accumulation(300_000, 2) == 150_000
     assert scheduler_steps_for_accumulation(5, 2) == 3
     assert scheduler_steps_for_accumulation(5, 0) == 5
+
+
+def test_legacy_gan_trainer_accumulation_fallback_matches_shared_config():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "hsi_model"
+        / "training_script_fixed.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'config.get("gradient_accumulation_steps", 1)' in source
+    assert 'cfg.setdefault("gradient_accumulation_steps", 1)' in source
+    assert 'gradient_accumulation_steps", 2' not in source
 
 
 def test_train_optimized_resolves_split_generator_discriminator_lrs():

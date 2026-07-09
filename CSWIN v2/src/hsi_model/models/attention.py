@@ -217,9 +217,11 @@ class CSWinAttentionBlock(nn.Module):
             if config
             else "axial"
         )
-        if self._attention_mode not in ("axial", "local_global"):
+        if self._attention_mode == "cross_shaped":
+            self._attention_mode = "cswin"
+        if self._attention_mode not in ("axial", "local_global", "cswin"):
             raise ValueError(
-                "cswin_attention_mode must be 'axial' or 'local_global', "
+                "cswin_attention_mode must be 'axial', 'local_global', or 'cswin', "
                 f"got {self._attention_mode!r}"
             )
         self._global_token_threshold = (
@@ -238,6 +240,41 @@ class CSWinAttentionBlock(nn.Module):
         # Locally enhanced positional encoding
         self.lepe_h = LePEAttention(dim)
         self.lepe_v = LePEAttention(dim)
+
+        if self._attention_mode == "cswin":
+            # The true CSWin path uses the shared qkv_cswin projection below.
+            # Keep the legacy axial/local-global modules in the state dict for
+            # checkpoint compatibility, but do not leave unreachable parameters
+            # trainable: DDP with find_unused_parameters=False treats them as a
+            # reducer error, and optimizers waste slots on dead tensors.
+            for legacy_module in (self.qkv_h, self.qkv_v, self.lepe_h, self.lepe_v):
+                for parameter in legacy_module.parameters():
+                    parameter.requires_grad_(False)
+
+            if num_heads < 2 or num_heads % 2 != 0:
+                raise ValueError(
+                    "cswin_attention_mode='cswin' requires an even num_heads >= 2 "
+                    "so horizontal and vertical stripe branches can split heads."
+                )
+            if dim % 2 != 0:
+                raise ValueError(
+                    "cswin_attention_mode='cswin' requires an even channel dimension."
+                )
+            branch_dim = dim // 2
+            if branch_dim % (num_heads // 2) != 0:
+                raise ValueError(
+                    "Each CSWin branch dimension must be divisible by its head count: "
+                    f"branch_dim={branch_dim}, branch_heads={num_heads // 2}."
+                )
+            self._cswin_branch_heads = num_heads // 2
+            self._cswin_branch_dim = branch_dim
+            self.qkv_cswin = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=qkv_bias)
+            self.lepe_h_cswin = nn.Conv2d(
+                branch_dim, branch_dim, kernel_size=3, padding=1, groups=branch_dim
+            )
+            self.lepe_v_cswin = nn.Conv2d(
+                branch_dim, branch_dim, kernel_size=3, padding=1, groups=branch_dim
+            )
 
         torch_version = version.parse(torch.__version__.split('+')[0]) if hasattr(torch, "__version__") else version.parse("0")
         self._supports_non_reentrant_ckpt = torch_version >= version.parse("2.1")
@@ -307,8 +344,11 @@ class CSWinAttentionBlock(nn.Module):
         # parameters which is negligible (≤ a few KiB).
         table_shape = (2 * split_size - 1, 2 * split_size - 1, num_heads)
         use_window_bias = (
-            self._attention_mode == "local_global"
-            or self._bias_mode == "window_cyclic"
+            self._attention_mode != "cswin"
+            and (
+                self._attention_mode == "local_global"
+                or self._bias_mode == "window_cyclic"
+            )
         )
         self.relative_position_bias_table_h = nn.Parameter(
             torch.zeros(table_shape, dtype=bias_dtype),
@@ -473,6 +513,123 @@ class CSWinAttentionBlock(nn.Module):
         ):
             mode = "replicate"
         return F.pad(x, pad, mode=mode)
+
+    def _compute_cross_shaped_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """CSWin-style cross-shaped stripe attention.
+
+        The official CSWin block splits heads/channels into two parallel
+        branches: one attends in horizontal stripes of height ``split_size`` and
+        one attends in vertical stripes of width ``split_size``. The branch
+        outputs are concatenated, then projected. This is distinct from the
+        legacy ``local_global`` mode, which runs two full-channel local-window
+        attentions and averages them.
+        """
+        B, _, H, W = x.shape
+        split = self.split_size
+        if split <= 0:
+            raise ValueError(f"split_size must be positive, got {split}")
+
+        pad_h = (split - H % split) % split
+        pad_w = (split - W % split) % split
+        if pad_h or pad_w:
+            x_work = self._safe_spatial_pad(x, (0, pad_w, 0, pad_h))
+        else:
+            x_work = x
+        padded_H, padded_W = x_work.shape[-2:]
+
+        qkv = self.qkv_cswin(x_work)
+        qkv = rearrange(
+            qkv,
+            "b (three head d) h w -> three b head d h w",
+            three=3,
+            head=self.num_heads,
+            d=self.head_dim,
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        branch_heads = self._cswin_branch_heads
+
+        # Horizontal branch: windows are split-size rows by full width.
+        q_h = rearrange(
+            q[:, :branch_heads],
+            "b head d (nh sh) w -> (b nh) head (sh w) d",
+            sh=split,
+        )
+        k_h = rearrange(
+            k[:, :branch_heads],
+            "b head d (nh sh) w -> (b nh) head (sh w) d",
+            sh=split,
+        )
+        v_h = rearrange(
+            v[:, :branch_heads],
+            "b head d (nh sh) w -> (b nh) head (sh w) d",
+            sh=split,
+        )
+        v_h_img = rearrange(
+            v[:, :branch_heads],
+            "b head d (nh sh) w -> (b nh) (head d) sh w",
+            sh=split,
+        )
+        lepe_h = self.lepe_h_cswin(v_h_img)
+        lepe_h = rearrange(
+            lepe_h,
+            "(b nh) (head d) sh w -> (b nh) head (sh w) d",
+            b=B,
+            head=branch_heads,
+            d=self.head_dim,
+            sh=split,
+        )
+        out_h = self._scaled_attention(q_h, k_h, v_h) + lepe_h
+        out_h = rearrange(
+            out_h,
+            "(b nh) head (sh w) d -> b (head d) (nh sh) w",
+            b=B,
+            sh=split,
+            w=padded_W,
+        )
+
+        # Vertical branch: windows are full height by split-size columns.
+        q_v = rearrange(
+            q[:, branch_heads:],
+            "b head d h (nw sw) -> (b nw) head (h sw) d",
+            sw=split,
+        )
+        k_v = rearrange(
+            k[:, branch_heads:],
+            "b head d h (nw sw) -> (b nw) head (h sw) d",
+            sw=split,
+        )
+        v_v = rearrange(
+            v[:, branch_heads:],
+            "b head d h (nw sw) -> (b nw) head (h sw) d",
+            sw=split,
+        )
+        v_v_img = rearrange(
+            v[:, branch_heads:],
+            "b head d h (nw sw) -> (b nw) (head d) h sw",
+            sw=split,
+        )
+        lepe_v = self.lepe_v_cswin(v_v_img)
+        lepe_v = rearrange(
+            lepe_v,
+            "(b nw) (head d) h sw -> (b nw) head (h sw) d",
+            b=B,
+            head=branch_heads,
+            d=self.head_dim,
+            sw=split,
+        )
+        out_v = self._scaled_attention(q_v, k_v, v_v) + lepe_v
+        out_v = rearrange(
+            out_v,
+            "(b nw) head (h sw) d -> b (head d) h (nw sw)",
+            b=B,
+            h=padded_H,
+            sw=split,
+        )
+
+        out = self.proj(torch.cat([out_h, out_v], dim=1))
+        if pad_h or pad_w:
+            out = out[..., :H, :W]
+        return out
 
     def _compute_local_window_attention(
         self,
@@ -811,6 +968,19 @@ class CSWinAttentionBlock(nn.Module):
             padded_H, padded_W = H + pad_h, W + pad_w
         else:
             padded_H, padded_W = H, W
+
+        if self._attention_mode == "cswin":
+            num_tokens = padded_H * padded_W
+            should_ckpt = self.training and (num_tokens >= self._ckpt_min_tokens)
+            if should_ckpt:
+                if self._supports_non_reentrant_ckpt:
+                    return checkpoint(
+                        self._compute_cross_shaped_attention,
+                        x,
+                        use_reentrant=False,
+                    )
+                return checkpoint(self._compute_cross_shaped_attention, x)
+            return self._compute_cross_shaped_attention(x)
         
         use_global = (
             self._attention_mode == "local_global"
