@@ -8,9 +8,16 @@ python train_mswr_v212_logging.py \
   --data_root /path/to/ARAD_1K
 ```
 
-`train.yaml` is the maintained recipe for new runs. It uses the base model,
-spectral attention, one wavelet level per stage, MRAE loss, AdamW, AMP, and EMA.
-CLI arguments may override individual YAML values.
+`train.yaml` is the maintained fresh-run recovery baseline. It uses full-rank
+spectral attention, spectral FFN/refinement, content-conditioned landmarks,
+identity-centred wavelet details, radiometry-preserving convolution paths,
+MRAE loss, AdamW, AMP, and EMA. CLI arguments may override individual YAML
+values; it is not checkpoint-compatible with old static-landmark runs.
+
+`wavelet_detail_gain_mode` is also checkpoint semantics: old checkpoints retain
+`legacy`, while the fresh recipes use `identity` for an exact initial detail
+gain of one. Do not override it when evaluating a checkpoint; the evaluator
+loads the saved model configuration.
 
 The files under `experiments/` are frozen comparison recipes:
 
@@ -28,6 +35,8 @@ The files under `experiments/` are frozen comparison recipes:
 | `robust_mrae_spectralffn.yaml` | `robust_mrae_fullrank.yaml` + `spectral_ffn: true` (`spectral_ffn_mult: 2`): a zero-init-gated GDFN spectral feed-forward residual per block — the MSAB FFN the spectral branch lacked, and the non-redundant addition once attention is full-rank. ~+0.44M params (+14.5%), identity at init, checkpoint-safe. Won the Rung-1 A/B (−0.01..−0.018 MRAE); current working baseline. |
 | `robust_mrae_shortcos.yaml` | Overfit attack (REFUTED 2026-06-25): `robust_mrae_spectralffn.yaml` with `end_epoch: 140` (was 220). Made it **~0.03 worse** (best EMA 0.269 vs 0.240) — this model needs the long high-LR schedule to reach its minimum; the shorter cosine froze it in a shallow one. Kept as a documented negative result; use the 220-epoch `robust_mrae_spectralffn.yaml` as the baseline. |
 | `robust_mrae_multistage.yaml` | `robust_mrae_spectralffn.yaml` + `multistage_refine: true` (`refine_hidden: 64`): an MPRNet-style coarse-to-fine refinement stage on the final output — a small conv stage refines the stage-1 reconstruction conditioned on the original RGB, as a zero-init-gated residual. ~+47K params (+1.4%), identity at init, checkpoint-safe. Rung-2 single-variable A/B vs `robust_mrae_spectralffn.yaml` (keep 220ep). |
+| `sota_depth_recovery.yaml` | Fresh-run recovery for the failed depth/prelayer stack. Uses `layer_scale_init: 1e-2` and `residual_gate_init: 1e-2` so newly stacked branches receive usable first-step gradients; monitor the first 8 epochs and retain the logged clipping telemetry. |
+| `sota_spectral_depth.yaml` | Historical failed Rung-3 reproduction (train ~0.78 / val ~0.68 MRAE). Retained for forensic comparison only; use `sota_depth_recovery.yaml` instead. |
 
 Do not choose an experiment config for ordinary training unless you are
 reproducing that specific comparison.

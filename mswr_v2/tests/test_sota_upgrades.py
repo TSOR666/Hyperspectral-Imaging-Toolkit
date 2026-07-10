@@ -45,6 +45,10 @@ class TestConfigFields:
         config = MSWRDualConfig()
         assert config.spectral_prelayer is False
         assert config.blocks_per_stage == 1
+        assert config.layer_scale_init == 1e-4
+        assert config.residual_gate_init == 0.0
+        assert config.wavelet_detail_gain_mode == "legacy"
+        assert config.conv_norm_type is None
 
     def test_blocks_per_stage_validated(self):
         with pytest.raises(AssertionError):
@@ -88,6 +92,20 @@ class TestSpectralPrelayer:
         assert grads, "spectral prelayer received no gradients"
         assert any(g.abs().sum() > 0 for g in grads)
 
+    def test_nonzero_gate_initialization_reaches_inner_branches_on_step_zero(self):
+        block = SpectralMSABlock(dim=32, num_heads=1, gate_init=1e-2)
+        x = torch.randn(2, 32, 16, 16)
+        block(x).square().mean().backward()
+
+        for prefix in ("attn.", "ffn.net."):
+            grads = [
+                parameter.grad
+                for name, parameter in block.named_parameters()
+                if name.startswith(prefix)
+            ]
+            assert grads, f"missing {prefix} parameters"
+            assert any(grad is not None and grad.abs().sum() > 0 for grad in grads)
+
 
 class TestBlocksPerStage:
     def test_default_keeps_legacy_key_layout(self):
@@ -130,6 +148,18 @@ class TestCombinedSotaConfig:
             spectral_ffn=True,
             multistage_refine=True,
             wavelet_detail_processing=True,
+            landmark_pooling="learned_content",
+            conv_norm_type="none",
+            layer_scale_init=1e-2,
+            residual_gate_init=1e-2,
+        )
+        prelayer = model.encoder_stages[0][0].spectral_pre
+        assert prelayer is not None
+        assert torch.allclose(prelayer.gate, torch.full_like(prelayer.gate, 1e-2))
+        assert torch.allclose(prelayer.ffn.gate, torch.full_like(prelayer.ffn.gate, 1e-2))
+        assert model.refine_stage is not None
+        assert torch.allclose(
+            model.refine_stage.gate, torch.full_like(model.refine_stage.gate, 1e-2)
         )
         x = torch.randn(1, 3, 64, 64)
         with torch.no_grad():

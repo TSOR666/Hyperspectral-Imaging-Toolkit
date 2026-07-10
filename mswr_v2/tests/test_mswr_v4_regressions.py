@@ -10,6 +10,9 @@ from model.mswr_net_v212 import (
     EnhancedDualAttention2D,
     IntegratedMSWRNet,
     MSWRDualConfig,
+    OptimizedCNNInverseWaveletTransform,
+    OptimizedCNNWaveletTransform,
+    OptimizedLandmarkAttention2D,
     create_mswr_tiny,
 )
 from train_mswr_v212_logging import (
@@ -17,6 +20,7 @@ from train_mswr_v212_logging import (
     _accumulation_group_size,
     _is_accumulation_boundary,
     _validate_checkpoint_compatibility,
+    _validate_resume_model_config,
 )
 
 
@@ -149,7 +153,36 @@ def test_training_resume_rejects_large_checkpoint_mismatch():
         _validate_checkpoint_compatibility(Incompatible(), 100, "test checkpoint")
 
 
-def test_wavelet_gate_starts_near_identity():
+def test_training_resume_rejects_semantic_model_config_mismatch():
+    current = MSWRDualConfig(
+        base_channels=16,
+        num_heads=4,
+        num_stages=1,
+        wavelet_levels=[1],
+        landmark_pooling="learned",
+    )
+    checkpoint_config = current.to_dict()
+    checkpoint_config["landmark_pooling"] = "learned_content"
+
+    with pytest.raises(RuntimeError, match="semantic-changing full-state resume"):
+        _validate_resume_model_config(checkpoint_config, current)
+
+
+def test_training_resume_normalizes_legacy_config_defaults():
+    current = MSWRDualConfig(
+        base_channels=16,
+        num_heads=4,
+        num_stages=1,
+        wavelet_levels=[1],
+    )
+    checkpoint_config = current.to_dict()
+    for key in ("conv_norm_type", "residual_gate_init", "wavelet_detail_gain_mode"):
+        checkpoint_config.pop(key)
+
+    assert _validate_resume_model_config(checkpoint_config, current) is True
+
+
+def test_wavelet_gate_default_preserves_legacy_checkpoint_semantics():
     model = IntegratedMSWRNet(
         MSWRDualConfig(
             base_channels=16,
@@ -166,6 +199,69 @@ def test_wavelet_gate_starts_near_identity():
     expected = torch.sigmoid(torch.tensor(4.0))
     actual = gate(torch.randn(2, 16, 8, 8))
     assert torch.allclose(actual, torch.full_like(actual, expected), atol=1e-6)
+
+
+def test_conv_norm_inherits_legacy_norm_type_when_not_explicitly_set():
+    model = IntegratedMSWRNet(
+        MSWRDualConfig(
+            base_channels=16,
+            num_heads=4,
+            num_stages=1,
+            wavelet_levels=[1],
+            norm_type="none",
+            conv_norm_type=None,
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+    )
+
+    assert isinstance(model.input_proj.norm.norm, torch.nn.Identity)
+
+
+def test_identity_wavelet_mode_starts_with_exact_detail_gain_one():
+    model = IntegratedMSWRNet(
+        MSWRDualConfig(
+            base_channels=16,
+            num_heads=4,
+            num_stages=1,
+            wavelet_levels=[1],
+            wavelet_detail_gain_mode="identity",
+            use_checkpoint=False,
+            performance_monitoring=False,
+        )
+    )
+    gate = model.encoder_stages[0].wavelet_gate
+
+    assert torch.count_nonzero(gate[-2].weight) == 0
+    actual = gate(torch.randn(2, 16, 8, 8))
+    assert torch.allclose(actual, torch.full_like(actual, 0.5), atol=1e-6)
+    assert torch.allclose(0.5 + actual, torch.ones_like(actual), atol=1e-6)
+
+
+@pytest.mark.parametrize("wave", ["db1", "db2", "db3", "db4"])
+def test_wavelet_round_trip_preserves_signal(wave):
+    x = torch.randn(2, 3, 32, 32)
+    coeffs = OptimizedCNNWaveletTransform(J=1, wave=wave)(x)
+    reconstructed = OptimizedCNNInverseWaveletTransform(wave=wave)(coeffs)
+
+    torch.testing.assert_close(reconstructed, x, rtol=1e-5, atol=2e-5)
+
+
+def test_learned_content_landmarks_depend_on_scene_but_legacy_does_not():
+    torch.manual_seed(17)
+    x = torch.randn(1, 8, 8, 8)
+    changed = x.clone()
+    changed[:, :, 7, 7] += 5.0
+
+    content = OptimizedLandmarkAttention2D(
+        dim=8, num_heads=2, num_landmarks=4, pooling_type="learned_content"
+    )
+    legacy = OptimizedLandmarkAttention2D(
+        dim=8, num_heads=2, num_landmarks=4, pooling_type="learned"
+    )
+
+    assert not torch.allclose(content._make_landmarks(x), content._make_landmarks(changed))
+    torch.testing.assert_close(legacy._make_landmarks(x), legacy._make_landmarks(changed))
 
 
 @pytest.mark.parametrize(

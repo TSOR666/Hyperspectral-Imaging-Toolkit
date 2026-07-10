@@ -58,7 +58,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 # Setup logging
 logger = logging.getLogger(__name__)
 
-_WAVELET_GATE_INIT_BIAS = 4.0
+# Keep legacy checkpoints numerically compatible by default.  Fresh recipes may
+# opt into identity-centred modulation (0.5 + sigmoid(0) == 1.0) instead of the
+# older slightly attenuating sigmoid(4) detail gain.
+_WAVELET_GATE_LEGACY_INIT_BIAS = 4.0
+_WAVELET_GATE_IDENTITY_INIT_BIAS = 0.0
 
 
 def _wrap_block_with_checkpoint(block: nn.Module) -> nn.Module:
@@ -374,7 +378,7 @@ class WaveletDetailBlock(nn.Module):
 
 
 class SpectralGatedFFNBlock(nn.Module):
-    """Zero-init-gated GDFN spectral feed-forward residual (the MSAB FFN the
+    """ReZero-gated GDFN spectral feed-forward residual (the MSAB FFN the
     spectral branch lacks).
 
     The spectral S-MSA branch (SpectralMSA2D) models band-to-band attention but
@@ -382,19 +386,18 @@ class SpectralGatedFFNBlock(nn.Module):
     is under-modeled. This adds one as a SELF-GATED residual:
         out = x + gate * FFN(LN(x))
     where FFN is a depthwise-conv GDFN (Conv1x1 -> GELU -> depthwise 3x3 ->
-    GELU -> Conv1x1). `gate` is a per-channel parameter initialized to ZERO, so
-    the block is an EXACT identity at start: enabling it does not perturb a
-    fresh model or destabilize from-scratch training, and existing checkpoints
-    (which simply lack these params) load unchanged under strict=False when off.
-    reset_identity() re-zeros the gate so it survives the global Kaiming apply().
+    GELU -> Conv1x1). `gate` defaults to zero for exact legacy identity; a
+    fresh deeply stacked recipe can use a small positive ``gate_init`` so inner
+    weights receive useful gradients on the first optimizer step.
 
     Added params per block ~ 2*mult*C^2 (the two 1x1 convs); at mult=2 this is
     the non-redundant lever once SpectralMSA2D is already full-rank (heads=1),
     where a second attention would merely duplicate the existing one.
     """
 
-    def __init__(self, dim: int, mult: int = 2) -> None:
+    def __init__(self, dim: int, mult: int = 2, gate_init: float = 0.0) -> None:
         super().__init__()
+        self.gate_init = float(gate_init)
         self.norm = nn.LayerNorm(dim)
         hidden = dim * mult
         self.net = nn.Sequential(
@@ -404,22 +407,25 @@ class SpectralGatedFFNBlock(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden, dim, 1, bias=False),
         )
-        self.gate = nn.Parameter(torch.zeros(1, dim, 1, 1))  # (1, C, 1, 1)
+        self.gate = nn.Parameter(torch.full((1, dim, 1, 1), self.gate_init))  # (1, C, 1, 1)
         self.reset_identity()
 
     def reset_identity(self) -> None:
-        nn.init.zeros_(self.gate)
+        # ``gate_init=0`` retains exact legacy identity. A small positive value
+        # is useful for fresh, deeply stacked runs: inner FFN weights receive
+        # gradients on step one instead of waiting for an outer ReZero gate.
+        nn.init.constant_(self.gate, self.gate_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # LayerNorm over the channel (spectral) axis: NCHW -> NHWC -> norm -> NCHW.
         x_n = x.permute(0, 2, 3, 1)           # (B, H, W, C)
         x_n = self.norm(x_n)                  # (B, H, W, C)
         x_n = x_n.permute(0, 3, 1, 2)         # (B, C, H, W)
-        return x + self.gate * self.net(x_n)  # gate=0 at init -> exact identity
+        return x + self.gate * self.net(x_n)  # gate_init=0 -> exact legacy identity
 
 
 class SpectralMSABlock(nn.Module):
-    """Full-resolution MST++-style MSAB (S-MSA + spectral gated-FFN), zero-init gated.
+    """Full-resolution MST++-style MSAB (S-MSA + spectral gated-FFN), ReZero-gated.
 
     The legacy architecture applies spectral (band-to-band) attention only on
     the wavelet LL band inside the dual-attention fusion, where its output is
@@ -430,55 +436,53 @@ class SpectralMSABlock(nn.Module):
 
         x = x + gate * S-MSA(LN(x));   x = SpectralGatedFFN(x)
 
-    with the S-MSA gate (per-channel) initialized to ZERO and the FFN already
-    zero-init gated -> the whole unit is an EXACT identity at init. Enabling it
-    does not perturb a fresh model, and existing checkpoints (which simply lack
-    these params) load unchanged under strict=False when off. reset_identity()
-    re-zeros both gates so they survive the global Kaiming apply().
+    with a per-channel S-MSA gate and a gated FFN. Both default to zero for
+    exact legacy identity, while a fresh deep/prelayer recipe can set a small
+    positive ``gate_init`` to avoid first-step gradient starvation.
     """
 
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0,
-                 ffn_mult: int = 2) -> None:
+                 ffn_mult: int = 2, gate_init: float = 0.0) -> None:
         super().__init__()
+        self.gate_init = float(gate_init)
         self.norm = nn.LayerNorm(dim)
         self.attn = SpectralMSA2D(dim, num_heads, dropout)
-        self.gate = nn.Parameter(torch.zeros(1, dim, 1, 1))  # (1, C, 1, 1)
-        self.ffn = SpectralGatedFFNBlock(dim, mult=ffn_mult)
+        self.gate = nn.Parameter(torch.full((1, dim, 1, 1), self.gate_init))  # (1, C, 1, 1)
+        self.ffn = SpectralGatedFFNBlock(dim, mult=ffn_mult, gate_init=self.gate_init)
         self.reset_identity()
 
     def reset_identity(self) -> None:
-        nn.init.zeros_(self.gate)
+        nn.init.constant_(self.gate, self.gate_init)
         self.ffn.reset_identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, C, H, W) -> (B, C, H, W); exact identity while gates are zero."""
+        """(B, C, H, W) -> (B, C, H, W); identity when gate_init is zero."""
         x_n = x.permute(0, 2, 3, 1)            # (B, H, W, C)
         x_n = self.norm(x_n).permute(0, 3, 1, 2)  # (B, C, H, W)
-        x = x + self.gate * self.attn(x_n)     # gate=0 at init -> identity
-        return self.ffn(x)                     # zero-init gated -> identity
+        x = x + self.gate * self.attn(x_n)     # gate_init=0 -> identity
+        return self.ffn(x)                     # gate_init=0 -> identity
 
 
 class SpectralRefinementStage(nn.Module):
-    """MPRNet-style coarse-to-fine multistage refinement (zero-init-gated).
+    """MPRNet-style coarse-to-fine multistage refinement (ReZero-gated).
 
     Takes the stage-1 HSI reconstruction (output_channels bands) concatenated
     with the original RGB and predicts a residual correction added back to the
     stage-1 output:  out = hsi + gate * Refine([hsi, rgb]). Conditioning on the
     original RGB lets the second stage re-inject high-frequency spatial detail
     the encoder/decoder U-net may have smoothed -- the coarse-to-fine idea in
-    MPRNet. `gate` is a per-band parameter initialized to ZERO, so the stage is
-    an EXACT identity at start: enabling it does not perturb a fresh model or
-    destabilize from-scratch training, and existing checkpoints (which simply
-    lack these params) load unchanged under strict=False when off.
-    reset_identity() re-zeros the gate so it survives the global Kaiming apply().
+    MPRNet. `gate` defaults to zero for exact legacy identity; a fresh deeply
+    stacked recipe can use a small positive ``gate_init`` to train the inner
+    refinement convolutions from step one.
 
     Added params ~ hidden*(in_ch+out_ch)*9 + n_blocks*hidden*(hidden+9); at
     hidden=64 / n_blocks=2 on 31-band output this is ~+47K (+1.4% on base).
     """
 
     def __init__(self, hsi_channels: int = 31, rgb_channels: int = 3,
-                 hidden: int = 64, n_blocks: int = 2) -> None:
+                 hidden: int = 64, n_blocks: int = 2, gate_init: float = 0.0) -> None:
         super().__init__()
+        self.gate_init = float(gate_init)
         in_ch = hsi_channels + rgb_channels
         self.head = nn.Sequential(
             nn.Conv2d(in_ch, hidden, 3, padding=1, bias=True),
@@ -494,17 +498,17 @@ class SpectralRefinementStage(nn.Module):
             for _ in range(n_blocks)
         ])
         self.tail = nn.Conv2d(hidden, hsi_channels, 3, padding=1, bias=True)
-        self.gate = nn.Parameter(torch.zeros(1, hsi_channels, 1, 1))  # (1, C_out, 1, 1)
+        self.gate = nn.Parameter(torch.full((1, hsi_channels, 1, 1), self.gate_init))  # (1, C_out, 1, 1)
         self.reset_identity()
 
     def reset_identity(self) -> None:
-        nn.init.zeros_(self.gate)
+        nn.init.constant_(self.gate, self.gate_init)
 
     def forward(self, hsi: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
         feat = self.head(torch.cat([hsi, rgb], dim=1))
         for blk in self.blocks:
             feat = feat + blk(feat)             # residual DS-conv block
-        return hsi + self.gate * self.tail(feat)  # gate=0 at init -> exact identity
+        return hsi + self.gate * self.tail(feat)  # gate_init=0 -> exact identity
 
 
 # ===================== ENHANCED PERFORMANCE MONITORING =====================
@@ -612,7 +616,7 @@ class MSWRDualConfig:
     num_heads: int = 8
     window_size: int = 8
     num_landmarks: int = 64
-    landmark_pooling: Literal['learned', 'uniform', 'adaptive'] = 'learned'
+    landmark_pooling: Literal['learned', 'learned_content', 'uniform', 'adaptive'] = 'learned'
     local_global_fusion: Literal['adaptive', 'concat', 'add', 'gated'] = 'adaptive'
     # MST++-style spectral (band-to-band) self-attention, added as a parallel
     # branch inside the dual-attention block. The original architecture attends
@@ -635,6 +639,10 @@ class MSWRDualConfig:
     use_wavelet: bool = True
     wavelet_type: str = 'db1'
     wavelet_levels: Optional[List[int]] = None
+    # ``legacy`` preserves the original sigmoid-only high-band gain for old
+    # checkpoints. ``identity`` uses 0.5 + sigmoid(logit), initialized at a
+    # gain of exactly one, for fresh ARAD training recipes.
+    wavelet_detail_gain_mode: Literal['legacy', 'identity'] = 'legacy'
     # When True, the high-frequency detail subbands (LH/HL/HH) are processed by a
     # lightweight depthwise residual block instead of being only multiplicatively
     # gated. The original wavelet path applies attention/FFN to the LL band only,
@@ -694,6 +702,10 @@ class MSWRDualConfig:
     attention_dropout: float = 0.0
     drop_path: float = 0.1
     layer_scale_init: float = 1e-4
+    # Fresh deep/prelayer runs can use a small non-zero ReZero gate so the
+    # inner spectral/refinement weights receive gradients from step one. Keep
+    # the default at zero for legacy checkpoint and identity-init compatibility.
+    residual_gate_init: float = 0.0
     
     # Optimization & Performance
     use_checkpoint: bool = True
@@ -707,12 +719,25 @@ class MSWRDualConfig:
     use_multi_scale_input: bool = True
     use_skip_init: bool = True
     norm_type: str = 'layer'  # Default to LayerNorm for better compatibility
+    # Keep transformer pre-norm independent from convolutional projections.
+    # Per-pixel channel LayerNorm after RGB/downsample/skip convolutions removes
+    # radiometric amplitude cues; image-restoration recipes can set this to
+    # ``none`` while retaining ``norm_type='layer'`` inside attention/FFNs.
+    # None inherits ``norm_type`` exactly, preserving legacy custom configs.
+    # Fresh recipes can explicitly set a separate convolutional norm.
+    conv_norm_type: Optional[str] = None
     performance_monitoring: bool = True
     
     def __post_init__(self) -> None:
         """Enhanced validation with detailed error messages"""
         if self.attention_type not in {'window', 'dual', 'landmark', 'hybrid'}:
             raise ValueError(f"Unsupported attention_type: {self.attention_type!r}")
+        if self.landmark_pooling not in {'learned', 'learned_content', 'uniform', 'adaptive'}:
+            raise ValueError(f"Unsupported landmark_pooling: {self.landmark_pooling!r}")
+        if self.wavelet_detail_gain_mode not in {'legacy', 'identity'}:
+            raise ValueError(
+                f"Unsupported wavelet_detail_gain_mode: {self.wavelet_detail_gain_mode!r}"
+            )
 
         if self.wavelet_levels is None:
             self.wavelet_levels = list(range(1, self.num_stages + 1))
@@ -768,6 +793,8 @@ class MSWRDualConfig:
         assert 0.0 <= self.dropout <= 1.0, "dropout must be in [0, 1]"
         assert 0.0 <= self.attention_dropout <= 1.0, "attention_dropout must be in [0, 1]"
         assert 0.0 <= self.drop_path <= 1.0, "drop_path must be in [0, 1]"
+        assert self.layer_scale_init >= 0.0, "layer_scale_init must be non-negative"
+        assert self.residual_gate_init >= 0.0, "residual_gate_init must be non-negative"
         assert self.num_heads > 0, "num_heads must be positive"
         assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
         assert self.spectral_ffn_mult >= 1, "spectral_ffn_mult must be >= 1"
@@ -775,6 +802,11 @@ class MSWRDualConfig:
         assert self.blocks_per_stage >= 1, "blocks_per_stage must be >= 1"
         assert self.base_channels > 0, "base_channels must be positive"
         assert self.num_stages > 0, "num_stages must be positive"
+        valid_norm_types = {'layer', 'group', 'batch', 'none'}
+        if self.norm_type not in valid_norm_types:
+            raise ValueError(f"Unsupported norm_type: {self.norm_type!r}")
+        if self.conv_norm_type is not None and self.conv_norm_type not in valid_norm_types:
+            raise ValueError(f"Unsupported conv_norm_type: {self.conv_norm_type!r}")
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1068,9 +1100,13 @@ class OptimizedLandmarkAttention2D(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
         self.dropout = nn.Dropout(dropout)
         
-        # Landmark generation
-        if pooling_type == "learned":
-            self.landmarks = nn.Parameter(torch.randn(1, num_landmarks, dim) * 0.02)  # (1, L, C)
+        # ``learned`` is the legacy static K/V dictionary used by existing
+        # checkpoints.  ``learned_content`` reuses the same learned seed shape
+        # but pools scene tokens into content-dependent landmarks.  Keeping the
+        # behaviours separate makes the upgrade opt-in rather than silently
+        # changing the meaning of an existing checkpoint parameter.
+        if pooling_type in {"learned", "learned_content"}:
+            self.landmarks = nn.Parameter(torch.randn(1, num_landmarks, dim) * 0.02)
         elif pooling_type == "adaptive":
             self.landmark_proj = nn.Sequential(
                 nn.Linear(dim, dim // 2),
@@ -1078,6 +1114,47 @@ class OptimizedLandmarkAttention2D(nn.Module):
                 nn.Linear(dim // 2, num_landmarks * dim)
             )
     
+    def _make_landmarks(self, x: torch.Tensor) -> torch.Tensor:
+        """Return landmark tokens while preserving legacy pooling semantics."""
+        B, C, H, W = x.shape  # (B, C, H, W)
+
+        if self.pooling_type == "learned":
+            # Legacy static dictionary.  Do not make this branch content-aware:
+            # old checkpoints were trained with precisely this interpretation.
+            return self.landmarks.expand(B, -1, -1)
+        if self.pooling_type == "learned_content":
+            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, H*W, C)
+            queries = self.landmarks.expand(B, -1, -1)  # (B, L, C) learned seeds
+            # Pool scene tokens into L learned landmarks in fp32.  Unlike the
+            # legacy static branch, remote pixels can now influence local output
+            # through the landmark K/V path.
+            scores = torch.bmm(
+                queries.float(), x_flat.transpose(1, 2).float()
+            ) * (C ** -0.5)  # (B, L, H*W)
+            weights = F.softmax(scores, dim=-1)
+            return torch.bmm(weights, x_flat.float()).to(dtype=x.dtype)  # (B, L, C)
+        if self.pooling_type == "adaptive":
+            x_pool = F.adaptive_avg_pool2d(x, 1).flatten(1)  # (B, C, 1, 1) -> (B, C)
+            landmark_weights = self.landmark_proj(x_pool).view(B, self.num_landmarks, C)  # (B, C) -> (B, L, C)
+            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
+            
+            # Efficient landmark selection
+            attn_scores = torch.bmm(landmark_weights.float(), x_flat.transpose(1, 2).float())  # (B, L, C) @ (B, C, H*W) -> (B, L, H*W)
+            attn_scores = attn_scores * (C ** -0.5)  # scale in fp32 for stability
+            attn_weights = F.softmax(attn_scores, dim=-1)  # (B, L, H*W), softmax over tokens
+            return torch.bmm(attn_weights, x_flat.float()).to(dtype=x_flat.dtype)  # (B, L, H*W) @ (B, H*W, C) -> (B, L, C)
+        if self.pooling_type == "uniform":
+            if H * W < self.num_landmarks:
+                raise ValueError(
+                    f"uniform landmark pooling requires H*W >= num_landmarks "
+                    f"({H*W} < {self.num_landmarks})"
+                )
+            step = max(1, (H * W) // self.num_landmarks)
+            indices = torch.arange(0, H * W, step, device=x.device)[:self.num_landmarks]  # (L,)
+            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
+            return x_flat[:, indices]  # (B, L, C)
+        raise ValueError(f"Unknown landmark pooling type: {self.pooling_type}")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Landmark attention over NCHW input.
@@ -1094,30 +1171,8 @@ class OptimizedLandmarkAttention2D(nn.Module):
         q = self.q_conv(x)  # (B, C, H, W) -> (B, C, H, W)
         # Reshape: (B, C, H, W) -> (B, num_heads, H*W, head_dim)
         q = rearrange(q, 'b (h d) H W -> b h (H W) d', h=self.num_heads, H=H, W=W)  # (B, C, H, W) -> (B, Heads, H*W, D)
-        
-        # Efficient landmark generation
-        if self.pooling_type == "learned":
-            landmarks = self.landmarks.expand(B, -1, -1)  # (1, L, C) -> (B, L, C), broadcast
-        elif self.pooling_type == "adaptive":
-            x_pool = F.adaptive_avg_pool2d(x, 1).flatten(1)  # (B, C, 1, 1) -> (B, C)
-            landmark_weights = self.landmark_proj(x_pool).view(B, self.num_landmarks, C)  # (B, C) -> (B, L, C)
-            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
-            
-            # Efficient landmark selection
-            attn_scores = torch.bmm(landmark_weights.float(), x_flat.transpose(1, 2).float())  # (B, L, C) @ (B, C, H*W) -> (B, L, H*W)
-            attn_scores = attn_scores * (C ** -0.5)  # scale in fp32 for stability
-            attn_weights = F.softmax(attn_scores, dim=-1)  # (B, L, H*W), softmax over tokens
-            landmarks = torch.bmm(attn_weights, x_flat.float()).to(dtype=x_flat.dtype)  # (B, L, H*W) @ (B, H*W, C) -> (B, L, C)
-        else:  # uniform
-            if H * W < self.num_landmarks:
-                raise ValueError(
-                    f"uniform landmark pooling requires H*W >= num_landmarks "
-                    f"({H*W} < {self.num_landmarks})"
-                )
-            step = max(1, (H * W) // self.num_landmarks)
-            indices = torch.arange(0, H * W, step, device=x.device)[:self.num_landmarks]  # (L,)
-            x_flat = rearrange(x, 'b c h w -> b (h w) c')  # (B, C, H, W) -> (B, H*W, C)
-            landmarks = x_flat[:, indices]  # (B, L, C)
+
+        landmarks = self._make_landmarks(x)
         
         # Generate keys and values
         kv = self.kv_linear(landmarks)  # (B, L, C) -> (B, L, 2*C)
@@ -1443,9 +1498,17 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
                 nn.Sigmoid()
             )
             
-            # Better initialization for wavelet gate
+            # The legacy mode must retain sigmoid(4) exactly for old checkpoint
+            # semantics. Fresh identity-centred recipes start at a true gain of
+            # one with 0.5 + sigmoid(0).
+            self.wavelet_detail_gain_mode = config.wavelet_detail_gain_mode
+            wavelet_gate_init_bias = (
+                _WAVELET_GATE_IDENTITY_INIT_BIAS
+                if self.wavelet_detail_gain_mode == 'identity'
+                else _WAVELET_GATE_LEGACY_INIT_BIAS
+            )
             nn.init.zeros_(self.wavelet_gate[-2].weight)
-            nn.init.constant_(self.wavelet_gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
+            nn.init.constant_(self.wavelet_gate[-2].bias, wavelet_gate_init_bias)
 
             # Optional high-frequency detail processing (audit ROUND5). Default
             # off => exact legacy behavior (detail bands only gated).
@@ -1458,6 +1521,7 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             self.dwt = None
             self.wavelet_level = 0
             self.wavelet_detail = None
+            self.wavelet_detail_gain_mode = 'legacy'
         
         # Core transformer components
         self.attn = EnhancedDualAttention2D(dim, config)
@@ -1481,7 +1545,11 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
         # Optional spectral gated-FFN (the MSAB feed-forward the spectral branch
         # lacks). Zero-init gated residual => exact identity at init, checkpoint-safe.
         self.spectral_ffn = (
-            SpectralGatedFFNBlock(dim, mult=getattr(config, 'spectral_ffn_mult', 2))
+            SpectralGatedFFNBlock(
+                dim,
+                mult=getattr(config, 'spectral_ffn_mult', 2),
+                gate_init=getattr(config, 'residual_gate_init', 0.0),
+            )
             if getattr(config, 'spectral_ffn', False)
             else None
         )
@@ -1494,6 +1562,7 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             self.spectral_pre = SpectralMSABlock(
                 dim, prelayer_heads, config.attention_dropout,
                 ffn_mult=getattr(config, 'spectral_ffn_mult', 2),
+                gate_init=getattr(config, 'residual_gate_init', 0.0),
             )
         else:
             self.spectral_pre = None
@@ -1574,9 +1643,15 @@ class EnhancedWaveletDualTransformerBlock(nn.Module):
             else:
                 gate_resized = gate  # (B, C, H_level, W_level)
 
-            # Apply gate with proper broadcasting
-            gate_expanded = gate_resized.unsqueeze(2)  # (B, C, H_level, W_level) -> (B, C, 1, H_level, W_level)
-            h_gated = h_coeffs * gate_expanded  # (B, C, 3, H_level, W_level), broadcast along band dim
+            # ``legacy`` preserves existing checkpoint semantics. ``identity``
+            # gives a fresh run an exact high-band gain of one at initialization
+            # and keeps the learned gain bounded in (0.5, 1.5).
+            if self.wavelet_detail_gain_mode == 'identity':
+                detail_gain = 0.5 + gate_resized
+            else:
+                detail_gain = gate_resized
+            detail_gain = detail_gain.unsqueeze(2)  # (B, C, 1, H_level, W_level)
+            h_gated = h_coeffs * detail_gain  # (B, C, 3, H_level, W_level), broadcast along band dim
 
             # Optional lightweight detail-band processing (near-identity residual
             # at init). When disabled this branch is skipped entirely.
@@ -1649,9 +1724,10 @@ class DropPath(nn.Module):
 # ===================== INPUT/OUTPUT MODULES =====================
 
 class EnhancedMultiScaleInputProjection(nn.Module):
-    """Optimized multi-scale input processing with fixed grouped convolution"""
+    """Optimized multi-scale input processing with configurable CNN normalization."""
     
-    def __init__(self, in_channels: int, out_channels: int, memory_efficient: bool = True) -> None:
+    def __init__(self, in_channels: int, out_channels: int,
+                 memory_efficient: bool = True, norm_type: str = 'layer') -> None:
         super().__init__()
         mid_channels = out_channels // 2
         
@@ -1689,8 +1765,10 @@ class EnhancedMultiScaleInputProjection(nn.Module):
             nn.GELU()
         )
         
-        # Use AdaptiveNorm2d for CNN context
-        self.norm = create_norm_layer(out_channels, 'layer', for_conv=True)
+        # Do not hard-code LayerNorm here.  Image restoration needs the option
+        # to preserve RGB radiometry in convolutional paths while transformer
+        # attention still uses its own pre-norm.
+        self.norm = create_norm_layer(out_channels, norm_type, for_conv=True)
         self.memory_efficient = memory_efficient
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1815,6 +1893,7 @@ class IntegratedMSWRNet(nn.Module):
         
         # Shared wavelet gate cache for memory efficiency
         self.wavelet_gate_cache = {} if config.wavelet_gate_reuse else None
+        conv_norm_type = getattr(config, 'conv_norm_type', None) or config.norm_type
         
         # Enhanced input projection with fallback for compatibility
         if config.use_multi_scale_input:
@@ -1823,6 +1902,7 @@ class IntegratedMSWRNet(nn.Module):
                     config.input_channels,
                     config.base_channels,
                     config.memory_efficient and config.use_checkpoint,
+                    norm_type=conv_norm_type,
                 )
             except ValueError as e:
                 # Fallback to simple projection if grouped conv fails
@@ -1873,7 +1953,7 @@ class IntegratedMSWRNet(nn.Module):
                 downsample = nn.Sequential(
                     nn.Conv2d(channels, next_channels, 2, stride=2),
                     # Use AdaptiveNorm2d for CNN context which handles NCHW format correctly
-                    create_norm_layer(next_channels, config.norm_type, for_conv=True)
+                    create_norm_layer(next_channels, conv_norm_type, for_conv=True)
                 )
                 self.downsamples.append(downsample)
                 channels = next_channels
@@ -1890,7 +1970,7 @@ class IntegratedMSWRNet(nn.Module):
             # Enhanced upsampling with proper normalization for CNN context
             upsample = nn.Sequential(
                 nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2),
-                create_norm_layer(out_ch, config.norm_type, for_conv=True),
+                create_norm_layer(out_ch, conv_norm_type, for_conv=True),
                 nn.GELU()
             )
             self.upsamples.append(upsample)
@@ -1898,7 +1978,7 @@ class IntegratedMSWRNet(nn.Module):
             # Optimized skip connections with proper normalization
             skip_conv = nn.Sequential(
                 nn.Conv2d(out_ch * 2, out_ch, 1),
-                create_norm_layer(out_ch, config.norm_type, for_conv=True),
+                create_norm_layer(out_ch, conv_norm_type, for_conv=True),
                 nn.GELU()
             )
             self.skip_connections.append(skip_conv)
@@ -1923,6 +2003,7 @@ class IntegratedMSWRNet(nn.Module):
                 hsi_channels=config.output_channels,
                 rgb_channels=config.input_channels,
                 hidden=getattr(config, 'refine_hidden', 64),
+                gate_init=getattr(config, 'residual_gate_init', 0.0),
             )
             if getattr(config, 'multistage_refine', False)
             else None
@@ -1946,26 +2027,32 @@ class IntegratedMSWRNet(nn.Module):
             if self.input_skip.bias is not None:
                 nn.init.zeros_(self.input_skip.bias)
 
-        # Re-apply the near-identity wavelet-gate init after Kaiming.
+        # Re-apply the configured wavelet-gate init after Kaiming.  This is
+        # deliberately per-module: ``legacy`` checkpoint semantics use
+        # sigmoid(4), while fresh identity-centred modules use sigmoid(0).
         for module in self.modules():
             gate = getattr(module, "wavelet_gate", None)
             if gate is not None:
                 nn.init.zeros_(gate[-2].weight)
-                nn.init.constant_(gate[-2].bias, _WAVELET_GATE_INIT_BIAS)
+                gate_bias = (
+                    _WAVELET_GATE_IDENTITY_INIT_BIAS
+                    if getattr(module, "wavelet_detail_gain_mode", "legacy") == "identity"
+                    else _WAVELET_GATE_LEGACY_INIT_BIAS
+                )
+                nn.init.constant_(gate[-2].bias, gate_bias)
             # Restore the zero (identity) init of any wavelet detail block, which
             # the global Kaiming apply() above would otherwise overwrite.
             detail = getattr(module, "wavelet_detail", None)
             if isinstance(detail, WaveletDetailBlock):
                 detail.reset_identity()
-            # Same for the zero-init spectral gated-FFN gate.
+            # Restore configured spectral gated-FFN initialization.
             sffn = getattr(module, "spectral_ffn", None)
             if isinstance(sffn, SpectralGatedFFNBlock):
                 sffn.reset_identity()
-            # Same for the zero-init full-resolution spectral MSAB pre-layer
-            # (re-zeros both its S-MSA gate and its internal FFN gate).
+            # Same for the full-resolution spectral MSAB pre-layer.
             if isinstance(module, SpectralMSABlock):
                 module.reset_identity()
-            # Same for the zero-init multistage refinement stage.
+            # Same for the multistage refinement stage.
             if isinstance(module, SpectralRefinementStage):
                 module.reset_identity()
         
@@ -2212,6 +2299,7 @@ class IntegratedMSWRNet(nn.Module):
                 'num_stages': self.config.num_stages,
                 'base_channels': self.config.base_channels,
                 'attention_type': self.config.attention_type,
+                'landmark_pooling': self.config.landmark_pooling,
                 'use_spectral_attn': (
                     self.config.attention_type == 'hybrid'
                     or getattr(self.config, 'use_spectral_attn', False)
@@ -2219,8 +2307,12 @@ class IntegratedMSWRNet(nn.Module):
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
                 'wavelet_levels': list(self.config.wavelet_levels or []),
+                'wavelet_detail_gain_mode': self.config.wavelet_detail_gain_mode,
                 'use_flash_attn': self.config.use_flash_attn,
-                'norm_type': self.config.norm_type
+                'norm_type': self.config.norm_type,
+                'conv_norm_type': getattr(self.config, 'conv_norm_type', None) or self.config.norm_type,
+                'layer_scale_init': self.config.layer_scale_init,
+                'residual_gate_init': getattr(self.config, 'residual_gate_init', 0.0),
             },
             'optimization': {
                 'use_checkpoint': self.config.use_checkpoint,

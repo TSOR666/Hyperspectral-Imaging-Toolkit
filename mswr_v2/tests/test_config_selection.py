@@ -18,6 +18,12 @@ def test_default_launch_uses_canonical_train_config(monkeypatch):
 
     assert Path(args.config).resolve() == (ROOT / "configs" / "train.yaml").resolve()
     assert args.use_spectral_attn is True
+    assert args.spectral_attn_heads == 1
+    assert args.spectral_ffn is True
+    assert args.multistage_refine is True
+    assert args.landmark_pooling == "learned_content"
+    assert args.conv_norm_type == "none"
+    assert args.wavelet_detail_gain_mode == "identity"
     assert args.wavelet_levels == [1, 1, 1]
     assert args.use_ema is True
 
@@ -62,3 +68,25 @@ def test_spectralffn_experiment_plumbs_architecture_knobs(monkeypatch):
     assert args.wavelet_detail_processing is True
     assert args.cache_dtype == "float32"
     assert args.use_enhanced_loss is False
+
+
+def test_depth_recovery_config_plumbs_fresh_initialization_controls(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_mswr_v212_logging.py",
+            "--config",
+            str(ROOT / "configs" / "experiments" / "sota_depth_recovery.yaml"),
+        ],
+    )
+
+    args = trainer.load_config(trainer.parse_arguments())
+
+    assert args.spectral_prelayer is True
+    assert args.blocks_per_stage == 2
+    assert args.landmark_pooling == "learned_content"
+    assert args.layer_scale_init == 1e-2
+    assert args.residual_gate_init == 1e-2
+    assert args.conv_norm_type == "none"
+    assert args.wavelet_detail_gain_mode == "identity"

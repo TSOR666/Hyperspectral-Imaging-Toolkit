@@ -181,6 +181,80 @@ def _validate_checkpoint_compatibility(
         )
 
 
+_RESUME_MODEL_CONFIG_FIELDS = (
+    # Tensor layout and topology.
+    'input_channels', 'output_channels', 'base_channels', 'channel_expansion',
+    'num_stages', 'attention_type', 'num_heads', 'window_size', 'num_landmarks',
+    'landmark_pooling', 'local_global_fusion', 'use_wavelet', 'wavelet_type',
+    'wavelet_levels', 'wavelet_detail_processing', 'wavelet_detail_gain_mode',
+    'use_spectral_attn', 'spectral_attn_heads', 'spectral_ffn',
+    'spectral_ffn_mult', 'multistage_refine', 'refine_hidden',
+    'spectral_prelayer', 'blocks_per_stage', 'mlp_ratio', 'ffn_type',
+    'use_multi_scale_input', 'use_skip_init',
+    # Parameters can have the same state-dict keys but different semantics when
+    # any of these values changes, so a key-count check alone is not enough.
+    'norm_type', 'conv_norm_type', 'layer_scale_init', 'residual_gate_init',
+    'dropout', 'attention_dropout', 'drop_path', 'use_flash_attn',
+    'wavelet_gate_reuse',
+)
+
+
+def _validate_resume_model_config(
+    checkpoint_model_config: Any,
+    current_model_config: MSWRDualConfig,
+) -> bool:
+    """Reject a full-state resume whose model settings change weight meaning.
+
+    ``strict=False`` cannot catch semantic changes such as static versus
+    content-pooled landmarks because their parameter keys and shapes match.
+    Normalize old configs through the current dataclass so newly added fields
+    receive their backward-compatible defaults before comparison.
+
+    Returns ``False`` when an old checkpoint has no saved model config, allowing
+    the caller to emit a prominent compatibility warning before falling back to
+    state-dict checks.
+    """
+    if checkpoint_model_config is None:
+        return False
+    if not isinstance(checkpoint_model_config, dict):
+        raise RuntimeError(
+            "Training checkpoint has a non-mapping model_config; refusing a full-state resume."
+        )
+
+    valid_fields = set(current_model_config.to_dict())
+    unknown_fields = sorted(set(checkpoint_model_config) - valid_fields)
+    if unknown_fields:
+        raise RuntimeError(
+            "Training checkpoint model_config contains unrecognized field(s): "
+            f"{', '.join(unknown_fields)}. Refusing a potentially incompatible resume."
+        )
+
+    try:
+        normalized_checkpoint = MSWRDualConfig(**checkpoint_model_config).to_dict()
+    except (AssertionError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Training checkpoint model_config is invalid under the current model: {exc}"
+        ) from exc
+
+    current = current_model_config.to_dict()
+    differences = {
+        key: (normalized_checkpoint.get(key), current.get(key))
+        for key in _RESUME_MODEL_CONFIG_FIELDS
+        if normalized_checkpoint.get(key) != current.get(key)
+    }
+    if differences:
+        detail = '; '.join(
+            f"{key}: checkpoint={saved!r}, current={requested!r}"
+            for key, (saved, requested) in differences.items()
+        )
+        raise RuntimeError(
+            "Training checkpoint model_config does not match the current architecture; "
+            "refusing a semantic-changing full-state resume. Start a fresh run or load "
+            f"weights through an explicit fine-tuning workflow. Differences: {detail}"
+        )
+    return True
+
+
 def _env_int(name: str, default: int = 0) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -444,12 +518,20 @@ class TrainingConfig:
         self.refine_hidden = getattr(args, 'refine_hidden', 64)
         self.spectral_prelayer = getattr(args, 'spectral_prelayer', False)
         self.blocks_per_stage = getattr(args, 'blocks_per_stage', 1)
+        # Keep transformer pre-norm and convolutional normalization independent:
+        # RGB-to-HSI radiometry is particularly sensitive to per-pixel channel
+        # normalization in projection/resampling convolutions.
+        self.norm_type = getattr(args, 'norm_type', 'layer')
+        self.conv_norm_type = getattr(args, 'conv_norm_type', None)
+        self.layer_scale_init = getattr(args, 'layer_scale_init', 1e-4)
+        self.residual_gate_init = getattr(args, 'residual_gate_init', 0.0)
 
         # CNN Wavelet parameters (no external dependencies)
         self.use_wavelet = args.use_wavelet
         self.wavelet_type = args.wavelet_type
         self.wavelet_levels = getattr(args, 'wavelet_levels', None)
         self.wavelet_detail_processing = getattr(args, 'wavelet_detail_processing', False)
+        self.wavelet_detail_gain_mode = getattr(args, 'wavelet_detail_gain_mode', 'legacy')
 
         # Regularization knobs (None = keep the model's defaults). These are
         # the comparability-safe anti-overfitting levers (architecture-internal
@@ -583,7 +665,9 @@ def parse_arguments():
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--num_landmarks", type=int, default=64)
     parser.add_argument("--landmark_pooling", type=str, default='learned',
-                       choices=['learned', 'uniform', 'adaptive'])
+                       choices=['learned', 'learned_content', 'uniform', 'adaptive'],
+                       help="'learned' preserves legacy static landmarks; "
+                            "'learned_content' pools input-dependent global landmarks")
     parser.add_argument("--use_checkpoint", action='store_true')
     parser.add_argument("--use_flash_attn", action='store_true', default=True)
     
@@ -624,6 +708,22 @@ def parse_arguments():
     parser.add_argument("--wavelet_detail_processing", action='store_true', default=False,
                        help="Process high-frequency wavelet detail bands with a lightweight "
                             "depthwise residual instead of gating only (near-identity at init).")
+    parser.add_argument("--wavelet_detail_gain_mode", type=str, default='legacy',
+                       choices=['legacy', 'identity'],
+                       help="High-band gate semantics: legacy preserves old checkpoints; "
+                            "identity starts fresh runs with exact detail gain one")
+    parser.add_argument("--norm_type", type=str, default='layer',
+                       choices=['layer', 'group', 'batch', 'none'],
+                       help="Normalization used inside attention and feed-forward blocks")
+    parser.add_argument("--conv_norm_type", type=str, default=None,
+                       choices=['layer', 'group', 'batch', 'none'],
+                       help="Normalization used by RGB projection/resampling convolutions; "
+                            "omit to inherit --norm_type (legacy behavior)")
+    parser.add_argument("--layer_scale_init", type=float, default=1e-4,
+                       help="Initial LayerScale value for transformer residual branches")
+    parser.add_argument("--residual_gate_init", type=float, default=0.0,
+                       help="Initial value for optional spectral/refinement ReZero gates; "
+                            "use a small positive value only for fresh deep/prelayer runs")
     # Regularization (None keeps the model defaults: drop_path 0.1, dropout 0)
     parser.add_argument("--drop_path", type=float, default=None,
                        help='Stochastic-depth rate (model default 0.1); the main '
@@ -1263,6 +1363,7 @@ class EnhancedTrainer:
                 'use_wavelet': self.config.use_wavelet,
                 'wavelet_type': self.config.wavelet_type,
                 'wavelet_detail_processing': self.config.wavelet_detail_processing,
+                'wavelet_detail_gain_mode': self.config.wavelet_detail_gain_mode,
                 'landmark_pooling': self.config.landmark_pooling,
                 'use_spectral_attn': self.config.use_spectral_attn,
                 'spectral_attn_heads': self.config.spectral_attn_heads,
@@ -1272,6 +1373,10 @@ class EnhancedTrainer:
                 'refine_hidden': self.config.refine_hidden,
                 'spectral_prelayer': self.config.spectral_prelayer,
                 'blocks_per_stage': self.config.blocks_per_stage,
+                'norm_type': self.config.norm_type,
+                'conv_norm_type': self.config.conv_norm_type,
+                'layer_scale_init': self.config.layer_scale_init,
+                'residual_gate_init': self.config.residual_gate_init,
                 # The model's per-forward PerformanceMonitor is consumed ONLY by
                 # _profile_model() (gated on --profile_model). Driving it from
                 # memory_monitoring meant it ran on every training forward with
@@ -1308,6 +1413,7 @@ class EnhancedTrainer:
                 wavelet_type=self.config.wavelet_type,
                 wavelet_levels=self.config.wavelet_levels,
                 wavelet_detail_processing=self.config.wavelet_detail_processing,
+                wavelet_detail_gain_mode=self.config.wavelet_detail_gain_mode,
                 use_spectral_attn=self.config.use_spectral_attn,
                 spectral_attn_heads=self.config.spectral_attn_heads,
                 spectral_ffn=self.config.spectral_ffn,
@@ -1316,6 +1422,10 @@ class EnhancedTrainer:
                 refine_hidden=self.config.refine_hidden,
                 spectral_prelayer=self.config.spectral_prelayer,
                 blocks_per_stage=self.config.blocks_per_stage,
+                norm_type=self.config.norm_type,
+                conv_norm_type=self.config.conv_norm_type,
+                layer_scale_init=self.config.layer_scale_init,
+                residual_gate_init=self.config.residual_gate_init,
                 # See note above: only --profile_model consumes this monitor.
                 performance_monitoring=self.config.profile_model,
                 **{
@@ -1660,11 +1770,25 @@ class EnhancedTrainer:
                 )
                 checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             
+            # Verify architecture semantics before loading model/optimizer state.
+            # Matching state_dict keys are insufficient for settings such as
+            # learned vs learned_content landmarks or legacy vs identity wavelet
+            # gains, whose tensors have identical shapes but different meanings.
+            current_model = unwrap_model(self.model)
+            config_verified = _validate_resume_model_config(
+                checkpoint.get('model_config'), current_model.config
+            )
+            if not config_verified:
+                self.logger.warning(
+                    "Checkpoint has no model_config; semantic resume compatibility cannot be "
+                    "verified. Falling back to state-dict key checks only."
+                )
+
             # Load model state
-            incompatible = unwrap_model(self.model).load_state_dict(checkpoint['state_dict'], strict=False)
+            incompatible = current_model.load_state_dict(checkpoint['state_dict'], strict=False)
             _validate_checkpoint_compatibility(
                 incompatible,
-                len(unwrap_model(self.model).state_dict()),
+                len(current_model.state_dict()),
                 "Training checkpoint",
             )
 
@@ -1775,6 +1899,8 @@ class EnhancedTrainer:
         losses = AverageMeter()
         loss_components = defaultdict(AverageMeter)
         grad_norms = AverageMeter()
+        optimizer_steps = 0
+        clipped_steps = 0
         
         # Update loss epoch if using enhanced loss
         if hasattr(self.criterion, 'set_epoch'):
@@ -1936,7 +2062,11 @@ class EnhancedTrainer:
                     _gn = grad_norm.item()
                 else:
                     _gn = grad_norm
-                grad_norms.update(_gn)
+                optimizer_steps += 1
+                if self.config.gradient_clip > 0:
+                    grad_norms.update(_gn)
+                    if _gn > self.config.gradient_clip:
+                        clipped_steps += 1
 
                 # Vanishing gradient detection
                 if _gn == 0.0:
@@ -2089,6 +2219,16 @@ class EnhancedTrainer:
         result = {'loss': losses.avg}
         for key, meter in loss_components.items():
             result[key] = meter.avg
+        if grad_norms.count > 0:
+            result['grad_norm'] = grad_norms.avg
+            result['grad_clipped_fraction'] = clipped_steps / max(1, optimizer_steps)
+            self.logger.info(
+                "Gradient telemetry: pre-clip norm=%.4f; clipped=%.1f%% (%d/%d steps)",
+                grad_norms.avg,
+                100.0 * result['grad_clipped_fraction'],
+                clipped_steps,
+                optimizer_steps,
+            )
         
         # Memory summary
         if self.config.memory_monitoring and torch.cuda.is_available():
@@ -2545,6 +2685,11 @@ class EnhancedTrainer:
                     f"| Val PSNR: {val_metrics['psnr']:.2f}dB "
                     f"| Val SSIM: {val_metrics['ssim']:.4f}"
                 )
+                if 'grad_norm' in train_metrics:
+                    log_msg += (
+                        f" | Grad norm (pre-clip): {train_metrics['grad_norm']:.4f}"
+                        f" | Clipped: {100.0 * train_metrics.get('grad_clipped_fraction', 0.0):.1f}%"
+                    )
                 
                 if 'sam' in val_metrics:
                     log_msg += f" | Val SAM: {val_metrics['sam']:.2f}deg"

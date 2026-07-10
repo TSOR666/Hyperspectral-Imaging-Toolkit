@@ -1,5 +1,6 @@
 """Runtime regression tests for the NTIRE evaluation path."""
 
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,41 @@ import torch.nn as nn
 import mswr_test_ntire
 from mswr_inference import EnsembleProcessor
 from mswr_test_ntire import MetricsCalculator, NTIRETestEngine
+
+
+def test_cli_can_disable_amp_for_precision_controlled_scoring(monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run_test(self):
+            return {}
+
+    monkeypatch.setattr(mswr_test_ntire, "NTIRETestEngine", FakeEngine)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mswr_test_ntire.py",
+            "--model_path",
+            "checkpoint.pth",
+            "--data_root",
+            "ARAD_1K",
+            "--split",
+            "valid",
+            "--no_amp",
+            "--amp_dtype",
+            "bf16",
+        ],
+    )
+
+    mswr_test_ntire.main()
+
+    assert captured["config"].split == "valid"
+    assert captured["config"].use_amp is False
+    assert captured["config"].amp_dtype == "bf16"
 
 
 def test_raw_error_statistics_are_strictly_bounded():
