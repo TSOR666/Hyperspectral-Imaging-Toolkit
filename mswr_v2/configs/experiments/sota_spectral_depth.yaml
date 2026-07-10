@@ -1,7 +1,15 @@
 # ============================================================================
-# MSWR-Net v2.1.2  -  Rung-3: full-resolution spectral MSAB + depth
+# MSWR-Net v2.1.2  -  HISTORICAL FAILED Rung-3: full-resolution spectral MSAB + depth
 # experiment_name: mswr_v212_sota_spectral_depth
 # ============================================================================
+#
+# WARNING: This exact recipe was reproduced in the corrected July 2026 logs and
+# catastrophically underfit (train MRAE ~0.78, validation ~0.68 after 40k
+# updates). It is retained only to reproduce that failure; do not launch or
+# resume it for a production result. Use `sota_depth_recovery.yaml` for a fresh
+# depth/prelayer run, or `../train.yaml` for the stable shallow recovery baseline.
+# The rationale and expected trajectory below are historical hypotheses, not
+# results; this header takes precedence.
 #
 # The Rung-0..2 ladder (full-rank spectral, spectral-FFN, multistage refine)
 # established that the config-reachable floor is ~0.235-0.250 MRAE and that the

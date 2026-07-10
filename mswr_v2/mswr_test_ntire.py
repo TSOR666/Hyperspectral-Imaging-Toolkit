@@ -1382,7 +1382,13 @@ def main():
     parser.add_argument('--ensemble_mode', type=str, default=None,
                        choices=['flip', 'rotate', 'full'])
     parser.add_argument('--mc_dropout_samples', type=int, default=0)
-    parser.add_argument('--use_amp', action='store_true', default=True)
+    parser.add_argument('--use_amp', dest='use_amp', action='store_true', default=True,
+                       help='Score with automatic mixed precision (default).')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                       help='Disable AMP and score in FP32 for a precision-controlled comparison.')
+    parser.add_argument('--amp_dtype', type=str, default='auto',
+                       choices=['auto', 'fp16', 'bf16'],
+                       help='Autocast dtype when AMP is enabled; match the training run for comparison.')
     
     args = parser.parse_args()
     
