@@ -462,8 +462,13 @@ class RotaryEmbedding(nn.Module):
         
         t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)  # (seq_len,)
         freqs = torch.einsum("i,j->ij", t, inv_freq)  # (seq_len,) x (dim/2,) -> (seq_len, dim/2)
-        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim/2) -> (seq_len, dim)
-        
+        # apply_rotary_emb pairs INTERLEAVED elements (x[...,::2], x[...,1::2]), the GPT-J
+        # convention, so each rotary pair (2i, 2i+1) must share the SAME angle. Use
+        # repeat_interleave (cos=[c0,c0,c1,c1,...]) NOT cat((freqs,freqs)) (=[c0,c1,...,c0,c1,...],
+        # the rotate-half/NeoX layout). cat here gave each interleaved pair two different
+        # frequencies -> not an orthogonal rotation and no relative-position invariance.
+        emb = freqs.repeat_interleave(2, dim=-1)  # (seq_len, dim/2) -> (seq_len, dim)
+
         cos = emb.cos().to(dtype)  # (seq_len, dim)
         sin = emb.sin().to(dtype)  # (seq_len, dim)
         
@@ -741,20 +746,18 @@ class Sparsemax(nn.Module):
         # Compute threshold
         threshold = (x_cumsum - 1) / k  # (..., N)
         is_gt = x_sorted > threshold  # (..., N)
-        k_z = is_gt.sum(dim=self.dim, keepdim=True).float().clamp_min(EPS)  # (..., 1)
-        
-        # Compute tau(z) - IMPROVED: Use where instead of creating full mask
-        indices = torch.arange(x.size(self.dim), device=x.device)  # (N,)
-        if self.dim != -1:
-            shape = [1] * x.ndim
-            shape[self.dim] = -1
-            indices = indices.view(*shape)  # broadcastable to x
-        
-        # Use torch.where for efficient selection
-        valid_cumsum = torch.where(indices < k_z, x_cumsum, torch.zeros_like(x_cumsum))  # (..., N)
-        x_cumsum_filtered = valid_cumsum.max(dim=self.dim, keepdim=True)[0]  # (..., 1)
-        tau = (x_cumsum_filtered - 1) / k_z  # (..., 1)
-        
+        k_z = is_gt.sum(dim=self.dim, keepdim=True)  # (..., 1) integer support size, >= 1
+
+        # tau(z) = (sum of the top-k_z sorted values - 1) / k_z = (x_cumsum[k_z-1] - 1) / k_z.
+        # Gather x_cumsum at index k_z-1 directly. The previous where(indices<k_z, x_cumsum, 0).max()
+        # was wrong: after the x-=x.max() stabilization the descending cumsum is non-increasing and
+        # starts at 0, so .max() returned x_cumsum[0]=0 (the sentinel) instead of x_cumsum[k_z-1],
+        # yielding tau too small and outputs that do not sum to 1 (simplex violated).
+        k_idx = (k_z - 1).clamp_min(0)  # (..., 1) long index into the sorted axis
+        x_cumsum_at_k = x_cumsum.gather(self.dim, k_idx)  # (..., 1)
+        k_z_f = k_z.to(x.dtype).clamp_min(EPS)  # (..., 1)
+        tau = (x_cumsum_at_k - 1) / k_z_f  # (..., 1)
+
         # Apply sparsemax
         return torch.clamp(x - tau, min=0)  # broadcast (..., 1) over x
 

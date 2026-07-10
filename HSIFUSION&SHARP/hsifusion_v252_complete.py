@@ -36,6 +36,7 @@ import math
 import time
 import warnings
 import tempfile
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -700,36 +701,39 @@ class RobustEnhancedSpectralAttention(nn.Module):
                     )
                     continue
                 
-                # (B, rd, h_p, w_p) -> (B, bands_per_group, num_bands, h_p*w_p)
+                # Expose (num_bands, bands_per_group). The 31 spectral bands are the ATTENDED
+                # tokens; bands_per_group is the per-band feature/head width. rd is laid out as
+                # channel = group*num_bands + band (bands_per_group is the outer split).
                 q = q.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
-                    0, 3, 1, 2
-                )  # (B, h_p*w_p, bands_per_group, num_bands)
+                    0, 3, 2, 1
+                )  # (B, h_p*w_p, num_bands, bands_per_group)
                 k = k.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
                     0, 3, 2, 1
                 )  # (B, h_p*w_p, num_bands, bands_per_group)
                 v = v.view(B, bands_per_group, self.num_bands, spatial_dim).permute(
-                    0, 3, 1, 2
-                )  # (B, h_p*w_p, bands_per_group, num_bands)
-                
-                # Compute spectral attention with correlation
-                scale = (self.num_bands) ** -0.5
-                q_float = q.float()  # (B, h_p*w_p, bands_per_group, num_bands)
-                k_float = k.float()  # (B, h_p*w_p, num_bands, bands_per_group)
-                v_float = v.float()  # (B, h_p*w_p, bands_per_group, num_bands)
-                spectral_weight_float = self._get_spectral_weight(
+                    0, 3, 2, 1
+                )  # (B, h_p*w_p, num_bands, bands_per_group)
+
+                # Spectral attention: a per-pixel 31x31 band-band map, softmaxed over the 31
+                # spectral bands, with the learned 31x31 correlation as an additive (relative)
+                # bias. Previously the softmax ran over the degenerate bands_per_group axis
+                # (2-9 elements) and the 31x31 correlation was never the attended distribution,
+                # so no genuine cross-band spectral modeling happened.
+                scale = float(bands_per_group) ** -0.5
+                q_float = q.float()  # (B, HW, num_bands, bands_per_group)
+                k_float = k.float()  # (B, HW, num_bands, bands_per_group)
+                v_float = v.float()  # (B, HW, num_bands, bands_per_group)
+                spectral_bias = self._get_spectral_weight(
                     idx, q.device, torch.float32
                 )  # (num_bands, num_bands)
-                # (B, h_p*w_p, bands_per_group, num_bands) @ (num_bands, num_bands) -> same
-                # then @ (B, h_p*w_p, num_bands, bands_per_group) -> (B, h_p*w_p, bands_per_group, bands_per_group)
-                attn = torch.matmul(torch.matmul(q_float, spectral_weight_float), k_float) * scale  # (B, h_p*w_p, bands_per_group, bands_per_group)
-                attn = F.softmax(attn, dim=-1)  # (B, h_p*w_p, bands_per_group, bands_per_group)
-                
-                # (B, h_p*w_p, bands_per_group, bands_per_group) @ (B, h_p*w_p, bands_per_group, num_bands)
-                out = torch.matmul(attn, v_float)  # (B, h_p*w_p, bands_per_group, num_bands)
-                out = out.to(q.dtype)  # (B, h_p*w_p, bands_per_group, num_bands)
-                out = out.permute(0, 2, 3, 1).contiguous().reshape(
+                attn = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale  # (B, HW, num_bands, num_bands)
+                attn = attn + spectral_bias  # broadcast (num_bands, num_bands) over (B, HW)
+                attn = F.softmax(attn, dim=-1)  # over the 31 spectral bands
+                out = torch.matmul(attn, v_float)  # (B, HW, num_bands, bands_per_group)
+                out = out.to(q.dtype)
+                out = out.permute(0, 3, 2, 1).contiguous().reshape(
                     B, rd, h_p, w_p
-                )  # (B, h_p*w_p, bands_per_group, num_bands) -> (B, rd, h_p, w_p)
+                )  # (B, HW, num_bands, bpg) -> (B, bpg, num_bands, HW) -> (B, rd, h_p, w_p)
                 
                 # Upsample back to original size
                 out = F.interpolate(
@@ -1181,7 +1185,12 @@ class HSIFusionNetV25LightningPro(nn.Module):
                 B, C, H, W = x.shape
                 x_flat = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
                 skip_flat = skip.flatten(2).transpose(1, 2)  # (B, C, Hs, Ws) -> (B, Hs*Ws, C)
-                x_flat = self.cross_attns[i](
+                # Residual around the cross-attention so the upsampled bottleneck features
+                # survive as VALUES, not merely as attention query logits. Without this residual
+                # the decoder output was a pure (softmax-weighted) copy of the pooled skip
+                # tokens, discarding the decoder trunk and throttling gradient flow to the
+                # bottleneck. This is a standard transformer cross-attention residual.
+                x_flat = x_flat + self.cross_attns[i](
                     x_flat, skip_flat, context_hw=skip.shape[-2:]
                 )  # (B, H*W, C)
                 x = x_flat.transpose(1, 2).reshape(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
@@ -1323,15 +1332,34 @@ class HSIFusionNetV25LightningPro(nn.Module):
             config_dict = checkpoint['hyper_parameters'].get('config', {})
         else:
             raise ValueError("No config found in checkpoint")
-        
+
+        # The HSIFusion trainer saves its HSIFusionTrainingConfig dataclass (not a
+        # LightningProConfig) under 'config'. Normalize any dataclass to a plain dict.
+        if dataclasses.is_dataclass(config_dict) and not isinstance(config_dict, type):
+            config_dict = dataclasses.asdict(config_dict)
+        config_dict = dict(config_dict)
+
         # Apply overrides
         if config_override:
             config_dict.update(config_override)
-        
-        # Create model
-        config = LightningProConfig(**config_dict)
-        model = cls(config)
-        
+
+        # A training-style config (identified by 'model_size') describes the backbone via a
+        # size preset + a handful of model kwargs, NOT the full LightningProConfig field set.
+        # Rebuild through the factory (as the trainer does) instead of splatting training-only
+        # fields (batch_size, epochs, ...) into LightningProConfig, which would raise TypeError.
+        if 'model_size' in config_dict:
+            model = create_hsifusion_lightning_pro(
+                model_size=config_dict['model_size'],
+                in_channels=config_dict.get('in_channels', 3),
+                out_channels=config_dict.get('out_channels', 31),
+                compile_mode=None,  # never compile a freshly-loaded inference model
+                cross_attention_max_tokens=config_dict.get('cross_attention_max_tokens', 1024),
+                estimate_uncertainty=config_dict.get('estimate_uncertainty', False),
+            )
+        else:
+            config = LightningProConfig(**config_dict)
+            model = cls(config)
+
         # Load state dict
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
@@ -1339,11 +1367,21 @@ class HSIFusionNetV25LightningPro(nn.Module):
             state_dict = checkpoint['model_state_dict']
         else:
             state_dict = checkpoint
-        
-        # Remove 'model.' prefix if present (from Lightning)
-        state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
-        
-        model.load_state_dict(state_dict, strict=strict)
+
+        # Strip a leading 'model.' prefix (Lightning) / torch.compile '_orig_mod.' wrapper.
+        # Use prefix stripping, NOT str.replace, which would corrupt any key that merely
+        # contains 'model.' as a substring.
+        def _strip_prefix(key: str) -> str:
+            for pfx in ("_orig_mod.", "model."):
+                if key.startswith(pfx):
+                    return key[len(pfx):]
+            return key
+        state_dict = {_strip_prefix(k): v for k, v in state_dict.items()}
+
+        # Unwrap a compiled module target if present.
+        target = getattr(model, "_orig_mod", model)
+        target.load_state_dict(state_dict, strict=strict)
+        model.eval()
         return model
 
 

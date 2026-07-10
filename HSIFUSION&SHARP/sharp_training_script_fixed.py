@@ -409,10 +409,12 @@ class DedicatedSHARPTrainer:
         return "out of memory" in str(exc).lower()
 
     def _has_finite_gradients(self) -> bool:
-        for param in self.model.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                return False
-        return True
+        # One fused reduction (single host-device sync) instead of one .all() sync per
+        # parameter tensor on the optimizer-step hot path.
+        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        if not grads:
+            return True
+        return bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
 
     def _safe_mrae(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
@@ -574,12 +576,17 @@ class DedicatedSHARPTrainer:
         return ema_state
     
     def _update_ema(self):
-        """Update EMA weights"""
+        """Update EMA weights (called once every ema_update_every optimizer steps).
+
+        Compensates decay for throttling (decay**N) so the effective averaging window
+        matches an every-step EMA with ema_decay, mirroring SHARPv32Trainer.update_ema.
+        """
+        decay = self.config.ema_decay ** max(1, self.config.ema_update_every)
         with torch.no_grad():
             for name, param in unwrap_model(self.model).named_parameters():
                 if name in self.ema_state:
-                    self.ema_state[name].mul_(self.config.ema_decay).add_(
-                        param.detach().cpu(), alpha=1 - self.config.ema_decay
+                    self.ema_state[name].mul_(decay).add_(
+                        param.detach().cpu(), alpha=1 - decay
                     )
     
     def _estimate_steps_per_epoch(self) -> int:
@@ -845,21 +852,36 @@ class DedicatedSHARPTrainer:
 
         self.consecutive_nonfinite = 0
         loss = loss / self.config.accumulate_steps
-        
-        # Backward pass
-        self.scaler.scale(loss).backward()
-        
+
+        is_step = should_optimizer_step(batch_idx, len(self.train_loader), self.config.accumulate_steps) or is_last_batch
+
+        # Backward pass. Under DDP, skip the gradient all-reduce on non-stepping
+        # micro-batches: without no_sync() every accumulated micro-batch triggers a full
+        # all-reduce (K reductions per optimizer step instead of 1). The math is unchanged
+        # (sum of per-rank-averaged grads == average of summed grads); only the comms differ.
+        sync_grads = is_step or not getattr(self, "distributed", False)
+        backward_ctx = (
+            contextlib.nullcontext()
+            if sync_grads or not isinstance(self.model, DDP)
+            else self.model.no_sync()
+        )
+        with backward_ctx:
+            self.scaler.scale(loss).backward()
+
         # Gradient accumulation
-        if should_optimizer_step(batch_idx, len(self.train_loader), self.config.accumulate_steps) or is_last_batch:
+        if is_step:
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 
+                self.model.parameters(),
                 self.config.gradient_clip
             )
             if not self._all_ranks_true(self._has_finite_gradients()):
                 self.consecutive_nonfinite += 1
                 warnings.warn(f"Non-finite gradients at batch={batch_idx+1}; skipping optimizer step.")
                 self.optimizer.zero_grad(set_to_none=True)
+                # unscale_ already ran: reset scaler state (and lower scale) so the next
+                # step's unscale_ does not raise and abort the run.
+                self.scaler.update()
                 if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
                     raise RuntimeError("Exceeded maximum consecutive non-finite gradients; aborting to avoid divergence.")
                 return {
@@ -868,15 +890,19 @@ class DedicatedSHARPTrainer:
                     'lr': self.optimizer.param_groups[0]['lr'],
                     'skipped': True,
                 }
-            
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.scheduler.step()
-            
-            # Update EMA if available
+
+            # Update EMA if available. Honor ema_update_every here too so the manual path
+            # matches the built-in SHARPv32Trainer (otherwise the flag is silently ignored
+            # whenever accumulate_steps > 1, giving different EMA weights for identical HPs).
             if self.ema_state is not None:
-                self._update_ema()
+                self._ema_step_counter = getattr(self, "_ema_step_counter", 0) + 1
+                if self._ema_step_counter % max(1, self.config.ema_update_every) == 0:
+                    self._update_ema()
         else:
             grad_norm = 0.0
         
@@ -899,6 +925,7 @@ class DedicatedSHARPTrainer:
                 psnr_max=self.config.psnr_data_range,
                 crop_size=crop_size,
                 use_ema=self.config.ema_decay > 0,
+                mrae_eps=self.config.min_mrae_denom,
             )
         else:
             metrics = self._manual_validate()

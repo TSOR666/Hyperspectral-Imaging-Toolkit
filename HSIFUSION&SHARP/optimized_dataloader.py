@@ -196,11 +196,29 @@ class OptimizedTrainDataset(Dataset):
     
     def _setup_cache(self, cache_size: int):
         """Setup LRU cache for lazy loading"""
+        self._cache_size = int(cache_size)
+
         @lru_cache(maxsize=cache_size)
         def load_image_cached(idx: int) -> Tuple[np.ndarray, np.ndarray]:
             return self._load_image_pair(idx)
-        
+
         self._load_cached = load_image_cached
+
+    def __getstate__(self):
+        """Drop the un-picklable lru_cache closure so the dataset can be sent to DataLoader
+        workers. Under the Windows/macOS 'spawn' start method the dataset is pickled per
+        worker; a nested @lru_cache function is a local object and raises
+        "Can't pickle local object" at worker startup, crashing lazy-mode training before
+        the first batch. The cache is rebuilt in __setstate__.
+        """
+        state = self.__dict__.copy()
+        state.pop("_load_cached", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if getattr(self, "memory_mode", None) == "lazy":
+            self._setup_cache(getattr(self, "_cache_size", 4))
     
     def _load_image_pair(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """Load a single RGB-HSI pair"""
@@ -490,7 +508,11 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
     num_workers = config.num_workers
     memory_mode = memory_mode or config.memory_mode
     augment = getattr(config, "augment", True)
-    cache_size = int(getattr(config, "cache_size", 4 if memory_mode == 'lazy' else 0))
+    # Lazy mode keys the LRU on image index; under globally-shuffled patch sampling
+    # consecutive __getitem__ calls touch random images, so a tiny cache thrashes (a
+    # cache of 4 gives <1% hit rate and re-decodes a full .mat+RGB per patch). Size this
+    # to a RAM budget: larger is dramatically faster at the cost of resident memory.
+    cache_size = int(getattr(config, "cache_size", 32 if memory_mode == 'lazy' else 0))
     base_seed = int(getattr(config, "seed", 42))
     distributed = bool(getattr(config, "distributed", False))
     rank = int(getattr(config, "rank", 0))
@@ -559,7 +581,11 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         pin_memory=pin_memory,
         drop_last=True,
         worker_init_fn=worker_init_fn,
-        persistent_workers=num_workers > 0 and memory_mode == 'lazy',
+        # Keep workers alive across epochs for ALL memory modes (not just lazy). Under 'spawn'
+        # (Windows/macOS default) a non-persistent worker re-pickles the whole dataset every
+        # epoch; for preloaded standard/float16 mode that re-serializes and re-duplicates the
+        # full in-RAM image set to every worker each epoch (multi-minute stalls / RAM spike / OOM).
+        persistent_workers=num_workers > 0,
         **_prefetch_kwargs(num_workers),
         **pin_memory_kwargs,
     )

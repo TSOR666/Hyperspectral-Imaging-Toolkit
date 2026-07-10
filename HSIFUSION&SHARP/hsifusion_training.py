@@ -174,10 +174,14 @@ class HSIFusionTrainer:
         return "out of memory" in str(exc).lower()
 
     def _has_finite_gradients(self) -> bool:
-        for param in self.model.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                return False
-        return True
+        # Aggregate per-parameter finiteness into a single reduction so we pay ONE
+        # host-device sync per optimizer step instead of one per parameter tensor
+        # (hundreds of serialized syncs on GPU). Mirrors the scaler's own inf check.
+        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        if not grads:
+            return True
+        flags = torch.stack([torch.isfinite(g).all() for g in grads])
+        return bool(flags.all().item())
 
     def _safe_mrae(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
@@ -364,6 +368,12 @@ class HSIFusionTrainer:
                         self.consecutive_nonfinite += 1
                         self.skipped_nonfinite_batches += 1
                         self.optimizer.zero_grad(set_to_none=True)
+                        # CRITICAL: unscale_ has already run this iteration. We must call
+                        # scaler.update() (which also lowers the loss scale) to reset the
+                        # scaler's per-optimizer state; otherwise the NEXT optimizer step's
+                        # unscale_ raises "unscale_() has already been called ...", aborting
+                        # the whole run on the first fp16 overflow this guard exists to survive.
+                        self.scaler.update()
                         warnings.warn(
                             f"Non-finite gradients at epoch={epoch+1}, batch={batch_idx+1}; skipping optimizer step."
                         )
@@ -430,10 +440,15 @@ class HSIFusionTrainer:
                 rgb = rgb.to(self.device, non_blocking=True)
                 hsi = hsi.to(self.device, non_blocking=True)
 
-                with autocast(enabled=self.use_amp):
+                # Validate in fp32 (autocast disabled): the MST++/ARAD-1K MRAE protocol and
+                # best-checkpoint selection must be computed on fp32 predictions for
+                # comparability. Running the sparse per-image val set (batch_size=1) without
+                # AMP is cheap and removes fp16 rounding from the reported/selected metric.
+                with autocast(enabled=False):
                     outputs = self.model(rgb)
                     if isinstance(outputs, tuple):
                         outputs, _ = outputs
+                outputs = outputs.float()
 
                 metrics = self._compute_metrics(outputs, hsi)
                 for key in metrics_agg:
