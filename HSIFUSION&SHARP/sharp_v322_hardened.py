@@ -1022,7 +1022,11 @@ class SHARPv32Config:
     sparse_sparsity_ratio: float = 0.9
     sparse_exact_topk_max_tokens: int = 1024
     sparse_landmark_tokens: int = 256
-    max_global_tokens: Optional[int] = None
+    # Bound the dense global-attention branch (MultiScaleAttention) and decoder cross-attention
+    # K/V to this many pooled tokens. Default 1024 (matches the training config) so a model built
+    # directly via create_sharp_v32()/SHARPv32Config() is not silently O(N^2) at high resolution
+    # (e.g. 128x128 -> N=16384). None restores unbounded dense attention.
+    max_global_tokens: Optional[int] = 1024
     # RBF kernel parameters
     rbf_centers_per_head: int = 32
     # v3.2.2 additions
@@ -1561,13 +1565,18 @@ class SHARPv32Trainer:
         # v3.2.2: Only update every N steps
         if self._step % self.ema_update_every != 0:
             return
-            
+
+        # Compensate decay for throttling: applying the EMA once every N steps with the raw
+        # per-step decay would make the effective averaging window N x too long. Using
+        # decay**N keeps the time-constant equal to an every-step EMA with `ema_decay`.
+        decay = self.ema_decay ** self.ema_update_every
+
         # Update EMA parameters
         for name, param in self._orig_model.named_parameters():
             if name in self.ema_state:
                 param_cpu = param.detach().to('cpu', non_blocking=True).float()
-                self.ema_state[name].mul_(self.ema_decay).add_(
-                    param_cpu, alpha=1 - self.ema_decay
+                self.ema_state[name].mul_(decay).add_(
+                    param_cpu, alpha=1 - decay
                 )
         
         # Update buffers
@@ -1581,8 +1590,8 @@ class SHARPv32Trainer:
                     if buffer.dtype.is_floating_point:
                         buffer_cpu = buffer.detach().to(device='cpu', dtype=torch.float32, non_blocking=True)
                         self.ema_state[full_name] = self.ema_state[full_name].to(torch.float32)
-                        self.ema_state[full_name].mul_(self.ema_decay).add_(
-                            buffer_cpu, alpha=1 - self.ema_decay
+                        self.ema_state[full_name].mul_(decay).add_(
+                            buffer_cpu, alpha=1 - decay
                         )
                     else:
                         self.ema_state[full_name] = buffer.detach().to('cpu', non_blocking=True)
@@ -1626,14 +1635,20 @@ class SHARPv32Trainer:
         else:
             grad_norm = 0.0
 
-        has_finite_grads = True
-        for param in self.model.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                has_finite_grads = False
-                break
+        # Single fused reduction (one host-device sync) instead of one .all() sync per
+        # parameter tensor on the hot path.
+        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        has_finite_grads = (
+            bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
+            if grads else True
+        )
 
         if not self._all_ranks_true(has_finite_grads):
             self.optimizer.zero_grad(set_to_none=True)
+            # CRITICAL: unscale_ already ran above; call scaler.update() so the scaler
+            # resets its per-optimizer state (and lowers the scale). Without it the next
+            # step's unscale_ raises and aborts the run on the first fp16 overflow.
+            self.scaler.update()
             return {
                 'loss': float('nan'),
                 'grad_norm': 0.0,
@@ -1664,8 +1679,14 @@ class SHARPv32Trainer:
         psnr_max: float = 1.0,
         crop_size: Optional[Tuple[int, int]] = None,
         use_ema: bool = False,
+        mrae_eps: float = 1e-6,
     ) -> Dict[str, float]:
-        """Evaluate model."""
+        """Evaluate model.
+
+        mrae_eps is the MRAE denominator floor; keep it equal to the training criterion's
+        eps (config.min_mrae_denom) so the selection/eval metric stays bit-identical to the
+        optimized objective (MST++/ARAD-1K comparability).
+        """
         if psnr_max <= 0:
             raise ValueError("psnr_max must be positive")
         
@@ -1702,8 +1723,11 @@ class SHARPv32Trainer:
                         ]
                 loss = self._loss(outputs, targets)
             
+            # Compute metrics in fp32 for comparability (predictions may be fp16 under AMP).
+            outputs = outputs.float()
+            targets = targets.float()
             abs_err = torch.abs(outputs - targets)
-            mrae = torch.mean(abs_err / torch.clamp_min(torch.abs(targets), 1e-6))
+            mrae = torch.mean(abs_err / torch.clamp_min(torch.abs(targets), mrae_eps))
             mse = F.mse_loss(outputs, targets)
             rmse = torch.sqrt(mse)
             psnr = 10 * torch.log10((psnr_max ** 2) / mse.clamp(min=1e-8))

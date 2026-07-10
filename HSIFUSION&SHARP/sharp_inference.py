@@ -193,14 +193,19 @@ class SHARPInference:
         stride = patch_size - overlap
         blend_weights = {}
         
-        for y in range(0, H - overlap, stride):
-            for x in range(0, W - overlap, stride):
+        # max(1, ...) guarantees at least one tile per axis even when a dimension is <=
+        # overlap or < patch_size (e.g. a panoramic strip, or --patch_size larger than a
+        # side). Starts are clamped to >= 0 so a dimension smaller than patch_size yields a
+        # single full-span patch instead of a negative-start slice that silently extracts the
+        # wrong region and leaves most pixels at 0 after weight normalization.
+        for y in range(0, max(1, H - overlap), stride):
+            for x in range(0, max(1, W - overlap), stride):
                 # Define patch boundaries
                 y_end = min(y + patch_size, H)
                 x_end = min(x + patch_size, W)
-                y_start = y_end - patch_size if y_end == H else y
-                x_start = x_end - patch_size if x_end == W else x
-                
+                y_start = max(0, y_end - patch_size) if y_end == H else y
+                x_start = max(0, x_end - patch_size) if x_end == W else x
+
                 # Extract patch
                 patch = rgb_image[:, :, y_start:y_end, x_start:x_end]
                 
