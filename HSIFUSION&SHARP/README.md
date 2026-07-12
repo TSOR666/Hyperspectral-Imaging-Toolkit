@@ -5,22 +5,33 @@ This directory packages the two transformer-based baselines we maintain alongsid
 - **HSIFusionNet v2.5.3 ("Lightning Pro")** – a lightweight spectrum-aware ViT that favours fast convergence and AMP-friendly kernels.
 - **SHARP v3.2.2 (Hardened)** – a sparse attention reconstruction pipeline with the audit fixes applied for production use.
 
-Both projects share the same data preparation code and operate on ARAD-1K style hyperspectral datasets (31 channels). The scripts here mirror the ones we run internally after incorporating stability fixes, deterministic logging, and memory-usage guards.
+Both projects share the same data preparation code and operate on ARAD-1K style hyperspectral datasets (31 channels). The scripts here mirror the ones we run internally after incorporating stability fixes, deterministic logging, and memory-usage guards, plus the fixes from five audit passes (see `AUDIT_REPORT*.md`).
+
+**The canonical entry points are now [`unified_training.py`](unified_training.py) and [`unified_inference.py`](unified_inference.py)**, which train and evaluate either model behind a single `--model {hsifusion,sharp}` flag with MST++/NTIRE-faithful defaults. The per-model scripts (`hsifusion_training.py`, `sharp_training_script_fixed.py`, `sharp_inference.py`) are retained because the audit regression tests pin their internals, but new runs should use the unified scripts.
 
 ## Directory structure
 
 ```
 HSIFUSION&SHARP/
-├─ hsifusion_training.py           # HSIFusionNet Lightning Pro trainer
-├─ hsifusion_v252_complete.py      # Model factory (tiny/small/base/large variants)
-├─ sharp_training_script_fixed.py  # SHARP v3.2.2 hardened trainer
-├─ sharp_inference.py              # Offline inference / patch-based tiling utility
-├─ sharp_v322_hardened.py          # Model + trainer implementations
+├─ unified_training.py             # Canonical trainer (--model hsifusion|sharp)
+├─ unified_inference.py            # Canonical evaluation / reconstruction CLI
+├─ test_unified_infra.py           # Tests for the unified infrastructure
+├─ hsifusion_training.py           # Legacy HSIFusionNet Lightning Pro trainer
+├─ hsifusion_v252_complete.py      # HSIFusion model factory (tiny/small/base/large)
+├─ hsifusion_classifier_v253.py    # Classifier variant of the HSIFusion backbone
+├─ sharp_training_script_fixed.py  # Legacy SHARP v3.2.2 hardened trainer
+├─ sharp_inference.py              # Legacy inference / patch-based tiling utility
+├─ sharp_v322_hardened.py          # SHARP model + trainer implementations
+├─ sharp_config.ini                # SHARP config file (+ sharp_config_loader.py)
 ├─ optimized_dataloader.py         # Memory-efficient MST++ dataloaders + losses
 ├─ common_utils_v32.py             # Shared utilities for both models
+├─ early_stopping.py               # Early-stopping helper
 ├─ dataset_setup.py                # Helper to stage ARAD-1K splits and caches
-├─ train_job_HSI.sh                # Example SLURM launcher for HSIFusion
-├─ train_job_SHARP.sh              # Example SLURM launcher for SHARP
+├─ smoke_train.py / smoke_infer.py / smoke_pipeline.py  # CPU smoke checks
+├─ test_audit*.py, test_runtime_audit_regressions.py    # Audit regression suites
+├─ AUDIT_REPORT*.md                # Findings from the audit passes
+├─ train_job_HSI.sh                # Example LSF launcher for HSIFusion
+├─ train_job_SHARP.sh              # Example LSF launcher for SHARP
 └─ README.md
 ```
 
@@ -53,6 +64,59 @@ python dataset_setup.py /path/to/ARAD_1K --train-ratio 0.95 --samples 5
 ```
 
 The dataset root must already contain `Train_RGB/` images and matching `Train_Spec/*.mat` cubes. Skip split creation with `--verify-only`.
+
+## Unified training (canonical)
+
+`unified_training.py` trains either model with MST++/NTIRE-faithful defaults: Adam (`--optimizer adam`), lr `4e-4` with per-iteration cosine decay to `--eta_min 1e-6`, batch 20, 300 epochs, 128×128 patches with stride 8, no weight decay, no warmup, and the MRAE objective.
+
+```bash
+cd "HSIFUSION&SHARP"
+python unified_training.py \
+  --model sharp \
+  --model_size base \
+  --data_root ${HSI_DATA_DIR:-./data/ARAD_1K} \
+  --output_dir ./experiments/unified
+```
+
+Key flags (see `unified_training.py --help` for the full list):
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `--model {hsifusion,sharp}` | Which architecture to train. | `sharp` |
+| `--model_size` | Backbone variant passed to the model factory. | `base` |
+| `--model_kwargs` | JSON string of extra config overrides. | `{}` |
+| `--batch_size` / `--patch_size` / `--stride` | MST++-style patch pipeline. | `20` / `128` / `8` |
+| `--epochs` / `--lr` / `--eta_min` | Schedule length and cosine bounds. | `300` / `4e-4` / `1e-6` |
+| `--optimizer {adam,adamw}` / `--weight_decay` | Optimizer family. | `adam` / `0.0` |
+| `--amp {auto,bf16,fp16,off}` | Mixed precision (`auto` prefers BF16). | `auto` |
+| `--ema_decay` | EMA of model weights (`0` disables). | `0.0` |
+| `--memory_mode {standard,float16,lazy}` / `--cache_size` | Dataloader caching. | `float16` / `4` |
+| `--accumulate_steps` / `--gradient_clip` | Effective batch / clipping. | `1` / `1.0` |
+| `--val_interval` / `--val_crop_border` | Validation cadence and MST++ crop. | `10` / `128` |
+| `--compile` | Enable `torch.compile`. | off |
+| `--resume` | Trainer checkpoint to resume from. | – |
+
+Validation reports MRAE, RMSE, PSNR, SAM, SSIM, and MAE via the shared [`hsi_benchmark`](../hsi_benchmark) metrics package, under **both** the MST++ center-crop protocol and full-frame evaluation. Inputs are automatically padded to a multiple of 8 for SHARP (ARAD frames are 482×512, which SHARP's decoder cannot handle unpadded) and cropped back after the forward pass.
+
+## Unified inference (canonical)
+
+`unified_inference.py` evaluates a checkpoint on a dataset split or reconstructs arbitrary RGB images. The architecture is auto-detected from checkpoint metadata when `--model` is omitted, and legacy SHARP checkpoints (pre-sigmoid output) load with a tanh fallback automatically.
+
+```bash
+# Evaluate on a dataset (crop + full protocols, 6 metrics)
+python unified_inference.py experiments/unified/best_model.pth \
+  --data_root ${HSI_DATA_DIR:-./data/ARAD_1K}
+
+# Reconstruct RGB images to NTIRE-style .mat cubes
+python unified_inference.py experiments/unified/best_model.pth \
+  --rgb path/to/rgb_folder --out_dir outputs/cubes
+```
+
+Reconstruction writes NTIRE-compatible `.mat` files containing an `(H, W, 31)` `cube`. Use `--no_ema` to evaluate raw weights when the checkpoint carries EMA weights, and `--crop_border` (default 128) to adjust the MST++ crop protocol.
+
+## Legacy per-model trainers
+
+The scripts below predate the unified infrastructure and are kept because the audit regression tests pin their internals. Note their defaults differ from the unified recipe (e.g. `hsifusion_training.py` uses AdamW, lr `3e-4`, weight decay `1e-4`).
 
 ## Training HSIFusionNet v2.5.3
 
@@ -92,6 +156,8 @@ python sharp_training_script_fixed.py \
   --max_global_tokens 1024
 ```
 
+SHARP now defaults to a **sigmoid** output activation and the **MRAE** loss (`--loss_type mrae`, matching the MST++ objective); the old tanh output and `l1_curvature` loss (L1 + 0.1× spectral curvature) remain available for ablations. Legacy checkpoints trained before this change load automatically with the tanh fallback.
+
 Important parameters:
 
 - `--sparse_exact_topk_max_tokens` bounds exact all-key top-k. Longer sequences use 2D local candidates plus `--sparse_landmark_tokens` pooled global candidates, reducing attention compute to `O(N * (window + landmarks))`.
@@ -114,9 +180,9 @@ torchrun --standalone --nproc_per_node=4 sharp_training_script_fixed.py \
 samplers; validation metrics are reduced globally, while logs and checkpoints
 are written only by rank zero.
 
-## SHARP inference
+## SHARP inference (legacy utility)
 
-The standalone inference utility loads checkpoints (with or without embedded configs) and optionally tiles large RGB inputs.
+Prefer `unified_inference.py` (above) for evaluation and reconstruction. The standalone `sharp_inference.py` utility remains for patch-based tiling workflows; it loads checkpoints (with or without embedded configs) and optionally tiles large RGB inputs.
 
 ```bash
 python sharp_inference.py \
@@ -132,6 +198,17 @@ When `--patch_size` is provided the script applies overlap-and-blend tiling to a
 ## Batch jobs
 
 Two LSF job templates (`train_job_HSI.sh`, `train_job_SHARP.sh`) demonstrate single-GPU A100 runs. Adapt queue, account, module, and environment paths before use.
+
+## Testing
+
+The folder carries the regression suites from the five audit passes plus the unified-infrastructure tests (~118 tests total):
+
+```bash
+cd "HSIFUSION&SHARP"
+python -m pytest -q
+```
+
+`test_unified_infra.py` covers the unified trainer/inference CLIs, checkpoint auto-detection, the SHARP pad-to-multiple path on 482×512 inputs, and the metric protocols. The `test_audit*.py` and `test_runtime_audit_regressions.py` files pin the behavior of the fixes documented in `AUDIT_REPORT*.md`. The `smoke_*.py` scripts run quick CPU-only end-to-end checks.
 
 ## Interoperability tips
 
@@ -149,15 +226,21 @@ The HSIFusion and SHARP implementations are distributed under the [MIT License](
   - Blocks: `LightningProBlock` with sliding‑window attention (RoPE), spectral attention, optional MoE, and GELU MLP; layer‑scale and drop‑path.
   - Topology: Encoder–decoder hierarchy with GroupNorm, staged down/upsampling, optional cross‑attention fusion, optional uncertainty head.
   - Robustness: Torch compile compatibility, safe sliding window merge, dtype handling, AMP/bfloat16 support.
+  - Audit pass 4 repaired three inductive biases that had silently degraded to no-ops: RoPE is now applied in standard attention (`standard_attn_rope` defaults on), spectral attention groups along the true spectral axis (`spectral_min_bands_per_group=4`), and the decoder cross-attention residual path is wired correctly.
   - Reference: `hsifusion_v252_complete.py` (`LightningProConfig`, factory `create_hsifusion_lightning_pro`).
 
 - SHARP v3.2.2 (Hardened)
-  - Attention: Multi-scale attention plus exact top-k for short sequences and bounded 2D-local + pooled-landmark top-k for moderate/high resolutions; RBF query/key projection modes (mean/linear/none).
-  - Norm: Channel RMSNorm with eval‑time caches; cross‑attention fusion in the decoder.
-  - Topology: Hierarchical encoder–decoder with ChannelRMSNorm, spectral basis regularization in the head.
+  - Attention: Multi-scale attention plus exact top-k for short sequences and bounded 2D-local + pooled-landmark top-k for moderate/high resolutions; RBF query/key projection modes (`linear` default, `mean`/`none` legacy).
+  - Norm: Channel RMSNorm with eval‑time caches; the second attention sublayer is pre-normed by default (`attn2_prenorm=True`); cross‑attention fusion in the decoder.
+  - Topology: Hierarchical encoder–decoder; output head applies a smooth rank-limited spectral-basis refinement (`spectral_head_rank=8`) and a **sigmoid** output activation by default (tanh retained as legacy-checkpoint fallback).
+  - MoE: Switch-style routing now includes a load-balancing auxiliary loss.
   - Reference: `sharp_v322_hardened.py` (`SHARPv32Config`, factory `create_sharp_v32`).
 
 ## Training Overview
+
+- Unified (`unified_training.py`) — canonical
+  - One trainer for both models with MST++/NTIRE-faithful defaults (Adam, lr 4e-4, per-iteration cosine, batch 20, 300 epochs, MRAE loss, no weight decay/warmup).
+  - Non-finite gradients are skipped safely under AMP (`GradScaler` fix from pass 4); optional EMA; validation on crop + full protocols with the shared `hsi_benchmark` metrics.
 
 - HSIFusionNet (`hsifusion_training.py`)
   - Data: `optimized_dataloader.py` (MST++ compatible) with `memory_mode` (standard/float16/lazy).

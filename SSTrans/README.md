@@ -51,10 +51,17 @@ style:
 - Adam with betas `(0.9, 0.999)`
 - per-iteration cosine learning-rate decay to `1e-6`
 - L1 objective, matching the reported ARAD-1K training procedure
-- 300,000 iterations with 128x128 crops
-- 50,000 iterations with 256x256 crops
-- 50,000 full-resolution iterations (the 512 stage uses 482x512 ARAD frames)
+- 300,000 iterations with 128x128 crops at batch 32
+- 50,000 iterations with 256x256 crops at batch 8
+- 50,000 iterations at a nominal 512 crop with batch 1 (clamped to the
+  482-pixel-tall ARAD frames, i.e. effectively full resolution)
 - validation and checkpointing every 2,000 iterations
+- BF16 autocast by default (`"amp_dtype": "bf16"`); the earlier FP16 setup
+  caused a NaN loss collapse, so the GradScaler is intentionally disabled
+  under BF16
+- gradient-norm clipping at `1.0` (`"grad_clip_norm"`)
+- a finite-loss guard: optimizer steps with non-finite loss or gradients are
+  skipped, and training aborts after 100 consecutive non-finite steps
 
 Start training:
 
@@ -78,6 +85,8 @@ python scripts/train.py `
 
 Each checkpoint includes the model architecture, optimizer, scheduler, AMP
 scaler, stage position, global iteration, and resolved training configuration.
+Resume refuses NaN/Inf-poisoned checkpoints: non-finite parameters or
+optimizer moments raise instead of silently continuing a collapsed run.
 Training metrics are appended to `metrics.jsonl`.
 
 The default fresh-training preset is `recommended_retrain`. It keeps the

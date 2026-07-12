@@ -1,7 +1,8 @@
 # CSWIN v2
 
 CSWIN v2 reconstructs a 31-band hyperspectral cube from an RGB image. The
-active model is a hierarchical U-Net/Transformer hybrid with spectral
+active model is a generator-only hierarchical U-Net/Transformer hybrid
+(~11.4M trainable parameters at `base_channels: 48`) with spectral
 self-attention, learned PixelShuffle sampling, and a fresh-run CSWin recovery
 recipe that uses head-split cross-shaped stripe attention.
 
@@ -112,17 +113,35 @@ python src/hsi_model/train_generator.py --config-name ablation_stable_lite
 # Fresh-run SOTA recovery after the old local_global recipe saturates
 python src/hsi_model/train_generator.py --config-name sota_cascade
 
+# Isolate the three CSWin recovery levers one at a time
+python src/hsi_model/train_generator.py --config-name ablation_axial      # axial attention only
+python src/hsi_model/train_generator.py --config-name ablation_smsa_off  # smsa_output_norm=false only
+python src/hsi_model/train_generator.py --config-name ablation_cascade   # cascade_stages only
+
 # Resume a saturated 128x128 annealed-MRAE run for a short 128-only polish
+# (note the leading + — resume_checkpoint is not in the base config)
 python src/hsi_model/train_generator.py \
   --config-name finetune_128_polish_annealed \
-  resume_checkpoint=/path/to/best_model.pth
+  +resume_checkpoint=/path/to/best_model.pth
 
 # Experimental: 256/512 fine-tuning. Validate with a patch-size sweep first;
 # the 2026-06-25 run worsened 128-tile validation MRAE after the 256 switch.
 python src/hsi_model/train_generator.py \
   --config-name finetune_progressive_annealed \
-  resume_checkpoint=/path/to/latest_checkpoint.pth
+  +resume_checkpoint=/path/to/latest_checkpoint.pth
 ```
+
+> ⚠️ The 2026-07 three-lever `sota_cascade` bundle run (with `cswin_attention_mode: axial`) regressed badly (~2× worse MRAE); the ablations isolated **axial attention as the culprit**, while cascade and `smsa_output_norm: false` were exonerated. `sota_cascade.yaml` now uses the paper-faithful `cswin` mode, which has been smoke-verified healthy. Avoid `axial` outside diagnostic runs.
+
+### Attention-mode and recovery levers
+
+| Key | Values | Default | Notes |
+| --- | --- | --- | --- |
+| `cswin_attention_mode` | `local_global`, `cswin`, `axial` | `local_global` (`config.yaml`) | `cswin` = head-split cross-shaped stripes (used by `sota_cascade.yaml`); `axial` regressed in ablation — diagnostic only. |
+| `cascade_stages` | int | `1` (code default) | Cascaded refinement stages; `sota_cascade.yaml` sets `3`. |
+| `smsa_output_norm` | bool | `true` (code default) | `sota_cascade.yaml` disables it. |
+
+These keys are absent from the base `config.yaml`; set them in an experiment YAML or append them on the CLI with the `+key=value` form.
 
 These configurations use separate log/checkpoint directories and should start
 from random initialization except the fine-tune recipes, which are designed to
@@ -205,5 +224,5 @@ src/hsi_model/utils/inference.py
 src/hsi_model/utils/patch_inference.py
 ```
 
-See `MODEL_OPTIMIZATION_REPORT.md` for the bottleneck audit and benchmark
-history.
+See the config headers in `src/configs/*.yaml` and the probe scripts under
+`probes/` for the bottleneck-audit and benchmark history.

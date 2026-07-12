@@ -37,10 +37,10 @@ The top-level `README.md` (this file) gives a project overview. Module-level det
 See `WaveDiff/README.md` for module‑level details (encoders, decoders, denoisers, attention).
 
 ## Installation
-1. Clone the repository and move into the project root:
+1. Clone the Hyperspectral-Imaging-Toolkit monorepo and move into this folder:
    ```bash
-   git clone https://github.com/yourusername/hsi-wavelet-diffusion.git
-   cd hsi-wavelet-diffusion/WaveDiff
+   git clone https://github.com/TSOR666/Hyperspectral-Imaging-Toolkit.git
+   cd Hyperspectral-Imaging-Toolkit/WaveDiff
    ```
 2. (Optional) Create and activate a Python environment (Python ≥ 3.9 recommended).
 3. Install dependencies:

@@ -37,6 +37,8 @@ The files under `experiments/` are frozen comparison recipes:
 | `robust_mrae_multistage.yaml` | `robust_mrae_spectralffn.yaml` + `multistage_refine: true` (`refine_hidden: 64`): an MPRNet-style coarse-to-fine refinement stage on the final output — a small conv stage refines the stage-1 reconstruction conditioned on the original RGB, as a zero-init-gated residual. ~+47K params (+1.4%), identity at init, checkpoint-safe. Rung-2 single-variable A/B vs `robust_mrae_spectralffn.yaml` (keep 220ep). |
 | `sota_depth_recovery.yaml` | Fresh-run recovery for the failed depth/prelayer stack. Uses `layer_scale_init: 1e-2` and `residual_gate_init: 1e-2` so newly stacked branches receive usable first-step gradients; monitor the first 8 epochs and retain the logged clipping telemetry. |
 | `sota_spectral_depth.yaml` | Historical failed Rung-3 reproduction (train ~0.78 / val ~0.68 MRAE). Retained for forensic comparison only; use `sota_depth_recovery.yaml` instead. |
+| `ablation_prelayer.yaml` | Single-lever isolation of `spectral_prelayer: true` on top of `robust_mrae_multistage.yaml` (known-good ~0.24 EMA), to attribute the `sota_spectral_depth` underfit; `use_checkpoint` pinned false. |
+| `ablation_depth.yaml` | Companion single-lever isolation of `blocks_per_stage: 2` on the same baseline; depth is the more mechanically implicated lever. |
 
 Do not choose an experiment config for ordinary training unless you are
 reproducing that specific comparison.

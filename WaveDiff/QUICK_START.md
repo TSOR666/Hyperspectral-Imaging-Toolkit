@@ -4,10 +4,10 @@ This guide will help you get started with the Hyperspectral Image (HSI) Wavelet 
 
 ## Installation
 
-1. Clone the repository:
+1. From the Hyperspectral-Imaging-Toolkit checkout, enter the WaveDiff folder
+   (all commands below run from here):
    ```bash
-   git clone https://github.com/yourusername/hsi-wavelet-diffusion.git
-   cd hsi-wavelet-diffusion
+   cd WaveDiff
    ```
 
 2. Install dependencies:

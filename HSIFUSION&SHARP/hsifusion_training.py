@@ -104,6 +104,11 @@ class HSIFusionTrainingConfig:
     use_channels_last: bool = True
     cross_attention_max_tokens: Optional[int] = 1024
     estimate_uncertainty: bool = False
+    # Pass-5 architecture knobs, ON for fresh training runs (the model-side defaults stay
+    # legacy-off so old checkpoints reload bit-exactly). Resuming a pre-pass-5 checkpoint
+    # requires --no_standard_attn_rope --spectral_min_bands_per_group 1.
+    standard_attn_rope: bool = True
+    spectral_min_bands_per_group: int = 4
 
     # Validation & logging
     val_interval: int = 10
@@ -131,6 +136,8 @@ class HSIFusionTrainingConfig:
             raise ValueError("cache_size must be >= 0")
         if self.cross_attention_max_tokens is not None and self.cross_attention_max_tokens <= 0:
             raise ValueError("cross_attention_max_tokens must be positive or None")
+        if self.spectral_min_bands_per_group < 1:
+            raise ValueError("spectral_min_bands_per_group must be >= 1")
 
     def experiment_path(self) -> Path:
         root = Path(self.output_dir)
@@ -199,6 +206,8 @@ class HSIFusionTrainer:
             force_compile=self.config.compile_model,
             cross_attention_max_tokens=self.config.cross_attention_max_tokens,
             estimate_uncertainty=self.config.estimate_uncertainty,
+            standard_attn_rope=self.config.standard_attn_rope,
+            spectral_min_bands_per_group=self.config.spectral_min_bands_per_group,
         )
         model = model.to(self.device)
         if self.config.use_channels_last and self.device.type == "cuda":
@@ -485,6 +494,10 @@ def parse_args() -> HSIFusionTrainingConfig:
                         help="Maximum encoder tokens used by decoder cross-attention (0 disables cap)")
     parser.add_argument("--estimate_uncertainty", action="store_true",
                         help="Enable the uncertainty head (requires a custom uncertainty loss to train it)")
+    parser.add_argument("--no_standard_attn_rope", action="store_true",
+                        help="Disable RoPE in deep-stage StandardAttention (required to resume pre-pass-5 checkpoints)")
+    parser.add_argument("--spectral_min_bands_per_group", type=int, default=4,
+                        help="Floor on spectral-attention per-band QK width (use 1 to resume pre-pass-5 checkpoints)")
     parser.add_argument("--min_mrae_denom", type=float, default=1e-6)
     parser.add_argument("--max_consecutive_nonfinite", type=int, default=8)
     parser.add_argument("--early_stopping_patience", type=int, default=40)
@@ -522,6 +535,8 @@ def parse_args() -> HSIFusionTrainingConfig:
             args.cross_attention_max_tokens if args.cross_attention_max_tokens > 0 else None
         ),
         estimate_uncertainty=args.estimate_uncertainty,
+        standard_attn_rope=not args.no_standard_attn_rope,
+        spectral_min_bands_per_group=args.spectral_min_bands_per_group,
         min_mrae_denom=args.min_mrae_denom,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         early_stopping_patience=args.early_stopping_patience,
