@@ -152,8 +152,11 @@ class FrequencyDomainLoss(nn.Module):
         pred_phase = torch.angle(pred_freq_low)
         target_phase = torch.angle(target_freq_low)
         # Circular distance avoids a false 2*pi discontinuity at the phase
-        # wrap boundary.
-        phase_loss = (1.0 - torch.cos(pred_phase - target_phase)).mean()
+        # wrap boundary. Mask bins where either magnitude ~ 0: torch.angle has
+        # a 1/|z| gradient that explodes near the origin, and phase is
+        # meaningless there anyway.
+        phase_mask = ((pred_mag > 1e-6) & (target_mag > 1e-6)).float()
+        phase_loss = ((1.0 - torch.cos(pred_phase - target_phase)) * phase_mask).mean()
 
         return mag_loss + 0.5 * phase_loss
 
@@ -163,7 +166,7 @@ class PerceptualSpectralLoss(nn.Module):
     Perceptual loss adapted for spectral domain
     Uses a simple feature extractor to compare high-level spectral features
     """
-    def __init__(self, num_bands=31, feature_channels=(16, 32, 64)):
+    def __init__(self, num_bands=31, feature_channels=(16, 32, 64), seed=3407):
         super().__init__()
 
         # Simple feature extractor for spectral features
@@ -183,6 +186,22 @@ class PerceptualSpectralLoss(nn.Module):
             in_channels = out_channels
 
         self.feature_extractor = nn.Sequential(*layers)
+
+        # Random-projection features are a valid perceptual target, but only
+        # if they are the SAME projection every run: the loss module lives
+        # outside model checkpoints, so unseeded init silently changes the
+        # objective on every restart/resume. Deterministic re-init:
+        generator = torch.Generator().manual_seed(seed)
+        with torch.no_grad():
+            for module in self.feature_extractor.modules():
+                if isinstance(module, nn.Conv2d):
+                    fan_in = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
+                    std = (2.0 / fan_in) ** 0.5
+                    module.weight.copy_(
+                        torch.randn(module.weight.shape, generator=generator) * std
+                    )
+                    if module.bias is not None:
+                        module.bias.zero_()
 
         # Freeze feature extractor (we want fixed features)
         for param in self.feature_extractor.parameters():
@@ -319,7 +338,9 @@ class CombinedSpectralLoss(nn.Module):
         Returns:
             Combined loss (and optionally loss components dict)
         """
-        total_loss = 0.0
+        # Tensor zero, not python float: with target_hsi=None and
+        # use_physical=False the result must still support .backward().
+        total_loss = pred_hsi.new_zeros(())
         components = {}
 
         # Supervised losses (require target)

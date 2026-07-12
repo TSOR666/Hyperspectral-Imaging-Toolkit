@@ -387,6 +387,14 @@ def train(config):
     # Initialize augmentation
     train_augmentation = None
     if config.get('use_augmentation', True):
+        if config.get('mixup_prob', 0.0) > 0:
+            import warnings
+            warnings.warn(
+                "mixup_prob > 0 has no effect: augmentation runs per-sample in "
+                "the Dataset (unbatched tensors), and mixup requires a batch. "
+                "It is disabled until applied on collated batches.",
+                RuntimeWarning,
+            )
         aug_strength = 0.5 if progressive_manager is None else progressive_manager.get_augmentation_strength(0)
         train_augmentation = RGBHSIAugmentation(
             geometric_prob=aug_strength,
@@ -418,10 +426,21 @@ def train(config):
     
     # Create data loaders
     pin_memory = device.type == 'cuda'
-    loader_worker_options = {}
+    train_worker_options = {}
+    val_worker_options = {}
     if config['num_workers'] > 0:
-        loader_worker_options['persistent_workers'] = True
-        loader_worker_options['prefetch_factor'] = config.get('prefetch_factor', 2)
+        train_worker_options['prefetch_factor'] = config.get('prefetch_factor', 2)
+        val_worker_options['prefetch_factor'] = config.get('prefetch_factor', 2)
+        # The progressive augmentation schedule mutates the Dataset's
+        # augmentation object in the main process each epoch. Persistent
+        # workers keep a stale pickled copy forever, silently freezing the
+        # schedule at epoch-0 strength — so the train loader must re-fork its
+        # workers each epoch whenever a schedule is active.
+        aug_schedule_active = (
+            progressive_manager is not None and train_augmentation is not None
+        )
+        train_worker_options['persistent_workers'] = not aug_schedule_active
+        val_worker_options['persistent_workers'] = True
 
     train_loader = DataLoader(
         train_dataset,
@@ -429,16 +448,16 @@ def train(config):
         shuffle=True,
         num_workers=config['num_workers'],
         pin_memory=pin_memory,
-        **loader_worker_options,
+        **train_worker_options,
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
         pin_memory=pin_memory,
-        **loader_worker_options,
+        **val_worker_options,
     )
     
     # Create masking configuration
@@ -608,7 +627,7 @@ def train(config):
     
     if config['resume_from_checkpoint']:
         checkpoint_path = config['resume_from_checkpoint']
-        checkpoint, start_epoch, best_val_loss = load_checkpoint(
+        checkpoint, start_epoch, _checkpoint_val_loss = load_checkpoint(
             model,
             optimizer,
             scheduler,
@@ -617,6 +636,9 @@ def train(config):
             scaler=scaler,
             ema=ema,
         )
+        # The checkpoint's stored val_loss is a weighted total — not
+        # comparable to the L1 selection metric; derive the best from history.
+        best_val_loss = float('inf')
         if checkpoint is not None and 'history' in checkpoint:
             history = checkpoint['history']
             for key in [
@@ -624,6 +646,12 @@ def train(config):
                 'val_pre_spectral_l1', 'val_pre_pixel_l1'
             ]:
                 history.setdefault(key, [])
+            # Restore the HISTORICAL best, not the resumed checkpoint's own
+            # val loss: resuming from latest_model.pt after a regression would
+            # otherwise crown any marginally-better epoch as "best".
+            past_val_l1 = [v for v in history.get('val_l1_loss', []) if v is not None]
+            if past_val_l1:
+                best_val_loss = min(past_val_l1)
     
     # Training loop
     for epoch in range(start_epoch, config['num_epochs']):
@@ -752,8 +780,10 @@ def train(config):
                         f"epoch_{epoch+1}_batch_{batch_idx}_train.png"
                     )
                     
+                    # Denormalize RGB from [-1, 1] before visualizing — the
+                    # visualizer clips to [0, 1], crushing the negative half.
                     visualize_reconstruction_comparison(
-                        rgb_imgs[0].cpu(),
+                        rgb_imgs[0].cpu() * 0.5 + 0.5,
                         hsi_data[0].cpu(),
                         outputs['hsi_output'][0].cpu(),
                         save_path=save_path
@@ -853,8 +883,10 @@ def train(config):
                         f"epoch_{epoch+1}_validation.png"
                     )
                     
+                    # Denormalize RGB from [-1, 1] before visualizing — the
+                    # visualizer clips to [0, 1], crushing the negative half.
                     visualize_reconstruction_comparison(
-                        rgb_imgs[0].cpu(),
+                        rgb_imgs[0].cpu() * 0.5 + 0.5,
                         hsi_data[0].cpu(),
                         outputs['hsi_output'][0].cpu(),
                         save_path=save_path
@@ -884,9 +916,14 @@ def train(config):
               f"L1={val_metrics['l1_loss']:.4f}, "
               f"Wavelet={val_metrics['wavelet_loss']:.4f}")
         
-        # Save checkpoint if validation loss improved
-        if val_metrics['total_loss'] < best_val_loss:
-            best_val_loss = val_metrics['total_loss']
+        # Save checkpoint if the model-selection metric improved. Selection
+        # uses val L1 (pure reconstruction), NOT the weighted total: the
+        # curriculum re-weights the total across warmup epochs (epoch-0 totals
+        # omit whole terms and are unbeatably low) and it includes the
+        # random-timestep diffusion term, so cross-epoch total comparisons are
+        # neither stable nor meaningful.
+        if val_metrics['l1_loss'] < best_val_loss:
+            best_val_loss = val_metrics['l1_loss']
             checkpoint_path = os.path.join(config['checkpoint_dir'], f"best_model_epoch_{epoch+1}.pt")
             save_checkpoint(
                 model, optimizer, scheduler, epoch,

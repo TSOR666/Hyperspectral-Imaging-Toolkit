@@ -57,12 +57,18 @@ class FrequencyDomainLoss(nn.Module):
         # Expand weights to match dimensions
         weights = weights.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)
         
-        # Calculate weighted magnitude loss
-        mag_loss = F.mse_loss(weights * pred_mag, weights * target_mag)
-        
-        # Calculate phase loss (only where magnitude is significant)
-        # This prevents phase from dominating in regions with negligible energy
-        magnitude_mask = (target_mag > target_mag.mean() * 0.1).float()
+        # Calculate weighted magnitude loss. Weights multiply the SQUARED
+        # error once — putting them inside mse_loss squared them, silently
+        # turning the documented 2:1 low/high emphasis into 4:1.
+        mag_loss = (weights * (pred_mag - target_mag) ** 2).mean()
+
+        # Calculate phase loss (only where BOTH magnitudes are significant).
+        # torch.angle has a 1/|z| gradient: where the predicted coefficient
+        # passes near the origin the phase gradient explodes, so bins with a
+        # near-zero predicted magnitude must be masked out too.
+        magnitude_mask = (
+            (target_mag > target_mag.mean() * 0.1) & (pred_mag > 1e-6)
+        ).float()
         phase_diff = 1.0 - torch.cos(pred_phase - target_phase)
         phase_loss = (phase_diff * magnitude_mask).mean()
         
@@ -83,7 +89,8 @@ class FrequencyBandLoss(nn.Module):
         if band_weights is None:
             # Create band weights that emphasize low and mid frequencies
             # First band (lowest freq) gets highest weight, then gradually decrease
-            band_weights = [1.0 - 0.7 * (i / (num_bands - 1)) for i in range(num_bands)]
+            denom = max(num_bands - 1, 1)
+            band_weights = [1.0 - 0.7 * (i / denom) for i in range(num_bands)]
         
         self.register_buffer('band_weights', torch.tensor(band_weights))
         
@@ -120,16 +127,28 @@ class FrequencyBandLoss(nn.Module):
         max_dist = torch.sqrt(torch.tensor(0.5**2 + 0.5**2, device=pred.device))
         norm_dist = freq_dist / max_dist
         
-        # Calculate band boundaries (logarithmic spacing for better emphasis on low frequencies)
-        log_bands = torch.logspace(-3, 0, self.num_bands + 1, device=pred.device)
-        
+        # Calculate band boundaries (logarithmic spacing for better emphasis
+        # on low frequencies). The first edge must be 0: with a 1e-3 lower
+        # edge the DC bin (and at coarse resolutions the first band or two
+        # entirely) fell into NO band, so the "low-frequency-emphasizing"
+        # loss ignored global brightness errors completely.
+        log_bands = torch.cat([
+            torch.zeros(1, device=pred.device),
+            torch.logspace(-3, 0, self.num_bands, device=pred.device),
+        ])
+
         # Initialize total loss
         total_loss = 0.0
-        
+
         # Calculate loss for each frequency band
         for i in range(self.num_bands):
-            # Create band mask
-            band_mask = ((norm_dist >= log_bands[i]) & (norm_dist < log_bands[i+1])).float()
+            # Create band mask (final edge inclusive so Nyquist is counted)
+            upper_ok = (
+                norm_dist <= log_bands[i + 1]
+                if i == self.num_bands - 1
+                else norm_dist < log_bands[i + 1]
+            )
+            band_mask = ((norm_dist >= log_bands[i]) & upper_ok).float()
             band_mask = band_mask.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)
             
             # Mask magnitude

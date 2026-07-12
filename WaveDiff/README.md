@@ -32,7 +32,7 @@ The top-level `README.md` (this file) gives a project overview. Module-level det
 - Backbones: Latent diffusion models specialized for 31‑band HSI reconstruction.
 - Wavelets: Standard, learnable, and adaptive wavelet transforms for multi‑scale spectral structure; optional adaptive thresholding.
 - Refinement: Spectral refinement head and optional pixel‑space refinement to reduce artifacts after denoising.
-- Schedules: `diffusion/noise_schedule.py` with DPM‑OT samplers (`diffusion/dpm_ot.py`, `enhanced_dpm_ot.py`).
+- Schedules: `diffusion/noise_schedule.py` with DDPM/DDIM samplers (`diffusion/dpm_ot.py`).
 
 See `WaveDiff/README.md` for module‑level details (encoders, decoders, denoisers, attention).
 

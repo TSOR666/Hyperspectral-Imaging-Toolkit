@@ -152,14 +152,23 @@ def load_model(
 
 
 def build_rgb_transform(image_size=256):
-    """Build the RGB preprocessing used by both single and batched inference."""
+    """Build the RGB preprocessing used by both single and batched inference.
+
+    ``image_size=None`` keeps the native resolution (no square resize) —
+    required for benchmark-comparable evaluation: squashing e.g. ARAD's
+    482x512 frames to a 256x256 square both warps the aspect ratio and forces
+    the ground truth to be degraded to match the prediction.
+    """
     from torchvision import transforms
 
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+    steps = []
+    if image_size is not None:
+        steps.append(transforms.Resize((image_size, image_size)))
+    steps.extend([
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
+    return transforms.Compose(steps)
 
 
 def preprocess_image(image_path, image_size=256):
@@ -168,7 +177,7 @@ def preprocess_image(image_path, image_size=256):
 
     Args:
         image_path: Path to image file
-        image_size: Size to resize image to
+        image_size: Size to resize image to (None keeps native resolution)
 
     Returns:
         Preprocessed image tensor
@@ -328,7 +337,13 @@ def postprocess_hsi_output(hsi_tensor, config=None, clamp=True):
 
 
 def align_hsi_ground_truth(hsi_gt, reference):
-    """Align ground-truth spatial size with the model output."""
+    """Align ground-truth spatial size with the model output.
+
+    Visualization-only helper: downsampling GT low-pass filters exactly the
+    high-frequency content models fail on, so METRICS must never use this —
+    see evaluate_metrics, which instead evaluates at the GT's native
+    resolution.
+    """
     if hsi_gt.shape[1] != reference.shape[1]:
         raise ValueError(
             f"HSI channel mismatch: ground truth has {hsi_gt.shape[1]} bands, "
@@ -344,12 +359,30 @@ def align_hsi_ground_truth(hsi_gt, reference):
     return hsi_gt
 
 
+def _pad_input_to_multiple(rgb_tensor, multiple=32):
+    """Pad H/W up to a multiple so strided/wavelet stages divide evenly.
+
+    Reflect padding when possible; replicate when the required padding meets
+    or exceeds the input dimension (reflect is undefined there — e.g. small
+    tiles from run_tiled_inference).
+    """
+    h, w = rgb_tensor.shape[-2:]
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h or pad_w:
+        mode = 'reflect' if (pad_h < h and pad_w < w) else 'replicate'
+        rgb_tensor = torch.nn.functional.pad(
+            rgb_tensor, (0, pad_w, 0, pad_h), mode=mode
+        )
+    return rgb_tensor, (h, w)
+
+
 def run_inference(
     model,
     rgb_tensor,
     device,
     sampling_steps=20,
-    apply_adaptive_threshold=True,
+    apply_adaptive_threshold=False,
     latent_mode="direct",
 ):
     """
@@ -365,9 +398,11 @@ def run_inference(
     Returns:
         Tuple of (predicted HSI tensor, stage_outputs_dict)
     """
-    # Move tensor to device
+    # Move tensor to device; pad so non-square/native sizes divide evenly
+    # through the strided and wavelet stages (cropped back below).
     rgb_tensor = rgb_tensor.to(device)
-    
+    rgb_tensor, original_hw = _pad_input_to_multiple(rgb_tensor)
+
     # Run inference
     stage_outputs = {}
     with torch.inference_mode():
@@ -420,6 +455,15 @@ def run_inference(
     if 'final' not in stage_outputs:
         stage_outputs['final'] = hsi_output
 
+    # Crop the padding back off
+    out_h, out_w = original_hw
+    if hsi_output.shape[-2:] != (out_h, out_w):
+        hsi_output = hsi_output[..., :out_h, :out_w]
+        stage_outputs = {
+            name: tensor[..., :out_h, :out_w]
+            for name, tensor in stage_outputs.items()
+        }
+
     return hsi_output, stage_outputs
 
 
@@ -452,7 +496,7 @@ def run_tiled_inference(
     overlap=32,
     tile_batch_size=1,
     sampling_steps=20,
-    apply_adaptive_threshold=True,
+    apply_adaptive_threshold=False,
     latent_mode="direct",
 ):
     """Run overlapping tiled inference with weighted stitching."""
@@ -588,8 +632,9 @@ def save_results(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Convert tensors to numpy
-    rgb_np = rgb_tensor.squeeze(0).cpu().numpy()
+    # Convert tensors to numpy. RGB is in the [-1, 1] model domain; the
+    # visualizers clip to [0, 1], so denormalize first.
+    rgb_np = (rgb_tensor.squeeze(0).cpu().numpy() * 0.5 + 0.5)
     hsi_output = postprocess_hsi_output(hsi_output, config)
     hsi_np = hsi_output.squeeze(0).cpu().numpy()
     
@@ -659,34 +704,66 @@ def evaluate_metrics(hsi_output, hsi_gt, config=None):
     Returns:
         Dictionary of metrics
     """
-    # Ensure both tensors are on the same device
+    # Ensure both tensors are on the same device.
+    # Benchmark parity (NTIRE/MST++ convention): metrics are computed on
+    # UNCLAMPED predictions — clamping to the valid range flatters MRAE/RMSE.
+    # Clamped outputs are only for saved cubes and visualization.
     device = hsi_output.device
-    hsi_output = postprocess_hsi_output(hsi_output, config)
+    hsi_output = postprocess_hsi_output(hsi_output, config, clamp=False)
     hsi_gt = hsi_gt.to(device)
-    hsi_gt = align_hsi_ground_truth(hsi_gt, hsi_output)
-    
+
+    if hsi_gt.shape[1] != hsi_output.shape[1]:
+        raise ValueError(
+            f"HSI channel mismatch: ground truth has {hsi_gt.shape[1]} bands, "
+            f"prediction has {hsi_output.shape[1]}"
+        )
+    if hsi_gt.shape[-2:] != hsi_output.shape[-2:]:
+        # Evaluate at the GT's NATIVE resolution: downsampling GT removes the
+        # high-frequency content models fail on and inflates every metric.
+        import warnings
+        warnings.warn(
+            "Prediction resolution differs from ground truth; upsampling the "
+            "prediction for metrics. For benchmark-comparable numbers run with "
+            "native resolution (--native_resolution).",
+            RuntimeWarning,
+        )
+        hsi_output = torch.nn.functional.interpolate(
+            hsi_output,
+            size=hsi_gt.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+
+    # Fixed PSNR range: inferring it per-image from GT min/max makes PSNR
+    # depend on scene dynamic range instead of error.
+    data_range = 1.0
+    if config:
+        data_range = float(config.get('hsi_max_value', 1.0) or 1.0)
+
     # Calculate metrics
     metrics = {}
-    
+
     # RMSE
     metrics['rmse'] = root_mean_square_error(hsi_output, hsi_gt).item()
-    
+
     # PSNR
-    metrics['psnr'] = peak_signal_to_noise_ratio(hsi_output, hsi_gt).item()
-    
+    metrics['psnr'] = peak_signal_to_noise_ratio(
+        hsi_output, hsi_gt, data_range=data_range
+    ).item()
+
     # SAM (Spectral Angle Mapper)
     metrics['sam'] = spectral_angular_mapper(hsi_output, hsi_gt).item()
-    
+
     # MRAE (Mean Relative Absolute Error)
     metrics['mrae'] = mean_relative_absolute_error(hsi_output, hsi_gt).item()
-    
+
     return metrics
 
 
 def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
-                      apply_adaptive_threshold=True, batch_size=1, config=None,
+                      apply_adaptive_threshold=False, batch_size=1, config=None,
                       latent_mode="direct", tile_size=None, tile_overlap=32,
-                      tile_batch_size=1, num_workers=0):
+                      tile_batch_size=1, num_workers=0, native_resolution=True):
     """
     Process all RGB images in a directory
     
@@ -721,9 +798,17 @@ def process_directory(input_dir, model, device, output_dir, sampling_steps=20,
     results_summary = {}
     
     image_files = sorted(image_files)
+    # Native resolution keeps the benchmark protocol honest (no square resize,
+    # no GT degradation). Requires same-sized images per batch — use
+    # batch_size=1 for mixed-size directories.
+    dataset_image_size = (
+        None
+        if native_resolution
+        else (config.get('image_size', 256) if config else 256)
+    )
     dataset = InferenceImageDataset(
         image_files,
-        image_size=config.get('image_size', 256) if config else 256,
+        image_size=dataset_image_size,
     )
     loader = DataLoader(
         dataset,
@@ -897,9 +982,18 @@ def main():
         action='store_true',
         help='Use raw training weights even when EMA weights are available',
     )
-    
-    # Parse arguments
-    parser.set_defaults(adaptive_threshold=True)
+    parser.add_argument(
+        '--native_resolution', dest='native_resolution', action='store_true',
+        help='Run at native input resolution with padding (benchmark protocol; default)',
+    )
+    parser.add_argument(
+        '--resize_to_config', dest='native_resolution', action='store_false',
+        help='Legacy behavior: square-resize inputs to the training image_size',
+    )
+
+    # Parse arguments. adaptive_threshold defaults OFF: the output-side
+    # thresholds are never trained (see AdaptiveWaveletHSILatentDiffusionModel).
+    parser.set_defaults(adaptive_threshold=False, native_resolution=True)
     args = parser.parse_args()
     
     # Setup device
@@ -925,7 +1019,7 @@ def main():
         # Load and preprocess image
         rgb_tensor = preprocess_image(
             args.image,
-            image_size=config.get('image_size', 256),
+            image_size=None if args.native_resolution else config.get('image_size', 256),
         )
         
         # Get base filename
@@ -1002,8 +1096,9 @@ def main():
             tile_overlap=args.tile_overlap,
             tile_batch_size=args.tile_batch_size,
             num_workers=args.num_workers,
+            native_resolution=args.native_resolution,
         )
-        
+
         print(f"Results saved to {args.output_dir}")
 
 

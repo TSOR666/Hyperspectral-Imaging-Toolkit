@@ -111,12 +111,14 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
             latent_dim=latent_dim
         )
         
-        # DPM-OT diffusion process
+        # DPM-OT diffusion process (x0 dynamic thresholding guards the
+        # reduced-step DDIM sampler against error blow-up at high noise)
         self.dpm_ot = DPMOT(
             denoiser=self.denoiser,
             spectral_schedule=self.spectral_schedule,
             timesteps=timesteps,
             conditional=conditional_residual_diffusion,
+            x0_clip_quantile=0.995,
         )
         
         # Advanced masking configuration
@@ -162,6 +164,25 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         
         return losses
     
+    def _combine_step_losses(self, losses):
+        """Weighted total used by the model-embedded train/validation steps.
+
+        Mirrors train.py's default weighting so the standalone API optimizes
+        the same objective, including the terms it previously dropped.
+        """
+        total_loss = (
+            losses['diffusion_loss'] * 1.0
+            + losses['cycle_loss'] * 0.8
+            + losses.get('l1_loss', 0) * 1.0
+        )
+        if 'wavelet_loss' in losses:
+            total_loss = total_loss + losses['wavelet_loss'] * 0.5
+        if 'latent_reconstruction_loss' in losses:
+            total_loss = total_loss + losses['latent_reconstruction_loss'] * 0.5
+        if 'threshold_reg' in losses:
+            total_loss = total_loss + losses['threshold_reg'] * 1e-4
+        return total_loss
+
     def train_step(self, batch, batch_idx):
         """Single training step implementation"""
         # Extract batch data
@@ -174,18 +195,12 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         # Calculate losses
         losses = self.calculate_losses(outputs, rgb, hsi)
         
-        # Combine losses with weighting
-        total_loss = (
-            losses['diffusion_loss'] * 1.0 +  # Diffusion loss
-            losses['cycle_loss'] * 0.8 +       # Cycle consistency
-            losses.get('l1_loss', 0) * 1.0     # L1 loss (if available)
-        )
-        
-        # Add wavelet loss if available
-        if 'wavelet_loss' in losses:
-            total_loss += losses['wavelet_loss'] * 0.5
-        
-        # Update model 
+        # Combine losses with weighting. All optimizable terms must enter the
+        # total BEFORE backward() — previously latent_reconstruction_loss and
+        # threshold_reg were computed but never optimized through this API.
+        total_loss = self._combine_step_losses(losses)
+
+        # Update model
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
@@ -209,18 +224,10 @@ class WaveletHSILatentDiffusionModel(HSILatentDiffusionModel):
         
         # Calculate losses
         losses = self.calculate_losses(outputs, rgb, hsi)
-        
-        # Combine losses with weighting
-        total_loss = (
-            losses['diffusion_loss'] * 1.0 +  # Diffusion loss
-            losses['cycle_loss'] * 0.8 +       # Cycle consistency
-            losses.get('l1_loss', 0) * 1.0     # L1 loss (if available)
-        )
-        
-        # Add wavelet loss if available
-        if 'wavelet_loss' in losses:
-            total_loss += losses['wavelet_loss'] * 0.5
-        
+
+        # Combine losses with the same weighting as train_step
+        total_loss = self._combine_step_losses(losses)
+
         # Return losses for logging
         return {
             'val_loss': total_loss.item(),

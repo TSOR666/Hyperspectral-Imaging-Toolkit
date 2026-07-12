@@ -11,7 +11,11 @@ def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_peri
         dtype = timesteps.dtype
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(half_dim, device=timesteps.device, dtype=dtype) / half_dim
+    # Frequencies must be computed in fp32: under bf16/fp16 adjacent embedding
+    # channels collapse to identical frequencies. Cast to `dtype` only at return.
+    exponent = -math.log(max_period) * torch.arange(
+        half_dim, device=timesteps.device, dtype=torch.float32
+    ) / half_dim
     exponent = exponent.unsqueeze(0)
 
     timesteps = timesteps.float().unsqueeze(1)
@@ -20,5 +24,8 @@ def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_peri
 
     if embedding_dim % 2 == 1:
         emb = torch.nn.functional.pad(emb, (0, 1))
+
+    if dtype.is_floating_point and emb.dtype != dtype:
+        emb = emb.to(dtype)
 
     return emb

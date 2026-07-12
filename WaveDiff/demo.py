@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Demo script to showcase the HSI Wavelet Diffusion model
 Demonstrates inference on sample images and compares different model variants
@@ -83,7 +83,7 @@ def load_pretrained_models(checkpoint_dir, device):
     base_path = os.path.join(checkpoint_dir, 'base_model.pt')
     if os.path.exists(base_path):
         print(f"Loading base model from {base_path}")
-        checkpoint = torch.load(base_path, map_location=device)
+        checkpoint = torch.load(base_path, map_location=device, weights_only=True)
         base_model = HSILatentDiffusionModel(
             latent_dim=64,
             out_channels=31,
@@ -98,7 +98,7 @@ def load_pretrained_models(checkpoint_dir, device):
     wavelet_path = os.path.join(checkpoint_dir, 'wavelet_model.pt')
     if os.path.exists(wavelet_path):
         print(f"Loading wavelet model from {wavelet_path}")
-        checkpoint = torch.load(wavelet_path, map_location=device)
+        checkpoint = torch.load(wavelet_path, map_location=device, weights_only=True)
         wavelet_model = WaveletHSILatentDiffusionModel(
             latent_dim=64,
             out_channels=31,
@@ -113,7 +113,7 @@ def load_pretrained_models(checkpoint_dir, device):
     adaptive_path = os.path.join(checkpoint_dir, 'adaptive_wavelet_model.pt')
     if os.path.exists(adaptive_path):
         print(f"Loading adaptive wavelet model from {adaptive_path}")
-        checkpoint = torch.load(adaptive_path, map_location=device)
+        checkpoint = torch.load(adaptive_path, map_location=device, weights_only=True)
         adaptive_model = AdaptiveWaveletHSILatentDiffusionModel(
             latent_dim=64,
             out_channels=31,
@@ -127,7 +127,7 @@ def load_pretrained_models(checkpoint_dir, device):
     return models
 
 
-def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_threshold=True):
+def run_inference(model, rgb_tensor, device, sampling_steps=20, apply_adaptive_threshold=False):
     """Run inference with a model"""
     # Move tensor to device
     rgb_tensor = rgb_tensor.to(device)
@@ -340,10 +340,12 @@ def main():
         hsi_outputs = {}
         for model_name, model in models.items():
             print(f"  Running inference with {model_name} model...")
+            # apply_adaptive_threshold stays False: the output-side thresholds
+            # are never trained, so applying them only blurs the demo output.
             hsi_output = run_inference(
-                model, rgb_tensor, device, 
+                model, rgb_tensor, device,
                 sampling_steps=args.sampling_steps,
-                apply_adaptive_threshold=(model_name == 'adaptive_wavelet')
+                apply_adaptive_threshold=False,
             )
             hsi_outputs[model_name] = hsi_output
         

@@ -48,9 +48,17 @@ class HaarWaveletTransform(nn.Module):
             x: Input tensor [B, C, H, W]
 
         Returns:
-            Wavelet coefficients [B, C, 4, H//2, W//2]
+            Wavelet coefficients [B, C, 4, ceil(H/2), ceil(W/2)]
         """
         B, C, H, W = x.shape
+
+        # Odd sizes: a stride-2 valid conv would silently drop the last
+        # row/column (it never enters any 2x2 window). Replicate-pad to even
+        # so every pixel contributes; callers cropping after the inverse get
+        # back ceil-sized reconstructions instead of truncated content.
+        if H % 2 or W % 2:
+            x = F.pad(x, (0, W % 2, 0, H % 2), mode='replicate')
+            H, W = x.shape[-2:]
 
         # Apply grouped convolution: each channel gets 4 output coefficients
         # Input: [B, C, H, W]

@@ -192,6 +192,10 @@ class AdaptiveNoiseSchedule(BaseNoiseSchedule):
             nn.Linear(8, 4),
             nn.Sigmoid()
         )
+        # Diagnostic-only, like the other adaptive schedules: forward() never
+        # feeds the diffusion process, so these weights can receive no gradient.
+        # Freeze them so they don't inflate optimizer state or break DDP.
+        self.adaptation_net.requires_grad_(False)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         base_beta = self.betas[t]
