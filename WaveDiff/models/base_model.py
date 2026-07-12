@@ -150,12 +150,14 @@ class HSILatentDiffusionModel(nn.Module):
             num_freq_bands=8
         )
         
-        # DPM-OT diffusion process
+        # DPM-OT diffusion process (x0 dynamic thresholding guards the
+        # reduced-step DDIM sampler against error blow-up at high noise)
         self.dpm_ot = DPMOT(
             denoiser=self.denoiser,
             spectral_schedule=self.spectral_schedule,
             timesteps=timesteps,
             conditional=self.conditional_residual_diffusion,
+            x0_clip_quantile=0.995,
         )
         
         # Advanced masking configuration
@@ -383,14 +385,17 @@ class HSILatentDiffusionModel(nn.Module):
             )
             target_latent_hsi = self._decode_and_refine(target_latent)[0]
         elif self.conditional_residual_diffusion:
-            residual_target = torch.zeros_like(latent)
-            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(
-                residual_target,
-                t,
-                conditioning=latent.detach(),
-            )
+            # No HSI target -> no residual to learn. Training on a zeros
+            # target teaches the denoiser a delta-at-0 residual distribution,
+            # biasing diffusion mode toward the direct path. Skip instead.
+            diffusion_loss = latent.new_zeros(())
+            pred_noise, noise = None, None
         else:
-            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(latent, t)
+            # Detach: the ε-MSE otherwise backprops into the RGB encoder,
+            # which can trivially lower it by shrinking the latent toward 0 —
+            # fighting the reconstruction losses (the conditional branch
+            # already detaches for the same reason).
+            diffusion_loss, pred_noise, noise = self.dpm_ot.p_losses(latent.detach(), t)
 
         # Get clean latent (for direct path)
         latent_clean = latent

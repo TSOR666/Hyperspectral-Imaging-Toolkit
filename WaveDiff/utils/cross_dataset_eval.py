@@ -25,18 +25,34 @@ class CrossDatasetEvaluator:
         self,
         model: torch.nn.Module,
         device: str = 'cuda',
-        metrics: tuple = ('rmse', 'psnr', 'sam', 'mrae')
+        metrics: tuple = ('rmse', 'psnr', 'sam', 'mrae'),
+        hsi_max_value: float = 1.0,
+        normalized_to_neg_one_to_one: bool = True,
     ) -> None:
         """
         Args:
             model: HSI reconstruction model (torch.nn.Module)
             device: Device for computation
             metrics: Metrics to compute
+            hsi_max_value: Physical-domain maximum used during training
+            normalized_to_neg_one_to_one: Whether model/dataset tensors are in
+                [-1, 1] (the training default). Metrics are always computed in
+                the physical [0, hsi_max_value] domain: MRAE divides by the
+                target (near-zero denominators everywhere in signed space) and
+                SAM is undefined for vectors with negative components.
         """
         self.model = model
         self.device = device
         self.metrics = metrics
+        self.hsi_max_value = float(hsi_max_value)
+        self.normalized_to_neg_one_to_one = bool(normalized_to_neg_one_to_one)
         self.results: Dict[str, Dict[str, float]] = {}
+
+    def _to_physical(self, hsi: torch.Tensor) -> torch.Tensor:
+        """Map model-domain tensors back to the physical data domain."""
+        if self.normalized_to_neg_one_to_one:
+            hsi = (hsi + 1.0) * 0.5
+        return hsi * self.hsi_max_value
 
     def evaluate_dataset(
         self,
@@ -128,14 +144,18 @@ class CrossDatasetEvaluator:
         pred_hsi: torch.Tensor,
         target_hsi: torch.Tensor
     ) -> Dict[str, float]:
-        """Compute all metrics for a batch"""
+        """Compute all metrics for a batch (in the physical data domain)"""
+        pred_hsi = self._to_physical(pred_hsi)
+        target_hsi = self._to_physical(target_hsi)
         metrics = {}
 
         if 'rmse' in self.metrics:
             metrics['rmse'] = calculate_rmse(pred_hsi, target_hsi).item()
 
         if 'psnr' in self.metrics:
-            metrics['psnr'] = calculate_psnr(pred_hsi, target_hsi).item()
+            metrics['psnr'] = calculate_psnr(
+                pred_hsi, target_hsi, data_range=self.hsi_max_value
+            ).item()
 
         if 'sam' in self.metrics:
             metrics['sam'] = calculate_sam(pred_hsi, target_hsi).item()
@@ -427,11 +447,11 @@ class TransferLearningEvaluator:
         Returns:
             Metrics after adaptation
         """
-        # Clone model for adaptation
-        adapted_model = type(self.model)(
-            **{k: v for k, v in self.model.__dict__.items() if not k.startswith('_')}
-        ).to(self.device)
-        adapted_model.load_state_dict(self.model.state_dict())
+        # Clone model for adaptation. (Reconstructing via type(model)(**__dict__)
+        # crashed unconditionally: an nn.Module's __dict__ holds 'training',
+        # '_parameters', etc. — not constructor kwargs.)
+        from copy import deepcopy
+        adapted_model = deepcopy(self.model).to(self.device)
 
         # Adapt on support set
         optimizer = torch.optim.Adam(adapted_model.parameters(), lr=adaptation_lr)

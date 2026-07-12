@@ -48,10 +48,20 @@ class MaskingManager:
         Returns:
             Boolean mask tensor [B, channels, H, W] (True = keep, False = mask)
         """
-        # Set strategy and parameters
-        strategy = override_strategy or self.strategy
-        mask_ratio = override_mask_ratio or self.config.get('mask_ratio', 0.5)
-        band_mask_ratio = override_band_mask_ratio or self.config.get('band_mask_ratio', 0.3)
+        # Set strategy and parameters. `is not None` checks: `or` silently
+        # replaced a falsy-but-explicit override (e.g. 0.0 to disable masking)
+        # with the config default.
+        strategy = override_strategy if override_strategy is not None else self.strategy
+        mask_ratio = (
+            override_mask_ratio
+            if override_mask_ratio is not None
+            else self.config.get('mask_ratio', 0.5)
+        )
+        band_mask_ratio = (
+            override_band_mask_ratio
+            if override_band_mask_ratio is not None
+            else self.config.get('band_mask_ratio', 0.3)
+        )
         
         # Choose masking strategy
         if strategy == 'random':
@@ -168,7 +178,10 @@ class MaskingManager:
     
     def _curriculum_masking(self, batch_size, num_bands, height, width, device):
         """Progressive curriculum masking that changes with training progress"""
-        progress = min(1.0, self.current_epoch / self.max_epochs)
+        # Denominator max_epochs-1: epochs run 0..max_epochs-1, so dividing by
+        # max_epochs meant progress never reached 1.0 and the schedule never
+        # hit final_mask_ratio (badly so for short runs).
+        progress = min(1.0, self.current_epoch / max(self.max_epochs - 1, 1))
         strategies = self.config.get('curriculum_strategies', 
                                     ['random', 'block', 'spectral', 'combined'])
         

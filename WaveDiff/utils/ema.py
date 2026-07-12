@@ -19,11 +19,14 @@ class ModelEMA:
     @torch.no_grad()
     def update(self, model):
         self.num_updates += 1
+        # Decay warmup: without it the EMA is dominated by random-init weights
+        # for the first ~1k steps, understating early validation.
+        decay = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
         source = model.state_dict()
         for name, value in self.module.state_dict().items():
             source_value = source[name].detach()
             if value.is_floating_point():
-                value.lerp_(source_value, 1.0 - self.decay)
+                value.lerp_(source_value, 1.0 - decay)
             else:
                 value.copy_(source_value)
 

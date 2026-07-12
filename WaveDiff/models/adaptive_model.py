@@ -57,6 +57,7 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
             spectral_schedule=self.spectral_schedule,
             timesteps=timesteps,
             conditional=conditional_residual_diffusion,
+            x0_clip_quantile=0.995,
         )
 
         # Add noise estimator for adaptive processing
@@ -116,16 +117,15 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         # Get basic losses using parent implementation
         losses = super().calculate_losses(outputs, rgb_target, hsi_target)
         
-        # Add thresholding regularization if available
+        # Add thresholding regularization if available. ll_threshold is a
+        # non-trainable buffer (LL is never thresholded) — regularizing it
+        # would only add a constant.
         if hasattr(self.denoiser, 'input_thresholding') and \
-           hasattr(self.denoiser.input_thresholding, 'll_threshold'):
+           hasattr(self.denoiser.input_thresholding, 'detail_thresholds'):
             # Add small regularization to prevent threshold values from growing too large
-            threshold_reg = (
-                torch.norm(self.denoiser.input_thresholding.ll_threshold) +
-                torch.norm(self.denoiser.input_thresholding.detail_thresholds)
+            losses['threshold_reg'] = torch.norm(
+                self.denoiser.input_thresholding.detail_thresholds
             )
-            
-            losses['threshold_reg'] = threshold_reg
         
         return losses
     
@@ -135,7 +135,7 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         sampling_steps=None,
         return_stages=False,
         *,
-        apply_adaptive_threshold: bool = True,
+        apply_adaptive_threshold: bool = False,
         latent_mode: str = "direct",
     ):
         """
@@ -145,7 +145,11 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
             rgb: RGB image tensor [B, 3, H, W]
             sampling_steps: Optional reduced number of sampling steps
             return_stages: Whether to return intermediate stages
-            apply_adaptive_threshold: Whether to apply adaptive thresholding to the output (keyword-only)
+            apply_adaptive_threshold: Whether to apply adaptive thresholding to
+                the output (keyword-only). Defaults to False: the output
+                thresholds are never exercised by any training loss, so
+                enabling this shrinks detail with an untrained threshold the
+                objective never saw — systematically worse eval metrics.
 
         Returns:
             HSI image tensor [B, C, H, W] or tuple of (HSI, stages dict)
@@ -193,8 +197,10 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
             # Apply adaptive thresholding
             thresholded_coeffs = self.adaptive_thresholding(hsi_coeffs, noise_level)
 
-            # Apply inverse transform
+            # Apply inverse transform; crop back in case the forward transform
+            # replicate-padded an odd-sized input to even.
             refined_hsi = self.inverse_wavelet_transform(thresholded_coeffs)
+            refined_hsi = refined_hsi[..., :hsi_after_pixel.shape[-2], :hsi_after_pixel.shape[-1]]
             stages['after_threshold'] = refined_hsi
             stages['final'] = refined_hsi
 
@@ -210,15 +216,13 @@ class AdaptiveWaveletHSILatentDiffusionModel(WaveletHSILatentDiffusionModel):
         return hsi_after_pixel
     
     def train_step(self, batch, batch_idx):
-        """Single training step implementation with adaptive components"""
-        # Get basic train step result
-        result = super().train_step(batch, batch_idx)
-        
-        # Add threshold regularization if available
-        if 'threshold_reg' in result:
-            result['loss'] += result['threshold_reg'] * 1e-4
-        
-        return result
+        """Single training step implementation with adaptive components.
+
+        Note: threshold_reg participates in the objective inside the parent's
+        train_step (via calculate_losses) — mutating the returned float here
+        after backward() could never affect gradients, so no post-hoc addition.
+        """
+        return super().train_step(batch, batch_idx)
     
     def get_adaptive_threshold_stats(self):
         """Get current threshold values for monitoring"""

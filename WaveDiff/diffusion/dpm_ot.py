@@ -1,6 +1,7 @@
 """DPM-OT: Diffusion Probabilistic Models with Optimal Transport sampling."""
 from __future__ import annotations
 
+import warnings
 from typing import Optional, List, Tuple, TYPE_CHECKING
 
 import torch
@@ -31,11 +32,19 @@ class DPMOT(nn.Module):
         spectral_schedule=None,
         timesteps=1000,
         conditional=False,
+        x0_clip_quantile: Optional[float] = None,
     ):
         super().__init__()
         self.denoiser = denoiser
         self.timesteps = timesteps
         self.conditional = bool(conditional)
+        # Dynamic thresholding for the DDIM x0-estimate: at large t the
+        # x0-prediction divides by sqrt(alpha_bar) ~ 0.0066, amplifying any
+        # epsilon error ~150x with only ~20 solver steps to recover. Clamping
+        # per-sample to a high quantile bounds the blow-up without assuming a
+        # fixed latent range. None (default) disables, preserving the exact
+        # DDIM update; the WaveDiff models enable it for latent sampling.
+        self.x0_clip_quantile = x0_clip_quantile
 
         # Base schedule is always available as a fallback
         self.base_schedule = BaseNoiseSchedule(timesteps=timesteps)
@@ -241,11 +250,27 @@ class DPMOT(nn.Module):
         sqrt_alpha_t = torch.sqrt(torch.clamp(alpha_t, min=_EPS))
         sigma_t = torch.sqrt(torch.clamp(1.0 - alpha_t, min=_EPS))
         pred_x0 = (x - sigma_t * noise_pred) / sqrt_alpha_t
+        pred_x0 = self._threshold_x0(pred_x0)
 
         return (
             torch.sqrt(torch.clamp(alpha_next, min=_EPS)) * pred_x0
             + torch.sqrt(torch.clamp(1.0 - alpha_next, min=0.0)) * noise_pred
         )
+
+    def _threshold_x0(self, pred_x0: torch.Tensor) -> torch.Tensor:
+        """Per-sample dynamic thresholding of the x0-estimate (Imagen-style).
+
+        The latent range is unbounded, so instead of a hard data-range clamp we
+        clamp each sample to its own high-magnitude quantile (floored at 1.0 so
+        well-behaved latents are untouched). This bounds error amplification at
+        high-noise timesteps without rescaling the bulk of the distribution.
+        """
+        if self.x0_clip_quantile is None:
+            return pred_x0
+        flat = pred_x0.reshape(pred_x0.shape[0], -1).abs().float()
+        s = torch.quantile(flat, self.x0_clip_quantile, dim=1)
+        s = s.clamp(min=1.0).view(-1, *[1] * (pred_x0.dim() - 1)).to(pred_x0.dtype)
+        return pred_x0.clamp(-s, s)
 
     def _prepare_starting_point(
         self,
@@ -256,6 +281,21 @@ class DPMOT(nn.Module):
         """Return the sampler's initial noisy state."""
         if conditioning is None or self.conditional:
             return torch.randn(shape, device=device)
+
+        # Unconditional denoiser + conditioning: the only influence the
+        # conditioning has is the q_sample(T-1) initialization below, where
+        # sqrt(alpha_bar_{T-1}) ~ 0.0066 attenuates the signal ~150x under unit
+        # noise. The reverse chain then denoises UNCONDITIONALLY — the output is
+        # essentially a sample from the prior, not a reconstruction. Warn loudly
+        # instead of failing silently.
+        warnings.warn(
+            "DPMOT.sample() received conditioning but the denoiser is unconditional: "
+            "the conditioning only sets the t=T-1 initialization (~150x attenuated) and "
+            "the reverse process ignores it. Build the model with conditional=True "
+            "(e.g. conditional_residual_diffusion) for conditioned sampling.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
         if list(conditioning.shape) != list(shape):
             raise ValueError(f"Conditioning shape {tuple(conditioning.shape)} does not match requested {shape}.")
@@ -274,161 +314,6 @@ class DPMOT(nn.Module):
                 raise ValueError("Conditional diffusion requires a conditioning latent")
             return self.denoiser(x, t, conditioning=conditioning)
         return self.denoiser(x, t)
-
-    def _dpm_solver_update(
-        self, x: torch.Tensor, noise_pred: torch.Tensor, t: torch.Tensor, next_t: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        First-order DPM-Solver update (DDIM / deterministic DDPM step).
-
-        Correct formula for ε-prediction parameterisation:
-
-            x_next = √(ᾱ_next/ᾱ_t) · x
-                   + [√(1−ᾱ_next) − √(ᾱ_next/ᾱ_t) · √(1−ᾱ_t)] · ε_θ
-
-        The previous implementation used (√ᾱ_next − √ᾱ_t) as the noise
-        coefficient, which omits the σ_bar terms and underestimates the
-        correction by ~30-50× at high-noise timesteps.
-
-        Args:
-            x: Current sample [B, C, H, W]
-            noise_pred: Predicted noise [B, C, H, W]
-            t: Current (noisier) timestep [B]
-            next_t: Next (cleaner) timestep [B]
-
-        Returns:
-            Updated sample [B, C, H, W]
-        """
-        idx_t = self._time_to_index(t)
-        idx_next = self._time_to_index(next_t)
-
-        a_bar_t = self._gather_alphas(idx_t).view(-1, 1, 1, 1)
-        a_bar_next = self._gather_alphas(idx_next).view(-1, 1, 1, 1)
-
-        sqrt_a_t = torch.sqrt(torch.clamp(a_bar_t, min=_EPS))
-        sqrt_a_next = torch.sqrt(torch.clamp(a_bar_next, min=_EPS))
-        sigma_t = torch.sqrt(torch.clamp(1.0 - a_bar_t, min=_EPS))
-        sigma_next = torch.sqrt(torch.clamp(1.0 - a_bar_next, min=_EPS))
-
-        # √(ᾱ_next / ᾱ_t)
-        sqrt_ratio = sqrt_a_next / sqrt_a_t
-        # σ_next − √(ᾱ_next/ᾱ_t) · σ_t  (negative: denoising direction)
-        coeff_eps = sigma_next - sqrt_ratio * sigma_t
-
-        return sqrt_ratio * x + coeff_eps * noise_pred
-
-    def _dpm_solver_second_order_update(
-        self,
-        x: torch.Tensor,
-        x_mid: torch.Tensor,
-        noise_t: torch.Tensor,
-        noise_mid: torch.Tensor,
-        t: torch.Tensor,
-        mid_t: torch.Tensor,
-        next_t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Second-order DPM-Solver update (midpoint method).
-
-        Applies the same DDIM formula as _dpm_solver_update, but uses the
-        noise prediction at the midpoint (noise_mid) as a second-order
-        corrector.  This is equivalent to the DPM-Solver-2 (midpoint variant):
-
-            x_next = √(ᾱ_next/ᾱ_t) · x
-                   + [√(1−ᾱ_next) − √(ᾱ_next/ᾱ_t) · √(1−ᾱ_t)] · ε_mid
-
-        The previous implementation used (√ᾱ_next − √ᾱ_t) as the noise
-        coefficient (same σ-omission bug as the first-order method).
-
-        Args:
-            x: Current sample [B, C, H, W]
-            x_mid: Intermediate first-order estimate (retained for API compat)
-            noise_t: Noise at t (retained for API compat, not used here)
-            noise_mid: Noise prediction at midpoint [B, C, H, W]
-            t, mid_t, next_t: Timestep tensors
-
-        Returns:
-            Updated sample [B, C, H, W]
-        """
-        idx_t = self._time_to_index(t)
-        idx_next = self._time_to_index(next_t)
-
-        a_bar_t = self._gather_alphas(idx_t).view(-1, 1, 1, 1)
-        a_bar_next = self._gather_alphas(idx_next).view(-1, 1, 1, 1)
-
-        sqrt_a_t = torch.sqrt(torch.clamp(a_bar_t, min=_EPS))
-        sqrt_a_next = torch.sqrt(torch.clamp(a_bar_next, min=_EPS))
-        sigma_t = torch.sqrt(torch.clamp(1.0 - a_bar_t, min=_EPS))
-        sigma_next = torch.sqrt(torch.clamp(1.0 - a_bar_next, min=_EPS))
-
-        sqrt_ratio = sqrt_a_next / sqrt_a_t
-        coeff_eps = sigma_next - sqrt_ratio * sigma_t
-
-        return sqrt_ratio * x + coeff_eps * noise_mid
-
-    def _dpm_solver_third_order_update(
-        self,
-        x: torch.Tensor,
-        x_mid: torch.Tensor,
-        x_end: torch.Tensor,
-        noise_t: torch.Tensor,
-        noise_mid: torch.Tensor,
-        noise_end: torch.Tensor,
-        t: torch.Tensor,
-        mid_t: torch.Tensor,
-        next_t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Third-order DPM-Solver update (Simpson's-rule noise integration).
-
-        Combines three noise predictions using composite Simpson's 1/3 weights
-        (1/6, 4/6, 1/6) over the interval [t, next_t].  The base DDIM formula
-        is unchanged; only the effective noise estimate improves:
-
-            ε_eff = (ε_t + 4·ε_mid + ε_next) / 6
-
-            x_next = √(ᾱ_next/ᾱ_t) · x
-                   + [√(1−ᾱ_next) − √(ᾱ_next/ᾱ_t) · √(1−ᾱ_t)] · ε_eff
-
-        The previous implementation used (√ᾱ_next − √ᾱ_t) style coefficients
-        which were both in the wrong variable (√ᾱ vs √(1−ᾱ)) and structured
-        as a Taylor expansion that diverged from the DDIM formula.
-
-        Args:
-            x: Current sample [B, C, H, W]
-            x_mid, x_end: Intermediate estimates (retained for API compat)
-            noise_t: Noise at t [B, C, H, W]
-            noise_mid: Noise at midpoint [B, C, H, W]
-            noise_end: Noise at next_t [B, C, H, W]
-            t, mid_t, next_t: Timestep tensors
-
-        Returns:
-            Updated sample [B, C, H, W]
-        """
-        idx_t = self._time_to_index(t)
-        idx_next = self._time_to_index(next_t)
-
-        a_bar_t = self._gather_alphas(idx_t).view(-1, 1, 1, 1)
-        a_bar_next = self._gather_alphas(idx_next).view(-1, 1, 1, 1)
-
-        sqrt_a_t = torch.sqrt(torch.clamp(a_bar_t, min=_EPS))
-        sqrt_a_next = torch.sqrt(torch.clamp(a_bar_next, min=_EPS))
-        sigma_t = torch.sqrt(torch.clamp(1.0 - a_bar_t, min=_EPS))
-        sigma_next = torch.sqrt(torch.clamp(1.0 - a_bar_next, min=_EPS))
-
-        sqrt_ratio = sqrt_a_next / sqrt_a_t
-        coeff_eps = sigma_next - sqrt_ratio * sigma_t
-
-        # Simpson's 1/3 composite weights over [ε_t, ε_mid, ε_next]
-        noise_eff = (noise_t + 4.0 * noise_mid + noise_end) / 6.0
-
-        return sqrt_ratio * x + coeff_eps * noise_eff
-
-    def _integral_beta(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute integral of beta schedule from 0 to t (negative log-alpha)."""
-        idx = self._time_to_index(t)
-        alphas_cumprod = self._gather_alphas(idx)
-        return -torch.log(torch.clamp(alphas_cumprod, min=_EPS))
 
     def _gather_alphas(self, idx):
         """Safely gather alpha values from schedule using batched indices."""

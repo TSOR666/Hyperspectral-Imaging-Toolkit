@@ -1,8 +1,12 @@
 """Spectral and spatial attention modules for HSI processing."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from modules.normalization import compatible_group_count
 
 # Numerical stability constant used across attention modules
 _EPS = 1e-6
@@ -71,10 +75,19 @@ class CrossSpectralAttention(nn.Module):
         
         # Output projection
         self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        
+
         # Scale factor for attention
         self.scale = self.head_dim ** -0.5
-        
+
+        # Channel mode uses cosine attention (q,k L2-normalized over H*W), so
+        # raw logits live in [-1, 1] — without sharpening the softmax over the
+        # channel tokens is near-uniform and the module degenerates to channel
+        # averaging. Learnable per-head logit scale, Swin-v2 style: init 10,
+        # clamped at 100.
+        self.channel_logit_scale = nn.Parameter(
+            torch.full((num_heads, 1, 1), math.log(10.0))
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with multi-head cross-spectral attention.
@@ -124,6 +137,11 @@ class CrossSpectralAttention(nn.Module):
         v = self.value(x).view(b, self.num_heads, self.head_dim, h * w)
         q = F.normalize(q, dim=-1, eps=_EPS)
         k = F.normalize(k, dim=-1, eps=_EPS)
+
+        # Sharpen the cosine logits with the learnable per-head scale (baked
+        # into q so every SDPA backend applies it identically).
+        logit_scale = torch.clamp(self.channel_logit_scale, max=math.log(100.0)).exp()
+        q = q * logit_scale.to(q.dtype)
 
         if _HAS_SDPA:
             out = F.scaled_dot_product_attention(q, k, v, scale=1.0)
@@ -352,12 +370,17 @@ class MultiHeadSpectralAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
 
-        # Learnable temperature. Initialised to the 1/sqrt(d) scale of the
-        # token-feature dimension for the selected mode: head_dim for
-        # spatial attention (D = head_dim), head_dim for channel attention
-        # (D = H*W is input-dependent, so head_dim is a reasonable anchor
-        # that the temperature parameter can learn to adjust).
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * (self.head_dim ** -0.5))
+        # Learnable temperature.
+        # - spatial mode: initialised to the standard 1/sqrt(head_dim).
+        # - channel mode: q,k are L2-normalized over the H*W feature axis in
+        #   forward() (cosine attention), because raw dot products over H*W
+        #   terms saturate the softmax at init while head_dim**-0.5 is anchored
+        #   to the wrong dimension. Cosine logits then need SHARPENING, so the
+        #   channel temperature starts at 10 (Swin-v2 style).
+        if mode == "channel":
+            self.temperature = nn.Parameter(torch.full((num_heads, 1, 1), 10.0))
+        else:
+            self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * (self.head_dim ** -0.5))
 
         # Channel mixing MLP for better representation
         hidden_dim = channels // reduction
@@ -369,9 +392,10 @@ class MultiHeadSpectralAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # Layer normalization
-        self.norm1 = nn.GroupNorm(num_groups=min(32, channels), num_channels=channels)
-        self.norm2 = nn.GroupNorm(num_groups=min(32, channels), num_channels=channels)
+        # Layer normalization (group count must divide channels — min(32, C)
+        # crashes at construction for e.g. C=48)
+        self.norm1 = nn.GroupNorm(num_groups=compatible_group_count(channels, 32), num_channels=channels)
+        self.norm2 = nn.GroupNorm(num_groups=compatible_group_count(channels, 32), num_channels=channels)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -395,10 +419,14 @@ class MultiHeadSpectralAttention(nn.Module):
             q = q.reshape(B, self.num_heads, self.head_dim, H * W)
             k = k.reshape(B, self.num_heads, self.head_dim, H * W)
             v = v.reshape(B, self.num_heads, self.head_dim, H * W)
+            # Cosine attention: without this the logits are sums over H*W
+            # (16k+) terms and the softmax saturates from step 0.
+            q = F.normalize(q, dim=-1, eps=_EPS)
+            k = F.normalize(k, dim=-1, eps=_EPS)
 
         # Per-head learnable temperature replaces the constant scale used by
         # SDPA. Clamped to avoid exploding/vanishing scales under AMP.
-        clamped_temp = torch.clamp(self.temperature, min=1e-4, max=10.0)
+        clamped_temp = torch.clamp(self.temperature, min=1e-4, max=100.0)
         # Bake the per-head temperature into Q so SDPA's internal scaling
         # applies it consistently across all backends.
         q = q * clamped_temp.to(q.dtype)

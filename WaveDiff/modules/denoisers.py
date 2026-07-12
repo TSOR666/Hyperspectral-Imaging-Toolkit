@@ -78,32 +78,49 @@ class UNetDenoiser(nn.Module):
             )
         )
         
-        # Decoder part of U-Net with spectral attention
+        # Decoder part of U-Net with spectral attention.
+        # WIRING FIX: skips are concatenated AFTER upsampling, at their native
+        # resolution. The previous layout concatenated skip2 (H/2) at H/4 and
+        # skip1 (H) at H/2, forcing a 2x bilinear downsample of every skip on
+        # every forward — destroying the high-frequency detail skips exist to
+        # carry. up1 processes the middle output then upsamples to H/2 where
+        # skip2 joins; up2 processes that concat then upsamples to H where
+        # skip1 joins via skip_fuse.
         self.up1 = nn.Sequential(
+            ResidualBlock(
+                channels * 2, use_batchnorm, norm_type, norm_groups
+            ),
+            SpectralAttention(channels * 2),
+            nn.ConvTranspose2d(channels * 2, channels * 2, kernel_size=4, stride=2, padding=1),
+            nn.SiLU()
+        )
+
+        self.up2 = nn.Sequential(
             ResidualBlock(
                 channels * 4, use_batchnorm, norm_type, norm_groups
             ),
             SpectralAttention(channels * 4),
-            nn.ConvTranspose2d(channels * 4, channels * 2, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(channels * 4, channels, kernel_size=4, stride=2, padding=1),
             nn.SiLU()
         )
-        
-        self.up2 = nn.Sequential(
-            ResidualBlock(
-                channels * 3, use_batchnorm, norm_type, norm_groups
-            ),
-            SpectralAttention(channels * 3),
-            nn.ConvTranspose2d(channels * 3, channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU()
-        )
-        
+
+        # Fuses the full-resolution skip1 into the decoder stream
+        self.skip_fuse = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
+
+        # Per-stage time injection: a single input-level addition washes out
+        # by the middle of the network; standard DDPM U-Nets condition every
+        # stage on t.
+        self.time_proj_down = nn.Conv2d(time_embedding_dim, channels * 2, kernel_size=1)
+        self.time_proj_mid = nn.Conv2d(time_embedding_dim, channels * 2, kernel_size=1)
+        self.time_proj_up = nn.Conv2d(time_embedding_dim, channels * 2, kernel_size=1)
+
         # Final blocks with spectral-spatial attention
         self.final_attn = SpectralSpatialAttention(channels * 2)  # Doubled due to skip connection
         self.final_res = ResidualBlock(
             channels * 2, use_batchnorm, norm_type, norm_groups
         )
         self.final_conv = nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1)
-        
+
     def forward(self, x, t, conditioning=None):
         if self.condition_proj is not None:
             if conditioning is None:
@@ -117,30 +134,33 @@ class UNetDenoiser(nn.Module):
                 )
             x = x + self.condition_proj(conditioning)
         # Embed timestep
-        t_emb = get_timestep_embedding(t, self.time_dim, dtype=x.dtype)
-        t_emb = self.time_mlp(t_emb)
-        t_emb = t_emb.view(-1, self.time_dim, 1, 1)
-        t_emb = self.time_proj(t_emb)
-        t_emb = t_emb.expand(-1, -1, x.shape[2], x.shape[3])
+        t_vec = get_timestep_embedding(t, self.time_dim, dtype=x.dtype)
+        t_vec = self.time_mlp(t_vec).view(-1, self.time_dim, 1, 1)
+        t_emb = self.time_proj(t_vec)
 
         # Initial convolution and spectral attention
         h = self.init_conv(x) + t_emb
         h = self.init_attn(h)
-        
+
         # Save skip connections
         skip1 = h
-        
-        # Downsampling with spectral attention
+
+        # Downsampling with spectral attention (time re-injected per stage)
         h = self.down1(h)
+        h = h + self.time_proj_down(t_vec)
         skip2 = h
         h = self.down2(h)
-        
+        h = h + self.time_proj_mid(t_vec)
+
         # Middle with cross-spectral attention
         h = self.middle_attn(h)
         h = self.middle(h)
-        
-        # Upsampling with skip connections and spectral attention
+
+        # Upsample first, then concatenate skips at their native resolution
+        h = self.up1(h)
+        h = h + self.time_proj_up(t_vec)
         if skip2.shape[2:] != h.shape[2:]:
+            # Genuine odd-size fallback only
             skip2 = F.interpolate(
                 skip2,
                 size=h.shape[2:],
@@ -148,7 +168,7 @@ class UNetDenoiser(nn.Module):
                 align_corners=False,
             )
         h = torch.cat([h, skip2], dim=1)
-        h = self.up1(h)
+        h = self.up2(h)
 
         if skip1.shape[2:] != h.shape[2:]:
             skip1 = F.interpolate(
@@ -157,8 +177,7 @@ class UNetDenoiser(nn.Module):
                 mode='bilinear',
                 align_corners=False,
             )
-        h = torch.cat([h, skip1], dim=1)
-        h = self.up2(h)
+        h = F.silu(self.skip_fuse(torch.cat([h, skip1], dim=1)))
 
         # Final processing with spectral-spatial attention
         if h.shape[2:] != x.shape[2:]:
@@ -225,7 +244,11 @@ class WaveletUNetDenoiser(nn.Module):
         
         # Time projection
         self.time_proj = nn.Conv2d(time_embedding_dim, channels * 4, kernel_size=1)
-        
+
+        # Second time injection before the middle blocks — a single input-side
+        # addition washes out; the noise level must stay visible mid-network.
+        self.time_proj_mid = nn.Conv2d(time_embedding_dim, channels * 2, kernel_size=1)
+
         # Combine processed wavelet components
         self.combine_wavelet = nn.Conv2d(channels * 4, channels * 2, kernel_size=3, padding=1)
         
@@ -323,7 +346,8 @@ class WaveletUNetDenoiser(nn.Module):
         combined = components.view(B, C * 4, H, W)
         features = F.silu(self.combine_wavelet(combined))  # [B, C*2, H//2, W//2]
 
-        # Middle processing
+        # Middle processing (time re-injected)
+        features = features + self.time_proj_mid(t_emb)
         features = self.middle_attn(features)
         features = self.middle(features)  # [B, C*2, H//2, W//2]
 
@@ -412,7 +436,11 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
         
         # Time projection
         self.time_proj = nn.Conv2d(time_embedding_dim, channels * 4, kernel_size=1)
-        
+
+        # Second time injection before the middle blocks — a single input-side
+        # addition washes out; the noise level must stay visible mid-network.
+        self.time_proj_mid = nn.Conv2d(time_embedding_dim, channels * 2, kernel_size=1)
+
         # Combine processed wavelet components
         self.combine_wavelet = nn.Conv2d(channels * 4, channels * 2, kernel_size=3, padding=1)
         
@@ -505,15 +533,21 @@ class ThresholdingWaveletUNetDenoiser(nn.Module):
         combined = components.view(B, C * 4, H, W)
         features = F.silu(self.combine_wavelet(combined))  # [B, C*2, H//2, W//2]
 
-        # Middle processing
+        # Middle processing (time re-injected)
+        features = features + self.time_proj_mid(t_emb)
         features = self.middle_attn(features)
         features = self.middle(features)  # [B, C*2, H//2, W//2]
 
         # Generate wavelet coefficients for the output: [B, C//2, 4, H//2, W//2]
         out_coeffs = features.view(B, features.shape[1] // 4, 4, H, W)
 
-        # Apply output thresholding
-        out_coeffs = self.output_thresholding(out_coeffs, noise_level)
+        # Apply output thresholding. The per-input-channel noise estimate
+        # ([B, C, 1, 1]) cannot broadcast against these C//2 feature channels
+        # (this crashed every forward), and the reshaped feature channels do
+        # not correspond to input channels anyway — use the global estimate.
+        out_coeffs = self.output_thresholding(
+            out_coeffs, noise_level.mean(dim=1, keepdim=True)
+        )
 
         # Apply inverse wavelet transform: [B, C//2, H, W]
         features_upsampled = self.inverse_wavelet(out_coeffs)
