@@ -568,6 +568,7 @@ class RobustEnhancedSpectralAttention(nn.Module):
         reduction: int = 4,
         pool_sizes: Optional[List[int]] = None,
         spectral_basis_rank: Optional[int] = None,
+        min_bands_per_group: int = 1,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -582,9 +583,18 @@ class RobustEnhancedSpectralAttention(nn.Module):
                     "spectral_basis_rank must be in [1, num_bands) for low-rank spectral attention"
                 )
             self.spectral_basis_rank = int(spectral_basis_rank)
-        
-        # Ensure reduced_dim is divisible by num_bands
-        reduced_dim = max(dim // reduction, num_bands)
+        if min_bands_per_group < 1:
+            raise ValueError(
+                f"min_bands_per_group must be >= 1, got {min_bands_per_group}"
+            )
+
+        # Ensure reduced_dim is divisible by num_bands. min_bands_per_group floors the
+        # per-band QK feature width: with the legacy default of 1, small dims give
+        # bands_per_group of only 1-2, so the band-band similarity q.k is near-degenerate
+        # and the learned 31x31 bias dominates content matching. A floor of ~4 restores
+        # a meaningful content-dependent spectral attention (changes conv shapes, so it
+        # must stay 1 for legacy checkpoints and is enabled via the training config).
+        reduced_dim = max(dim // reduction, num_bands * min_bands_per_group)
         reduced_dim = ((reduced_dim + num_bands - 1) // num_bands) * num_bands
         self.reduced_dim = reduced_dim
         
@@ -789,6 +799,8 @@ class LightningProBlock(nn.Module):
         use_spectral: bool = True,
         use_rope: bool = True,
         spectral_basis_rank: Optional[int] = None,
+        standard_attn_rope: bool = False,
+        spectral_min_bands_per_group: int = 1,
     ) -> None:
         super().__init__()
         
@@ -814,17 +826,21 @@ class LightningProBlock(nn.Module):
                 attn_drop=dropout
             )
         else:
-            # Standard attention fallback with optimized sdpa
+            # Standard attention fallback with optimized sdpa. standard_attn_rope gives the
+            # otherwise position-blind global attention (deep stages) a relative-position
+            # signal; parameter-free but output-changing, so legacy default is False.
             self.attn = StandardAttention(
                 dim=dim, num_heads=num_heads,
-                attn_drop=dropout, proj_drop=dropout
+                attn_drop=dropout, proj_drop=dropout,
+                use_rope=standard_attn_rope,
             )
-        
+
         # Spectral attention
         if use_spectral:
             self.spectral_attn = RobustEnhancedSpectralAttention(
                 dim=dim,
                 spectral_basis_rank=spectral_basis_rank,
+                min_bands_per_group=spectral_min_bands_per_group,
             )
         
         # MLP or MoE
@@ -953,7 +969,12 @@ class LightningProConfig:
     cross_attention_max_tokens: Optional[int] = 1024
     enable_spectral: bool = True
     spectral_basis_rank: Optional[int] = None
-    
+    # Pass-5 architecture knobs. Defaults preserve legacy checkpoints EXACTLY (RoPE would
+    # silently change old models' outputs; the QK-width floor changes conv shapes), so both
+    # stay off/1 here and are enabled for fresh runs by hsifusion_training.py defaults.
+    standard_attn_rope: bool = False        # RoPE for the deep-stage StandardAttention
+    spectral_min_bands_per_group: int = 1   # floor on spectral-attention per-band QK width
+
     # Training
     dropout: float = 0.0
     drop_path: float = 0.1
@@ -962,7 +983,9 @@ class LightningProConfig:
     # arbitrary second output during direct create_hsifusion_lightning_pro()/inference use.
     estimate_uncertainty: bool = False
     auxiliary_loss_weight: float = 0.01
-    spectral_failure_weight: float = 0.1  # Weight for spectral attention failures
+    # Deprecated (pass 5): the failure "penalty" had no gradient path and is no longer added
+    # to the auxiliary loss. Field kept so older configs still construct.
+    spectral_failure_weight: float = 0.1
     gradient_clip_val: float = 1.0
     
     # Performance
@@ -1041,6 +1064,10 @@ class HSIFusionNetV25LightningPro(nn.Module):
                     use_spectral=config.enable_spectral,
                     use_rope=config.use_rope,
                     spectral_basis_rank=config.spectral_basis_rank,
+                    standard_attn_rope=getattr(config, 'standard_attn_rope', False),
+                    spectral_min_bands_per_group=getattr(
+                        config, 'spectral_min_bands_per_group', 1
+                    ),
                 )
                 blocks.append(block)
             
@@ -1282,22 +1309,27 @@ class HSIFusionNetV25LightningPro(nn.Module):
         device = next(self.parameters()).device
         
         total_loss = torch.tensor(0.0, device=device)  # ()
-        
+
         # Add MoE auxiliary losses
         if self.aux_losses:
             total_loss = total_loss + sum(self.aux_losses.values()) * self.config.auxiliary_loss_weight  # () + () -> ()
-        
-        # Add spectral attention failure penalty if any
-        if self.config.enable_spectral:
-            for module in self.modules():
-                if isinstance(module, RobustEnhancedSpectralAttention):
-                    failure_rate = module.get_scale_failure_rate()  # (), scalar
-                    if failure_rate > 0:
-                        # Penalize high failure rates (configurable weight)
-                        failure_penalty = failure_rate * self.config.spectral_failure_weight  # () * scalar -> ()
-                        total_loss = total_loss + failure_penalty  # () + () -> ()
-        
+
+        # NOTE: the spectral-attention failure rate is intentionally NOT added here. It is a
+        # Python-counter ratio with no autograd path, so as a "penalty" it was a constant that
+        # shifted reported loss values without producing any gradient. Failures remain tracked
+        # (see get_spectral_failure_rate) and surfaced via throttled warnings for monitoring;
+        # config.spectral_failure_weight is retained only for config back-compat and is unused.
         return total_loss
+
+    def get_spectral_failure_rate(self) -> float:
+        """Aggregate spectral-attention scale failure rate across blocks (monitoring only)."""
+        failures = 0
+        attempts = 0
+        for module in self.modules():
+            if isinstance(module, RobustEnhancedSpectralAttention):
+                failures += module.scale_failures
+                attempts += module.total_attempts
+        return failures / max(1, attempts)
     
     @classmethod
     def from_pretrained(
@@ -1355,6 +1387,12 @@ class HSIFusionNetV25LightningPro(nn.Module):
                 compile_mode=None,  # never compile a freshly-loaded inference model
                 cross_attention_max_tokens=config_dict.get('cross_attention_max_tokens', 1024),
                 estimate_uncertainty=config_dict.get('estimate_uncertainty', False),
+                # Pass-5 knobs: legacy checkpoints predate them, so fall back to the exact
+                # legacy architecture (no RoPE in StandardAttention, unfloored QK width).
+                standard_attn_rope=config_dict.get('standard_attn_rope', False),
+                spectral_min_bands_per_group=config_dict.get(
+                    'spectral_min_bands_per_group', 1
+                ),
             )
         else:
             config = LightningProConfig(**config_dict)

@@ -136,6 +136,10 @@ class SHARPTrainingConfig:
     sparsemax_pad_value: Optional[float] = None  # Custom pad value for sparsemax
     output_activation: str = 'sigmoid'      # Output param for [0,1] reflectance (sigmoid|tanh|relu|softplus|none)
     ema_update_every: int = 1               # EMA update frequency (v3.2.2 throttling)
+    # Pass-5 architecture knobs (fresh runs ON; resuming a pre-pass-5 checkpoint requires
+    # --no_attn2_prenorm --spectral_head_rank 0 so the rebuilt architecture matches).
+    attn2_prenorm: bool = True              # Pre-norm on the sparse-attention residual branch
+    spectral_head_rank: int = 8             # Smooth spectral refinement head rank (0 = off)
     # Training objective. 'mrae' matches the MST++/ARAD-1K selection+eval metric and the
     # sibling HSIFusion baseline (fair benchmark comparability). 'l1_curvature' uses the
     # model's compute_loss (L1 + 0.1*spectral-curvature) and is kept for ablation only.
@@ -230,6 +234,8 @@ class SHARPTrainingConfig:
             raise ValueError("ema_update_every must be > 0")
         if self.key_rbf_mode not in {'mean', 'linear', 'none'}:
             raise ValueError("key_rbf_mode must be one of mean/linear/none")
+        if self.spectral_head_rank < 0:
+            raise ValueError("spectral_head_rank must be >= 0 (0 disables the spectral head)")
         if self.loss_type not in {'mrae', 'l1_curvature'}:
             raise ValueError("loss_type must be one of mrae/l1_curvature")
         if self.output_activation not in {'sigmoid', 'tanh', 'relu', 'softplus', 'none'}:
@@ -470,6 +476,8 @@ class DedicatedSHARPTrainer:
                 sparsemax_pad_value=self.config.sparsemax_pad_value,
                 output_activation=self.config.output_activation,
                 ema_update_every=self.config.ema_update_every,
+                attn2_prenorm=self.config.attn2_prenorm,
+                spectral_head_rank=self.config.spectral_head_rank,
                 verbose=getattr(self, "is_main_process", True),
             )
             
@@ -1226,6 +1234,10 @@ def main():
     parser.add_argument('--loss_type', type=str, default='mrae',
                         choices=['mrae', 'l1_curvature'],
                         help='Training objective: mrae (matches eval metric/MST++) or l1_curvature (ablation)')
+    parser.add_argument('--no_attn2_prenorm', action='store_true',
+                        help='Disable the sparse-attention pre-norm (required to resume pre-pass-5 checkpoints)')
+    parser.add_argument('--spectral_head_rank', type=int, default=8,
+                        help='Rank of the smooth spectral refinement head (0 disables; use 0 to resume pre-pass-5 checkpoints)')
 
     # Optimization
     parser.add_argument('--compile', '--compile_model', dest='compile', action='store_true',
@@ -1308,6 +1320,8 @@ def main():
         output_activation=args.output_activation,
         loss_type=args.loss_type,
         ema_update_every=args.ema_update_every,
+        attn2_prenorm=not args.no_attn2_prenorm,
+        spectral_head_rank=args.spectral_head_rank,
         compile_model=args.compile,
         use_amp=not args.no_amp,
         use_checkpoint=args.checkpoint,

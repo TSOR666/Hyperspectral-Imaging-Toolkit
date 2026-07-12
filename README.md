@@ -6,11 +6,13 @@ This monorepo hosts production-ready code and utilities for hyperspectral image 
 
 | Path | Description |
 | --- | --- |
-| [`CSWIN v2/`](CSWIN%20v2/README.md) | Sinkhorn-GAN training pipelines for a noise-robust CSWin transformer. |
-| [`HSIFUSION&SHARP/`](HSIFUSION&SHARP/README.md) | Transformer baselines featuring HSIFusionNet v2.5.3 and SHARP v3.2.2 with hardened training scripts. |
+| [`CSWIN v2/`](CSWIN%20v2/README.md) | Generator-only U-Net/Transformer hybrid with CSWin cross-shaped attention and spectral self-attention (legacy Sinkhorn-GAN trainers retained). |
+| [`HSIFUSION&SHARP/`](HSIFUSION&SHARP/README.md) | Transformer baselines featuring HSIFusionNet v2.5.3 and SHARP v3.2.2, with unified MST++-faithful training/inference entry points. |
 | [`hsi_viz_suite/`](hsi_viz_suite/README.md) | Stand-alone visualization suite for turning reconstruction results into publication-ready figures. |
 | [`mswr_v2/`](mswr_v2/README.md) | Training and inference scripts for the MSWR-Net v2.1.2 architecture with robustness patches. |
+| [`SSTrans/`](SSTrans/README.md) | HSIFormer — a self-contained spectral-spatial transformer (CSWin spatial + spectral MSA + CAT blocks) retraining pipeline for ARAD-1K. |
 | [`WaveDiff/`](WaveDiff/README.md) | Latent diffusion-based HSI reconstruction with wavelet modules and spectral refinement. |
+| [`hsi_benchmark/`](hsi_benchmark) | Shared benchmarking package (metrics, model loading, datasets, reports) behind [`benchmark_hsi.py`](benchmark_hsi.py). |
 
 > 💡 The directory names are preserved from their original projects. Scripts assume you execute them from inside their respective folders (for example `cd mswr_v2` before running a training command).
 
@@ -50,10 +52,12 @@ manifests, wavelength calibration, RGB synthesis, and reproducibility notes.
 
 ```bash
 cd "CSWIN v2"
-pip install -r requirements.txt  # if you have a curated requirements file
-python -m pip install hydra-core torch torchvision  # minimal dependencies
-python src/hsi_model/training_script_fixed.py --config-name config
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
+python src/hsi_model/train_generator.py --config-name config data_dir=/path/to/ARAD_1K
 ```
+
+The generator-only trainer (`train_generator.py`) is the active entry point; the legacy Sinkhorn-GAN trainers (`training_script_fixed.py`, `train_optimized.py`) remain for legacy experiments only.
 
 Key environment variables:
 
@@ -68,15 +72,16 @@ See the [CSWIN v2 README](CSWIN%20v2/README.md) for distributed training tips an
 ```bash
 cd "HSIFUSION&SHARP"
 python dataset_setup.py /path/to/ARAD_1K --train-ratio 0.95
-python hsifusion_training.py --data_root ./data/ARAD_1K --model_size base
-python sharp_training_script_fixed.py --data_root ./data/ARAD_1K --model_size base
+python unified_training.py --model hsifusion --data_root ./data/ARAD_1K --model_size base
+python unified_training.py --model sharp --data_root ./data/ARAD_1K --model_size base
+python unified_inference.py experiments/unified/best_model.pth --data_root ./data/ARAD_1K
 ```
 
 Highlights:
 
-- Shared MST++-style dataloaders (`optimized_dataloader.py`) work across both transformer trainers.
-- `sharp_inference.py` can tile large RGB inputs and export `.npy` hyperspectral reconstructions for downstream evaluation.
-- SLURM examples (`train_job_HSI.sh`, `train_job_SHARP.sh`) show how to schedule multi-GPU jobs with consistent logging dirs.
+- `unified_training.py` / `unified_inference.py` are the canonical entry points: one `--model {hsifusion,sharp}` flag, MST++/NTIRE-faithful defaults, and 6-metric evaluation (MRAE/RMSE/PSNR/SAM/SSIM/MAE) via the shared `hsi_benchmark` package under both crop and full-frame protocols.
+- Shared MST++-style dataloaders (`optimized_dataloader.py`) work across both transformer trainers; the legacy per-model trainers remain for the pinned regression suites.
+- LSF job examples (`train_job_HSI.sh`, `train_job_SHARP.sh`) show how to schedule GPU jobs with consistent logging dirs.
 
 See the [HSIFusion & SHARP README](HSIFUSION&SHARP/README.md) for dataset staging, CLI options, and inference details.
 
@@ -101,6 +106,17 @@ python train_mswr_v212_logging.py --config configs/train.yaml --data_root /path/
 ```
 
 MSWR scripts expect the legacy `dataloader.py` module on the Python path. The training driver enables EMA, SAM loss, and extensive logging by default; refer to the [MSWR README](mswr_v2/README.md) for CLI flags and inference notes.
+
+### SSTrans (HSIFormer)
+
+```bash
+cd SSTrans
+uv sync --extra dev   # or: python -m pip install -e ".[dev]"
+python scripts/train.py --data-root /path/to/ARAD_1K --output-dir runs/hsiformer_arad1k --device cuda
+python scripts/test_ntire.py --checkpoint runs/hsiformer_arad1k/checkpoints/best.pt --data-root /path/to/ARAD_1K --output-dir outputs/public_test
+```
+
+A self-contained, author-faithful HSIFormer retraining pipeline: L1 objective, per-iteration cosine decay, progressive 128→256→512 stages, bf16 AMP with gradient clipping and non-finite guards. See the [SSTrans README](SSTrans/README.md) for presets and NTIRE cube export.
 
 ### WaveDiff
 
@@ -128,7 +144,7 @@ See the [WaveDiff README](WaveDiff/README.md) and [Quick Start](WaveDiff/QUICK_S
 
 Issues and improvements typically surface from training runs or visualization gaps. When reporting problems, include:
 
-1. The project folder (`CSWIN v2`, `hsi_viz_suite`, `mswr_v2`, or `WaveDiff`).
+1. The project folder (`CSWIN v2`, `HSIFUSION&SHARP`, `hsi_viz_suite`, `mswr_v2`, `SSTrans`, or `WaveDiff`).
 2. The command (with arguments) you ran and the environment description (CUDA version, GPU model).
 3. Relevant log excerpts from `artifacts/logs/` or generated figure paths.
 
@@ -147,12 +163,16 @@ The Hyperspectral Imaging Toolkit is released under the [MIT License](LICENSE). 
 
 - HSIFusionNet v2.5.3 and SHARP v3.2.2 (HSIFUSION&SHARP)
   - HSIFusionNet Architecture: Encoder–decoder with LightningPro blocks that combine sliding-window RoPE attention, spectral attention, optional MoE, and cross-attention fusion in the decoder. Optional uncertainty head. See `HSIFUSION&SHARP/hsifusion_v252_complete.py`.
-  - SHARP Architecture: Hierarchical transformer with multi-scale attention + streaming sparse attention (top-k/local window fallbacks), ChannelRMSNorm, and cross-attention fusion. Configurable RBF key projection. See `HSIFUSION&SHARP/sharp_v322_hardened.py`.
-  - Training: AMP, cosine LR with warmup, AdamW, gradient clipping/accumulation, optional `torch.compile`, EMA (SHARP). Entries: `hsifusion_training.py`, `sharp_training_script_fixed.py`.
+  - SHARP Architecture: Hierarchical transformer with multi-scale attention + streaming sparse attention (top-k/local window fallbacks), ChannelRMSNorm, cross-attention fusion, and a rank-limited spectral-basis refinement head. Sigmoid output and MRAE loss by default; linear RBF key projection. See `HSIFUSION&SHARP/sharp_v322_hardened.py`.
+  - Training: Canonical entry `unified_training.py` (`--model hsifusion|sharp`, MST++-faithful Adam/cosine/MRAE recipe, AMP, optional EMA); legacy entries `hsifusion_training.py`, `sharp_training_script_fixed.py`.
 
 - CSWIN v2 (CSWIN v2)
-  - Architecture: U-Net style generator with CSWin spatial attention + spectral attention + adaptive GroupNorm + NaN‑safe blocks; SN transformer discriminator with spectral normalization. See `CSWIN v2/src/hsi_model/models`.
-  - Training: Sinkhorn‑GAN pipeline with R1 regularization, mixed precision, EMA logging, Hydra configuration (`CSWIN v2/src/configs/config.yaml`). Entries: `training_script_fixed.py`, `train_optimized.py`.
+  - Architecture: Generator-only U-Net/Transformer hybrid with configurable spatial attention (`local_global` default, head-split `cswin` cross-shaped stripes, experimental `axial`), spectral self-attention, and learned PixelShuffle sampling (~11.4M trainable params). See `CSWIN v2/src/hsi_model/models`.
+  - Training: Annealed pure-MRAE objective, Adam 4e-4 with 300k-step cosine decay, EMA validation, Hydra configuration (`CSWIN v2/src/configs/config.yaml`). Entry: `train_generator.py`; legacy Sinkhorn-GAN entries `training_script_fixed.py`, `train_optimized.py`.
+
+- SSTrans / HSIFormer (SSTrans)
+  - Architecture: Spectral-spatial transformer combining CSWin spatial cross-attention, spectral multi-head self-attention, and CAT blocks, packaged as the `hsiformer` Python package with selectable presets (`recommended_retrain` default). See `SSTrans/src/hsiformer`.
+  - Training: Author-faithful recipe — L1 loss, Adam, per-iteration cosine to 1e-6, progressive 128→256→512 stages (batch 32→8→1), bf16 AMP, grad clip 1.0, non-finite loss/resume guards. Entry: `SSTrans/scripts/train.py` (`hsiformer-train`).
 
 - WaveDiff (WaveDiff)
   - Architecture: Latent diffusion models augmented with wavelet transforms (standard/learnable/adaptive) and spectral/pixel refinement heads. See `WaveDiff/modules` and `WaveDiff/models`.

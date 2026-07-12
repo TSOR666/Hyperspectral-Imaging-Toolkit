@@ -74,6 +74,11 @@ class SHARPInference:
                 # weights stay numerically consistent. New checkpoints carry 'sigmoid'.
                 'output_activation': _config_get(config, 'output_activation', 'tanh'),
                 'ema_update_every': _config_get(config, 'ema_update_every', 1),
+                # Pass-5 architecture fields: legacy checkpoints predate them, so rebuild
+                # the exact legacy architecture (no attn2 pre-norm, no spectral head) or
+                # strict state_dict loading would fail on the extra parameters.
+                'attn2_prenorm': _config_get(config, 'attn2_prenorm', False),
+                'spectral_head_rank': _config_get(config, 'spectral_head_rank', 0),
             }
         else:
             # Default configuration
@@ -96,6 +101,8 @@ class SHARPInference:
                 'sparsemax_pad_value': None,
                 'output_activation': 'tanh',  # configless checkpoints predate sigmoid default
                 'ema_update_every': 1,
+                'attn2_prenorm': False,       # configless checkpoints predate pass-5 arch
+                'spectral_head_rank': 0,
             }
         
         # Create model

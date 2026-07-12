@@ -609,13 +609,20 @@ class OptimizedMoERouter(nn.Module):
             minlength=self.num_experts,
         )  # (E,)
         
-        # Compute load balancing loss
-        tokens_per_expert_normalized = expert_counts.float() / (num_tokens * self.top_k)  # (E,)
+        # Switch-Transformer load-balancing loss: E * sum_e f_e * P_e, where f_e is the
+        # (detached) fraction of dispatched assignments landing on expert e and P_e is the
+        # mean router probability. The previous ((counts/N - 1/E)^2).mean() was built purely
+        # from bincount outputs, which are integers with NO autograd path — the "loss" was a
+        # constant and never trained the router. Here the gradient flows through P_e; the
+        # minimum value is 1 at a perfectly uniform load.
         ideal_load = 1.0 / self.num_experts
-        load_balancing_loss = ((tokens_per_expert_normalized - ideal_load) ** 2).mean()
-        
+        tokens_per_expert_normalized = expert_counts.float() / max(1, num_tokens * self.top_k)  # (E,)
+        expert_importance = router_probs.mean(dim=0)  # (E,) differentiable
+        load_balancing_loss = self.num_experts * torch.sum(
+            tokens_per_expert_normalized.detach() * expert_importance
+        )
+
         # Compute importance loss (encourage using all experts)
-        expert_importance = router_probs.mean(dim=0)  # (E,)
         importance_loss = ((expert_importance - ideal_load) ** 2).mean()
         
         aux_losses = {
@@ -1204,7 +1211,14 @@ def validate_model_config(config: Any, model_name: str = "Model") -> None:
 
 # ===== Additional Helper for Testing =====
 class StandardAttention(nn.Module):
-    """Standard attention fallback implementation."""
+    """Standard attention fallback implementation.
+
+    use_rope (opt-in, default False to keep legacy checkpoints numerically identical —
+    RoPE is parameter-free, so a silent default flip would change old models' outputs
+    without any load error): applies rotary embeddings over the flattened token order,
+    giving the otherwise permutation-equivariant global attention a relative-position
+    signal (1D raster approximation of the 2D grid).
+    """
     def __init__(
         self,
         dim: int,
@@ -1212,19 +1226,28 @@ class StandardAttention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
-        
+
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        
+
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
-        
+
+        self.use_rope = use_rope
+        if use_rope:
+            if self.head_dim % 2 != 0:
+                raise ValueError(
+                    f"use_rope requires an even head_dim, got {self.head_dim}"
+                )
+            self.rope = RotaryEmbedding(self.head_dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply standard attention.
 
@@ -1235,12 +1258,15 @@ class StandardAttention(nn.Module):
             (B, N, C)
         """
         B, N, C = x.shape
-        
+
         qkv = self.qkv(x).reshape(
             B, N, 3, self.num_heads, C // self.num_heads
         ).permute(2, 0, 3, 1, 4)  # (B, N, 3*C) -> (3, B, H, N, D)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
+
+        if self.use_rope:
+            q, k = self.rope(q, k)  # (B, H, N, D) -> same
+
         attn = sdpa_unified(q, k, v, scale=self.scale,
                            dropout_p=self.attn_drop.p if self.training else 0.0)
         

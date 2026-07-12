@@ -15,10 +15,16 @@ This directory bundles the patched MSWR-Net v2.1.2 architecture, accompanying ut
 mswr_v2/
 ├─ model/                        # Patched MSWR modules
 │  └─ mswr_net_v212.py
+├─ configs/                      # train.yaml + experiments/ (see configs/README.md)
+├─ dataloader.py                 # Bundled MST++-style ARAD-1K dataloader
 ├─ utils.py                      # Losses, metrics, and logging helpers
 ├─ train_mswr_v212_logging.py    # Main training entry point
 ├─ mswr_inference.py             # Offline inference utility
-├─ mswr_test_ntire.py            # NTIRE evaluation script
+├─ mswr_test_ntire.py            # NTIRE evaluation script (clamped + unclamped MRAE)
+├─ verify_robustness.py          # Robustness verification harness
+├─ smoke_train.py / smoke_infer.py  # Quick CPU smoke checks
+├─ scripts/                      # strip_checkpoint.py, submit_mstpp_baseline.sh
+├─ tests/                        # Regression tests
 └─ README.md
 ```
 
@@ -143,6 +149,13 @@ Architecture and attention options:
 | `--num_heads` | int | 8 | Used only by the custom `MSWRDualConfig` path. |
 | `--window_size` | int | 8 | Used only by the custom `MSWRDualConfig` path. |
 | `--num_landmarks` | int | 64 | Used only by the custom `MSWRDualConfig` path. |
+| `--spectral_prelayer` | flag | off | Adds a spectral attention pre-layer per stage (fresh-run lever; see `configs/experiments/ablation_prelayer.yaml`). |
+| `--blocks_per_stage` | int | 1 | Transformer blocks per stage (fresh-run depth lever; see `configs/experiments/ablation_depth.yaml`). |
+| `--spectral_ffn` / `--spectral_ffn_mult` | flag / int | off / 2 | Spectral gated-FFN and its hidden expansion (2 ≈ +0.44M params on base). |
+| `--multistage_refine` | flag | off | MPRNet-style refinement stage on the final output; zero-init-gated and checkpoint-safe. |
+| `--conv_norm_type` | `layer`, `group`, `batch`, `none` | inherit `--norm_type` | Normalization for RGB projection/resampling convolutions. |
+| `--residual_gate_init` | float | 0.0 | Initial value for spectral/refinement ReZero gates (`gate` params are weight-decay exempt); use a small positive value only for fresh deep/prelayer runs. |
+| `--drop_path` | float | 0.1 | Stochastic depth rate (now plumbed end-to-end). |
 
 Wavelet options:
 
@@ -225,7 +238,9 @@ The script loads the appropriate model configuration from the checkpoint metadat
 
 ## Testing and visualization export
 
-`mswr_test_ntire.py` now supports real ARAD test samples when they are available. By default `--split auto` prefers `split_txt/test_list.txt` with `Test_RGB` / `Test_Spec`, falling back to validation splits when no test split exists. For the selected visualization samples it also exports `test_results/hsi/<sample>.npy`, `test_results/hsi/<sample>_target.npy`, and per-sample metric JSON files so `hsi_viz_suite/scripts/generate_all_visualizations.py` can consume the actual test samples directly.
+`mswr_test_ntire.py` reports both clamped `mrae` and unclamped `mrae_unclamped` (printed as the "MRAE*" headline, matching the NTIRE protocol) and mirrors the trainer's BF16-preferring autocast selection during evaluation. `verify_robustness.py` runs the robustness verification harness against a checkpoint, and `smoke_train.py` / `smoke_infer.py` provide quick CPU smoke checks.
+
+`mswr_test_ntire.py` also supports real ARAD test samples when they are available. By default `--split auto` prefers `split_txt/test_list.txt` with `Test_RGB` / `Test_Spec`, falling back to validation splits when no test split exists. For the selected visualization samples it also exports `test_results/hsi/<sample>.npy`, `test_results/hsi/<sample>_target.npy`, and per-sample metric JSON files so `hsi_viz_suite/scripts/generate_all_visualizations.py` can consume the actual test samples directly.
 
 ## Related projects
 
@@ -262,7 +277,7 @@ Reference: `model/mswr_net_v212.py` (`IntegratedMSWRNet`, `MSWRDualConfig`).
 - Driver: `train_mswr_v212_logging.py` with robust logging and error capture.
 - Loss: `EnhancedMSWRLoss` combines L1, SSIM, SAM (radians, logged in degrees), and gradient loss with warm-up weighting.
 - Validation: reports clamped reflectance-domain metrics and raw MRAE; checkpoint selection follows the official MST++ raw-MRAE protocol.
-- Optimizer: AdamW/Adam/SGD with grouped parameter decay; continuous warm‑up + cosine/step/exponential scheduler via `LambdaLR`.
+- Optimizer: AdamW/Adam/SGD with grouped parameter decay — `gamma`, `gamma2`, `rescale`, `gate`, `landmarks`, and `relative_position_bias_table` parameters are exempt from weight decay; continuous warm‑up + cosine/step/exponential scheduler via `LambdaLR`.
 - Efficiency: AMP with `--amp_dtype auto|fp16|bf16`, channels-last CUDA training, gradient checkpointing, gradient accumulation, optional `torch.compile`, multi‑GPU DDP, EMA.
 - Data: `dataloader.py` (ARAD‑1K MST++ style). Patch extraction by `patch_size` and `stride`, optional RGB BGR→RGB, min/max scaling.
 

@@ -6,7 +6,7 @@
 
 ## Prerequisites
 
-- Python 3.8 or newer
+- Python 3.10–3.12 (see `pyproject.toml`)
 - NVIDIA GPU with CUDA support (recommended, CPU also works)
 - ARAD-1K dataset (or compatible HSI dataset)
 
@@ -176,6 +176,7 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 | `mixed_precision` | true | Use automatic mixed precision |
 | `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
 | `excluded_scene_stems` | `[ARAD_1K_0314]` | Known-corrupt scenes omitted intentionally |
+| `cswin_attention_mode` | `local_global` | Spatial attention: `cswin` (cross-shaped stripes, used by `sota_cascade`) or `local_global`; `axial` regressed in ablation — avoid |
 
 See `src/configs/config.yaml` for all parameters.
 
@@ -189,7 +190,7 @@ Test that everything is working:
 python -c "
 import sys
 sys.path.insert(0, 'src')
-from hsi_model.models import NoiseRobustCSWinModel
+from hsi_model.models import NoiseRobustCSWinGenerator
 print('✅ Installation verified!')
 "
 ```
@@ -280,9 +281,8 @@ ls -lh experiments/run1/checkpoints/
 ## Help & Support
 
 - **Full Documentation:** See `README.md`
-- **Verification Report:** See `CSWIN_VERIFICATION_REPORT.md`
-- **Model Audit:** See `MODEL_AUDIT_REPORT.md` (in repo root)
-- **Bug Fixes:** See `FIXES_APPLIED.md` (in repo root)
+- **Configs & Ablations:** See `src/configs/*.yaml` (headers document each recipe)
+- **Smoke checks:** `smoke_run.py`, `smoke_train.py`, `smoke_infer.py`
 
 ---
 

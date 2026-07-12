@@ -721,7 +721,13 @@ class OptimizedSparseAttention(nn.Module):
                  block_size: int = 2048, max_tokens: int = 8192,
                  window_size: int = 49, k_cap: int = 1024,
                  q_block_size: int = 1024, rbf_centers_per_head: int = 32,
-                 key_rbf_mode: str = KeyRBFMode.MEAN,
+                 # Default LINEAR (pass 5): with MEAN, every key collapses to its channel
+                 # mean broadcast across the 32 RBF dims, so the score matrix factors as
+                 # g(q_i)*mean(k_j) — exactly rank 1. All queries then select the SAME
+                 # top-k keys and the sparse-attention branch degenerates to a global
+                 # pooling with per-query scalar temperature. LINEAR keeps a genuine
+                 # query-dependent key ranking. MEAN is retained for legacy checkpoints.
+                 key_rbf_mode: str = KeyRBFMode.LINEAR,
                  sparsemax_pad_value: Optional[float] = None,
                  exact_topk_max_tokens: int = 1024,
                  landmark_tokens: int = 256):
@@ -894,28 +900,35 @@ class EnhancedDualAttentionBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.,
                  drop_path: float = 0., use_checkpoint: bool = False,
                  sparse_config: Optional[dict] = None,
-                 max_global_tokens: Optional[int] = None):
+                 max_global_tokens: Optional[int] = None,
+                 attn2_prenorm: bool = True):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        
+
         self.norm = ChannelRMSNorm(dim)
-        
+
+        # Pre-norm for the sparse-attention residual branch (pass 5). attn1 and the MLP were
+        # already pre-normed, but attn2 consumed the raw residual stream, so its input scale
+        # grew unbounded with depth. Off (None) reproduces the legacy architecture so
+        # pre-pass-5 checkpoints still load strict.
+        self.norm2 = ChannelRMSNorm(dim) if attn2_prenorm else None
+
         self.attn1 = MultiScaleAttention(
             dim, num_heads, max_global_tokens=max_global_tokens
         )
-        
+
         # Use sparse config if provided
         sparse_kwargs = sparse_config or {}
         self.attn2 = OptimizedSparseAttention(
-            dim, num_heads, 
-            use_sparsemax=True, 
+            dim, num_heads,
+            use_sparsemax=True,
             use_rbf=True,
             use_topk=True,
             sparsity_ratio=sparse_kwargs.get('sparsity_ratio', 0.9),
             rbf_centers_per_head=sparse_kwargs.get('rbf_centers_per_head', 32),
-            key_rbf_mode=sparse_kwargs.get('key_rbf_mode', KeyRBFMode.MEAN),
+            key_rbf_mode=sparse_kwargs.get('key_rbf_mode', KeyRBFMode.LINEAR),
             sparsemax_pad_value=sparse_kwargs.get('sparsemax_pad_value', None),
-            **{k: v for k, v in sparse_kwargs.items() 
+            **{k: v for k, v in sparse_kwargs.items()
                if k not in ['sparsity_ratio', 'rbf_centers_per_head', 'key_rbf_mode', 'sparsemax_pad_value']}
         )
         
@@ -933,7 +946,8 @@ class EnhancedDualAttentionBlock(nn.Module):
         
     def _forward_impl(self, x):
         x = x + self.drop_path(self.attn1(self.norm(x)))
-        x = x + self.drop_path(self.attn2(x))
+        attn2_in = self.norm2(x) if self.norm2 is not None else x
+        x = x + self.drop_path(self.attn2(attn2_in))
         x = x + self.drop_path(self.mlp(x))
         return x
         
@@ -1029,9 +1043,22 @@ class SHARPv32Config:
     max_global_tokens: Optional[int] = 1024
     # RBF kernel parameters
     rbf_centers_per_head: int = 32
-    # v3.2.2 additions
-    key_rbf_mode: str = KeyRBFMode.MEAN
+    # v3.2.2 additions. key_rbf_mode default LINEAR (pass 5): MEAN collapses the sparse
+    # attention scores to rank 1 (see OptimizedSparseAttention); matches the training-script
+    # default. Legacy checkpoints carry 'mean' in their saved config (sharp_inference falls
+    # back to 'mean' when the key is absent).
+    key_rbf_mode: str = KeyRBFMode.LINEAR
     sparsemax_pad_value: Optional[float] = None
+    # Pass-5 architecture additions. Defaults are the FIXED architecture for fresh models;
+    # legacy checkpoints predate these fields, and both load paths (sharp_inference
+    # _config_get fallbacks, SHARPv32.__init__ getattr on old pickled configs) reconstruct
+    # the legacy architecture (False / 0) so old state_dicts still load strict.
+    attn2_prenorm: bool = True
+    # Rank of the smooth low-frequency spectral refinement head: the head predicts per-pixel
+    # coefficients c(x) and adds B @ c(x) to the 31-band output, where B is an orthonormal
+    # cosine basis over the band axis — an explicit smooth-spectrum inductive bias (the
+    # previous spectral_basis buffer was generated but never used). 0 disables (legacy).
+    spectral_head_rank: int = 8
     # Output parameterization. ARAD-1K / MST++ HSI targets are normalized to [0, 1],
     # so 'sigmoid' (codomain [0,1], nonnegative) is the correct default. 'tanh' (legacy,
     # codomain [-1,1]) wastes the negative half and saturates near full reflectance; it is
@@ -1066,6 +1093,18 @@ class SHARPv32Config:
             raise ValueError("sparse_landmark_tokens must be > 0")
         if self.ema_update_every <= 0:
             raise ValueError("ema_update_every must be > 0")
+        if self.spectral_head_rank < 0:
+            raise ValueError(
+                f"spectral_head_rank must be >= 0, got {self.spectral_head_rank}"
+            )
+        if self.spectral_head_rank > self.out_channels:
+            # The basis cannot have more orthonormal columns than bands; clamp so the
+            # default rank (tuned for 31 bands) also works for small out_channels.
+            logger.info(
+                "spectral_head_rank %d exceeds out_channels %d; clamping.",
+                self.spectral_head_rank, self.out_channels,
+            )
+            self.spectral_head_rank = self.out_channels
 
 # ============================================================================
 # Improved SHARP Model with v3.2.2 enhancements
@@ -1125,6 +1164,8 @@ class SHARPv32(nn.Module):
                     use_checkpoint=config.use_checkpoint,
                     sparse_config=sparse_config,
                     max_global_tokens=config.max_global_tokens,
+                    # getattr: old pickled configs predate the field -> legacy arch (no norm2)
+                    attn2_prenorm=getattr(config, 'attn2_prenorm', False),
                 )
                 for j in range(config.depths[i])
             ])
@@ -1165,30 +1206,51 @@ class SHARPv32(nn.Module):
             nn.GELU(),
             nn.Conv2d(config.base_dim, config.out_channels * 2, 1)
         )
-        
-        # Register spectral basis on CPU
-        self.register_buffer(
-            'spectral_basis',
-            self._generate_spectral_basis(config.out_channels),
-            persistent=False
-        )
-        
+
+        # Smooth spectral refinement head (pass 5). The spectral_basis buffer used to be
+        # generated but never consumed anywhere in forward, i.e. the model had NO spectral
+        # inductive bias in the default (MRAE) recipe. Now, when spectral_head_rank > 0,
+        # a 1x1 conv predicts per-pixel coefficients over an orthonormal low-frequency
+        # cosine basis B (out_channels x rank) and out += B @ c(x) before the output
+        # activation — constraining the correction to smooth spectra. getattr: old pickled
+        # configs predate the field -> rank 0 -> legacy architecture, no extra params.
+        # The buffer stays non-persistent, so its shape change cannot break checkpoints.
+        spectral_head_rank = int(getattr(config, 'spectral_head_rank', 0) or 0)
+        self.spectral_head_rank = spectral_head_rank
+        if spectral_head_rank > 0:
+            self.register_buffer(
+                'spectral_basis',
+                self._generate_spectral_basis(config.out_channels, spectral_head_rank),
+                persistent=False
+            )
+            self.spectral_coeff_head = nn.Conv2d(config.base_dim, spectral_head_rank, 1)
+        else:
+            self.spectral_coeff_head = None
+
         self._init_weights()
-        
-    def _generate_spectral_basis(self, num_channels: int) -> torch.Tensor:
-        """Generate smooth spectral basis functions."""
-        x = torch.linspace(0, 1, num_channels)
-        n_freq = (num_channels + 1) // 2
-        
-        sin_part = torch.stack([
-            torch.sin(2 * math.pi * i * x) for i in range(n_freq)
-        ])
-        cos_part = torch.stack([
-            torch.cos(2 * math.pi * i * x) for i in range(n_freq)
-        ])
-        
-        basis = torch.cat([sin_part, cos_part], dim=0)[:num_channels]
-        return basis
+
+        # Zero-init AFTER _init_weights (which kaiming-inits every Conv2d): the refinement
+        # branch starts as an exact identity, so training starts from the unrefined model
+        # and learns the smooth correction from zero (standard residual-branch zero-init).
+        if self.spectral_coeff_head is not None:
+            nn.init.zeros_(self.spectral_coeff_head.weight)
+            nn.init.zeros_(self.spectral_coeff_head.bias)
+
+    @staticmethod
+    def _generate_spectral_basis(num_channels: int, rank: int) -> torch.Tensor:
+        """Orthonormal low-frequency cosine basis over the band axis, shape (bands, rank).
+
+        Replaces the legacy sin/cos stack, which contained an all-zero row (sin(0)=0) and
+        was not orthogonal. QR makes B^T B = I so coefficient magnitudes are comparable
+        across frequencies.
+        """
+        bands = torch.linspace(0.0, 1.0, num_channels)
+        components = [torch.ones_like(bands)]
+        for freq in range(1, rank):
+            components.append(torch.cos(math.pi * freq * bands))
+        basis = torch.stack(components, dim=1)  # (bands, rank)
+        basis, _ = torch.linalg.qr(basis, mode="reduced")
+        return basis[:, :rank].contiguous()
     
     def _get_spectral_basis(self, device, dtype):
         """v3.2.2: Get cached spectral basis for specific device/dtype."""
@@ -1253,6 +1315,14 @@ class SHARPv32(nn.Module):
         out = self.head(x)
         out, gate = out.chunk(2, dim=1)
         out = out * torch.sigmoid(gate)
+
+        # Smooth spectral refinement: out += B @ c(x), with B an orthonormal low-frequency
+        # cosine basis over the 31 bands and c(x) per-pixel coefficients from the decoder
+        # features. Applied before the output activation. Zero-init => exact no-op at init.
+        if self.spectral_coeff_head is not None:
+            coeffs = self.spectral_coeff_head(x)  # (B, rank, H, W)
+            basis = self._get_spectral_basis(coeffs.device, coeffs.dtype)  # (bands, rank)
+            out = out + torch.einsum('brhw,cr->bchw', coeffs, basis)  # (B, bands, H, W)
 
         act = getattr(self.config, "output_activation", "tanh")
         if act == "sigmoid":
