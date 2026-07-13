@@ -129,14 +129,13 @@ class GDFN(nn.Module):
             kernel_size=1,
             bias=bias,
         )
-        self.norm = nn.LayerNorm(hidden_features)
         self.dwconv = nn.Conv2d(
-            hidden_features,
-            hidden_features,
+            hidden_features * 2,
+            hidden_features * 2,
             kernel_size=3,
             stride=1,
             padding=1,
-            groups=hidden_features,
+            groups=hidden_features * 2,
             bias=bias,
         )
         self.project_out = nn.Conv2d(
@@ -154,16 +153,8 @@ class GDFN(nn.Module):
             h=height,
             w=width,
         )
-        x1, x2 = self.project_in(x).chunk(2, dim=1)
-        batch, channels, _, _ = x1.shape
-        x1 = x1.view(batch, channels, height * width).permute(0, 2, 1)
-        x1 = self.norm(x1).permute(0, 2, 1).view(
-            batch,
-            channels,
-            height,
-            width,
-        )
-        x = self.act_fn(self.dwconv(x1)) * x2
+        x1, x2 = self.dwconv(self.project_in(x)).chunk(2, dim=1)
+        x = self.act_fn(x1) * x2
         return rearrange(self.project_out(x), "b c h w -> b (h w) c")
 
 
