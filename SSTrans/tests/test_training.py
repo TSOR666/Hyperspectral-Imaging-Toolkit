@@ -50,7 +50,7 @@ def test_default_training_config_enables_stability_guards() -> None:
     config = TrainingConfig.from_json("configs/train_arad1k.json")
     assert config.grad_clip_norm == 1.0
     assert config.amp_dtype == "bf16"
-    assert config.warmup_steps == 2000
+    assert config.warmup_steps == 0
 
 
 def test_autocast_dtype_is_float32_on_cpu() -> None:
@@ -229,12 +229,14 @@ def test_packaged_training_config_matches_repository_config() -> None:
     assert packaged == repository
 
 
-def test_published_training_config_uses_mrae_loss() -> None:
-    # The benchmark objective is MRAE-only (matching how SST's target number was
-    # reached); training on the scored metric is what closes the L1/MRAE gap.
+def test_published_training_config_uses_l1_loss() -> None:
+    # Paper section 4.2: "The L1 loss function is used during training." The
+    # earlier MRAE-only objective was a detour and measured worse (0.315 vs
+    # 0.2755); the reported 0.1468 comes from L1 plus the progressive
+    # 128 -> 256 -> 512 schedule.
     config = TrainingConfig.from_json("configs/train_arad1k.json")
-    assert config.loss.mrae_weight == 1.0
-    assert config.loss.l1_weight == 0.0
+    assert config.loss.l1_weight == 1.0
+    assert config.loss.mrae_weight == 0.0
     assert config.loss.sam_weight == 0.0
 
 

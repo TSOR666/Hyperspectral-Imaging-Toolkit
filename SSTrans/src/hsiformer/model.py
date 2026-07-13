@@ -717,7 +717,13 @@ class SSTransformer(nn.Module):
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        # Convs keep PyTorch's default (Kaiming) init, as in CSWin/Restormer/
+        # MST++. trunc_normal_(std=0.02) is correct for the Linear-based spatial
+        # attention but ~10x under-scales a 3x3 depthwise conv (fan_in=9, default
+        # std 1/sqrt(27)~=0.192), and the spectral branch is entirely
+        # convolutional -- blanket-applying it left every spectral residual an
+        # identity map at init.
+        if isinstance(module, nn.Linear):
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
