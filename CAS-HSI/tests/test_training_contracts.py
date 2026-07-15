@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import pytest
 import torch
+import h5py
 
 import train_cas_hsi
+import test_cas_ntire
 from cas_hsi import CASHSIConfig, Depths, build_cas_hsi
-from dataloader import TrainDataset, _pad_to_crop, _patch_starts
+from dataloader import TrainDataset, _pad_to_crop, _patch_starts, load_hsi_cube
 
 
 def test_load_config_cli_resolves_postponed_annotations():
@@ -20,6 +24,63 @@ def test_load_config_cli_resolves_postponed_annotations():
     assert config.epochs == 1
     assert config.amp is False
     assert config.lr == pytest.approx(0.001)
+
+
+def test_checkpoint_rng_state_restores_python_numpy_and_torch_streams():
+    original = train_cas_hsi.capture_rng_state()
+    try:
+        train_cas_hsi.set_seed(1234, deterministic=False)
+        saved = train_cas_hsi.capture_rng_state()
+        expected = (random.random(), np.random.rand(), torch.rand(3))
+
+        train_cas_hsi.restore_rng_state(saved)
+        actual = (random.random(), np.random.rand(), torch.rand(3))
+
+        assert actual[0] == expected[0]
+        assert actual[1] == expected[1]
+        assert torch.equal(actual[2], expected[2])
+    finally:
+        train_cas_hsi.restore_rng_state(original)
+
+
+def test_evaluation_inherits_rgb_normalization_from_checkpoint():
+    checkpoint = {"train_config": {"rgb_norm": "div255"}}
+
+    assert test_cas_ntire.resolve_rgb_norm(None, checkpoint) == "div255"
+    assert test_cas_ntire.resolve_rgb_norm("minmax", checkpoint) == "minmax"
+
+
+def test_evaluation_uses_documented_legacy_rgb_normalization_fallback():
+    assert test_cas_ntire.resolve_rgb_norm(None, {}) == "minmax"
+
+
+def test_hsi_loader_restores_arad_spatial_axis_order_and_band_axis(tmp_path):
+    # ARAD HDF5 data is (bands, width, height); coordinate values make an accidental
+    # H/W transpose observable rather than merely checking the resulting shape.
+    stored = np.arange(31 * 7 * 5, dtype=np.float32).reshape(31, 7, 5)
+    path = tmp_path / "cube.mat"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("cube", data=stored)
+
+    cube = load_hsi_cube(path, expected_bands=31)
+
+    assert cube.shape == (31, 5, 7)
+    assert np.array_equal(cube, np.transpose(stored, (0, 2, 1)))
+
+
+def test_hsi_loader_rejects_nonfinite_or_wrong_band_count(tmp_path):
+    path = tmp_path / "invalid.mat"
+    stored = np.zeros((30, 7, 5), dtype=np.float32)
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("cube", data=stored)
+    with pytest.raises(ValueError, match="30 bands"):
+        load_hsi_cube(path, expected_bands=31)
+
+    stored[0, 0, 0] = np.nan
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("cube", data=stored)
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        load_hsi_cube(path, expected_bands=30)
 
 
 def test_patch_grid_includes_tail_when_stride_does_not_divide_extent():

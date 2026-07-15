@@ -13,10 +13,10 @@
                                                                       v
                                                             prior + residual
 
-Spatial attention is confined to H/2 and H/4; full resolution uses CAS-Lite.  The
-prediction is the learned linear RGB->HSI prior plus a near-zero-initialized deep
-residual, so an untrained network already outputs a sane linear colour-to-spectrum
-estimate and training only has to learn the correction.
+Spatial attention is confined to H/2 and H/4; full resolution uses CAS-Lite. The
+prediction is a learned linear RGB->HSI prior plus a near-zero-initialized deep
+residual. The residual formulation exposes a direct, trainable colour-to-spectrum
+path; it is not a calibrated physical prior until trained on a camera/dataset pair.
 """
 
 from __future__ import annotations
@@ -216,6 +216,21 @@ class CASHSI(nn.Module):
         """
         rgb_padded, pad_info = pad_to_multiple(rgb, multiple=self.config.size_multiple)
 
+        features, stage_features = self._forward_padded_features(rgb_padded)
+        return features, stage_features, pad_info, rgb_padded
+
+    def _forward_padded_features(
+        self, rgb_padded: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Backbone on an input whose spatial axes are already multiples of four.
+
+        This is intentionally private: ordinary callers must use :meth:`forward`,
+        which applies the reflect/replicate boundary policy and crops back to their
+        original extent. The ONNX export wrapper is the one exception because a
+        portable ONNX graph cannot express arbitrary-size reflect-pad-to-modulo
+        preprocessing with PyTorch's current symbolic-shape exporter.
+        """
+
         x0 = self.stem(rgb_padded)
         s0 = self.encoder_full(x0)
 
@@ -241,7 +256,17 @@ class CASHSI(nn.Module):
             "decoder_half": y1,
             "decoder_full": y0,
         }
-        return y0, features, pad_info, rgb_padded
+        return y0, features
+
+    def forward_padded(self, rgb_padded: torch.Tensor) -> torch.Tensor:
+        """Run a pre-padded image without internal padding or final cropping.
+
+        ``rgb_padded`` must be NCHW with both spatial dimensions divisible by four.
+        It is an export primitive, not the general inference API; use
+        :meth:`forward` for arbitrary-size eager inference.
+        """
+        features, _ = self._forward_padded_features(rgb_padded)
+        return self.rgb_prior(rgb_padded) + self.spectral_head(features)
 
     def forward(
         self,

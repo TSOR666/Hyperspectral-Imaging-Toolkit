@@ -78,6 +78,29 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[CASHSI, Dic
     return model, checkpoint
 
 
+def resolve_rgb_norm(requested: Optional[str], checkpoint: Dict[str, Any]) -> str:
+    """Use the checkpoint's recorded RGB preprocessing unless explicitly overridden.
+
+    Per-image min--max and ``/255`` scaling are different input domains. Running a
+    model trained in one domain on the other changes every predicted spectrum, while
+    the target cube and metric code remain valid enough to make the score plausible.
+    Checkpoints written by ``train_cas_hsi.py`` preserve the training configuration,
+    so evaluation consumes that contract by default.
+    """
+    if requested is not None:
+        return requested
+
+    train_config = checkpoint.get("train_config")
+    if isinstance(train_config, dict):
+        saved = train_config.get("rgb_norm")
+        if saved in {"minmax", "div255"}:
+            return str(saved)
+
+    # Backward-compatible fallback for checkpoints that predate the saved training
+    # configuration. It preserves the previous CLI default, but main() identifies it.
+    return "minmax"
+
+
 def save_mat(path: Path, cube: np.ndarray) -> None:
     """Write a prediction as a v7.3 .mat with a 'cube' variable (NTIRE submission format)."""
     try:
@@ -106,7 +129,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--clamp_eval", action="store_true", help="clamp predictions to [0,1] (spec 7.4)")
     parser.add_argument("--tile_size", type=int, default=0, help=">0 uses tiled inference (spec 8.7)")
     parser.add_argument("--overlap", type=int, default=32)
-    parser.add_argument("--rgb_norm", default="minmax", choices=["minmax", "div255"])
+    parser.add_argument(
+        "--rgb_norm",
+        default=None,
+        choices=["minmax", "div255"],
+        help="override RGB normalization; default: inherit it from the checkpoint",
+    )
     parser.add_argument("--use_ema", action="store_true", help="evaluate the EMA weights if present")
     parser.add_argument("--save_mat", type=Path, default=None, help="directory for .mat predictions")
     parser.add_argument("--json", type=Path, default=None, help="write the full report here")
@@ -114,6 +142,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     device = torch.device(args.device)
     model, checkpoint = load_model(args.checkpoint, device)
+    rgb_norm = resolve_rgb_norm(args.rgb_norm, checkpoint)
 
     if args.use_ema:
         ema_state = checkpoint.get("ema_state_dict")
@@ -132,10 +161,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  parameters    : {info['total_parameters']:,}")
     print(f"  weights       : {'EMA' if args.use_ema else 'raw'}")
     print(f"  metrics source: {METRICS_SOURCE}")
+    if args.rgb_norm is None and not isinstance(checkpoint.get("train_config"), dict):
+        print("  RGB norm      : minmax (legacy checkpoint: no saved training config)")
+    else:
+        source = "CLI override" if args.rgb_norm is not None else "checkpoint"
+        print(f"  RGB norm      : {rgb_norm} ({source})")
     print(f"  clamping      : {'clamped to [0,1]' if args.clamp_eval else 'UNCLAMPED (NTIRE convention)'}")
     print("=" * 78)
 
-    dataset = EvalDataset(args.data_root, split=args.split, rgb_norm=args.rgb_norm)
+    dataset = EvalDataset(
+        args.data_root,
+        split=args.split,
+        rgb_norm=rgb_norm,
+        expected_bands=model.config.output_bands,
+    )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     print(f"\nEvaluating {len(dataset)} '{args.split}' scenes\n")
 
@@ -210,6 +249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "split": args.split,
         "scenes": len(dataset),
         "clamped": bool(args.clamp_eval),
+        "rgb_norm": rgb_norm,
         "metrics_source": METRICS_SOURCE,
         "weights": "ema" if args.use_ema else "raw",
         "model_info": info,

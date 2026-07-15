@@ -1,4 +1,4 @@
-"""ONNX export with dynamic spatial dimensions (specification sections 9.8, 9.9).
+"""ONNX export with dynamic *pre-padded* spatial dimensions (specification 9.8/9.9).
 
 The export path is the **edge model**. The research backend's neighborhood attention
 is a gather-shift-softmax over 9 offsets; even where it traces, spec 9.7 explicitly
@@ -6,15 +6,18 @@ lists custom neighborhood attention among the operators to keep out of the deplo
 graph. :func:`export_onnx` therefore refuses an attention-bearing model unless you ask
 it to convert one (and tells you what that costs).
 
-Dynamic axes are not decoration: a hyperspectral scene is 482x512, a training patch is
-128x128, and a tiled pass is 256x256. An export pinned to one of those is useless for
-the other two. The equivalence check deliberately runs the graph at a size *different*
-from the example input, because that is the only thing that actually proves the dynamic
-axes work -- checking at the example size would pass even on a statically-shaped graph.
+The eager model accepts arbitrary spatial dimensions by padding to a multiple of four,
+then cropping back. The current PyTorch symbolic-shape exporter cannot preserve that
+arbitrary modulo-and-reflect-pad path: a graph can be labelled dynamic while hard-coding
+the PixelUnshuffle reshape. The ONNX contract is therefore explicit and portable: feed
+RGB already padded to H/W divisible by four, run the graph at any such spatial size,
+then crop its result outside ONNX. This mirrors deployment preprocessing and avoids a
+silently invalid export. The equivalence check uses a different valid resolution.
 """
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,8 +29,40 @@ from .replace_attention import attention_mixer_paths, replace_attention_mixers
 __all__ = ["export_onnx", "run_onnx"]
 
 _ONNX_HINT = (
-    "ONNX export needs the optional dependencies:  pip install onnx onnxruntime"
+    "ONNX export needs the optional dependencies: "
+    "pip install onnx onnxscript onnxruntime"
 )
+
+
+class _PaddedExportWrapper(nn.Module):
+    """Expose CAS-HSI's multiple-of-four core without its eager-only padding path."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_padded(rgb)  # type: ignore[attr-defined]
+
+
+def _check_padded_input(value: torch.Tensor, name: str) -> None:
+    if value.dim() != 4:
+        raise ValueError(f"{name} must be a 4-D NCHW RGB tensor, got {tuple(value.shape)}")
+    height, width = value.shape[-2:]
+    if height % 4 or width % 4:
+        raise ValueError(
+            f"{name} spatial dimensions must be divisible by 4 for ONNX export, got "
+            f"{height}x{width}. Pad RGB before the ONNX call and crop the output back."
+        )
+
+
+def _require_onnx_export_dependencies() -> None:
+    """Check the dependencies needed by the dynamic torch.export ONNX path."""
+    try:
+        import onnx as _onnx  # noqa: F401
+        import onnxscript as _onnxscript  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(_ONNX_HINT) from exc
 
 
 def _require_onnxruntime():
@@ -59,15 +94,15 @@ def export_onnx(
     rtol: float = 1e-3,
     atol: float = 1e-4,
 ) -> Path:
-    """Export ``model`` to ONNX with dynamic batch, height and width.
+    """Export ``model`` to ONNX with dynamic pre-padded height and width.
 
     Args:
         model: a CAS-HSI model. Must be free of attention spatial mixers, or
             ``replace_attention=True`` must be set.
         path: destination ``.onnx`` file.
-        example_input: tracing input. Defaults to ``[1, 3, 128, 128]``.
-        check_input: input for the equivalence check. Defaults to a *different*
-            spatial size than ``example_input`` -- that is the point of the check.
+        example_input: pre-padded tracing input. Defaults to ``[1, 3, 128, 128]``.
+        check_input: pre-padded input for the equivalence check. Defaults to a
+            *different* valid spatial size than ``example_input``.
         replace_attention: convert attention mixers to their conv equivalents first.
             Note this randomizes those weights (see :mod:`.replace_attention`); it is
             only meaningful on a model you are about to distil or retrain.
@@ -103,42 +138,58 @@ def export_onnx(
         model, _ = replace_attention_mixers(model)
         model.eval()
 
+    if not hasattr(model, "forward_padded"):
+        raise TypeError(
+            "export_onnx expects a CAS-HSI model with forward_padded(); use the "
+            "package's CASHSI builder rather than an arbitrary nn.Module."
+        )
+
     if example_input is None:
         example_input = torch.randn(1, 3, 128, 128)
+    _check_padded_input(example_input, "example_input")
 
-    try:
-        import onnx as _onnx  # noqa: F401  (import-for-presence: torch.onnx needs it installed)
+    _require_onnx_export_dependencies()
 
-        del _onnx
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(_ONNX_HINT) from exc
-
-    with torch.no_grad():
-        torch.onnx.export(
-            model,
-            example_input,
-            str(path),
-            input_names=["rgb"],
-            output_names=["hsi"],
-            dynamic_axes={
-                "rgb": {0: "batch", 2: "height", 3: "width"},
-                "hsi": {0: "batch", 2: "height", 3: "width"},
-            },
-            opset_version=opset,
-            do_constant_folding=True,
+    export_kwargs: Dict[str, Any] = {
+        "input_names": ["rgb"],
+        "output_names": ["hsi"],
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    # Dynamic spatial axes are a contract, not merely symbolic labels. The input is
+    # pre-padded, so H/W can be expressed as multiples of four; that relationship is
+    # what makes PixelUnshuffle's internal reshapes valid at every supported size.
+    if "dynamo" not in inspect.signature(torch.onnx.export).parameters:
+        raise RuntimeError(
+            "Dynamic CAS-HSI ONNX export requires a PyTorch release with the "
+            "torch.export-based ONNX exporter (PyTorch >= 2.6)."
         )
+    dim = torch.export.Dim
+    export_kwargs.update(
+        dynamo=True,
+        dynamic_shapes={
+            "rgb": {
+                2: 4 * dim("height", min=1),
+                3: 4 * dim("width", min=1),
+            }
+        },
+    )
+
+    export_model = _PaddedExportWrapper(model).eval()
+    with torch.no_grad():
+        torch.onnx.export(export_model, example_input, str(path), **export_kwargs)
 
     if not check:
         return path
 
     # --- spec 9.9 equivalence, at a size the graph has never seen ---
     if check_input is None:
-        # Deliberately odd and unequal to the example: it exercises the internal
-        # reflect-pad-to-multiple-of-4 and the crop back, as well as the dynamic axes.
-        check_input = torch.randn(1, 3, 127, 193)
+        # Different from the trace size, while honoring the pre-padded ONNX contract.
+        check_input = torch.randn(1, 3, 124, 196)
+    _check_padded_input(check_input, "check_input")
 
     with torch.no_grad():
-        torch_output = model(check_input).cpu().numpy()
+        torch_output = export_model(check_input).cpu().numpy()
 
     onnx_output = run_onnx(path, {"rgb": check_input.cpu().numpy()})[0]
 

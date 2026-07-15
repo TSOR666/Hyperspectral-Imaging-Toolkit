@@ -44,8 +44,8 @@ RGB ──┬─► Conv1x1(3→31) linear prior ──────────�
 
 The identity path is never scaled, so `layer_scale_init=0` makes a block an exact
 identity. The prediction is a **learned linear RGB→HSI prior plus a near-zero-initialized
-deep residual**: an untrained network already emits a sane linear colour-to-spectrum
-estimate, and training only has to learn the correction.
+deep residual**. The linear branch is trainable rather than camera-calibrated: before
+training, it is a well-scaled initialization, not a physically meaningful spectrum.
 
 ### Variants
 
@@ -200,8 +200,14 @@ from cas_hsi.deployment import replace_attention_mixers, export_onnx
 
 edge = build_cas_hsi("tiny", backend="edge")        # train from scratch, or
 model, report = replace_attention_mixers(model)      # swap a trained research model's mixers
-export_onnx(edge, "cas_hsi.onnx", opset=18)          # dynamic H and W
+export_onnx(edge, "cas_hsi.onnx", opset=18)          # dynamic padded H and W
 ```
+
+The ONNX graph accepts any H/W **divisible by 4** (at the traced batch size). For
+an arbitrary-sized scene, apply `pad_to_multiple(rgb, 4)`, retain the `PadInfo`, run
+ONNX Runtime on the padded RGB, then call `crop_to_original` on the output. This keeps
+the graph's PixelUnshuffle reshapes valid at every exported resolution. Eager PyTorch
+inference still accepts arbitrary sizes directly.
 
 `replace_attention_mixers` gives the new convolutions **random weights** — it is the
 starting point for distillation (spec 9.4), not a free edge model.
@@ -230,7 +236,7 @@ so per-tile attention is not mathematically identical to one full-scene forward.
 
 ## Deviations from the spec
 
-Three, all forced, all commented at the site:
+Four, all forced, all commented at the site:
 
 1. **`base` uses `head_dim=24`, not 32.** Spec 3.2 specifies `base_width: 48, head_dim: 32`,
    but spec 3.6's own validator requires every width (48, 96, 192) to be divisible by
@@ -254,7 +260,13 @@ Three, all forced, all commented at the site:
    border pixel attends only to real ones. Set `mask_padding=False` to recover the reference
    exactly — `tests/test_equivalence.py` asserts the two agree bit-for-bit in that mode.
 
-The last point also covers the one *implementation* difference: `neighborhood_attention`
+4. **ONNX takes pre-padded inputs.** PyTorch's symbolic-shape exporter cannot represent
+   CAS-HSI's arbitrary-size reflect-pad-to-multiple-of-four path without freezing a
+   PixelUnshuffle reshape to the trace size. The deployment graph therefore accepts H/W
+   divisible by four, with caller-side pad/crop; `tests/test_export.py` runs a 64x64
+   export at 124x196 to verify that the spatial axes are genuinely dynamic.
+
+The third point also covers the one *implementation* difference: `neighborhood_attention`
 computes the spec's function by shifting over the 9 offsets rather than materializing
 `[B, h, d, H, W, 9]` patch tensors (which are the largest activation in the network).
 `local_attention_reference` keeps the literal unfold version, and the equivalence is a test,
