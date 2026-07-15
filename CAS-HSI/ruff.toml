@@ -1,0 +1,27 @@
+# Ruff configuration for CAS-HSI (mirrors mswr_v2/ruff.toml)
+
+[lint]
+select = ["E", "F", "W"]
+
+ignore = [
+    # The entry-point scripts insert their own directory on sys.path before importing
+    # the local package, so module-level imports cannot all sit at the top.
+    "E402",
+    "E501",  # line length handled by review, not the linter
+    "W291",
+    "W293",
+]
+
+exclude = [
+    "__pycache__",
+    ".git",
+    ".ruff_cache",
+    "experiments",
+]
+
+[lint.per-file-ignores]
+"train_cas_hsi.py" = ["E402"]
+"test_cas_ntire.py" = ["E402"]
+"smoke_train.py" = ["E402"]
+"smoke_infer.py" = ["E402"]
+"benchmark_cas.py" = ["E402"]

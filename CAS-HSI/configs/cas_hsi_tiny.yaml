@@ -1,0 +1,83 @@
+# ============================================================================
+# CAS-HSI-Tiny on ARAD-1K (900 / 50 / 50) -- MST++/NTIRE reference recipe
+# ============================================================================
+#
+# This is the comparability-safe baseline. Every optimization knob below is the
+# MST++ default, so a number produced by this config is directly comparable to the
+# ARAD-1K leaderboard and to the other models in this toolkit.
+#
+#   loss       MRAE (the NTIRE objective), on the UNCLAMPED prediction
+#   data       128x128 patches, stride 8, rot90 + h/v flips (geometric only --
+#              photometric jitter would break the RGB->spectrum physics)
+#   optimizer  Adam(0.9, 0.999), lr 4e-4, NO weight decay, NO warmup
+#   schedule   cosine to 1e-6, stepped per optimizer step
+#   batch      20, 300 epochs, 1000 steps/epoch
+#   selection  MRAE on the MST++ centre crop (128-px border)
+#
+# Deviating from any of these is legitimate, but it costs comparability -- say so
+# when you report the number.
+# ============================================================================
+
+experiment_name: cas_hsi_tiny
+
+# ---- model (spec 3.2, CAS-HSI-Tiny) ----
+variant: tiny                 # base_width 32, head_dim 32 -> widths 32/64/128
+backend: research             # attention spatial mixers at H/2 and H/4
+model_overrides:
+  layer_scale_init: 1.0e-3    # spec 4.4 for tiny/base
+  drop_path: 0.0              # spec 4.2: keep stochastic depth off until the baseline is stable
+  ffn_expansion: 2.0
+  enable_stripe_attention: true
+  stripe_frequency: 3         # one hybrid local+stripe block every 3rd bottleneck block
+  spectral_head: residual     # 'low_rank' is the spec 7.5 ablation
+
+# ---- data ----
+data_root: ./data/ARAD_1K
+patch_size: 128
+stride: 8
+batch_size: 20
+num_workers: 4
+rgb_norm: minmax              # MST++ normalizes each image by its own min/max, not /255
+cache_dtype: float32
+augment: true
+
+# ---- objective ----
+loss: mrae
+mrae_eps: 1.0e-6
+
+# ---- optimization (MST++) ----
+epochs: 300
+steps_per_epoch: 1000
+optimizer: adam
+lr: 4.0e-4
+min_lr: 1.0e-6
+weight_decay: 0.0
+warmup_epochs: 0
+scheduler: cosine
+gradient_clip: 1.0
+accumulate_steps: 1
+
+# ---- precision ----
+amp: true
+amp_dtype: auto               # bf16 where supported; fp16 overflows this family's logits
+channels_last: true
+
+# ---- EMA (off by default: MST++ used none, so this stays comparable) ----
+use_ema: false
+ema_decay: 0.999
+ema_start_epoch: 5
+
+# ---- validation ----
+val_interval: 1
+val_crop_border: 128          # MST++ centre region: 482x512 -> 226x256
+val_tile_size: 0              # >0 switches to tiled inference (spec 8.7)
+clamp_eval: false             # NTIRE convention. true flatters MRAE -- do not mix.
+selection_protocol: crop
+selection_metric: mrae
+
+# ---- logging ----
+output_root: ./experiments
+log_interval: 100
+train_metric_interval: 1      # train MRAE/PSNR/RMSE/SSIM on every batch
+save_interval: 0
+seed: 42
