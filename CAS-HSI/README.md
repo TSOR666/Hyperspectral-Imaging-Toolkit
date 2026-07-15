@@ -234,45 +234,6 @@ so per-tile attention is not mathematically identical to one full-scene forward.
 
 ---
 
-## Deviations from the spec
-
-Four, all forced, all commented at the site:
-
-1. **`base` uses `head_dim=24`, not 32.** Spec 3.2 specifies `base_width: 48, head_dim: 32`,
-   but spec 3.6's own validator requires every width (48, 96, 192) to be divisible by
-   `head_dim` — and `48 % 32 = 16`. It is not merely a validator quibble:
-   `CrossChannelAttention(48, head_dim=32)` cannot split 48 channels into 32-wide heads
-   either, so the Base variant **cannot be constructed as written**. 24 is the largest
-   divisor of 48 below 32. The alternative (widening `base_width` to 64) was rejected: it
-   inflates the model ~1.8× and changes the variant's identity, whereas `head_dim` is an
-   internal partitioning choice. Override it in a config if you prefer a different fix.
-
-2. **`MultiDilationDepthwiseMixer` splits channels unevenly when it must.** The spec's
-   reference raises if `channels % len(dilations) != 0` — but the spec's own recommended
-   Tiny config hits exactly that: the quarter-resolution width is 128 and the quarter-stage
-   dilations are (1, 2, 3), and `128 % 3 = 2`. Channels are split as evenly as possible with
-   the remainder going to the larger dilations (mirroring the head-allocation rule of 4.5.2).
-   Pass `strict_split=True` to restore the hard failure.
-
-3. **Neighborhood attention masks out-of-image neighbours** (`mask_padding=True`, default).
-   The spec's `unfold` reference zero-pads K and V, so border pixels attend to fabricated
-   zero-valued neighbours that still receive softmax mass. Masking them instead means a
-   border pixel attends only to real ones. Set `mask_padding=False` to recover the reference
-   exactly — `tests/test_equivalence.py` asserts the two agree bit-for-bit in that mode.
-
-4. **ONNX takes pre-padded inputs.** PyTorch's symbolic-shape exporter cannot represent
-   CAS-HSI's arbitrary-size reflect-pad-to-multiple-of-four path without freezing a
-   PixelUnshuffle reshape to the trace size. The deployment graph therefore accepts H/W
-   divisible by four, with caller-side pad/crop; `tests/test_export.py` runs a 64x64
-   export at 124x196 to verify that the spatial axes are genuinely dynamic.
-
-The third point also covers the one *implementation* difference: `neighborhood_attention`
-computes the spec's function by shifting over the 9 offsets rather than materializing
-`[B, h, d, H, W, 9]` patch tensors (which are the largest activation in the network).
-`local_attention_reference` keeps the literal unfold version, and the equivalence is a test,
-not a claim.
-
----
 
 ## Layout
 
