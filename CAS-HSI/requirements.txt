@@ -1,0 +1,22 @@
+# CAS-HSI runtime dependencies.
+#
+# Install the PyTorch wheel matching your CUDA/CPU setup FIRST, then:
+#   pip install -r requirements.txt
+
+torch>=2.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0      # RGB reading (BGR -> RGB, MST++ convention)
+h5py>=3.7.0               # ARAD .mat cubes are HDF5
+pyyaml>=6.0
+tqdm>=4.64.0
+psutil>=5.9.0             # CPU memory reporting in benchmark_cas.py
+scipy>=1.7.0
+pillow>=9.0.0             # hsi_benchmark package import path used by evaluation.py
+
+# --- optional ---
+hdf5storage>=0.1.19       # test_cas_ntire.py --save_mat (v7.3 .mat export)
+onnx>=1.15.0              # cas_hsi.deployment.export_onnx
+onnxruntime>=1.17.0       # ONNX equivalence checking (spec 9.9)
+fvcore>=0.1.5             # MAC counting in benchmark_cas.py
+tensorboard>=2.12.0       # optional training curves
+pytest>=7.2.0

@@ -1,0 +1,77 @@
+# ============================================================================
+# CAS-HSI edge profile (spec 9.11) -- the deployable, exportable model
+# ============================================================================
+#
+# Identical topology to Tiny. The two attention spatial mixers are replaced by
+# convolutional ones (spec 9.2/9.3):
+#
+#   H/2, H/4 blocks   dilated_local_attention       -> dilated_depthwise_conv
+#   stripe blocks     hybrid_local_stripe_attention -> large_kernel_depthwise_conv
+#   full resolution   depthwise 7x7  (unchanged -- CAS-Lite was already conv-only)
+#
+# CROSS-CHANNEL ATTENTION IS KEPT. Its cost is independent of H*W and it is what
+# carries the spectral prior; dropping it would gut the model, not speed it up.
+#
+# ~1.46M parameters. This is the ONNX/TensorRT export path -- the research backend's
+# neighborhood attention has no portable operator (spec 9.7).
+#
+# Two ways to get an edge model:
+#   1. Train this config from scratch (what this file is for).
+#   2. Train the research model, then distill into this one (spec 9.4) via
+#      cas_hsi.deployment.replace_attention -- better accuracy, more work.
+# Simply swapping the mixers of a trained research model gives RANDOM conv weights;
+# it is a starting point for distillation, not a free edge model.
+# ============================================================================
+
+experiment_name: cas_hsi_edge
+
+variant: tiny
+backend: edge
+model_overrides:
+  layer_scale_init: 1.0e-3
+  drop_path: 0.0
+  ffn_expansion: 2.0
+  enable_stripe_attention: true   # selects large_kernel_depthwise_conv in this backend
+  stripe_frequency: 3
+  large_kernel: 11
+  spectral_head: residual
+
+data_root: ./data/ARAD_1K
+patch_size: 128
+stride: 8
+batch_size: 20
+num_workers: 4
+rgb_norm: minmax
+cache_dtype: float32
+augment: true
+
+loss: mrae
+mrae_eps: 1.0e-6
+
+epochs: 300
+steps_per_epoch: 1000
+optimizer: adam
+lr: 4.0e-4
+min_lr: 1.0e-6
+weight_decay: 0.0
+warmup_epochs: 0
+scheduler: cosine
+gradient_clip: 1.0
+accumulate_steps: 1
+
+amp: true
+amp_dtype: auto
+channels_last: true
+
+use_ema: false
+
+val_interval: 1
+val_crop_border: 128
+clamp_eval: false
+selection_protocol: crop
+selection_metric: mrae
+
+output_root: ./experiments
+log_interval: 100
+train_metric_interval: 1
+seed: 42

@@ -1,0 +1,71 @@
+# ============================================================================
+# CAS-HSI-Base on ARAD-1K (900 / 50 / 50) -- accuracy profile
+# ============================================================================
+#
+# Same MST++ recipe as cas_hsi_tiny.yaml; the only changes are capacity.
+#
+# HEAD_DIM IS 24, NOT 32 -- and that is deliberate.
+#   Spec 3.2 gives Base `base_width: 48, head_dim: 32`. Spec 3.6's own validator
+#   requires every width (48, 96, 192) to be divisible by head_dim, and 48 % 32 = 16.
+#   The variant as written cannot be constructed: CrossChannelAttention(48, head_dim=32)
+#   cannot split 48 channels into 32-wide heads either. 24 is the largest divisor of 48
+#   below 32, giving 2/4/8 heads across the three stages. See cas_hsi/config.py.
+#
+# ~4.7M parameters vs Tiny's ~1.8M. Slower; use when accuracy beats latency.
+# ============================================================================
+
+experiment_name: cas_hsi_base
+
+variant: base                 # base_width 48, head_dim 24 -> widths 48/96/192
+backend: research
+model_overrides:
+  layer_scale_init: 1.0e-3
+  drop_path: 0.0              # raise toward 0.1 only if you observe overfitting
+  ffn_expansion: 2.0
+  enable_stripe_attention: true
+  stripe_frequency: 3
+  spectral_head: residual
+
+data_root: ./data/ARAD_1K
+patch_size: 128
+stride: 8
+batch_size: 20
+num_workers: 4
+rgb_norm: minmax
+cache_dtype: float32
+augment: true
+
+loss: mrae
+mrae_eps: 1.0e-6
+
+epochs: 300
+steps_per_epoch: 1000
+optimizer: adam
+lr: 4.0e-4
+min_lr: 1.0e-6
+weight_decay: 0.0
+warmup_epochs: 0
+scheduler: cosine
+gradient_clip: 1.0
+accumulate_steps: 1
+
+amp: true
+amp_dtype: auto
+channels_last: true
+
+use_ema: false
+ema_decay: 0.999
+ema_start_epoch: 5
+
+val_interval: 1
+val_crop_border: 128
+val_tile_size: 0
+clamp_eval: false
+selection_protocol: crop
+selection_metric: mrae
+
+output_root: ./experiments
+log_interval: 100
+train_metric_interval: 1
+save_interval: 0
+seed: 42
