@@ -7,8 +7,9 @@ The prediction is ``Y = P_rgb(RGB) + dY(features)``:
 * ``dY`` is the deep residual: metamer disambiguation, material-dependent
   corrections, spatial context, high-frequency detail.
 
-The residual head is initialized near zero so the network starts out equal to the
-linear prior and improves from there, instead of starting from noise (spec 7.3).
+The residual head is initialized near zero so the network starts equal to its learned
+linear branch. Xavier initialization makes that branch well-scaled for optimization,
+but it is not a calibrated physical RGB-to-spectrum mapping before training.
 
 No activation is applied after the 31-band projection (spec 7.4).  Clamping is an
 *evaluation* concern only: clamp() has zero gradient outside its range, so
@@ -35,8 +36,9 @@ class RGBPrior(nn.Module):
             kernel_size=1,
             bias=True,
         )
-        # Standard Xavier init (spec 7.3): the prior is a genuine linear model and
-        # should start with sane gain, unlike the residual head.
+        # Xavier gives the trainable linear branch a well-scaled gain. It is not a
+        # calibrated spectral response; physical calibration requires the camera's
+        # sensitivity functions and a dataset-specific fitting procedure.
         nn.init.xavier_uniform_(self.projection.weight)
         nn.init.zeros_(self.projection.bias)
 

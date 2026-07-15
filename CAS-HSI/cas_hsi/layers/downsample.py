@@ -13,6 +13,12 @@ import torch.nn as nn
 __all__ = ["PixelUnshuffleDownsample"]
 
 
+def _is_compiling() -> bool:
+    """Whether the current call is being captured by ``torch.export``/Dynamo."""
+    compiler = getattr(torch, "compiler", None)
+    return bool(compiler is not None and compiler.is_compiling())
+
+
 class PixelUnshuffleDownsample(nn.Module):
     """``B x C_in x H x W  ->  B x C_out x H/2 x W/2``."""
 
@@ -30,16 +36,21 @@ class PixelUnshuffleDownsample(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-2] % 2 != 0:
-            raise ValueError(
-                f"Input height must be divisible by 2, got {int(x.shape[-2])}. "
-                "Pad the network input with pad_to_multiple(x, multiple=4) first."
-            )
-        if x.shape[-1] % 2 != 0:
-            raise ValueError(
-                f"Input width must be divisible by 2, got {int(x.shape[-1])}. "
-                "Pad the network input with pad_to_multiple(x, multiple=4) first."
-            )
+        # These checks are valuable in eager mode, but Python branching on a SymInt
+        # specializes the dimensions during torch.export. The enclosing CASHSI
+        # forward pads to a multiple of four before this module, and the exported
+        # graph retains that symbolic padding relationship.
+        if not _is_compiling():
+            if x.shape[-2] % 2 != 0:
+                raise ValueError(
+                    f"Input height must be divisible by 2, got {int(x.shape[-2])}. "
+                    "Pad the network input with pad_to_multiple(x, multiple=4) first."
+                )
+            if x.shape[-1] % 2 != 0:
+                raise ValueError(
+                    f"Input width must be divisible by 2, got {int(x.shape[-1])}. "
+                    "Pad the network input with pad_to_multiple(x, multiple=4) first."
+                )
 
         x = self.unshuffle(x)
         x = self.projection(x)

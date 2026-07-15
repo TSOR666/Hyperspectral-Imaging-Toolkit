@@ -16,6 +16,7 @@ pillow>=9.0.0             # hsi_benchmark package import path used by evaluation
 # --- optional ---
 hdf5storage>=0.1.19       # test_cas_ntire.py --save_mat (v7.3 .mat export)
 onnx>=1.15.0              # cas_hsi.deployment.export_onnx
+onnxscript>=0.1.0         # torch.export-based ONNX export with dynamic shapes
 onnxruntime>=1.17.0       # ONNX equivalence checking (spec 9.9)
 fvcore>=0.1.5             # MAC counting in benchmark_cas.py
 tensorboard>=2.12.0       # optional training curves

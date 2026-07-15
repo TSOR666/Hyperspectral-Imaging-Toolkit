@@ -69,14 +69,27 @@ def _resolve_cache_dtype(name: str) -> np.dtype:
     return np.dtype(_CACHE_DTYPES[key])
 
 
-def load_hsi_cube(path: Path) -> np.ndarray:
-    """Read an ARAD .mat cube as ``(bands, height, width)`` float32."""
+def load_hsi_cube(path: Path, *, expected_bands: Optional[int] = None) -> np.ndarray:
+    """Read an ARAD .mat cube as finite ``(bands, height, width)`` float32.
+
+    ``expected_bands`` is optional for backwards compatibility, but training and
+    evaluation pass the model's output-band count. This turns a corrupted cube or
+    a wrong MATLAB axis convention into an immediate data error rather than a
+    later non-finite loss or opaque broadcast failure.
+    """
     with h5py.File(path, "r") as mat:
         if "cube" not in mat:
             raise KeyError(f"Missing 'cube' dataset in {path} (keys: {list(mat.keys())})")
         cube = np.array(mat["cube"], dtype=np.float32)
     if cube.ndim != 3:
         raise ValueError(f"Unexpected cube shape {cube.shape} in {path}")
+    if not np.isfinite(cube).all():
+        raise ValueError(f"HSI cube contains NaN or Inf values: {path}")
+    if expected_bands is not None and cube.shape[0] != int(expected_bands):
+        raise ValueError(
+            f"HSI cube has {cube.shape[0]} bands in {path}; expected {int(expected_bands)}. "
+            "Check the source cube's band axis and the model output_bands setting."
+        )
     # ARAD stores (bands, width, height).
     return np.transpose(cube, (0, 2, 1))
 
@@ -194,6 +207,7 @@ class TrainDataset(Dataset):
         rgb_norm: str = "minmax",
         augment: bool = True,
         cache_dtype: str = "float32",
+        expected_bands: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
@@ -234,7 +248,7 @@ class TrainDataset(Dataset):
                 continue
             try:
                 rgb = load_rgb_image(rgb_path, bgr2rgb=bgr2rgb, norm=rgb_norm)
-                hsi = load_hsi_cube(hsi_path)
+                hsi = load_hsi_cube(hsi_path, expected_bands=expected_bands)
             except Exception as exc:  # pragma: no cover - defensive
                 self.config.logger.warning("Skipping %s: %s", stem, exc)
                 continue
@@ -324,6 +338,7 @@ class EvalDataset(Dataset):
         bgr2rgb: bool = True,
         rgb_norm: str = "minmax",
         cache_dtype: str = "float32",
+        expected_bands: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         super().__init__()
@@ -361,7 +376,7 @@ class EvalDataset(Dataset):
                 continue
             try:
                 rgb = load_rgb_image(rgb_path, bgr2rgb=bgr2rgb, norm=rgb_norm)
-                hsi = load_hsi_cube(hsi_path)
+                hsi = load_hsi_cube(hsi_path, expected_bands=expected_bands)
             except Exception as exc:  # pragma: no cover - defensive
                 raise RuntimeError(f"Failed to load {split} scene {stem}: {exc}") from exc
 

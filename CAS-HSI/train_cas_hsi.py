@@ -38,7 +38,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, get_type_hints
+from typing import Any, Dict, List, Mapping, Optional, get_type_hints
 
 import numpy as np
 import torch
@@ -264,6 +264,32 @@ def set_seed(seed: int, deterministic: bool) -> None:
             torch.backends.cudnn.allow_tf32 = True
 
 
+def capture_rng_state() -> Dict[str, Any]:
+    """Capture every RNG stream that affects data order and augmentation."""
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore a checkpointed RNG state, tolerating a CPU/CUDA environment change."""
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        saved_cuda = state["cuda"]
+        if len(saved_cuda) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(saved_cuda)
+
+
 def resolve_amp_dtype(requested: str) -> torch.dtype:
     """bf16 where supported: fp16 overflows the attention logits of this family.
 
@@ -386,6 +412,7 @@ class Trainer:
             rgb_norm=cfg.rgb_norm,
             augment=cfg.augment,
             cache_dtype=cfg.cache_dtype,
+            expected_bands=self.model.config.output_bands,
             logger=self.logger,
         )
         self.val_set = EvalDataset(
@@ -393,6 +420,7 @@ class Trainer:
             split="valid",
             rgb_norm=cfg.rgb_norm,
             cache_dtype=cfg.cache_dtype,
+            expected_bands=self.model.config.output_bands,
             logger=self.logger,
         )
 
@@ -665,6 +693,7 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "scaler_state_dict": self.scaler.state_dict(),
+            "rng_state": capture_rng_state(),
             "best_selection": self.best_selection,
             "best_epoch": self.best_epoch,
         }
@@ -718,6 +747,8 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if checkpoint.get("scaler_state_dict"):
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        if isinstance(checkpoint.get("rng_state"), Mapping):
+            restore_rng_state(checkpoint["rng_state"])
 
         self.epoch = int(checkpoint.get("epoch", 0))
         self.step = int(checkpoint.get("step", 0))

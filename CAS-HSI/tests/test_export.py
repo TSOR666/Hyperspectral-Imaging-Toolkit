@@ -119,6 +119,7 @@ def test_export_refuses_a_model_with_attention(small_model, tmp_path):
 
 def test_export_edge_model_with_dynamic_axes(small_edge_model, tmp_path):
     pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
     path = export_onnx(
         small_edge_model,
         tmp_path / "cas_hsi.onnx",
@@ -143,6 +144,7 @@ def test_onnx_matches_torch_at_a_different_size(small_edge_model, tmp_path):
     """Spec 9.9. The check size deliberately differs from the trace size -- exporting at
     64x64 and checking at 64x64 would pass even on a statically-shaped graph."""
     pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
     pytest.importorskip("onnxruntime")
 
     import numpy as np
@@ -156,18 +158,19 @@ def test_onnx_matches_torch_at_a_different_size(small_edge_model, tmp_path):
         check=False,
     )
 
-    probe = torch.randn(1, 3, 127, 193)  # odd, and not the trace size
+    probe = torch.randn(1, 3, 124, 196)  # different from the trace size, still divisible by four
     with torch.no_grad():
         torch_output = small_edge_model(probe).cpu().numpy()
 
     onnx_output = run_onnx(path, {"rgb": probe.cpu().numpy()})[0]
 
-    assert onnx_output.shape == torch_output.shape == (1, 31, 127, 193)
+    assert onnx_output.shape == torch_output.shape == (1, 31, 124, 196)
     np.testing.assert_allclose(torch_output, onnx_output, rtol=1e-3, atol=1e-4)
 
 
 def test_export_with_replace_attention_succeeds(small_model, tmp_path):
     pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
     model = build_cas_hsi(small_model.config)
     path = export_onnx(
         model,
@@ -177,6 +180,16 @@ def test_export_with_replace_attention_succeeds(small_model, tmp_path):
         check=False,
     )
     assert path.exists()
+
+
+def test_export_rejects_an_unpadded_example_input(small_edge_model, tmp_path):
+    with pytest.raises(ValueError, match="divisible by 4"):
+        export_onnx(
+            small_edge_model,
+            tmp_path / "invalid.onnx",
+            example_input=torch.randn(1, 3, 127, 193),
+            check=False,
+        )
 
 
 # ------------------------------------------------------------- quantization ----
