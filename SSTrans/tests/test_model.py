@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from hsiformer import build_model, load_checkpoint
 from hsiformer.attention import Spectral_MSA
-from hsiformer.model import SSTLayer
+from hsiformer.model import SSTLayer, SSTransformer
 
 
 def _tiny_model(preset: str = "legacy"):
@@ -149,6 +150,18 @@ def test_tiny_batch_l1_loss_decreases() -> None:
         final_loss = F.l1_loss(model(inputs), target)
 
     assert final_loss < initial_loss
+
+
+def test_model_initialization_keeps_convolution_projections_small() -> None:
+    convolution = nn.Conv2d(8, 8, kernel_size=3, bias=True)
+    with torch.no_grad():
+        convolution.weight.fill_(1)
+        convolution.bias.fill_(1)
+
+    SSTransformer._init_weights(convolution)
+
+    assert convolution.weight.std() < 0.03
+    torch.testing.assert_close(convolution.bias, torch.zeros_like(convolution.bias))
 
 
 def test_checkpoint_loader_accepts_wrapped_model_prefix(tmp_path) -> None:
