@@ -95,8 +95,8 @@ def test_progressive_finetune_config_switches_after_saturated_128_stage():
     stages = list(config.progressive_stages)
     assert [int(stage.patch_size) for stage in stages] == [128, 256, 512]
     assert int(stages[0].iterations) == 70_000
-    assert int(stages[1].batch_size) == 8
-    assert int(stages[2].batch_size) == 2
+    assert int(stages[1].batch_size) == 5
+    assert int(stages[2].batch_size) == 1
     assert int(config.early_stopping_patience) == 3
     assert bool(config.early_stopping_final_stage_only) is False
 

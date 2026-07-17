@@ -149,9 +149,13 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 
 ### "CUDA out of memory"
 **Solutions:**
-1. Reduce batch size: `batch_size=8`
-2. Reduce the progressive-stage batch sizes
-3. Set `memory_mode=lazy` to trade loader throughput for lower host RAM
+1. The generator trainer first retries the same samples with automatic
+   gradient microbatches (20 -> 10 -> 5 -> 3 -> 2 -> 1), preserving the
+   configured effective batch size. Look for the selected `microbatch=` in
+   the training log.
+2. If microbatch 1 still fails, reduce batch size: `batch_size=8`
+3. Reduce the progressive-stage batch sizes or patch size.
+4. Set `memory_mode=lazy` to trade loader throughput for lower host RAM
 
 ### "Padding error at dimension 3"
 **Solution:** This is already fixed in the code. Ensure you're using the latest version.

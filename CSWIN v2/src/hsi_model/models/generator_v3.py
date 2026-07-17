@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Union, Mapping
+from packaging import version
+from torch.utils.checkpoint import checkpoint
 
 from .attention import CSWinAttentionBlock, EfficientSpectralAttention, SpectralMSA
 
@@ -298,13 +300,55 @@ class DualTransformerBlock(nn.Module):
         self.spatial_attn = NaNSafeAttention(spatial_attn)
         self.sgfn = SGFN(channels, expansion=ffn_expansion)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Attention-only checkpointing leaves the much larger GDFN/SGFN and
+        # residual activations live. At a large configured batch this can
+        # consume an entire 80 GB GPU before backward starts. Checkpoint the
+        # complete SST block when its feature map is sufficiently large, then
+        # recompute it during backward. There is no stochastic op in this
+        # block, so the recomputation is numerically equivalent.
+        checkpointing = config.get("activation_checkpointing", "auto")
+        if isinstance(checkpointing, str):
+            checkpointing = checkpointing.strip().lower()
+            if checkpointing == "auto":
+                self._activation_checkpointing = True
+            elif checkpointing in ("true", "1", "yes", "on"):
+                self._activation_checkpointing = True
+            elif checkpointing in ("false", "0", "no", "off"):
+                self._activation_checkpointing = False
+            else:
+                raise ValueError(
+                    "activation_checkpointing must be a boolean or 'auto', got "
+                    f"{checkpointing!r}"
+                )
+        else:
+            self._activation_checkpointing = bool(checkpointing)
+        self._activation_checkpoint_min_tokens = max(
+            0, int(config.get("activation_checkpoint_min_tokens", 1024))
+        )
+        self._supports_non_reentrant_checkpoint = (
+            version.parse(torch.__version__.split("+")[0]) >= version.parse("2.1")
+        )
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         g = self.gate(x)
         h = g + self.spectral_attn(self.norm1(g))   # Eq. 4 spectral pair
         h = h + self.gdfn(self.norm2(h))
         h = h + self.spatial_attn(self.norm3(h))     # Eq. 5 spatial pair
         h = h + self.sgfn(self.norm4(h))
         return h + x                                  # Eq. 2 outer residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        should_checkpoint = (
+            self.training
+            and self._activation_checkpointing
+            and x.shape[-2] * x.shape[-1]
+            >= self._activation_checkpoint_min_tokens
+        )
+        if not should_checkpoint:
+            return self._forward_impl(x)
+        if self._supports_non_reentrant_checkpoint:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        return checkpoint(self._forward_impl, x)
 
 
 class DynamicDownsampleBlock(nn.Module):

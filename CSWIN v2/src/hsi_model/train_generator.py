@@ -26,6 +26,8 @@ import sys
 import logging
 import math
 import time
+import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -250,7 +252,7 @@ def _resolve_stages(config: Dict[str, Any]) -> list:
                 "patch_size": int(s.get("patch_size", config.get("patch_size", 128))),
                 "iterations": int(s.get("iterations", default_iters)),
                 "init_lr": float(s.get("init_lr", default_lr)),
-                "batch_size": int(s.get("batch_size", config.get("batch_size", 32))),
+                "batch_size": int(s.get("batch_size", config.get("batch_size", 20))),
                 # Warmup only the first stage by default; later stages continue
                 # from trained weights at a low LR and need no warmup.
                 "warmup_steps": int(s.get("warmup_steps", default_warmup if i == 0 else 0)),
@@ -260,7 +262,7 @@ def _resolve_stages(config: Dict[str, Any]) -> list:
         "patch_size": int(config.get("patch_size", 128)),
         "iterations": default_iters,
         "init_lr": default_lr,
-        "batch_size": int(config.get("batch_size", 32)),
+        "batch_size": int(config.get("batch_size", 20)),
         "warmup_steps": default_warmup,
     }]
 
@@ -512,6 +514,64 @@ def validate_generator(
     return avg
 
 
+def _forward_backward_microbatched(
+    net: nn.Module,
+    criterion: nn.Module,
+    scaler: GradScaler,
+    rgb_batch: torch.Tensor,
+    hsi_batch: torch.Tensor,
+    device: torch.device,
+    use_amp: bool,
+    autocast_dtype: torch.dtype,
+    check_finite: bool,
+    microbatch_size: int,
+) -> tuple[torch.Tensor, bool]:
+    """Run one optimizer-step batch, optionally split into gradient microbatches.
+
+    The returned loss is the sample-weighted mean of the unscaled chunk losses.
+    Scaling each chunk by its share of the original batch keeps the accumulated
+    gradient equivalent to a single forward/backward over that batch (apart
+    from harmless floating-point reduction order differences).  DDP all-reduce
+    is deferred until the final chunk.
+    """
+    batch_size = int(rgb_batch.shape[0])
+    if batch_size < 1:
+        raise ValueError("Training batch must contain at least one sample.")
+    microbatch_size = max(1, min(int(microbatch_size), batch_size))
+    step_loss = torch.zeros((), device=device)
+    pred_is_finite = True
+
+    for start in range(0, batch_size, microbatch_size):
+        end = min(start + microbatch_size, batch_size)
+        chunk_size = end - start
+        is_final_chunk = end == batch_size
+        no_sync = getattr(net, "no_sync", None)
+        sync_context = (
+            no_sync()
+            if callable(no_sync) and not is_final_chunk
+            else nullcontext()
+        )
+        with sync_context:
+            rgb_tensor = rgb_batch[start:end].to(device, non_blocking=True)
+            hsi_tensor = hsi_batch[start:end].to(device, non_blocking=True)
+            with autocast_context(device.type, use_amp, autocast_dtype):
+                pred = net(rgb_tensor)
+
+            if check_finite and not torch.isfinite(pred).all():
+                pred_is_finite = False
+                break
+
+            with autocast_context(device.type, use_amp, autocast_dtype):
+                chunk_loss = criterion(pred.float(), hsi_tensor.float())
+            chunk_weight = chunk_size / batch_size
+            scaler.scale(chunk_loss * chunk_weight).backward()
+
+        # Keep logging loss detached so this does not retain chunk graphs.
+        step_loss = step_loss + chunk_loss.detach() * chunk_weight
+
+    return step_loss, pred_is_finite
+
+
 def _run_stage(
     net, generator, optimizer, scheduler, scaler, criterion, ema,
     train_loader, val_dataset, config, device, metrics_logger,
@@ -549,26 +609,34 @@ def _run_stage(
     iteration = global_iter
     log_window_start = time.perf_counter()
     log_window_iteration = iteration
+    # Start with the configured loader batch. If it does not fit, retain the
+    # same effective optimizer batch by accumulating progressively smaller
+    # chunks instead of repeating the impossible forward three times.
+    adaptive_microbatch_size: Optional[int] = None
+    retry_batch: Optional[tuple[Any, Any]] = None
 
     while stage_iter < stage_iterations:
         net.train()
-        try:
-            bgr_batch, hyper_batch = next(data_iter)
-        except StopIteration:
-            if is_distributed:
-                loader_epoch += 1
-                train_loader.sampler.set_epoch(loader_epoch)
-            data_iter = iter(train_loader)
-            bgr_batch, hyper_batch = next(data_iter)
+        if retry_batch is not None:
+            bgr_batch, hyper_batch = retry_batch
+            retry_batch = None
+        else:
+            try:
+                bgr_batch, hyper_batch = next(data_iter)
+            except StopIteration:
+                if is_distributed:
+                    loader_epoch += 1
+                    train_loader.sampler.set_epoch(loader_epoch)
+                data_iter = iter(train_loader)
+                bgr_batch, hyper_batch = next(data_iter)
 
         try:
-            rgb_tensor, hsi_tensor = mst_to_gan_batch(bgr_batch, hyper_batch)
-            rgb_tensor = rgb_tensor.to(device, non_blocking=True)
-            hsi_tensor = hsi_tensor.to(device, non_blocking=True)
+            rgb_batch, hsi_batch = mst_to_gan_batch(bgr_batch, hyper_batch)
+            step_batch_size = int(rgb_batch.shape[0])
             check_finite = iteration % finite_check_interval == 0
             if check_finite and (
-                not torch.isfinite(rgb_tensor).all()
-                or not torch.isfinite(hsi_tensor).all()
+                not torch.isfinite(rgb_batch).all()
+                or not torch.isfinite(hsi_batch).all()
             ):
                 train_logger.warning("Skipping non-finite batch at iteration %s", iteration)
                 continue
@@ -578,10 +646,25 @@ def _run_stage(
                 generator.set_iteration(iteration)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device.type, use_amp, autocast_dtype):
-                pred = net(rgb_tensor)
+            update_mrae_epsilon_schedule(criterion, config, iteration)
+            microbatch_size = min(
+                adaptive_microbatch_size or step_batch_size,
+                step_batch_size,
+            )
+            loss, pred_is_finite = _forward_backward_microbatched(
+                net=net,
+                criterion=criterion,
+                scaler=scaler,
+                rgb_batch=rgb_batch,
+                hsi_batch=hsi_batch,
+                device=device,
+                use_amp=use_amp,
+                autocast_dtype=autocast_dtype,
+                check_finite=check_finite,
+                microbatch_size=microbatch_size,
+            )
 
-            if check_finite and not torch.isfinite(pred).all():
+            if check_finite and not pred_is_finite:
                 consecutive_nonfinite += 1
                 train_logger.warning(
                     "Non-finite generator output at iter %s; retry %s/%s",
@@ -603,14 +686,9 @@ def _run_stage(
             # (consecutive_nonfinite is reset only after a successful optimizer
             # step below, so repeated NaN losses/grads cannot loop forever.)
 
-            with autocast_context(device.type, use_amp, autocast_dtype):
-                update_mrae_epsilon_schedule(criterion, config, iteration)
-                loss = criterion(pred.float(), hsi_tensor.float())
-
             # A non-finite loss is caught below via the grad-norm check (NaN
             # loss -> NaN grads -> NaN grad norm), which avoids a dedicated
             # per-step host-device sync on the loss here.
-            scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 net.parameters(), max_norm=DEFAULT_GRADIENT_CLIP_NORM
@@ -671,7 +749,7 @@ def _run_stage(
                     lr,
                     avg_loss,
                     elapsed / completed,
-                    completed * int(rgb_tensor.shape[0]) / elapsed,
+                    completed * step_batch_size / elapsed,
                 )
                 log_window_start = time.perf_counter()
                 log_window_iteration = iteration
@@ -835,18 +913,48 @@ def _run_stage(
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 consecutive_ooms += 1
-                train_logger.error(
-                    "OOM at iter %s; clearing cache (retry %s/%s)",
-                    iteration,
-                    consecutive_ooms,
-                    max_consecutive_ooms,
+                batch_size = int(bgr_batch.shape[0])
+                current_microbatch = min(
+                    adaptive_microbatch_size or batch_size,
+                    batch_size,
                 )
+                next_microbatch = max(1, (current_microbatch + 1) // 2)
+                can_reduce_microbatch = next_microbatch < current_microbatch
+                if can_reduce_microbatch:
+                    adaptive_microbatch_size = next_microbatch
+                    # Retry the exact samples that overflowed. Dropping them
+                    # would change the epoch's sample distribution and hides
+                    # the true effective batch from the scheduler.
+                    retry_batch = (bgr_batch, hyper_batch)
+                    train_logger.error(
+                        "OOM at iter %s; clearing cache and retrying with "
+                        "microbatch=%s (effective batch=%s; retry %s/%s)",
+                        iteration,
+                        next_microbatch,
+                        batch_size,
+                        consecutive_ooms,
+                        max_consecutive_ooms,
+                    )
+                else:
+                    train_logger.error(
+                        "OOM at iter %s with microbatch=1; clearing cache "
+                        "(retry %s/%s)",
+                        iteration,
+                        consecutive_ooms,
+                        max_consecutive_ooms,
+                    )
+                # The caught exception retains traceback frames from the
+                # failed forward. Clear their locals before emptying CUDA's
+                # cache; otherwise those frames can keep the very activations
+                # that caused the OOM alive through the retry.
+                traceback.clear_frames(e.__traceback__)
                 optimizer.zero_grad(set_to_none=True)
                 memory_cleanup()
                 if consecutive_ooms >= max_consecutive_ooms:
                     raise RuntimeError(
                         f"Training hit {consecutive_ooms} consecutive OOMs at "
-                        f"iteration {iteration}. Reduce the stage batch size or "
+                        f"iteration {iteration}; automatic microbatch recovery "
+                        "reached microbatch=1. Reduce the stage batch size or "
                         "patch size before retrying."
                     ) from e
                 continue
