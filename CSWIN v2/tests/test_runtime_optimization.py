@@ -105,6 +105,21 @@ class _AlwaysOOM(torch.nn.Module):
         raise RuntimeError("CUDA out of memory")
 
 
+class _OOMAtConfiguredBatch(torch.nn.Module):
+    """Synthetic model that proves the trainer retries with microbatches."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+        self.seen_batch_sizes = []
+
+    def forward(self, x):
+        self.seen_batch_sizes.append(int(x.shape[0]))
+        if x.shape[0] >= 4:
+            raise RuntimeError("CUDA out of memory")
+        return x[:, :1] * self.weight
+
+
 class _NoOpMetricsLogger:
     def log_scalars(self, *args, **kwargs):
         return None
@@ -255,6 +270,52 @@ def test_training_aborts_after_bounded_consecutive_ooms():
             early_stopping_bad_epochs=0,
             early_stopping_enabled=False,
         )
+
+
+def test_training_recovers_oom_with_microbatch_accumulation():
+    model = _OOMAtConfiguredBatch()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    loader = torch.utils.data.DataLoader(
+        TensorDataset(
+            torch.ones(4, 3, 8, 8),
+            torch.ones(4, 1, 8, 8),
+        ),
+        batch_size=4,
+    )
+
+    result = _run_stage(
+        net=model,
+        generator=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=make_grad_scaler("cpu", enabled=False),
+        criterion=torch.nn.L1Loss(),
+        ema=None,
+        train_loader=loader,
+        val_dataset=None,
+        config={
+            "iterations_per_epoch": 100,
+            "finite_check_interval": 1,
+            "max_consecutive_ooms": 2,
+        },
+        device=torch.device("cpu"),
+        metrics_logger=_NoOpMetricsLogger(),
+        distributed=False,
+        seed=42,
+        rank=0,
+        stage_idx=0,
+        stage_iterations=1,
+        global_iter=0,
+        record_mrae_loss=float("inf"),
+        early_stopping_best_mrae=float("inf"),
+        early_stopping_bad_epochs=0,
+        early_stopping_enabled=False,
+    )
+
+    assert result[0] == 1
+    assert model.seen_batch_sizes == [4, 2, 2]
+    assert model.weight.item() > 0
 
 
 def test_strict_checkpoint_load_rejects_missing_state(tmp_path):

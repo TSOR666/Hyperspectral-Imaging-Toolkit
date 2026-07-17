@@ -15,7 +15,7 @@ defaults:
 #     resume_checkpoint=/path/to/best_model.pth
 #
 progressive_stages:
-  - {patch_size: 128, iterations: 72000, init_lr: 4.0e-4, batch_size: 32, warmup_steps: 1000}
+  - {patch_size: 128, iterations: 72000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
 
 early_stopping_patience: 3
 early_stopping_min_delta: 5.0e-5

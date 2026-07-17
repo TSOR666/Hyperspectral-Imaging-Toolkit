@@ -100,6 +100,34 @@ def test_generator_gradients_flow():
     assert has_param_grad
 
 
+def test_generator_full_block_activation_checkpointing_preserves_gradients():
+    """The memory-saving SST-block checkpoint path must remain trainable."""
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 8,
+        "split_sizes": [2, 2, 2],
+        "stage_depths": [1, 1, 1, 1, 1],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "sampling": "bilinear",
+        "output_activation": "none",
+        "activation_checkpointing": True,
+        "activation_checkpoint_min_tokens": 1,
+    }
+    gen = NoiseRobustCSWinGenerator(config).train()
+    x = torch.randn(1, 3, 8, 8, requires_grad=True)
+
+    gen(x).square().mean().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in gen.parameters()
+        if p.requires_grad
+    )
+
+
 def test_discriminator_gradients_flow():
     """Test that gradients flow correctly through the discriminator (Finding 4.1)."""
     config = {

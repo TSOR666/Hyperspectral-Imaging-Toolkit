@@ -16,9 +16,9 @@ defaults:
 # current position from the checkpoint's global iteration, finishes the short
 # 128 stage, then rebuilds the loader for larger patches.
 progressive_stages:
-  - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 32, warmup_steps: 1000}
-  - {patch_size: 256, iterations: 60000, init_lr: 4.0e-5, batch_size: 8, warmup_steps: 0}
-  - {patch_size: 512, iterations: 40000, init_lr: 2.0e-5, batch_size: 2, warmup_steps: 0}
+  - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
+  - {patch_size: 256, iterations: 60000, init_lr: 4.0e-5, batch_size: 5, warmup_steps: 0}
+  - {patch_size: 512, iterations: 40000, init_lr: 2.0e-5, batch_size: 1, warmup_steps: 0}
 
 early_stopping_patience: 3
 early_stopping_min_delta: 5.0e-5

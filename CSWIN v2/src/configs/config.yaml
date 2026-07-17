@@ -24,7 +24,10 @@ hf_max_train_samples: null
 hf_max_val_samples: null
 hf_allow_pseudo_hsi: false
 
-batch_size: 32   # paper batch size (HSIFormer Sec 4.2)
+# MST++-style 128px training uses an optimizer batch of 20. In particular,
+# sota_cascade retains three body-pass graphs, so the old batch of 32 exhausts
+# an 80 GB GPU before backward reaches the second cascade pass.
+batch_size: 20
 val_batch_size: 1
 patch_size: 128
 stride: 8
@@ -53,7 +56,9 @@ strict_dataset_files: true  # fail instead of silently dropping missing/corrupt 
 excluded_scene_stems: [ARAD_1K_0314]  # known-corrupt ARAD-1K scene
 validation_max_batches: null
 finite_check_interval: 100
-max_consecutive_ooms: 3
+# Allows adaptive microbatch fallback to halve a batch-20 stage all the way to
+# one sample (20 -> 10 -> 5 -> 3 -> 2 -> 1) before declaring it impossible.
+max_consecutive_ooms: 6
 # Score checkpoints in the same physical reflectance domain used by
 # cswin_test_ntire.py and prediction export. Keep raw MRAE as a diagnostic so
 # output-range drift remains visible without selecting a worse deployed model.
@@ -110,6 +115,11 @@ spectral_attention_force_fp32: auto
 # Trainer-level finite checks remain enabled every 100 steps; disabling the
 # per-block scans removes dozens of GPU synchronization points per iteration.
 spectral_attention_sanitize_nonfinite: false
+# Recompute complete high-resolution SST blocks during backward instead of
+# retaining their GDFN/SGFN activations. This makes the documented 128px,
+# batch-20 cascade recipe viable on shared 80 GB GPUs; set false only for profiling.
+activation_checkpointing: auto
+activation_checkpoint_min_tokens: 1024
 # Scalable spatial attention: local 7x7 windows at high resolution, with a
 # second offset grid for cross-window mixing; switch to true global attention
 # only when a feature map has at most 1024 tokens. This replaces the legacy
@@ -148,9 +158,9 @@ refinement_ffn_expansion: 2.0
 # iterations_per_epoch above). Reduce batch_size at larger patches to fit
 # memory. The first stage keeps the benchmark-aligned 300k cosine horizon.
 # progressive_stages:
-#   - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 32}
-#   - {patch_size: 256, iterations: 50000,  init_lr: 4.0e-5, batch_size: 8}
-#   - {patch_size: 512, iterations: 50000,  init_lr: 4.0e-5, batch_size: 2}
+#   - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 20}
+#   - {patch_size: 256, iterations: 50000,  init_lr: 4.0e-5, batch_size: 5}
+#   - {patch_size: 512, iterations: 50000,  init_lr: 4.0e-5, batch_size: 1}
 
 warmup_steps: 1000
 # MST++ init_lr is 4e-4 (was 1e-4 for the GAN generator). Cosine-annealed over
