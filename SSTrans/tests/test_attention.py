@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+from einops import rearrange
 from torch.nn import functional as F
 
-from hsiformer.attention import CSWinCrossAttention, _scaled_cosine_attention
+from hsiformer.attention import (
+    CSWinCrossAttention,
+    GDFN,
+    _scaled_cosine_attention,
+)
 
 
 def _reference_attention(
@@ -69,6 +74,26 @@ def test_scaled_cosine_attention_is_bit_exact_below_ceiling() -> None:
     expected = _reference_attention(query, key, value, scale)
     actual = _scaled_cosine_attention(query, key, value, scale)
     torch.testing.assert_close(actual, expected)
+
+
+def test_gdfn_matches_the_paper_single_processed_gate_branch() -> None:
+    """Figure 3(c): only one split branch receives LN and DWConv."""
+    torch.manual_seed(0)
+    gdfn = GDFN(dim=8).eval()
+    inputs = torch.randn(2, 15, 8)
+
+    image = rearrange(inputs, "b (h w) c -> b c h w", h=3, w=5)
+    first, second = gdfn.project_in(image).chunk(2, dim=1)
+    batch, channels, _, _ = first.shape
+    first = first.view(batch, channels, 15).permute(0, 2, 1)
+    first = gdfn.norm(first).permute(0, 2, 1).view(batch, channels, 3, 5)
+    expected = gdfn.project_out(gdfn.act_fn(gdfn.dwconv(first)) * second)
+    expected = rearrange(expected, "b c h w -> b (h w) c")
+
+    actual = gdfn(inputs, height=3, width=5)
+    torch.testing.assert_close(actual, expected)
+    assert gdfn.dwconv.in_channels == gdfn.dwconv.out_channels == 32
+    assert gdfn.dwconv.groups == 32
 
 
 @pytest.mark.parametrize("stripe_index", [0, 1])
