@@ -28,7 +28,7 @@ experiment_name: cas_hsi_edge
 variant: tiny
 backend: edge
 model_overrides:
-  layer_scale_init: 1.0e-3
+  layer_scale_init: 1.0       # see cas_hsi_tiny.yaml: 1e-3 over-damps this depth
   drop_path: 0.0
   ffn_expansion: 2.0
   enable_stripe_attention: true   # selects large_kernel_depthwise_conv in this backend

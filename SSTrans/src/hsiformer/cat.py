@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from ._compat import DropPath, to_2tuple
-from .attention import _scaled_cosine_attention
+from .attention import _SPATIAL_COSINE_INIT_SCALE, _scaled_cosine_attention
 
 
 def partition(x: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -97,7 +97,12 @@ class Attention(nn.Module):
         self.dim = dim
         self.patch_size = to_2tuple(patch_size)
         self.num_heads = num_heads
-        self.scale = nn.Parameter(torch.ones(num_heads, 1, 1))
+        # Spatial cosine attention: initialise the scale above 1 so the
+        # normalised-q/k logits are not near-uniform at init (see
+        # _SPATIAL_COSINE_INIT_SCALE in attention.py).
+        self.scale = nn.Parameter(
+            torch.full((num_heads, 1, 1), _SPATIAL_COSINE_INIT_SCALE)
+        )
         self.rpe = rpe
 
         if rpe:

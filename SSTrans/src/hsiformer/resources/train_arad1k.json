@@ -38,7 +38,7 @@
   "log_every": 50,
   "validation_tile_size": null,
   "validation_overlap": 16,
-  "rgb_normalization": "scale_255",
+  "rgb_normalization": "per_image",
   "seed": 42,
   "amp": true,
   "amp_dtype": "bf16",

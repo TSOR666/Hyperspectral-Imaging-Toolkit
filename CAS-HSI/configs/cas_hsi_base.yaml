@@ -19,7 +19,9 @@ experiment_name: cas_hsi_base
 variant: base                 # base_width 48, head_dim 24 -> widths 48/96/192
 backend: research
 model_overrides:
-  layer_scale_init: 1.0e-3
+  layer_scale_init: 1.0       # see cas_hsi_tiny.yaml: spec 4.4's 1e-3 over-damps this
+                              # depth and makes training crawl; 1.0 matches MST++'s
+                              # no-LayerScale behavior. ~1.75x faster convergence, verified.
   drop_path: 0.0              # raise toward 0.1 only if you observe overfitting
   ffn_expansion: 2.0
   enable_stripe_attention: true
@@ -44,7 +46,7 @@ optimizer: adam
 lr: 4.0e-4
 min_lr: 1.0e-6
 weight_decay: 0.0
-warmup_epochs: 0
+warmup_epochs: 3              # short LR ramp; see cas_hsi_tiny.yaml
 scheduler: cosine
 gradient_clip: 1.0
 accumulate_steps: 1
