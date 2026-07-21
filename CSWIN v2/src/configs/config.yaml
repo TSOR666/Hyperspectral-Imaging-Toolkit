@@ -80,6 +80,23 @@ early_stopping_min_delta: 1.0e-4
 early_stopping_warmup_epochs: 10
 early_stopping_final_stage_only: true
 
+# ---------------------------------------------------------------------------
+# Divergence tripwire. The finite-guards only catch Inf/NaN; a loss that
+# explodes to a large-but-FINITE value (as in the annealed-eps collapse) slips
+# through and silently trains a dead network for hours (the 2026-07-20 run
+# burned ~13 GPU-hours after collapsing). This detector watches the smoothed
+# training loss and the per-epoch validation MRAE; on a blow-up it restores the
+# last-good checkpoint, decays the LR, and retries -- aborting loudly if it
+# cannot recover. Single-process runs only: it is auto-disabled under DDP, where
+# a per-rank loss spike cannot be acted on without a cross-rank collective.
+divergence_guard_enabled: true
+divergence_spike_factor: 5.0        # train-loss > factor x rolling median => spike
+divergence_spike_patience: 3        # consecutive 20-iter windows before firing
+divergence_history_windows: 50      # rolling-median window (units of 20 iters)
+divergence_val_factor: 3.0          # val MRAE > factor x best-so-far => diverged
+divergence_lr_decay: 0.5            # LR multiplier applied on each rollback
+max_divergence_rollbacks: 2         # after this many, abort instead of retrying
+
 # ===========================================================================
 # ACTIVE DIRECTION: generator-only HSIFormer/SST training (train_generator.py)
 # Architecture aligned to HSIFormer with an annealed MRAE-only objective:
@@ -95,9 +112,22 @@ objective: mrae_annealed
 allow_objective_mismatch_resume: false
 optimizer: adam          # matches MST++ training
 weight_decay: 0.0
-mrae_epsilon: 1.0e-3      # compatibility alias for the initial floor
-mrae_epsilon_start: 1.0e-3
-mrae_epsilon_end: 1.0e-8
+# The MRAE denominator floor. IMPORTANT: epsilon=1e-8 is the leaderboard
+# *metric* floor, NOT a trainable objective. Annealing the *training* floor down
+# to 1e-8 makes the loss ill-conditioned: ARAD [0,1] targets have a heavy
+# near-zero (dark) pixel tail (~10% of pixels below 1e-3), and dividing their
+# error by a tiny floor amplifies both loss AND gradient by ~1/epsilon. On a
+# healthy 2%-error model the gradient norm grows 0.1 -> 7139 as epsilon goes
+# 1e-2 -> 1e-8, and 100% of the gradient energy concentrates on the darkest 1%
+# of pixels -- so grad-norm clipping (which bounds magnitude, not direction)
+# cannot save it. The 2026-07-20 sota_cascade run collapsed exactly this way at
+# iter ~2500 (ValMRAE froze at 16.35 for 20k iters). Keep a well-conditioned
+# floor: start 1e-2, anneal only to 1e-3. The exact 1e-8 metric is still
+# reported at validation via utils.metrics.compute_mrae, so the benchmark
+# number is unaffected by the training floor.
+mrae_epsilon: 1.0e-2      # compatibility alias for the initial floor
+mrae_epsilon_start: 1.0e-2
+mrae_epsilon_end: 1.0e-3
 mrae_epsilon_anneal_iters: 50000
 
 # Generator architecture (HSIFormer SSTB, right-sized for ARAD's ~900 scenes):

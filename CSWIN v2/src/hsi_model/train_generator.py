@@ -25,8 +25,10 @@ import os
 import sys
 import logging
 import math
+import statistics
 import time
 import traceback
+from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -229,6 +231,69 @@ def update_mrae_epsilon_schedule(
     if not updated:
         raise TypeError("objective=mrae_annealed requires a criterion containing MRAELoss.")
     return epsilon
+
+
+def _restore_from_latest_checkpoint(
+    generator: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: Optional[GradScaler],
+    ema: Optional["GeneratorEMA"],
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    checkpoint_dir: str,
+    device: torch.device,
+    lr_decay: float,
+    train_logger: logging.Logger,
+) -> Optional[int]:
+    """Roll the model/optimizer back to the last saved checkpoint after a
+    divergence, and permanently decay the LR.
+
+    Restores generator/optimizer/scaler/EMA (the state that blows up), then
+    scales ``scheduler.base_lrs`` so every subsequent cosine LR is smaller. The
+    scheduler's ``last_epoch`` is deliberately NOT rewound: the training loop's
+    iteration counter keeps advancing, so we accept losing the (already
+    diverging) iterations since the checkpoint rather than desync the schedule.
+
+    Returns the checkpoint's iteration on success, or None if no checkpoint
+    exists yet (caller should then abort — nothing safe to fall back to).
+    """
+    path = os.path.join(checkpoint_dir, CHECKPOINT_LATEST_NAME)
+    if not os.path.exists(path):
+        return None
+
+    # weights_only=False: the checkpoint holds config/RNG/non-tensor state, same
+    # as utils.training_setup.resume_training_state. Only ever loads our own file.
+    ck = torch.load(path, map_location=device, weights_only=False)
+    target = generator.module if hasattr(generator, "module") else generator
+    state_dict = ck.get("state_dict") or ck.get("model_state_dict")
+    if not state_dict:
+        raise KeyError(f"Rollback checkpoint {path} has no model state.")
+    target.load_state_dict(state_dict, strict=True)
+
+    if ck.get("optimizer") is not None:
+        try:
+            optimizer.load_state_dict(ck["optimizer"])
+        except (RuntimeError, ValueError, KeyError) as e:
+            train_logger.warning("Rollback: could not restore optimizer state: %s", e)
+            optimizer.zero_grad(set_to_none=True)
+    if scaler is not None and ck.get("scaler") is not None:
+        try:
+            scaler.load_state_dict(ck["scaler"])
+        except (RuntimeError, ValueError, KeyError) as e:
+            train_logger.warning("Rollback: could not restore GradScaler state: %s", e)
+    if ema is not None:
+        ema.reinit_from(target)
+        if ck.get("ema"):
+            try:
+                ema.load_state_dict(ck["ema"], device=device)
+            except (RuntimeError, TypeError, ValueError) as e:
+                train_logger.warning("Rollback: could not restore EMA state: %s", e)
+
+    if lr_decay != 1.0 and hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [float(lr) * lr_decay for lr in scheduler.base_lrs]
+        for group in optimizer.param_groups:
+            group["lr"] = float(group.get("lr", 0.0)) * lr_decay
+
+    return int(ck.get("iter", -1))
 
 
 def _resolve_stages(config: Dict[str, Any]) -> list:
@@ -599,9 +664,29 @@ def _run_stage(
     early_stopping_min_delta = max(0.0, float(config.get("early_stopping_min_delta", 0.0)))
     early_stopping_warmup_epochs = max(0, int(config.get("early_stopping_warmup_epochs", 0)))
 
+    # Divergence tripwire (see config.yaml). Auto-disabled under DDP, where a
+    # per-rank loss spike cannot be acted on without a cross-rank collective.
+    divergence_guard_enabled = bool(config.get("divergence_guard_enabled", True))
+    divergence_guard_active = divergence_guard_enabled and not distributed
+    if divergence_guard_enabled and distributed:
+        train_logger.warning(
+            "divergence_guard_enabled=true but this run is distributed; the "
+            "tripwire is disabled under DDP."
+        )
+    divergence_spike_factor = float(config.get("divergence_spike_factor", 5.0))
+    divergence_spike_patience = max(1, int(config.get("divergence_spike_patience", 3)))
+    divergence_history_windows = max(5, int(config.get("divergence_history_windows", 50)))
+    divergence_val_factor = float(config.get("divergence_val_factor", 3.0))
+    divergence_lr_decay = float(config.get("divergence_lr_decay", 0.5))
+    max_divergence_rollbacks = max(0, int(config.get("max_divergence_rollbacks", 2)))
+    divergence_warmup = max(0, int(config.get("warmup_steps", DEFAULT_WARMUP_STEPS)))
+
     data_iter = iter(train_loader)
     is_distributed = isinstance(train_loader.sampler, DistributedSampler)
     epoch_losses = []
+    loss_history: "deque[float]" = deque(maxlen=divergence_history_windows)
+    divergence_spike_count = 0
+    divergence_rollbacks = 0
     loader_epoch = 0
     consecutive_nonfinite = 0
     consecutive_ooms = 0
@@ -614,6 +699,46 @@ def _run_stage(
     # chunks instead of repeating the impossible forward three times.
     adaptive_microbatch_size: Optional[int] = None
     retry_batch: Optional[tuple[Any, Any]] = None
+
+    def _do_rollback(reason: str) -> bool:
+        """Restore the last-good checkpoint and decay LR after a divergence.
+
+        Returns True if recovered (caller should ``continue``), False if it
+        could not recover (caller must abort loudly).
+        """
+        nonlocal divergence_rollbacks, divergence_spike_count
+        divergence_rollbacks += 1
+        train_logger.error(
+            "DIVERGENCE at iter %d (%s); rollback %d/%d.",
+            iteration, reason, divergence_rollbacks, max_divergence_rollbacks,
+        )
+        if divergence_rollbacks > max_divergence_rollbacks:
+            return False
+        restored_iter = _restore_from_latest_checkpoint(
+            generator, optimizer, scaler, ema, scheduler,
+            config["checkpoint_dir"], device, divergence_lr_decay, train_logger,
+        )
+        if restored_iter is None:
+            train_logger.error(
+                "No checkpoint to roll back to (divergence before the first "
+                "validation); cannot recover."
+            )
+            return False
+        base_lr = (
+            scheduler.base_lrs[0]
+            if getattr(scheduler, "base_lrs", None)
+            else optimizer.param_groups[0]["lr"]
+        )
+        train_logger.error(
+            "Rolled back to checkpoint iter %d; base LR decayed x%.3g -> %.3g. "
+            "Resuming.",
+            restored_iter, divergence_lr_decay, base_lr,
+        )
+        divergence_spike_count = 0
+        loss_history.clear()
+        epoch_losses.clear()
+        optimizer.zero_grad(set_to_none=True)
+        return True
 
     while stage_iter < stage_iterations:
         net.train()
@@ -754,6 +879,43 @@ def _run_stage(
                 log_window_start = time.perf_counter()
                 log_window_iteration = iteration
 
+                # Fast divergence path: a sudden blow-up of the smoothed train
+                # loss (finite but >> its recent rolling median) is caught here,
+                # within ~divergence_spike_patience*20 iters -- long before the
+                # per-epoch validation would notice. The rolling median tracks
+                # the slow annealed-epsilon drift so only genuine spikes fire.
+                if (
+                    divergence_guard_active
+                    and stage_iter > divergence_warmup
+                    and math.isfinite(avg_loss)
+                    and avg_loss > 0.0
+                ):
+                    if len(loss_history) >= max(5, divergence_history_windows // 5):
+                        median = statistics.median(loss_history)
+                        if median > 0.0 and avg_loss > divergence_spike_factor * median:
+                            divergence_spike_count += 1
+                            train_logger.warning(
+                                "Train-loss spike %d/%d at iter %d: %.4f > %.1fx "
+                                "median(%.4f)",
+                                divergence_spike_count, divergence_spike_patience,
+                                iteration, avg_loss, divergence_spike_factor, median,
+                            )
+                            if divergence_spike_count >= divergence_spike_patience:
+                                if _do_rollback(
+                                    f"train-loss {avg_loss:.4g} > "
+                                    f"{divergence_spike_factor:g}x median {median:.4g}"
+                                ):
+                                    continue
+                                raise FloatingPointError(
+                                    f"Training diverged at iter {iteration} and could "
+                                    "not be recovered by checkpoint rollback."
+                                )
+                        else:
+                            divergence_spike_count = 0
+                            loss_history.append(avg_loss)
+                    else:
+                        loss_history.append(avg_loss)
+
             if iteration % per_epoch_iteration == 0:
                 if ema is not None:
                     with ema.average_parameters(generator):
@@ -788,6 +950,30 @@ def _run_stage(
                     train_scalars, epoch_num, "train"
                 )
                 metrics_logger.log_scalars(val_metrics, epoch_num, "val")
+
+                # Backstop divergence path: catches a gradual collapse that the
+                # train-loss spike detector misses (e.g. the frozen-dead-network
+                # signature where val MRAE balloons past the best-so-far and
+                # stays there). Checked BEFORE the checkpoint save below, so the
+                # on-disk "latest" is still the pre-divergence epoch we roll back
+                # to; on success we skip this epoch's save entirely.
+                if (
+                    divergence_guard_active
+                    and stage_iter > divergence_warmup
+                    and math.isfinite(record_mrae_loss)
+                    and record_mrae_loss > 0.0
+                    and current_mrae > divergence_val_factor * record_mrae_loss
+                ):
+                    if _do_rollback(
+                        f"val MRAE {current_mrae:.4g} > {divergence_val_factor:g}x "
+                        f"best {record_mrae_loss:.4g}"
+                    ):
+                        continue
+                    raise FloatingPointError(
+                        f"Validation MRAE diverged at iter {iteration} "
+                        f"({current_mrae:.4g} vs best {record_mrae_loss:.4g}) and "
+                        "could not be recovered by checkpoint rollback."
+                    )
 
                 should_stop = False
                 if rank == 0:
