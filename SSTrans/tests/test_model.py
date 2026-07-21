@@ -152,16 +152,33 @@ def test_tiny_batch_l1_loss_decreases() -> None:
     assert final_loss < initial_loss
 
 
-def test_model_initialization_keeps_convolution_projections_small() -> None:
+def test_model_initialization_leaves_convolutions_at_default() -> None:
+    # Conv2d must keep PyTorch's Kaiming default -- matching MST++/CSWin/
+    # Restormer -- rather than being forced to trunc_normal(std=0.02), which
+    # ~10x under-scales the depthwise convs and collapses the U-Net main path.
     convolution = nn.Conv2d(8, 8, kernel_size=3, bias=True)
-    with torch.no_grad():
-        convolution.weight.fill_(1)
-        convolution.bias.fill_(1)
+    original_weight = convolution.weight.detach().clone()
+    original_bias = convolution.bias.detach().clone()
 
     SSTransformer._init_weights(convolution)
 
-    assert convolution.weight.std() < 0.03
-    torch.testing.assert_close(convolution.bias, torch.zeros_like(convolution.bias))
+    # _init_weights is a no-op for Conv2d: weights and bias are untouched, and
+    # the Kaiming default std is far larger than the old 0.02 regime.
+    torch.testing.assert_close(convolution.weight, original_weight)
+    torch.testing.assert_close(convolution.bias, original_bias)
+    assert convolution.weight.std() > 0.05
+
+
+def test_model_initialization_keeps_linear_projections_small() -> None:
+    linear = nn.Linear(32, 32, bias=True)
+    with torch.no_grad():
+        linear.weight.fill_(1)
+        linear.bias.fill_(1)
+
+    SSTransformer._init_weights(linear)
+
+    assert linear.weight.std() < 0.03
+    torch.testing.assert_close(linear.bias, torch.zeros_like(linear.bias))
 
 
 def test_checkpoint_loader_accepts_wrapped_model_prefix(tmp_path) -> None:

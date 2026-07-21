@@ -25,6 +25,21 @@ _MAX_COSINE_LOGIT_SCALE = 100.0
 # activation (whose norm is far above this floor).
 _NORMALIZE_EPS = 1e-6
 
+# Initial value of the learnable per-head scale on the SPATIAL cosine attentions
+# (CSWin LePE self-attention, the CSWin cross-attention, and the CAT IPSA/CPSA
+# attention). These modules L2-normalise q and k, so the pre-softmax logits live
+# in [-scale, scale]; with scale=1 the softmax is near-uniform at init and the
+# scale's gradient is ~1e-7, so it self-sharpens far too slowly ("weak spatial
+# attention"). Canonical CSWin/CAT use fixed 1/sqrt(head_dim) dot-product
+# attention on UN-normalised features; this port converted them to cosine but
+# left the scale at 1. Swin-V2 (which also uses cosine attention) initialises its
+# effective logit scale to ~10; we use a moderate 5.0 so spatial attention is
+# selective from the first step, still well under the _MAX_COSINE_LOGIT_SCALE
+# ceiling. The SPECTRAL S-MSA temperature is intentionally NOT changed here: it
+# stays at 1.0 to match Restormer/MST++, whose spectral attention converges fine
+# from that init.
+_SPATIAL_COSINE_INIT_SCALE = 5.0
+
 
 def _scaled_cosine_attention(
     query: torch.Tensor,
@@ -366,7 +381,9 @@ class LePEAttentionCross(nn.Module):
         self.resolution = _resolution_tuple(resolution)
         self.split_size = split_size
         self.num_heads = num_heads
-        self.scale = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.scale = nn.Parameter(
+            torch.full((num_heads, 1, 1), _SPATIAL_COSINE_INIT_SCALE)
+        )
         self.idx = idx
         self.H_sp, self.W_sp = self._window_shape(self.resolution)
         self.get_v = nn.Conv2d(
@@ -544,7 +561,9 @@ class CSWinCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.resolution = _resolution_tuple(resolution)
         self.split_size = split_size
-        self.scale = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.scale = nn.Parameter(
+            torch.full((num_heads, 1, 1), _SPATIAL_COSINE_INIT_SCALE)
+        )
         self.idx = idx
         self.H_sp, self.W_sp = self._window_shape(self.resolution)
         self.to_q = nn.Linear(dim, dim, bias=qkv_bias)

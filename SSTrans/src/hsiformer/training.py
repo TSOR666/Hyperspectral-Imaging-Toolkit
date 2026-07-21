@@ -67,7 +67,11 @@ class TrainingConfig:
     log_every: int = 50
     validation_tile_size: int | None = None
     validation_overlap: int = 16
-    rgb_normalization: str = "scale_255"
+    # Per-image min-max, matching MST++'s (x-min)/(max-min) exactly. The earlier
+    # scale_255 default was self-consistent across train/val/inference (not a
+    # correctness bug) but deviated from the reference input distribution and
+    # broke strict comparability with MST++'s reported ARAD numbers.
+    rgb_normalization: str = "per_image"
     train_manifest: str | None = None
     validation_manifest: str | None = None
     seed: int = 42

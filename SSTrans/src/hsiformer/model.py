@@ -717,11 +717,22 @@ class SSTransformer(nn.Module):
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
-        # Keep all projections in the original SSTrans initialization regime.
-        # Changing only Conv2d to Kaiming while altering GDFN substantially
-        # increased residual-branch scale and made the retraining run
-        # incomparable to the paper-compatible baseline.
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        # Convs keep PyTorch's default (Kaiming) init, exactly as in MST++,
+        # CSWin and Restormer -- all three trunc_normal only the Linear
+        # projections and leave every Conv2d (including the many depthwise
+        # convs) at the Kaiming default. trunc_normal_(std=0.02) is correct
+        # for the Linear-based spatial attention but ~10x under-scales a 3x3
+        # depthwise conv (fan_in=9; Kaiming std ~0.192 vs 0.02), and the
+        # spectral branch plus the whole conv U-Net main path are convolutional
+        # -- blanket-applying std=0.02 collapses the main path at init (the
+        # embed->downsample->upsample->to_out signal decays ~10x per stage and
+        # the global identity path carries a ~10x-too-weak embedded RGB), which
+        # is the systematic, present-from-step-0 handicap that capped the
+        # retraining run. A prior revert to std=0.02-on-Conv2d was made "to
+        # preserve baseline scales", but that baseline was itself the collapsed
+        # one; the fix is kept behind grad-clip 1.0 + bf16 + the finite/
+        # divergence guards in training.py.
+        if isinstance(module, nn.Linear):
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
