@@ -66,23 +66,28 @@ def test_stable_lite_config_builds_finite_train_step():
     )
 
 
-def test_sota_cascade_config_uses_recovery_architecture():
+def test_sota_cascade_config_pins_validated_recovery_architecture():
     with initialize_config_dir(
         version_base=None,
         config_dir=str(CONFIG_DIR),
     ):
         config = compose(config_name="sota_cascade")
 
-    assert config.cswin_attention_mode == "cswin"
-    assert list(config.split_sizes) == [1, 2, 7]
-    assert list(config.stage_num_heads) == [2, 4, 8, 8, 2]
-    assert bool(config.use_feature_norm) is False
-    assert bool(config.use_input_denoising) is False
-    assert int(config.cascade_stages) == 3
-    assert bool(config.use_spectral_input_skip) is True
+    assert config.cswin_attention_mode == "local_global"
+    assert list(config.split_sizes) == [7, 7, 7]
+    assert config.stage_num_heads is None
+    assert int(config.cswin_global_tokens) == 1024
+    assert bool(config.smsa_output_norm) is True
+    assert bool(config.use_feature_norm) is True
+    assert bool(config.use_input_denoising) is True
+    assert int(config.cascade_stages) == 1
+    assert bool(config.use_spectral_input_skip) is False
     assert int(config.refinement_blocks) == 0
-    assert int(config.base_channels) == 64
+    assert int(config.base_channels) == 48
+    assert int(config.batch_size) == 20
     assert int(config.gradient_accumulation_steps) == 1
+    assert str(config.log_dir).endswith("sota_recovery_local_global")
+    assert str(config.checkpoint_dir).endswith("sota_recovery_local_global")
 
 
 def test_progressive_finetune_config_switches_after_saturated_128_stage():

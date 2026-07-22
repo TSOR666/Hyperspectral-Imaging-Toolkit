@@ -72,7 +72,7 @@ python src/hsi_model/train_generator.py \
     data_dir=/path/to/ARAD_1K
 ```
 
-### Fresh SOTA Recovery Training
+### Fresh Validated Recovery Training
 ```bash
 python src/hsi_model/train_generator.py \
     --config-name sota_cascade \
@@ -180,7 +180,7 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 | `mixed_precision` | true | Use automatic mixed precision |
 | `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
 | `excluded_scene_stems` | `[ARAD_1K_0314]` | Known-corrupt scenes omitted intentionally |
-| `cswin_attention_mode` | `local_global` | Spatial attention: `cswin` (cross-shaped stripes, used by `sota_cascade`) or `local_global`; `axial` regressed in ablation — avoid |
+| `cswin_attention_mode` | `local_global` | Validated spatial attention; keep `cswin` and `axial` as controlled ablations |
 
 See `src/configs/config.yaml` for all parameters.
 
@@ -227,9 +227,10 @@ print('✅ Installation verified!')
 ### For Better Quality:
 - Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
 - Start a fresh run after changing the objective to `mrae_annealed`
-- If a local/global run saturates around 60k-70k at roughly 0.64 MRAE, start a
-  fresh `--config-name sota_cascade` run; the old polish recipe preserves the
-  saturated architecture.
+- Use `--config-name sota_cascade` only for a fresh run. It now pins the
+  validated local/global, single-pass architecture and writes to separate
+  recovery directories. Never resume the failed July 2026 true-CSWin/cascade-3
+  checkpoint bundle.
 - Treat 256/512 progressive fine-tuning as experimental unless a patch-size
   sweep shows it improves the deployed inference path
 - Track both deployed `mrae` and diagnostic `raw_mrae`
@@ -290,7 +291,7 @@ ls -lh experiments/run1/checkpoints/
 
 ---
 
-**Ready to train!** 🚀
+**Ready to train!**
 
 Just run:
 ```bash

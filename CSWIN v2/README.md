@@ -3,8 +3,8 @@
 CSWIN v2 reconstructs a 31-band hyperspectral cube from an RGB image. The
 active model is a generator-only hierarchical U-Net/Transformer hybrid
 (~11.4M trainable parameters at `base_channels: 48`) with spectral
-self-attention, learned PixelShuffle sampling, and a fresh-run CSWin recovery
-recipe that uses head-split cross-shaped stripe attention.
+self-attention, learned PixelShuffle sampling, and validated local/global
+spatial attention.
 
 ## Active Entry Point
 
@@ -16,8 +16,7 @@ python src/hsi_model/train_generator.py \
   data_dir=/path/to/ARAD_1K
 ```
 
-For a fresh SOTA-oriented recovery run, start from the explicit recovery
-config:
+For a fresh recovery run with all validated architecture values pinned, use:
 
 ```bash
 python src/hsi_model/train_generator.py \
@@ -59,10 +58,11 @@ or `uv run` fail before training starts.
 
 ## Active Recipe
 
-The defaults in `src/configs/config.yaml` use the checkpoint-compatible
-baseline. The fresh-run recovery recipe in `src/configs/sota_cascade.yaml`
-switches to true CSWin-style cross-shaped attention and removes legacy
-normalization/denoising baggage. The shared training protocol uses:
+The defaults in `src/configs/config.yaml` use the validated local/global
+baseline. The fresh-run recipe in `src/configs/sota_cascade.yaml` explicitly
+pins the same architecture and writes to isolated recovery directories. The
+historical filename is retained for command compatibility; it no longer
+enables the failed three-pass cascade bundle. The shared training protocol uses:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
 - Adam with learning rate `4e-4` and a 300k-step cosine decay.
@@ -70,8 +70,8 @@ normalization/denoising baggage. The shared training protocol uses:
   denominator floor starts stable, then decays to exact MST++/leaderboard MRAE.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
-- Deployment-matched spatial attention: checkpoint-compatible local/global in
-  `config.yaml`, true head-split CSWin stripes in `sota_cascade.yaml`.
+- Deployment-matched local/global spatial attention in both recommended
+  configurations.
 - Deployment-matched 128x128 tiled validation with FP32 overlap blending and
   the fixed centered 226x256 ARAD-1K scoring window.
 - Explicit exclusion of the known-corrupt `ARAD_1K_0314` scene, while other
@@ -110,7 +110,7 @@ python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 # Combined annealed-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
 
-# Fresh-run SOTA recovery after the old local_global recipe saturates
+# Fresh recovery with the validated local/global architecture pinned
 python src/hsi_model/train_generator.py --config-name sota_cascade
 
 # Isolate the three CSWin recovery levers one at a time
@@ -131,17 +131,24 @@ python src/hsi_model/train_generator.py \
   +resume_checkpoint=/path/to/latest_checkpoint.pth
 ```
 
-> ⚠️ The 2026-07 three-lever `sota_cascade` bundle run (with `cswin_attention_mode: axial`) regressed badly (~2× worse MRAE); the ablations isolated **axial attention as the culprit**, while cascade and `smsa_output_norm: false` were exonerated. `sota_cascade.yaml` now uses the paper-faithful `cswin` mode, which has been smoke-verified healthy. Avoid `axial` outside diagnostic runs.
+> The 2026-07-21 experimental `sota_cascade` bundle (`base_channels=64`, true
+> CSWin stripes, disabled feature/output normalization, three cascade passes,
+> and an RGB spectral skip) plateaued near 0.63 validation MRAE / 19.3 dB by
+> 12k-25k iterations. Do not resume its checkpoints. The active file now pins
+> the validated local/global single-pass architecture and uses new output
+> directories. Keep `cswin`, `axial`, and multi-pass cascades as controlled
+> one-lever ablations until independently validated.
 
 ### Attention-mode and recovery levers
 
 | Key | Values | Default | Notes |
 | --- | --- | --- | --- |
-| `cswin_attention_mode` | `local_global`, `cswin`, `axial` | `local_global` (`config.yaml`) | `cswin` = head-split cross-shaped stripes (used by `sota_cascade.yaml`); `axial` regressed in ablation — diagnostic only. |
-| `cascade_stages` | int | `1` (code default) | Cascaded refinement stages; `sota_cascade.yaml` sets `3`. |
-| `smsa_output_norm` | bool | `true` (code default) | `sota_cascade.yaml` disables it. |
+| `cswin_attention_mode` | `local_global`, `cswin`, `axial` | `local_global` | `cswin` and `axial` remain diagnostic modes; neither is recommended for the production run. |
+| `cascade_stages` | int | `1` | Values above one repeat the generator and materially increase activation memory; validate them as ablations. |
+| `smsa_output_norm` | bool | `true` | Keep enabled in the validated recipe. |
 
-These keys are absent from the base `config.yaml`; set them in an experiment YAML or append them on the CLI with the `+key=value` form.
+When a key is absent from the base `config.yaml`, set it in an experiment YAML
+or append it on the CLI with Hydra's `+key=value` form.
 
 These configurations use separate log/checkpoint directories and should start
 from random initialization except the fine-tune recipes, which are designed to
