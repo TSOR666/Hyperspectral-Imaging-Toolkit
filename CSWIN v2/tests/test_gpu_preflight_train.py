@@ -85,17 +85,17 @@ def test_training_command_distributed():
     assert cmd[-1] == "batch_size=8"
 
 
-def test_tiny_config_exercises_sota_recovery_architecture():
+def test_tiny_config_exercises_validated_recovery_architecture():
     config = tiny_config()
 
-    assert config["cswin_attention_mode"] == "cswin"
-    assert config["split_sizes"] == [1, 2, 7]
-    assert config["stage_num_heads"] == [2, 4, 8, 8, 2]
-    assert config["smsa_output_norm"] is False
-    assert config["use_feature_norm"] is False
-    assert config["use_input_denoising"] is False
-    assert config["cascade_stages"] == 3
-    assert config["use_spectral_input_skip"] is True
+    assert config["cswin_attention_mode"] == "local_global"
+    assert config["split_sizes"] == [2, 2, 2]
+    assert config["stage_num_heads"] is None
+    assert config["smsa_output_norm"] is True
+    assert config["use_feature_norm"] is True
+    assert config["use_input_denoising"] is True
+    assert config["cascade_stages"] == 1
+    assert config["use_spectral_input_skip"] is False
 
 
 def test_print_results_includes_pass_fail_rows():
