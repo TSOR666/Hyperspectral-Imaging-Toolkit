@@ -46,9 +46,9 @@ optimizer: adam
 lr: 4.0e-4
 min_lr: 1.0e-6
 weight_decay: 0.0
-warmup_epochs: 3              # short LR ramp; see cas_hsi_tiny.yaml
+warmup_epochs: 0              # MST++ starts at the configured learning rate
 scheduler: cosine
-gradient_clip: 1.0
+gradient_clip: 0.0            # MST++ performs the Adam step without norm clipping
 accumulate_steps: 1
 
 amp: true

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 import h5py
+import yaml
 
 import train_cas_hsi
 import test_cas_ntire
@@ -24,6 +26,23 @@ def test_load_config_cli_resolves_postponed_annotations():
     assert config.epochs == 1
     assert config.amp is False
     assert config.lr == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    ["cas_hsi_tiny.yaml", "cas_hsi_base.yaml", "cas_hsi_edge.yaml"],
+)
+def test_shipped_configs_preserve_mstpp_optimizer_contract(config_name):
+    """Reference configs must not silently warm up or clip the MST++ Adam updates."""
+    config_path = Path(__file__).resolve().parents[1] / "configs" / config_name
+    config = train_cas_hsi.load_config(["--config", str(config_path)])
+
+    assert config.optimizer == "adam"
+    assert config.lr == pytest.approx(4e-4)
+    assert config.min_lr == pytest.approx(1e-6)
+    assert config.weight_decay == 0.0
+    assert config.warmup_epochs == 0
+    assert config.gradient_clip == 0.0
 
 
 def test_checkpoint_rng_state_restores_python_numpy_and_torch_streams():
