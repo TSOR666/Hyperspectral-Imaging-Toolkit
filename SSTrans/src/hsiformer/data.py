@@ -159,6 +159,17 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         scene_id = self.scene_ids[scene_index]
         rgb_uint8, ycrcb_uint8 = self._load_rgb(scene_id)
         height, width = rgb_uint8.shape[-2:]
+        # Match the reference ARAD pipeline: estimate per-image normalization
+        # statistics from the complete scene, then select a training crop.
+        # Normalizing after cropping gives every random crop a different RGB
+        # scale while validation uses full-scene statistics, creating a
+        # train/validation input-distribution mismatch.
+        cond = _normalize_rgb(rgb_uint8, self.rgb_normalization)
+        ycrcb = (
+            _normalize_rgb(ycrcb_uint8, self.rgb_normalization)
+            if ycrcb_uint8 is not None
+            else None
+        )
         if (
             self.crop_size is not None
             and not self.random_crop
@@ -182,10 +193,10 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
                         self.crop_size,
                     )
                 active_crop_size = self.crop_size
-                rgb_uint8 = _crop(rgb_uint8, crop_position, self.crop_size)
-                if ycrcb_uint8 is not None:
-                    ycrcb_uint8 = _crop(
-                        ycrcb_uint8,
+                cond = _crop(cond, crop_position, self.crop_size)
+                if ycrcb is not None:
+                    ycrcb = _crop(
+                        ycrcb,
                         crop_position,
                         self.crop_size,
                     )
@@ -198,16 +209,14 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
             crop_size=active_crop_size,
         )
 
-        cond = _normalize_rgb(rgb_uint8, self.rgb_normalization)
         sample: dict[str, torch.Tensor | str] = {
             "cond": cond,
             "label": label,
             "scene_id": scene_id,
         }
         if self.include_ycrcb:
-            if ycrcb_uint8 is None:
+            if ycrcb is None:
                 raise RuntimeError("YCbCr input was requested but not loaded.")
-            ycrcb = _normalize_rgb(ycrcb_uint8, self.rgb_normalization)
             sample["ycrcb"] = torch.cat([cond, ycrcb], dim=0)
 
         if augment:

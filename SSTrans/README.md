@@ -51,6 +51,8 @@ style:
 - Adam with betas `(0.9, 0.999)`
 - per-iteration cosine learning-rate decay to `1e-6`
 - L1 objective, matching the reported ARAD-1K training procedure
+- full-scene RGB min-max normalization before crop extraction, matching the
+  reference loader and keeping train/validation input scales consistent
 - 300,000 iterations with 128x128 crops at batch 32
 - 50,000 iterations with 256x256 crops at batch 8
 - 50,000 iterations at a nominal 512 crop with batch 1 (clamped to the
