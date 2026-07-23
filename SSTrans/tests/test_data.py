@@ -106,6 +106,33 @@ def test_random_crop_length_is_controlled_per_scene(tmp_path) -> None:
     assert dataset[0]["cond"].shape == (3, 4, 4)
 
 
+def test_per_image_normalization_uses_full_scene_before_crop(tmp_path) -> None:
+    _write_scene(tmp_path)
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0001\n", encoding="utf-8")
+    dataset = ARAD1KDataset(
+        tmp_path,
+        manifest_path=manifest,
+        crop_size=(4, 4),
+        stride=(4, 4),
+        random_crop=False,
+        augment=False,
+        rgb_normalization="per_image",
+    )
+
+    full_rgb = data_module._load_rgb_tensor(
+        tmp_path / "Train_RGB" / "ARAD_1K_0001.jpg"
+    )
+    expected = data_module._normalize_rgb(full_rgb, "per_image")[:, :4, :4]
+    actual = dataset[0]["cond"]
+
+    assert isinstance(actual, torch.Tensor)
+    torch.testing.assert_close(actual, expected)
+    # This crop excludes the full scene's brightest pixels, so crop-local
+    # normalization (the old behavior) would incorrectly force its max to 1.
+    assert float(actual.max()) < 1.0
+
+
 @pytest.mark.parametrize("storage_order", tuple(permutations(range(3))))
 def test_hdf5_crop_reader_preserves_all_axis_orders(
     tmp_path,
