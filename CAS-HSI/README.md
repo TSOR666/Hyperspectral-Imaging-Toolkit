@@ -145,7 +145,7 @@ by it is comparable to the ARAD-1K leaderboard and to the other models in this t
 |---|---|
 | loss | MRAE, ε = 1e-6, on the **unclamped** prediction |
 | data | 128×128 patches, stride 8, rot90 + h/v flips (geometric only) |
-| optimizer | Adam(0.9, 0.999), lr 4e-4, **no** weight decay, **no** warmup |
+| optimizer | Adam(0.9, 0.999), lr 4e-4, **no** weight decay, warmup, or gradient clipping |
 | schedule | cosine → 1e-6, stepped per optimizer step |
 | batch / epochs | 20 / 300, 1000 steps per epoch |
 | validation | full scenes, batch 1, in fp32 |

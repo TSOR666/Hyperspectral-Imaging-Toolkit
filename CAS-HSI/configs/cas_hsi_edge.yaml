@@ -56,7 +56,7 @@ min_lr: 1.0e-6
 weight_decay: 0.0
 warmup_epochs: 0
 scheduler: cosine
-gradient_clip: 1.0
+gradient_clip: 0.0            # MST++ performs the Adam step without norm clipping
 accumulate_steps: 1
 
 amp: true

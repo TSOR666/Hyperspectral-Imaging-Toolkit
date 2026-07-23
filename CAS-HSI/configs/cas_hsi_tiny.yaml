@@ -59,13 +59,9 @@ optimizer: adam
 lr: 4.0e-4
 min_lr: 1.0e-6
 weight_decay: 0.0
-warmup_epochs: 3              # short LR warmup. MST++ uses none, but with active
-                             # LayerScale (1.0) the branches contribute from step 0, so
-                             # a 3-epoch ramp keeps the early loss from spiking (the raw
-                             # run showed loss jumping to ~1.5 with no warmup). Minor
-                             # deviation; drop to 0 for strict MST++ comparability.
+warmup_epochs: 0              # MST++ starts at 4e-4; do not silently discard 3k updates
 scheduler: cosine
-gradient_clip: 1.0
+gradient_clip: 0.0            # MST++ performs the Adam step without norm clipping
 accumulate_steps: 1
 
 # ---- precision ----

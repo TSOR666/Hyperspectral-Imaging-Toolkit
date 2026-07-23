@@ -5,7 +5,7 @@ Recipe (the MST++ defaults every ARAD-1K number in this repo is measured against
 
     loss        MRAE, eps 1e-6, on the UNCLAMPED prediction
     data        128x128 patches on a stride-8 grid, rot90 + h/v flips
-    optimizer   Adam(0.9, 0.999), lr 4e-4, no weight decay
+    optimizer   Adam(0.9, 0.999), lr 4e-4, no weight decay or gradient clipping
     schedule    cosine to 1e-6, stepped PER OPTIMIZER STEP, no warmup
     batch       20
     epochs      300
@@ -108,7 +108,7 @@ class TrainConfig:
     weight_decay: float = 0.0             # MST++ uses none
     warmup_epochs: int = 0                # MST++ uses none
     scheduler: str = "cosine"
-    gradient_clip: float = 1.0
+    gradient_clip: float = 0.0             # MST++ uses none; >0 opts into norm clipping
     accumulate_steps: int = 1
 
     # --- precision / speed ---
@@ -503,9 +503,11 @@ class Trainer:
         self.total_steps = total_steps
 
         self.logger.info(
-            "Optim: %s lr=%.1e -> %.1e (%s, %d steps/epoch, %d total), wd=%g, clip=%g, loss=%s",
+            "Optim: %s lr=%.1e -> %.1e (%s, %d steps/epoch, %d total), "
+            "warmup=%d steps, wd=%g, clip=%s, loss=%s",
             cfg.optimizer, cfg.lr, cfg.min_lr, cfg.scheduler,
-            steps_per_epoch, total_steps, cfg.weight_decay, cfg.gradient_clip, cfg.loss,
+            steps_per_epoch, total_steps, warmup_steps, cfg.weight_decay,
+            f"{cfg.gradient_clip:g}" if cfg.gradient_clip > 0 else "off", cfg.loss,
         )
 
     def _dump_config(self) -> None:
