@@ -100,6 +100,63 @@ def test_generator_gradients_flow():
     assert has_param_grad
 
 
+def test_small_output_head_init_scales_initial_prediction_without_blocking_gradients():
+    """Fresh MRAE runs must not start from the pathological large-output head."""
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 8,
+        "split_sizes": [2, 2, 2],
+        "stage_depths": [1, 1, 1, 1, 1],
+        "num_heads": 2,
+        "norm_groups": 4,
+        "sampling": "pixelshuffle",
+        "output_activation": "none",
+        "activation_checkpointing": False,
+    }
+    image = torch.rand(1, 3, 8, 8)
+
+    torch.manual_seed(123)
+    unscaled = NoiseRobustCSWinGenerator(
+        {**config, "output_head_init_scale": 1.0}
+    ).train()
+    torch.manual_seed(123)
+    scaled = NoiseRobustCSWinGenerator(
+        {**config, "output_head_init_scale": 0.01}
+    ).train()
+
+    unscaled_output = unscaled(image)
+    scaled_output = scaled(image)
+    torch.testing.assert_close(
+        scaled_output,
+        unscaled_output * 0.01,
+        rtol=2e-4,
+        atol=2e-5,
+    )
+
+    scaled_output.square().mean().backward()
+    body_grad = scaled.encoder1[0].norm1.norm.weight.grad
+    assert body_grad is not None
+    assert torch.isfinite(body_grad).all()
+    assert body_grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("scale", [-0.01, float("inf")])
+def test_output_head_init_scale_rejects_invalid_values(scale):
+    config = {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 8,
+        "split_sizes": [2, 2, 2],
+        "stage_depths": [1, 1, 1, 1, 1],
+        "num_heads": 2,
+        "output_head_init_scale": scale,
+    }
+
+    with pytest.raises(ValueError, match="output_head_init_scale"):
+        NoiseRobustCSWinGenerator(config)
+
+
 def test_generator_full_block_activation_checkpointing_preserves_gradients():
     """The memory-saving SST-block checkpoint path must remain trainable."""
     config = {

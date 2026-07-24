@@ -3,23 +3,25 @@ defaults:
   - _self_
 
 # ============================================================================
-# Validated recovery recipe. FRESH RUN ONLY.
+# Stable-initialization recovery recipe. FRESH RUN ONLY.
 #
-# The filename is retained for command compatibility, but this is deliberately
-# no longer a three-stage cascade. The 2026-07-21 run of the experimental
-# base=64 / true-CSWin / cascade=3 bundle plateaued at ValMRAE ~= 0.63 and
-# PSNR ~= 19.3 from roughly 12k through 25k iterations. Training was finite,
-# unclamped and OOM-free at batch 20, so the result is architectural
-# underfitting rather than a CUDA, validation-clamping, or numerical issue.
+# The filename is retained for command compatibility; this is deliberately not
+# a three-stage cascade. A 2026-07-23 local/global run using the previous
+# "recovery" recipe started at train MRAE 93.5 and plateaued at validation MRAE
+# 0.66 / PSNR 19.1 from roughly 10k through 37k iterations. The generator was
+# updating, but its random Kaiming-scale output projection amplified the
+# residual-heavy decoder. MRAE then drove the projection toward a low-output
+# median before the body learned a useful RGB-to-spectrum mapping.
 #
-# This recipe explicitly pins the repository's known-good local/global model
-# instead of inheriting experimental architecture switches. It retains the
-# MST++ training protocol from config.yaml, including batch_size=20, annealed
-# MRAE, 128x128 patches, Adam at 4e-4, EMA, and the 300k cosine schedule.
+# The base config now scales the final projection by 0.01. This recipe also
+# enables the already-implemented shallow RGB-to-HSI prior so training starts
+# near the well-conditioned zero-prediction MRAE baseline (~1) and has a direct
+# radiometric gradient path. The local/global attention, single body pass, and
+# MST++ training protocol otherwise stay unchanged.
 #
-# Do not resume a checkpoint from the failed sota_cascade run: the model shapes
-# and computation graph are incompatible. The separate output directories
-# below make accidental checkpoint mixing less likely.
+# Do not resume either failed July checkpoint bundle. Enabling the spectral
+# prior adds parameters, and initialization changes only take effect on a fresh
+# model. The separate output directories prevent accidental checkpoint mixing.
 # ============================================================================
 
 base_channels: 48
@@ -32,8 +34,9 @@ use_input_denoising: true
 smsa_output_norm: true
 cascade_stages: 1
 thick_output_head: false
-use_spectral_input_skip: false
+output_head_init_scale: 0.01
+use_spectral_input_skip: true
 refinement_blocks: 0
 
-log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_recovery_local_global
-checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_recovery_local_global
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_recovery_stable_init
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_recovery_stable_init

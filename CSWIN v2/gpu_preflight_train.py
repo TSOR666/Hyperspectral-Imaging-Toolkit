@@ -157,7 +157,8 @@ def tiny_config() -> dict[str, object]:
         "use_feature_norm": True,
         "use_input_denoising": True,
         "cascade_stages": 1,
-        "use_spectral_input_skip": False,
+        "output_head_init_scale": 0.01,
+        "use_spectral_input_skip": True,
         "spectral_input_skip_init": 0.03,
         "refinement_blocks": 0,
         "stage_depths": [1, 1, 1, 1, 1],
@@ -316,7 +317,14 @@ def assert_training_step(context: dict[str, object]) -> str:
         missing_grads = [
             name
             for name, parameter in model.generator.named_parameters()
-            if parameter.requires_grad and parameter.grad is None
+            if (
+                parameter.requires_grad
+                and parameter.grad is None
+                # local_global attention deliberately bypasses its local-window
+                # bias table when the current feature map takes the global
+                # branch. A single-size preflight cannot exercise both paths.
+                and "relative_position_bias_table_" not in name
+            )
         ]
         if missing_grads:
             preview = ", ".join(missing_grads[:5])

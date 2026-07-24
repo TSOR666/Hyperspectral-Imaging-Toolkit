@@ -789,6 +789,25 @@ def _run_stage(
                 microbatch_size=microbatch_size,
             )
 
+            max_initial_train_loss = config.get("max_initial_train_loss", None)
+            if stage_iter == 0 and max_initial_train_loss is not None:
+                initial_loss = float(loss.detach().item())
+                max_initial_train_loss = float(max_initial_train_loss)
+                if (
+                    math.isfinite(initial_loss)
+                    and max_initial_train_loss > 0.0
+                    and initial_loss > max_initial_train_loss
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+                    raise RuntimeError(
+                        "Initial training loss is pathologically high: "
+                        f"{initial_loss:.6g} > max_initial_train_loss="
+                        f"{max_initial_train_loss:.6g}. Refusing to optimize "
+                        "toward a collapsed low-output solution. Start a fresh "
+                        "model with output_head_init_scale=0.01 (the shipped "
+                        "config) and do not resume incompatible July checkpoints."
+                    )
+
             if check_finite and not pred_is_finite:
                 consecutive_nonfinite += 1
                 train_logger.warning(

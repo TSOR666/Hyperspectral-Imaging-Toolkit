@@ -56,6 +56,10 @@ strict_dataset_files: true  # fail instead of silently dropping missing/corrupt 
 excluded_scene_stems: [ARAD_1K_0314]  # known-corrupt ARAD-1K scene
 validation_max_batches: null
 finite_check_interval: 100
+# Fail the first fresh-stage update if initialization is already far outside
+# the MRAE zero-prediction baseline (~1). This would have stopped the 93.5-loss
+# run before it spent 11 hours converging to a weak low-output solution.
+max_initial_train_loss: 10.0
 # Allows adaptive microbatch fallback to halve a batch-20 stage all the way to
 # one sample (20 -> 10 -> 5 -> 3 -> 2 -> 1) before declaring it impossible.
 max_consecutive_ooms: 6
@@ -167,6 +171,12 @@ use_noise_block: false           # legacy unsupported flag; true now fails loudl
 # checkpoints; disable in fresh SOTA runs to match RGB->HSI reference models.
 use_input_denoising: true
 thick_output_head: false         # paper ToOut is a single conv
+# Scale only the final spectral projection after its normal initialization.
+# The old Kaiming-scale head made the residual-heavy decoder start around MRAE
+# 90, after which Adam collapsed to a weak low-output solution. A small nonzero
+# scale starts near the zero-prediction MRAE baseline (~1) while preserving
+# immediate gradients into the transformer body. Checkpoint loads overwrite it.
+output_head_init_scale: 0.01
 ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
 # Legacy stabilizer. Disable only in a fresh run: the transformer blocks are
 # already pre-normed, and extra GroupNorm after embedding/down/up convolutions

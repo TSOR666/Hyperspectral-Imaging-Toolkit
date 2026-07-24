@@ -66,7 +66,7 @@ def test_stable_lite_config_builds_finite_train_step():
     )
 
 
-def test_sota_cascade_config_pins_validated_recovery_architecture():
+def test_sota_cascade_config_pins_stable_recovery_architecture():
     with initialize_config_dir(
         version_base=None,
         config_dir=str(CONFIG_DIR),
@@ -81,13 +81,14 @@ def test_sota_cascade_config_pins_validated_recovery_architecture():
     assert bool(config.use_feature_norm) is True
     assert bool(config.use_input_denoising) is True
     assert int(config.cascade_stages) == 1
-    assert bool(config.use_spectral_input_skip) is False
+    assert float(config.output_head_init_scale) == pytest.approx(0.01)
+    assert bool(config.use_spectral_input_skip) is True
     assert int(config.refinement_blocks) == 0
     assert int(config.base_channels) == 48
     assert int(config.batch_size) == 20
     assert int(config.gradient_accumulation_steps) == 1
-    assert str(config.log_dir).endswith("sota_recovery_local_global")
-    assert str(config.checkpoint_dir).endswith("sota_recovery_local_global")
+    assert str(config.log_dir).endswith("sota_recovery_stable_init")
+    assert str(config.checkpoint_dir).endswith("sota_recovery_stable_init")
 
 
 def test_progressive_finetune_config_switches_after_saturated_128_stage():

@@ -58,9 +58,10 @@ or `uv run` fail before training starts.
 
 ## Active Recipe
 
-The defaults in `src/configs/config.yaml` use the validated local/global
-baseline. The fresh-run recipe in `src/configs/sota_cascade.yaml` explicitly
-pins the same architecture and writes to isolated recovery directories. The
+The defaults in `src/configs/config.yaml` use the local/global baseline with a
+small-initialized spectral output projection. The fresh-run recipe in
+`src/configs/sota_cascade.yaml` pins the same attention architecture, enables a
+shallow RGB-to-HSI prior, and writes to isolated recovery directories. The
 historical filename is retained for command compatibility; it no longer
 enables the failed three-pass cascade bundle. The shared training protocol uses:
 
@@ -70,6 +71,10 @@ enables the failed three-pass cascade bundle. The shared training protocol uses:
   denominator floor starts stable, then decays to exact MST++/leaderboard MRAE.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
+- A `0.01`-scaled final spectral projection so initial MRAE stays near the
+  well-conditioned zero-prediction baseline instead of starting in the tens.
+- A first-update guard that aborts if training loss exceeds `10`, catching a
+  pathological initialization before it consumes a long accelerator run.
 - Deployment-matched local/global spatial attention in both recommended
   configurations.
 - Deployment-matched 128x128 tiled validation with FP32 overlap blending and
@@ -110,7 +115,7 @@ python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 # Combined annealed-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
 
-# Fresh recovery with the validated local/global architecture pinned
+# Fresh recovery with stable output initialization and an RGB spectral prior
 python src/hsi_model/train_generator.py --config-name sota_cascade
 
 # Isolate the three CSWin recovery levers one at a time
@@ -131,13 +136,13 @@ python src/hsi_model/train_generator.py \
   +resume_checkpoint=/path/to/latest_checkpoint.pth
 ```
 
-> The 2026-07-21 experimental `sota_cascade` bundle (`base_channels=64`, true
-> CSWin stripes, disabled feature/output normalization, three cascade passes,
-> and an RGB spectral skip) plateaued near 0.63 validation MRAE / 19.3 dB by
-> 12k-25k iterations. Do not resume its checkpoints. The active file now pins
-> the validated local/global single-pass architecture and uses new output
-> directories. Keep `cswin`, `axial`, and multi-pass cascades as controlled
-> one-lever ablations until independently validated.
+> Two July runs must not be resumed: the 2026-07-21 true-CSWin/cascade-3 bundle
+> plateaued near 0.63 MRAE, and the 2026-07-23 local/global run started at
+> train MRAE 93.5 before plateauing near 0.66 MRAE / 19.1 dB through 37k
+> iterations. The latter exposed the oversized random output projection, not
+> frozen parameters. The active recipe uses a small output-head initialization,
+> a direct RGB spectral prior, and new output directories. Keep alternative
+> attention modes and multi-pass cascades as controlled one-lever ablations.
 
 ### Attention-mode and recovery levers
 
@@ -146,6 +151,8 @@ python src/hsi_model/train_generator.py \
 | `cswin_attention_mode` | `local_global`, `cswin`, `axial` | `local_global` | `cswin` and `axial` remain diagnostic modes; neither is recommended for the production run. |
 | `cascade_stages` | int | `1` | Values above one repeat the generator and materially increase activation memory; validate them as ablations. |
 | `smsa_output_norm` | bool | `true` | Keep enabled in the validated recipe. |
+| `output_head_init_scale` | float or null | `0.01` | Multiplies the fresh final projection initialization; checkpoint weights overwrite it on load. |
+| `use_spectral_input_skip` | bool | `false` (`true` in `sota_cascade`) | Adds a shallow radiometric RGB-to-HSI path; changing it requires a fresh checkpoint. |
 
 When a key is absent from the base `config.yaml`, set it in an experiment YAML
 or append it on the CLI with Hydra's `+key=value` form.

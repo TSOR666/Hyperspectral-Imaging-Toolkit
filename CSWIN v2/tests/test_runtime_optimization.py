@@ -318,6 +318,57 @@ def test_training_recovers_oom_with_microbatch_accumulation():
     assert model.weight.item() > 0
 
 
+def test_training_rejects_pathological_initial_loss_before_optimizer_step():
+    model = torch.nn.Conv2d(3, 1, kernel_size=1)
+    with torch.no_grad():
+        model.weight.zero_()
+        model.bias.fill_(100.0)
+    initial_weight = model.weight.detach().clone()
+    initial_bias = model.bias.detach().clone()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    loader = torch.utils.data.DataLoader(
+        TensorDataset(
+            torch.zeros(1, 3, 8, 8),
+            torch.zeros(1, 1, 8, 8),
+        ),
+        batch_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="Initial training loss is pathologically high"):
+        _run_stage(
+            net=model,
+            generator=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=make_grad_scaler("cpu", enabled=False),
+            criterion=torch.nn.L1Loss(),
+            ema=None,
+            train_loader=loader,
+            val_dataset=None,
+            config={
+                "iterations_per_epoch": 100,
+                "finite_check_interval": 1,
+                "max_initial_train_loss": 10.0,
+            },
+            device=torch.device("cpu"),
+            metrics_logger=_NoOpMetricsLogger(),
+            distributed=False,
+            seed=42,
+            rank=0,
+            stage_idx=0,
+            stage_iterations=1,
+            global_iter=0,
+            record_mrae_loss=float("inf"),
+            early_stopping_best_mrae=float("inf"),
+            early_stopping_bad_epochs=0,
+            early_stopping_enabled=False,
+        )
+
+    torch.testing.assert_close(model.weight, initial_weight)
+    torch.testing.assert_close(model.bias, initial_bias)
+
+
 def test_strict_checkpoint_load_rejects_missing_state(tmp_path):
     generator = NoiseRobustCSWinGenerator(_small_generator_config())
     state = generator.state_dict()
