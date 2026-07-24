@@ -135,11 +135,17 @@ class CASHSI(nn.Module):
         # The spec prescribes exactly two custom inits (7.3): Xavier on the RGB
         # prior, near-zero on the residual spectral head. Both modules do that
         # themselves. A blanket `self.apply(kaiming)` would run *after* them and
-        # silently overwrite both -- destroying the "network starts equal to the
-        # linear prior" property that the whole residual formulation rests on.
+        # silently overwrite both -- destroying the "network starts NEAR the linear
+        # prior" property that the whole residual formulation rests on.
         # Every other conv keeps PyTorch's default init, which is well-behaved for
-        # the depthwise/pointwise mix used here; the residual branches are already
-        # near-zero via LayerScale.
+        # the depthwise/pointwise mix used here.
+        #
+        # NOTE: "near", not "equal to". The head's near-zero init is the ONLY thing
+        # damping the deep branch. LayerScale must NOT be used as a second damper on
+        # top of it -- at layer_scale_init=1e-3 the two gates multiply and the whole
+        # network becomes an affine map of the RGB input (measured deviation from
+        # additivity: 4e-5), which plateaus at a linear map's MRAE. See the comment on
+        # CASHSIConfig.layer_scale_init.
 
     # ------------------------------------------------------------------ build --
     def _lite_stack(self, channels: int, depth: int) -> _Stack:

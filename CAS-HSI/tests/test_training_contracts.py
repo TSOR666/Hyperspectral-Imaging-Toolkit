@@ -158,7 +158,14 @@ def test_untrained_low_rank_head_starts_close_to_linear_prior():
 
     residual = (output - prior).abs().mean()
     prior_scale = prior.abs().mean()
-    assert residual < 0.05 * prior_scale
+    # Two-sided, for the same reason as test_gradients.py: an upper bound alone is
+    # satisfied by a trunk that is gated off entirely, which is a silent training failure.
+    ratio = float(residual / prior_scale)
+    assert ratio < 0.35, f"low-rank head residual {ratio:.3f} of prior; near-zero init lost"
+    assert ratio > 0.005, (
+        f"low-rank head residual is only {ratio:.2%} of the prior: the trunk is gated off "
+        "and the model is effectively a linear RGB->31 map"
+    )
 
 
 def test_config_rejects_nonpositive_head_dim_cleanly():

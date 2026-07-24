@@ -71,7 +71,22 @@ class CASHSIConfig:
     # --- block internals ---
     head_dim: int = 32
     ffn_expansion: float = 2.0
-    layer_scale_init: float = 1.0e-3
+    # DEVIATES from spec 4.4's 1e-3, deliberately, and this default matters more than it
+    # looks. LayerScale at 1e-3 gates EVERY residual branch of all ~17 blocks, and the
+    # spectral head is separately initialized near zero (head_init_std). The two near-zero
+    # gates multiply: measured on the tiny/research model, the fresh network's deviation
+    # from an exactly affine map (||f(a+b) - (f(a)+f(b)-f(0))|| / ||f(a+b)-f(0)||) is
+    # 4e-5 at 1e-3 versus 3.4e-2 at 1.0 -- i.e. at 1e-3 the model IS a linear RGB->31 map
+    # to four decimal places, and its whole nonlinear capacity has to be discovered from
+    # scratch by the optimizer. A linear map's MRAE floor on ARAD-1K is ~0.6-0.7, which is
+    # exactly where a 46k-step run plateaued.
+    #
+    # 1e-3 is a VERY-DEEP-net (100+ layer) stabilizer; it over-damps this depth. MST++,
+    # which this project is measured against, uses no LayerScale at all = effectively 1.0.
+    # All three shipped configs already override this to 1.0; the dataclass now agrees with
+    # them so that a run launched WITHOUT --config cannot silently build a crippled network.
+    # Lower toward 0.1 only if you observe early-training divergence.
+    layer_scale_init: float = 1.0
     drop_path: float = 0.0
     norm: str = "layernorm"
     norm_eps: float = 1.0e-6
