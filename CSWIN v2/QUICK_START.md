@@ -228,9 +228,9 @@ print('✅ Installation verified!')
 - Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
 - Start a fresh run after changing the objective to `mrae_annealed`
 - Use `--config-name sota_cascade` only for a fresh run. It now pins the
-  validated local/global, single-pass architecture and writes to separate
-  recovery directories. Never resume the failed July 2026 true-CSWin/cascade-3
-  checkpoint bundle.
+  local/global single-pass architecture, uses a small-initialized output head
+  plus an RGB spectral prior, and writes to separate recovery directories.
+  Never resume either failed July 2026 checkpoint bundle.
 - Treat 256/512 progressive fine-tuning as experimental unless a patch-size
   sweep shows it improves the deployed inference path
 - Track both deployed `mrae` and diagnostic `raw_mrae`

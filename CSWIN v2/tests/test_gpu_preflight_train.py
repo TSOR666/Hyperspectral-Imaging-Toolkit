@@ -3,6 +3,7 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,7 +86,7 @@ def test_training_command_distributed():
     assert cmd[-1] == "batch_size=8"
 
 
-def test_tiny_config_exercises_validated_recovery_architecture():
+def test_tiny_config_exercises_stable_recovery_architecture():
     config = tiny_config()
 
     assert config["cswin_attention_mode"] == "local_global"
@@ -95,7 +96,8 @@ def test_tiny_config_exercises_validated_recovery_architecture():
     assert config["use_feature_norm"] is True
     assert config["use_input_denoising"] is True
     assert config["cascade_stages"] == 1
-    assert config["use_spectral_input_skip"] is False
+    assert config["output_head_init_scale"] == pytest.approx(0.01)
+    assert config["use_spectral_input_skip"] is True
 
 
 def test_print_results_includes_pass_fail_rows():

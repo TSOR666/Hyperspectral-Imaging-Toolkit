@@ -728,6 +728,35 @@ class NoiseRobustCSWinGenerator(nn.Module):
         else:
             self.to_spectral = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
 
+        # MRAE is extremely sensitive to a large random prediction when target
+        # reflectance is close to zero.  The residual-heavy decoder can amplify
+        # a default Kaiming-initialized output projection enough to start with
+        # MRAE in the tens or hundreds.  In that regime Adam first collapses the
+        # projection toward a low-output median and the body receives weak
+        # gradients through the shrunken head.  Fresh MRAE recipes therefore
+        # opt into a small final-projection scale.  ``None`` preserves the
+        # historical initialization for direct constructors/legacy configs;
+        # loaded checkpoints are unaffected because load_state_dict replaces
+        # these values.
+        output_head_init_scale = config.get("output_head_init_scale", None)
+        if output_head_init_scale is not None:
+            output_head_init_scale = float(output_head_init_scale)
+            if not torch.isfinite(torch.tensor(output_head_init_scale)):
+                raise ValueError("output_head_init_scale must be finite")
+            if output_head_init_scale < 0.0:
+                raise ValueError("output_head_init_scale must be non-negative")
+            final_projection = (
+                self.to_spectral[-1]
+                if isinstance(self.to_spectral, nn.Sequential)
+                else self.to_spectral
+            )
+            if not isinstance(final_projection, nn.Conv2d):
+                raise TypeError("The final spectral projection must be Conv2d")
+            with torch.no_grad():
+                final_projection.weight.mul_(output_head_init_scale)
+                if final_projection.bias is not None:
+                    final_projection.bias.zero_()
+
         # Optional direct spectral prior: a shallow RGB->HSI path added to the
         # transformer prediction. Disabled by default for strict compatibility.
         self.spectral_input_skip: Optional[nn.Module] = None
