@@ -68,10 +68,15 @@ def test_cas_lite_block_is_identity_at_zero_layer_scale():
     assert torch.allclose(x, block(x), atol=1e-6)
 
 
-def test_untrained_model_is_close_to_its_linear_prior():
-    """Spec 7.3: the near-zero residual head makes the fresh model ~= the linear prior.
+def test_untrained_model_starts_near_but_not_collapsed_onto_its_linear_prior():
+    """Spec 7.3: the near-zero residual head makes the fresh model START near the prior.
 
-    This is the property a blanket weight re-init would silently destroy.
+    Two-sided on purpose. The upper bound is the original contract (a blanket weight
+    re-init would destroy it). The LOWER bound is the one that was missing, and its
+    absence cost a 46,000-step training run: with layer_scale_init=1e-3 the residual
+    branch is gated to ~1% of the prior AND the trunk is affine to 4e-5, so the network
+    is a linear Conv1x1 RGB->31 map whose ARAD-1K MRAE floor is ~0.6-0.7. That state
+    passes every shape, gradient and "loss went down" test in this suite.
     """
     torch.manual_seed(0)
     model = build_cas_hsi("tiny").eval()
@@ -83,9 +88,42 @@ def test_untrained_model_is_close_to_its_linear_prior():
 
     residual = (output - prior).abs().mean()
     prior_scale = prior.abs().mean()
-    assert residual < 0.05 * prior_scale, (
+    ratio = float(residual / prior_scale)
+
+    assert ratio < 0.35, (
         f"the deep residual ({residual:.4f}) is not small next to the prior "
         f"({prior_scale:.4f}); the near-zero head init was lost"
+    )
+    assert ratio > 0.005, (
+        f"the deep residual is only {ratio:.2%} of the prior: the trunk is gated off at "
+        "init and the model is effectively a linear RGB->31 map. Check layer_scale_init "
+        "(1e-3 over-damps this depth; 1.0 is the validated value) and head_init_std."
+    )
+
+
+def test_untrained_model_is_not_an_affine_function_of_its_input():
+    """The trunk must supply real nonlinearity at init, not just in principle.
+
+    Measures deviation from additivity: f(a+b) vs f(a)+f(b)-f(0). An exactly linear
+    network scores 0. Measured on the tiny/research model: 4e-5 at layer_scale_init=1e-3
+    versus 3.4e-2 at 1.0 -- an 850x difference that the parameter count, the loss curve
+    and every other test in this file are all blind to.
+    """
+    torch.manual_seed(0)
+    model = build_cas_hsi("tiny").eval()
+    a = torch.rand(1, 3, 32, 32)
+    b = torch.rand(1, 3, 32, 32)
+
+    with torch.no_grad():
+        zero = model(torch.zeros_like(a))
+        joint = model(a + b) - zero
+        split = (model(a) - zero) + (model(b) - zero)
+
+    deviation = float((joint - split).norm() / joint.norm().clamp_min(1e-12))
+    assert deviation > 1e-3, (
+        f"the untrained network is affine in its input to {deviation:.2e}; it cannot "
+        "resolve metamers or use spatial context, and will plateau at the MRAE of a "
+        "linear colour->spectrum map. Raise layer_scale_init."
     )
 
 
@@ -111,7 +149,14 @@ def test_model_gradients_are_finite_end_to_end():
 
 def test_model_can_actually_learn():
     """Overfit a single fixed batch. A model that runs but cannot learn passes every
-    shape and gradient test above -- this is the one that would catch it."""
+    shape and gradient test above -- this is the one that would catch it.
+
+    The target is deliberately NOT a function of RGB alone. It is a spatially-mixed
+    transform, so the Conv1x1 rgb_prior cannot fit it and progress here is evidence the
+    TRUNK is learning. The previous version of this test used a per-pixel linear target,
+    which the prior alone can fit: it passed with a completely dead trunk, which is
+    exactly the failure that reached a GPU.
+    """
     torch.manual_seed(0)
     model = build_cas_hsi(
         CASHSIConfig(
@@ -122,9 +167,8 @@ def test_model_can_actually_learn():
     ).train()
 
     rgb = torch.rand(2, 3, 32, 32)
-    # A learnable target: a smooth linear function of the input, not noise.
-    weight = torch.randn(31, 3, 1, 1) * 0.3
-    target = torch.nn.functional.conv2d(rgb, weight).sigmoid()
+    weight = torch.randn(31, 3, 5, 5) * 0.1
+    target = torch.nn.functional.conv2d(rgb, weight, padding=2).sigmoid()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
 
@@ -137,10 +181,24 @@ def test_model_can_actually_learn():
         return float(loss.detach())
 
     first = mrae()
-    for _ in range(30):
+    for _ in range(60):
         last = mrae()
 
     assert last < 0.5 * first, f"MRAE barely moved: {first:.4f} -> {last:.4f}"
+
+    # And the trunk -- not just the linear prior -- must be carrying some of it.
+    with torch.no_grad():
+        from cas_hsi.layers.padding import pad_to_multiple
+
+        padded, _ = pad_to_multiple(rgb, multiple=model.config.size_multiple)
+        features, _ = model._forward_padded_features(padded)
+        share = float(
+            model.spectral_head(features).norm() / model.rgb_prior(padded).norm().clamp_min(1e-12)
+        )
+    assert share > 0.05, (
+        f"the deep residual is {share:.2%} of the linear prior after training: the loss "
+        "fell but the trunk is dead, so this only fit what a Conv1x1 can fit"
+    )
 
 
 def test_drop_path_is_identity_in_eval():

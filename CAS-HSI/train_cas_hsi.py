@@ -350,6 +350,22 @@ class Trainer:
         self.ckpt_dir.mkdir(exist_ok=True)
 
         self.logger = create_logger(self.exp_dir)
+        # Make the run self-identifying. `experiment_name` alone is not enough: every value
+        # in the shipped YAMLs except experiment_name and model_overrides equals a dataclass
+        # default, so a defaults-only run is otherwise indistinguishable from the validated
+        # recipe in the log.
+        self.logger.info("argv            : %s", " ".join(sys.argv))
+        self.logger.info("run dir         : %s", self.exp_dir)
+        deltas = {
+            f.name: getattr(config, f.name)
+            for f in fields(TrainConfig)
+            if getattr(config, f.name) != getattr(TrainConfig(), f.name)
+        }
+        self.logger.info(
+            "TrainConfig vs defaults: %s",
+            json.dumps(deltas, sort_keys=True, default=str) if deltas
+            else "NONE -- every field is at its dataclass default; no --config was applied",
+        )
         set_seed(config.seed, config.deterministic)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -399,8 +415,19 @@ class Trainer:
         self.logger.info("  depths          : %s", info["depths"])
         self.logger.info("  half mixer      : %s", info["half_mixer"])
         self.logger.info("  bottleneck      : %s", info["bottleneck_mixers"])
+        # The gates that decide whether the deep trunk contributes at all. These are
+        # invisible in the parameter count -- a run with layer_scale_init=1e-3 and one with
+        # 1.0 print the SAME 1,782,049 -- so without this line the log cannot tell you which
+        # of two materially different networks was trained. That ambiguity cost a 46k-step
+        # GPU run once; it is not allowed to happen twice.
+        self.logger.info(
+            "  residual gates  : layer_scale=%g  head_init_std=%g  drop_path=%g  head=%s",
+            self.model.config.layer_scale_init, self.model.config.head_init_std,
+            self.model.config.drop_path, self.model.config.spectral_head,
+        )
         self.logger.info("  device / amp    : %s / %s", self.device, self.amp_dtype)
         self.logger.info("  metrics source  : %s", METRICS_SOURCE)
+        self.logger.info("  model_overrides : %s", json.dumps(overrides, sort_keys=True, default=str))
         self.logger.info("=" * 78)
 
     def _build_data(self) -> None:
@@ -638,6 +665,33 @@ class Trainer:
 
     # --------------------------------------------------------------- validate
     @torch.no_grad()
+    def _trunk_health(self, model: nn.Module, rgb: torch.Tensor) -> Dict[str, float]:
+        """Is the deep trunk contributing anything, or is this still the linear prior?
+
+        The prediction is ``RGBPrior(rgb) + spectral_head(trunk(rgb))``. The prior is a
+        Conv1x1 3->31, i.e. a purely linear per-pixel colour->spectrum map whose MRAE floor
+        on ARAD-1K is roughly 0.6-0.7. If ``resid/prior`` stays near zero, the network has
+        collapsed onto that linear solution and NO amount of further training will help --
+        which is indistinguishable, in a plain loss curve, from "converging slowly".
+        Logging it turns a 46-epoch mystery into a first-epoch read.
+        """
+        from cas_hsi.layers.padding import pad_to_multiple
+
+        padded, _ = pad_to_multiple(rgb, multiple=model.config.size_multiple)
+        features, _ = model._forward_padded_features(padded)
+        prior = model.rgb_prior(padded)
+        residual = model.spectral_head(features)
+
+        gammas = [p.detach().flatten() for name, p in model.named_parameters()
+                  if name.endswith(".scale") and "gamma" in name]
+        gamma = torch.cat(gammas) if gammas else torch.zeros(1, device=rgb.device)
+        return {
+            "resid_over_prior": float(residual.norm() / prior.norm().clamp_min(1e-12)),
+            "gamma_absmean": float(gamma.abs().mean()),
+            "gamma_max": float(gamma.max()),
+        }
+
+    @torch.no_grad()
     def validate(self) -> Dict[str, Any]:
         cfg = self.config
         model = self.ema.module if (self.ema is not None and self._ema_started) else self.model
@@ -646,10 +700,14 @@ class Trainer:
         rows: Dict[str, List[Dict[str, float]]] = {"full": [], "crop": []}
         loss_meter = AverageMeter()
         started = time.time()
+        health: Dict[str, float] = {}
 
         for rgb, hsi in self.val_loader:
             rgb = rgb.to(self.device, non_blocking=True)
             hsi_device = hsi.to(self.device, non_blocking=True)
+            if not health:
+                with self._autocast(enabled=False):
+                    health = self._trunk_health(model, rgb)
 
             # fp32: the selection metric must not carry AMP rounding.
             with self._autocast(enabled=False):
@@ -681,6 +739,7 @@ class Trainer:
             "selection_protocol": selection_protocol,
             "seconds": time.time() - started,
             "ema": self.ema is not None and self._ema_started,
+            "health": health,
         }
 
     # ------------------------------------------------------------ checkpoints
@@ -782,6 +841,7 @@ class Trainer:
         for protocol in ("full", "crop"):
             columns += [f"val/{protocol}/{key}" for key in METRIC_KEYS]
         columns += ["val/selection", "val/ema"]
+        columns += ["val/health/resid_over_prior", "val/health/gamma_absmean", "val/health/gamma_max"]
         return columns
 
     def _record(self, epoch: int, train: Dict[str, float], val: Optional[Dict[str, Any]]) -> None:
@@ -793,6 +853,7 @@ class Trainer:
                 row.update({f"val/{protocol}/{k}": v for k, v in values.items()})
             row["val/selection"] = val["selection"]
             row["val/ema"] = val["ema"]
+            row.update({f"val/health/{k}": v for k, v in (val.get("health") or {}).items()})
 
         with self._metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
@@ -825,6 +886,22 @@ class Trainer:
             )
             for line in format_metric_table(val["protocols"]).splitlines():
                 self.logger.info("%s", line)
+            health = val.get("health") or {}
+            if health:
+                self.logger.info(
+                    "           | trunk: |residual|/|prior| = %.4f   layer_scale |mean| %.4f  max %.4f",
+                    health["resid_over_prior"], health["gamma_absmean"], health["gamma_max"],
+                )
+                # A trunk stuck below ~5% of the prior means the model is still essentially
+                # the linear Conv1x1 baseline, whose ARAD-1K MRAE floor is ~0.6-0.7.
+                if epoch >= 3 and health["resid_over_prior"] < 0.05:
+                    self.logger.warning(
+                        "  DEAD TRUNK: the deep residual is %.1f%% of the linear prior at epoch %d. "
+                        "The network has collapsed onto its Conv1x1 RGB prior and will plateau near "
+                        "MRAE 0.6-0.7 no matter how long it runs. Check layer_scale_init (should be "
+                        "~1.0, not 1e-3) and head_init_std.",
+                        100.0 * health["resid_over_prior"], epoch,
+                    )
 
     # ------------------------------------------------------------------- loop
     def fit(self) -> Dict[str, Any]:
