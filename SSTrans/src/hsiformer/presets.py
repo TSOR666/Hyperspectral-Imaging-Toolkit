@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-from .attention import RPEMode
-from .model import HSIFormer, ResidualMode, SpectralHeadMode
+from .attention import AttentionMath, RPEMode
+from .model import HSIFormer, InitMode, ResidualMode, SpectralHeadMode
 
 PresetName = Literal[
     "legacy",
     "ablation_no_rpe",
+    "source_reproduction",
     "corrected_rpe",
     "optimized_candidate",
     "recommended_retrain",
@@ -35,6 +36,9 @@ class HSIFormerConfig:
     use_spatial_attention: bool = True
     use_checkpoint: bool = False
     rectangular_spatial: bool = False
+    init_mode: InitMode = "modern_kaiming_conv"
+    spatial_scale_init: float = 5.0
+    attention_math: AttentionMath = "stabilized_sdpa"
 
     def build(self) -> HSIFormer:
         return HSIFormer(**asdict(self))
@@ -45,6 +49,23 @@ def get_config(name: PresetName = "legacy") -> HSIFormerConfig:
         return HSIFormerConfig()
     if name == "ablation_no_rpe":
         return HSIFormerConfig(spectral_rpe="none")
+    if name == "source_reproduction":
+        return HSIFormerConfig(
+            n_blocks=(2, 2),
+            bottle_depth=2,
+            n_refine=2,
+            # The source creates a zero-valued relative-bias parameter even
+            # though the no-RPE forward path never reads it. Retaining that
+            # inert parameter makes released Lightning checkpoints loadable.
+            spectral_rpe="source_disabled",
+            spectral_head_mode="legacy_constant",
+            cat_rpe=True,
+            residual_mode="legacy",
+            use_checkpoint=False,
+            init_mode="source_trunc_normal",
+            spatial_scale_init=1.0,
+            attention_math="source_eager",
+        )
     if name == "corrected_rpe":
         return HSIFormerConfig(spectral_rpe="pre_softmax")
     if name == "optimized_candidate":

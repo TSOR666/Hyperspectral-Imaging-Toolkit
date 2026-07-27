@@ -199,6 +199,29 @@ def test_oversized_training_crop_uses_full_arad_frame(
     assert augmentation_called
 
 
+def test_oversized_grid_crop_is_one_full_frame_per_scene(tmp_path) -> None:
+    expected_cube = _write_scene(tmp_path)
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0001\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        manifest_path=manifest,
+        crop_size=9,
+        stride=4,
+        random_crop=False,
+        augment=False,
+    )
+
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["cond"].shape == (3, 6, 8)
+    torch.testing.assert_close(
+        sample["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
 def test_spectral_metrics_match_simple_reference() -> None:
     target = torch.ones(2, 3, 4, 4)
     prediction = torch.zeros_like(target)

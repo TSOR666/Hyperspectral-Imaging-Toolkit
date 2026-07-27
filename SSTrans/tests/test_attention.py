@@ -76,6 +76,26 @@ def test_scaled_cosine_attention_is_bit_exact_below_ceiling() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_source_eager_attention_preserves_upstream_near_zero_math() -> None:
+    query = torch.tensor([[[[1e-8, 0.0], [0.0, 1e-8]]]])
+    key = torch.tensor([[[[1e-8, 0.0], [0.0, 1e-8]]]])
+    value = torch.tensor([[[[1.0], [3.0]]]])
+    scale = torch.ones(1, 1, 1)
+
+    expected = _reference_attention(query, key, value, scale)
+    source = _scaled_cosine_attention(
+        query,
+        key,
+        value,
+        scale,
+        source_eager=True,
+    )
+    stabilized = _scaled_cosine_attention(query, key, value, scale)
+
+    torch.testing.assert_close(source, expected, rtol=0, atol=0)
+    assert not torch.allclose(stabilized, expected)
+
+
 def test_gdfn_matches_the_paper_single_processed_gate_branch() -> None:
     """Figure 3(c): only one split branch receives LN and DWConv."""
     torch.manual_seed(0)

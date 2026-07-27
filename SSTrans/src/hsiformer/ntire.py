@@ -11,7 +11,11 @@ import numpy as np
 import torch
 from torch import nn
 
-from .metrics import spectral_metrics
+from .metrics import (
+    MRAEDenominator,
+    peak_signal_to_noise_ratio,
+    spectral_metrics,
+)
 
 ARAD_BANDS_NM = np.arange(400, 701, 10, dtype=np.int32)
 
@@ -80,7 +84,23 @@ def evaluate_loader(
     amp: bool = False,
     output_dir: str | Path | None = None,
     clip: bool = False,
+    crop_border: int = 0,
+    mrae_denominator: MRAEDenominator = "clamp_abs",
+    mrae_epsilon: float = 1e-6,
+    psnr_clip: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, float | str]]]:
+    """Evaluate predictions under an explicitly selected metric protocol.
+
+    The reported SSTrans ``0.1468`` result uses full ARAD-origin frames and
+    the source evaluator's additive ``1e-5`` denominator. A 128-pixel center
+    crop is a separate NTIRE/MST++ protocol. Exported cubes always retain the
+    complete prediction regardless of the metric crop.
+    """
+    if crop_border < 0:
+        raise ValueError("crop_border cannot be negative.")
+    if mrae_epsilon <= 0:
+        raise ValueError("mrae_epsilon must be positive.")
+
     model.eval()
     rows: list[dict[str, float | str]] = []
     cube_dir = Path(output_dir) if output_dir is not None else None
@@ -104,13 +124,35 @@ def evaluate_loader(
                     tile_size=tile_size,
                     overlap=overlap,
                 )
-            if clip:
-                prediction = prediction.clamp(0.0, 1.0)
-
             for index, scene_id in enumerate(scene_ids):
                 predicted_scene = prediction[index : index + 1].float()
                 target_scene = target[index : index + 1].float()
-                metrics = spectral_metrics(predicted_scene, target_scene)
+                metric_prediction, metric_target = _crop_metric_region(
+                    predicted_scene,
+                    target_scene,
+                    crop_border,
+                )
+                if (
+                    mrae_denominator == "source_additive"
+                    and bool(torch.any(metric_target == 0))
+                ):
+                    # The result-generation script adds the same epsilon to
+                    # both arrays before all metrics. This leaves absolute
+                    # errors unchanged, supplies the MRAE denominator floor,
+                    # and reproduces its tiny SAM shift at zero-valued bands.
+                    metric_prediction = metric_prediction + mrae_epsilon
+                    metric_target = metric_target + mrae_epsilon
+                metrics = spectral_metrics(
+                    metric_prediction,
+                    metric_target,
+                    eps=mrae_epsilon,
+                    mrae_denominator=mrae_denominator,
+                )
+                if psnr_clip:
+                    metrics["psnr"] = peak_signal_to_noise_ratio(
+                        metric_prediction.clamp(0.0, 1.0),
+                        metric_target.clamp(0.0, 1.0),
+                    )
                 row: dict[str, float | str] = {"scene_id": scene_id}
                 row.update(
                     {name: float(value.item()) for name, value in metrics.items()}
@@ -119,7 +161,11 @@ def evaluate_loader(
                 if cube_dir is not None:
                     save_ntire_cube(
                         cube_dir / f"{scene_id}.mat",
-                        predicted_scene[0],
+                        (
+                            predicted_scene.clamp(0.0, 1.0)
+                            if clip
+                            else predicted_scene
+                        )[0],
                     )
 
     if not rows:
@@ -129,6 +175,7 @@ def evaluate_loader(
         for name in ("mrae", "rmse", "psnr", "sam")
     }
     summary["count"] = float(len(rows))
+    summary["crop_border"] = float(crop_border)
     return summary, rows
 
 
@@ -176,7 +223,7 @@ def infer_loader(
 
 def write_metric_reports(
     output_dir: str | Path,
-    summary: Mapping[str, float],
+    summary: Mapping[str, Any],
     rows: list[Mapping[str, float | str]],
 ) -> None:
     destination = Path(output_dir)
@@ -315,3 +362,28 @@ def _scene_ids(value: Any, batch_size: int) -> list[str]:
     if len(values) != batch_size:
         raise ValueError("Number of scene identifiers does not match batch size.")
     return values
+
+
+def _crop_metric_region(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    crop_border: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if crop_border == 0:
+        return prediction, target
+    height, width = prediction.shape[-2:]
+    if target.shape[-2:] != (height, width):
+        raise ValueError(
+            "Prediction and target spatial shapes must match before metric cropping."
+        )
+    if height <= 2 * crop_border or width <= 2 * crop_border:
+        raise ValueError(
+            f"crop_border={crop_border} leaves no scoring region for "
+            f"spatial shape {(height, width)}."
+        )
+    region = (
+        ...,
+        slice(crop_border, -crop_border),
+        slice(crop_border, -crop_border),
+    )
+    return prediction[region], target[region]

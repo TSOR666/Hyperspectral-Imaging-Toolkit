@@ -45,66 +45,93 @@ python scripts/inspect_arad.py "D:\datasets\ARAD_1K" --split test
 
 ## Training
 
-`configs/train_arad1k.json` follows the MST++/published HSIFormer training
-style:
+`configs/train_arad1k.json` now targets the executable source run associated
+with the reported ARAD-origin MRAE `0.1468109`. This matters because the
+released training code and the manuscript recipe are not the same. The source
+run uses:
 
 - Adam with betas `(0.9, 0.999)`
 - per-iteration cosine learning-rate decay to `1e-6`
-- L1 objective, matching the reported ARAD-1K training procedure
+- MRAE + `0.1 * SAM + 0.1 * DeltaE`, including the original 31-band camera
+  response used by the color loss
 - full-scene RGB min-max normalization before crop extraction, matching the
   reference loader and keeping train/validation input scales consistent
-- 300,000 iterations with 128x128 crops at batch 32
-- 50,000 iterations with 256x256 crops at batch 8
-- 50,000 iterations at a nominal 512 crop with batch 1 (clamped to the
-  482-pixel-tall ARAD frames, i.e. effectively full resolution)
+- exhaustive 128x128 patches at stride 8, rather than 16 random crops per scene
+- seven fixed-128 epochs at global batch 32: 63,394 updates per epoch and
+  443,758 total updates for the 900-scene training manifest
 - validation and checkpointing every 2,000 iterations
-- BF16 autocast by default (`"amp_dtype": "bf16"`); the earlier FP16 setup
-  caused a NaN loss collapse, so the GradScaler is intentionally disabled
-  under BF16
-- gradient-norm clipping at `1.0` (`"grad_clip_norm"`)
+- full-frame FP32 checkpoint selection with the source MRAE denominator:
+  `abs(pred-target)/(target+1e-5)` when a scene contains zeros
+- FP32 training without gradient clipping, matching the source optimizer path
 - a finite-loss guard: optimizer steps with non-finite loss or gradients are
   skipped, and training aborts after 100 consecutive non-finite steps
+
+This is the strongest tracked provenance: the result notebook inspects a
+native Lightning `last.ckpt` in the path targeted by the active seven-epoch
+job. Older commented job lines and standalone YAMLs describe a
+400k/50k/400k progressive experiment, but no tracked checkpoint, log, or hash
+links those continuation stages to the reported `0.1468` artifact. Exact
+checkpoint ancestry is therefore not provable from the upstream repository.
 
 Start training:
 
 ```powershell
 python scripts/train.py `
   --data-root "D:\datasets\ARAD_1K" `
-  --output-dir "runs\hsiformer_arad1k" `
+  --output-dir "runs\sstrans_source_arad1k" `
   --device cuda
 ```
 
 After installation, the equivalent command is `hsiformer-train`.
 
-Resume exactly from a trainer checkpoint:
+Resume model, optimizer, scheduler, stage, and iteration state from a trainer
+checkpoint:
 
 ```powershell
 python scripts/train.py `
   --config configs/train_arad1k.json `
   --data-root "D:\datasets\ARAD_1K" `
-  --resume "runs\hsiformer_arad1k\checkpoints\latest.pt"
+  --resume "runs\sstrans_source_arad1k\checkpoints\latest.pt"
 ```
 
 Each checkpoint includes the model architecture, optimizer, scheduler, AMP
 scaler, stage position, global iteration, and resolved training configuration.
+Mid-epoch resume is not bit-identical: the current trainer does not persist the
+DataLoader cursor or Python/NumPy/Torch RNG streams, so the shuffle and
+augmentation stream restarts.
 Resume refuses NaN/Inf-poisoned checkpoints: non-finite parameters or
 optimizer moments raise instead of silently continuing a collapsed run.
 Training metrics are appended to `metrics.jsonl`.
 
-The default fresh-training preset is `recommended_retrain`. It keeps the
-reported no-spectral-RPE improvement (MRAE `0.1497` to `0.1468`, SAM `0.0824`
-to `0.0774`), restores the intended 2/4/8/16 spectral head schedule, retains
-CAT's valid spatial relative bias, and uses the paper residual topology.
+When the crop, MRAE denominator, precision, tiling, normalization, or manifest
+changes on resume, the trainer resets only the stored best-MRAE threshold.
+Weights, optimizer, scheduler, stage, and iteration still resume normally.
+
+The default is `source_reproduction`: the no-spectral-RPE architecture actually
+used by the reported source run. It uses `[2, 2]` encoder depths, a depth-2 CAT
+bottleneck, 16 effective spectral heads at every scale, the legacy double
+residual graph, spatial attention scale 1, and trunc-normal initialization for
+both convolutions and linear layers. It also uses the source's eager
+normalize/matmul/softmax attention path (default normalization epsilon, no
+scale clamp, and no SDPA substitution). These details are
+checkpoint-incompatible with `recommended_retrain`. It keeps CAT relative bias
+because the executable source does, even though the manuscript prose says
+those blocks omit positional encoding.
+
 Available presets are:
 
-- `legacy`: published source behavior, for reproducing existing checkpoints.
-- `ablation_no_rpe`: strongest reported ablation with legacy head/residual
-  behavior.
+- `legacy`: historical local checkpoint layout with spectral RPE.
+- `ablation_no_rpe`: the historical local no-RPE toggle; it does not include
+  all source-run depths, scale, or initialization settings.
+- `source_reproduction`: complete source-run no-RPE architecture and
+  initialization associated with MRAE `0.1468`.
 - `corrected_rpe`: places spectral RPE before softmax.
 - `optimized_candidate`: no spectral/CAT RPE, corrected residual topology, and
   activation checkpointing.
 - `recommended_retrain`: no spectral RPE, intended stage-wise spectral heads,
-  CAT RPE, paper residual topology, and activation checkpointing.
+  CAT RPE, paper residual topology, Kaiming convolution initialization, spatial
+  scale 5, and activation checkpointing. This is experimental and is not the
+  architecture that produced `0.1468`.
 - `rectangular_candidate`: the recommended retraining architecture plus native
   rectangular CSWin stripe pairing and local CAT patch padding. Square inputs
   remain bit-exact; rectangular behavior requires retraining validation.
@@ -140,27 +167,39 @@ After installation, the equivalent command is `hsiformer-infer`.
 
 Each output is an NTIRE-compatible HDF5 `.mat` file containing `cube`, `bands`,
 and `norm_factor`. The layout is directly readable by
-`NTIRE2022Util.loadCube`.
+`NTIRE2022Util.loadCube`. Trainer checkpoints also carry their RGB
+normalization mode, which inference restores automatically. Raw legacy weights
+without that metadata require an explicit
+`--rgb-normalization per_image|scale_255`.
 
 For limited GPU memory, add `--tile-size 256 --overlap 32`. Omit
-`--tile-size` for full-frame inference. Add `--clip` only when clipped
-`[0, 1]` submission values are desired.
+`--tile-size` for full-frame inference and benchmark-comparable metrics:
+independent tiles change a global-context model's predictions. Add `--clip`
+only when clipped `[0, 1]` exported cubes are desired; raw MRAE/RMSE remain
+unclipped.
 
 ## Public Test
 
-Run inference on the now-public 50-image test split, export NTIRE cubes, and
+Reproduce the reported validation/ARAD-origin comparison, export cubes, and
 compute per-scene plus mean MRAE, RMSE, PSNR, and SAM:
 
 ```powershell
 python scripts/test_ntire.py `
-  --checkpoint "runs\hsiformer_arad1k\checkpoints\best.pt" `
+  --checkpoint "runs\sstrans_source_arad1k\checkpoints\latest.pt" `
   --data-root "D:\datasets\ARAD_1K" `
-  --output-dir "outputs\public_test" `
-  --device cuda `
-  --amp
+  --output-dir "outputs\source_validation" `
+  --split validation `
+  --metric-profile source_arad_origin `
+  --device cuda
 ```
 
+For the distinct 50-image public test split, use `--split test` and a separate
+output directory. Its score must not be compared directly with `0.1468`.
+
 After installation, the equivalent command is `hsiformer-test`.
+The upstream result notebook loads the Lightning `last.ckpt`, so the matching
+local artifact is `latest.pt`; `best.pt` is retained as a useful additional
+checkpoint selected by validation MRAE.
 
 Outputs:
 
@@ -171,12 +210,23 @@ outputs/public_test/
 `-- summary.json
 ```
 
+The default `--metric-profile source_arad_origin` reproduces the full-frame
+protocol used by the reported SSTrans `0.1468` line. Use
+`--metric-profile ntire_center` for the separate 128-pixel center-crop
+MST++/NTIRE comparison, or `--metric-profile legacy_full` to inspect older
+full-frame `clamp_min(1e-6)` logs. `summary.json` records the named profile,
+crop, denominator, RGB normalization, precision, tiling, and export clipping.
+
+The `0.1468` artifact is a validation/ARAD-origin result, not the held-out test
+split. The command above makes both the split and metric protocol explicit;
+the CLI also defaults to this matching pair.
+
 ## Package API
 
 ```python
 from hsiformer import build_model
 
-model = build_model("recommended_retrain")
+model = build_model("source_reproduction")
 ```
 
 The package also exposes `ARAD1KDataset`, `RGBImageDataset`, `TrainingConfig`,
@@ -186,5 +236,5 @@ The package also exposes `ARAD1KDataset`, `RGBImageDataset`, `TrainingConfig`,
 
 ```powershell
 python -m pytest
-python scripts/smoke_model.py --preset recommended_retrain
+python scripts/smoke_model.py --preset source_reproduction
 ```

@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "legacy",
             "ablation_no_rpe",
+            "source_reproduction",
             "corrected_rpe",
             "optimized_candidate",
             "recommended_retrain",

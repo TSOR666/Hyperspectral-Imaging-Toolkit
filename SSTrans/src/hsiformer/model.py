@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .attention import (
+    AttentionMath,
     CSWinCrossAttention,
     GDFN,
     LePEAttentionCross,
@@ -17,10 +18,12 @@ from .attention import (
     SGFN,
     Spectral_MSA,
 )
+from .cat import Attention as CATAttention
 from .cat import CATBlock
 
 ResidualMode = Literal["legacy", "paper", "branch_delta"]
 SpectralHeadMode = Literal["legacy_constant", "stage"]
+InitMode = Literal["modern_kaiming_conv", "source_trunc_normal"]
 
 
 class Spectral_MSAB(nn.Module):
@@ -587,6 +590,9 @@ class SSTransformer(nn.Module):
         use_spatial_attention: bool = True,
         use_checkpoint: bool = False,
         rectangular_spatial: bool = False,
+        init_mode: InitMode = "modern_kaiming_conv",
+        spatial_scale_init: float = 5.0,
+        attention_math: AttentionMath = "stabilized_sdpa",
     ) -> None:
         super().__init__()
         if residual_mode not in {"legacy", "paper", "branch_delta"}:
@@ -595,6 +601,12 @@ class SSTransformer(nn.Module):
             raise ValueError(
                 f"Unknown spectral head mode: {spectral_head_mode}"
             )
+        if init_mode not in {"modern_kaiming_conv", "source_trunc_normal"}:
+            raise ValueError(f"Unknown initialization mode: {init_mode}")
+        if spatial_scale_init <= 0:
+            raise ValueError("spatial_scale_init must be positive.")
+        if attention_math not in {"stabilized_sdpa", "source_eager"}:
+            raise ValueError(f"Unknown attention math mode: {attention_math}")
 
         resolution = _resolution_tuple(input_resolution)
         encoder_depths = tuple(n_blocks)
@@ -713,26 +725,45 @@ class SSTransformer(nn.Module):
             use_spatial_attention=use_spatial_attention,
         )
         self.to_out = nn.Conv2d(new_channels, out_dim, 3, 1, 1)
-        self.apply(self._init_weights)
+        if init_mode == "source_trunc_normal":
+            self.apply(self._init_source_weights)
+        else:
+            self.apply(self._init_weights)
+        for module in self.modules():
+            if isinstance(
+                module,
+                (LePEAttentionCross, CSWinCrossAttention, CATAttention),
+            ):
+                nn.init.constant_(module.scale, spatial_scale_init)
+            if isinstance(
+                module,
+                (
+                    Spectral_MSA,
+                    LePEAttentionCross,
+                    CSWinCrossAttention,
+                    CATAttention,
+                ),
+            ):
+                module.source_eager_attention = attention_math == "source_eager"
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
-        # Convs keep PyTorch's default (Kaiming) init, exactly as in MST++,
-        # CSWin and Restormer -- all three trunc_normal only the Linear
-        # projections and leave every Conv2d (including the many depthwise
-        # convs) at the Kaiming default. trunc_normal_(std=0.02) is correct
-        # for the Linear-based spatial attention but ~10x under-scales a 3x3
-        # depthwise conv (fan_in=9; Kaiming std ~0.192 vs 0.02), and the
-        # spectral branch plus the whole conv U-Net main path are convolutional
-        # -- blanket-applying std=0.02 collapses the main path at init (the
-        # embed->downsample->upsample->to_out signal decays ~10x per stage and
-        # the global identity path carries a ~10x-too-weak embedded RGB), which
-        # is the systematic, present-from-step-0 handicap that capped the
-        # retraining run. A prior revert to std=0.02-on-Conv2d was made "to
-        # preserve baseline scales", but that baseline was itself the collapsed
-        # one; the fix is kept behind grad-clip 1.0 + bf16 + the finite/
-        # divergence guards in training.py.
+        # Experimental modern presets retain PyTorch's default Kaiming Conv2d
+        # initialization and use small transformer-style Linear projections.
+        # The reported source run is selected independently through
+        # ``source_trunc_normal`` below.
         if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    @staticmethod
+    def _init_source_weights(module: nn.Module) -> None:
+        """Reproduce the initialization used by the reported SSTrans run."""
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)

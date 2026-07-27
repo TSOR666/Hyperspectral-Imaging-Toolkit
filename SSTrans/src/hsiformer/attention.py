@@ -7,7 +7,13 @@ from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
 
-RPEMode = Literal["none", "legacy_post_softmax", "pre_softmax"]
+RPEMode = Literal[
+    "none",
+    "source_disabled",
+    "legacy_post_softmax",
+    "pre_softmax",
+]
+AttentionMath = Literal["stabilized_sdpa", "source_eager"]
 
 # Upper bound on the learnable cosine-attention temperature/scale, applied at
 # forward time (Swin-V2 clamps its logit_scale identically). Because q and k are
@@ -50,8 +56,22 @@ def _scaled_cosine_attention(
     attention_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
+    source_eager: bool = False,
 ) -> torch.Tensor:
     """Run cosine attention through PyTorch's memory-efficient SDPA kernels."""
+    if source_eager:
+        query = F.normalize(query, dim=-1)
+        key = F.normalize(key, dim=-1)
+        attention = (query @ key.transpose(-2, -1)) * scale
+        if attention_bias is not None:
+            attention = attention + attention_bias
+        attention = F.dropout(
+            attention.softmax(dim=-1),
+            p=dropout_p,
+            training=training,
+        )
+        return attention @ value
+
     scale = scale.clamp(max=_MAX_COSINE_LOGIT_SCALE)
     query = F.normalize(query, dim=-1, eps=_NORMALIZE_EPS)
     key = F.normalize(key, dim=-1, eps=_NORMALIZE_EPS)
@@ -253,12 +273,18 @@ class Spectral_MSA(nn.Module):
         super().__init__()
         if dim % num_heads:
             raise ValueError(f"Dimension {dim} must divide {num_heads} heads.")
-        if rpe_mode not in {"none", "legacy_post_softmax", "pre_softmax"}:
+        if rpe_mode not in {
+            "none",
+            "source_disabled",
+            "legacy_post_softmax",
+            "pre_softmax",
+        }:
             raise ValueError(f"Unknown spectral RPE mode: {rpe_mode}")
 
         self.window_size = [4, 4]
         self.num_heads = num_heads
         self.rpe_mode = rpe_mode
+        self.source_eager_attention = False
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
         channels_per_head = dim // num_heads
@@ -327,7 +353,7 @@ class Spectral_MSA(nn.Module):
             head=self.num_heads,
         )
         bias = None
-        if self.rpe_mode != "none":
+        if self.rpe_mode in {"legacy_post_softmax", "pre_softmax"}:
             bias = self.relative_bias[self.coords].unsqueeze(0).unsqueeze(0)
         if self.rpe_mode == "legacy_post_softmax":
             temperature = self.temperature.clamp(max=_MAX_COSINE_LOGIT_SCALE)
@@ -343,6 +369,7 @@ class Spectral_MSA(nn.Module):
                 value,
                 self.temperature,
                 attention_bias=bias,
+                source_eager=self.source_eager_attention,
             )
         out = rearrange(
             out,
@@ -381,6 +408,7 @@ class LePEAttentionCross(nn.Module):
         self.resolution = _resolution_tuple(resolution)
         self.split_size = split_size
         self.num_heads = num_heads
+        self.source_eager_attention = False
         self.scale = nn.Parameter(
             torch.full((num_heads, 1, 1), _SPATIAL_COSINE_INIT_SCALE)
         )
@@ -512,6 +540,7 @@ class LePEAttentionCross(nn.Module):
             self.scale,
             dropout_p=self.attn_drop.p,
             training=self.training,
+            source_eager=self.source_eager_attention,
         ) + lepe
 
         window_height, window_width = self._window_shape(resolution)
@@ -559,6 +588,7 @@ class CSWinCrossAttention(nn.Module):
             raise ValueError(f"Dimension {dim} must divide {num_heads} heads.")
 
         self.num_heads = num_heads
+        self.source_eager_attention = False
         self.resolution = _resolution_tuple(resolution)
         self.split_size = split_size
         self.scale = nn.Parameter(
@@ -730,6 +760,7 @@ class CSWinCrossAttention(nn.Module):
                 self.scale,
                 dropout_p=self.attn_drop.p,
                 training=self.training,
+                source_eager=self.source_eager_attention,
             )
             + lepe
         ).transpose(1, 2).reshape(
@@ -783,6 +814,7 @@ class CSWinCrossAttention(nn.Module):
                 self.scale,
                 dropout_p=self.attn_drop.p,
                 training=self.training,
+                source_eager=self.source_eager_attention,
             )
             + lepe
         ).transpose(1, 2).reshape(

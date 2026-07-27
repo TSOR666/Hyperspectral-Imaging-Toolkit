@@ -1,47 +1,49 @@
 {
   "data_root": "path/to/ARAD_1K",
-  "output_dir": "runs/hsiformer_arad1k",
-  "preset": "recommended_retrain",
-  "model": {
-    "use_checkpoint": true
-  },
+  "output_dir": "runs/sstrans_source_arad1k",
+  "preset": "source_reproduction",
+  "model": {},
   "stages": [
     {
       "patch_size": 128,
-      "iterations": 300000,
+      "iterations": 443758,
       "batch_size": 32,
-      "learning_rate": 0.0004
-    },
-    {
-      "patch_size": 256,
-      "iterations": 50000,
-      "batch_size": 8,
-      "learning_rate": 0.00004
-    },
-    {
-      "patch_size": 512,
-      "iterations": 50000,
-      "batch_size": 1,
-      "learning_rate": 0.00004
+      "learning_rate": 0.0004,
+      "stride": 8,
+      "augment": true
     }
   ],
   "loss": {
-    "mrae_weight": 0.0,
-    "l1_weight": 1.0,
-    "sam_weight": 0.0
+    "mrae_weight": 1.0,
+    "l1_weight": 0.0,
+    "sam_weight": 0.1,
+    "delta_e_weight": 0.1,
+    "mrae_denominator": "source_additive",
+    "mrae_epsilon": 0.00001,
+    "sam_mode": "source"
   },
   "min_learning_rate": 0.000001,
-  "crops_per_scene": 16,
+  "crops_per_scene": 1,
+  "train_sampling": "grid",
+  "train_stride": 8,
+  "stage_from_best": false,
   "num_workers": 8,
   "validation_every": 2000,
   "checkpoint_every": 2000,
   "log_every": 50,
   "validation_tile_size": null,
   "validation_overlap": 16,
+  "validation_crop_border": 0,
+  "validation_mrae_denominator": "source_additive",
+  "validation_mrae_epsilon": 0.00001,
+  "validation_psnr_clip": false,
+  "validation_amp": false,
   "rgb_normalization": "per_image",
   "seed": 42,
-  "amp": true,
+  "amp": false,
   "amp_dtype": "bf16",
-  "grad_clip_norm": 1.0,
+  "grad_clip_norm": null,
+  "cudnn_benchmark": false,
+  "float32_matmul_precision": "highest",
   "warmup_steps": 0
 }
