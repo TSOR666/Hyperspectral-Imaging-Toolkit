@@ -111,9 +111,15 @@ max_divergence_rollbacks: 2         # after this many, abort instead of retrying
 # ===========================================================================
 # Start a fresh run. ``mrae_annealed`` is still pure MRAE: it starts with a
 # stabilized denominator floor so near-zero reflectance pixels do not dominate
-# early optimization, then decays to exact MST++/leaderboard MRAE.
+# optimization. Exact MST++/leaderboard MRAE remains the validation metric; use
+# finetune_128_exact_mrae to remove the training floor after this phase.
 objective: mrae_annealed
 allow_objective_mismatch_resume: false
+# ``resume_checkpoint`` continues the same optimizer/stage counters.
+# ``finetune_checkpoint`` loads only model weights and starts a fresh schedule;
+# use it for the low-LR polish configs below. They are mutually exclusive.
+resume_checkpoint: null
+finetune_checkpoint: null
 optimizer: adam          # matches MST++ training
 weight_decay: 0.0
 # The MRAE denominator floor. IMPORTANT: epsilon=1e-8 is the leaderboard

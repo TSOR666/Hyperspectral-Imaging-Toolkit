@@ -70,6 +70,7 @@ from hsi_model.utils.training_setup import (
     autocast_context,
     cleanup,
     GeneratorEMA,
+    load_finetune_weights,
     make_grad_scaler,
     pick_amp_dtype,
     resume_training_state,
@@ -1322,6 +1323,7 @@ def main(config: DictConfig) -> None:
         cfg.setdefault("num_workers", 8)
         cfg.setdefault("mixed_precision_dtype", "auto")
         cfg.setdefault("resume_checkpoint", None)
+        cfg.setdefault("finetune_checkpoint", None)
 
         log_level = getattr(logging, cfg.get("log_level", "INFO"))
         main_logger = setup_logging(cfg["log_dir"], log_level, rank)
@@ -1331,7 +1333,8 @@ def main(config: DictConfig) -> None:
             main_logger.info(
                 "objective=%s, sampling=%s, spectral=%s, cswin=%s, "
                 "base_channels=%s, stage_depths=%s, cascade=%s, "
-                "input_skip=%s, refinement_blocks=%s",
+                "input_skip=%s, feature_norm=%s, input_denoising=%s, "
+                "smsa_output_norm=%s, refinement_blocks=%s",
                 cfg.get("objective", "mrae"),
                 cfg.get("sampling"),
                 cfg.get("spectral_attention_type"),
@@ -1340,6 +1343,9 @@ def main(config: DictConfig) -> None:
                 cfg.get("stage_depths", cfg.get("blocks_per_stage")),
                 cfg.get("cascade_stages", 1),
                 cfg.get("use_spectral_input_skip", False),
+                cfg.get("use_feature_norm", True),
+                cfg.get("use_input_denoising", True),
+                cfg.get("smsa_output_norm", True),
                 cfg.get("refinement_blocks", 0),
             )
             main_logger.info("=" * 60)
@@ -1408,6 +1414,13 @@ def main(config: DictConfig) -> None:
 
         resume_info: Optional[Dict[str, Any]] = None
         resume_path = cfg.get("resume_checkpoint")
+        finetune_path = cfg.get("finetune_checkpoint")
+        if resume_path and finetune_path:
+            raise ValueError(
+                "resume_checkpoint and finetune_checkpoint are mutually "
+                "exclusive. Resume continues the same optimizer/stage state; "
+                "fine-tune starts a new optimization phase from model weights."
+            )
         if resume_path:
             resume_info = resume_training_state(
                 checkpoint_path=str(resume_path),
@@ -1421,6 +1434,13 @@ def main(config: DictConfig) -> None:
                 allow_objective_mismatch=bool(
                     cfg.get("allow_objective_mismatch_resume", False)
                 ),
+            )
+        elif finetune_path:
+            load_finetune_weights(
+                checkpoint_path=str(finetune_path),
+                model=net,
+                device=device,
+                ema=ema,
             )
 
         metrics_logger = MetricsLogger(cfg["log_dir"], rank)

@@ -601,6 +601,63 @@ def resume_training_state(
     return info
 
 
+def load_finetune_weights(
+    checkpoint_path: str,
+    model: "torch.nn.Module",
+    device: torch.device,
+    ema: Optional["GeneratorEMA"] = None,
+) -> Dict[str, Any]:
+    """Load model weights for a new optimization phase.
+
+    Unlike :func:`resume_training_state`, this deliberately does not restore
+    optimizer, scheduler, scaler, RNG, iteration, stage, best-metric, or
+    early-stopping state.  It is the correct operation when a completed or
+    saturated checkpoint starts a new low-LR polish schedule.  Treating that
+    transition as an ordinary resume preserves the old ``stage_iter`` and can
+    make the new stage exit immediately.
+
+    The trainer's best checkpoints already store EMA-applied weights in
+    ``state_dict``.  Re-initialize the new phase's EMA shadow from exactly the
+    weights loaded into the model so validation cannot accidentally use the
+    random shadow created before this function ran.
+    """
+    if not checkpoint_path:
+        return {}
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Fine-tune checkpoint not found: {checkpoint_path}")
+
+    # See resume_training_state: our checkpoints contain trusted non-tensor
+    # metadata, so weights_only=False is required.
+    ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = ck.get("state_dict") or ck.get("model_state_dict")
+    if not state_dict:
+        raise KeyError(
+            f"Checkpoint {checkpoint_path} contains no model state "
+            f"(looked for 'state_dict' and 'model_state_dict')."
+        )
+
+    target = model.module if hasattr(model, "module") else model
+    target.load_state_dict(state_dict, strict=True)
+    if ema is not None:
+        ema.reinit_from(target)
+
+    info = {
+        "source_iteration": int(ck.get("iter", ck.get("iteration", 0))),
+        "source_epoch": int(ck.get("epoch", 0)),
+        "source_best_mrae": float(ck.get("best_mrae", float("inf"))),
+        "ema_applied": bool(ck.get("ema_applied", False)),
+    }
+    logger.info(
+        "Loaded fine-tune weights from %s | source_iter=%d, "
+        "source_best_mrae=%.6f, ema_applied=%s; optimizer/stage counters reset",
+        checkpoint_path,
+        info["source_iteration"],
+        info["source_best_mrae"],
+        info["ema_applied"],
+    )
+    return info
+
+
 __all__ = [
     "setup_paths",
     "setup_distributed_training",
@@ -609,6 +666,7 @@ __all__ = [
     "pick_amp_dtype",
     "autocast_context",
     "make_grad_scaler",
+    "load_finetune_weights",
     "resume_training_state",
     "resolve_resume_stage_position",
     "GeneratorEMA",

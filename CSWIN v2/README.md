@@ -61,20 +61,25 @@ or `uv run` fail before training starts.
 The defaults in `src/configs/config.yaml` use the local/global baseline with a
 small-initialized spectral output projection. The fresh-run recipe in
 `src/configs/sota_cascade.yaml` pins the same attention architecture, enables a
-shallow RGB-to-HSI prior, and writes to isolated recovery directories. The
+shallow RGB-to-HSI prior, removes legacy normalization/denoising paths that
+erase radiometric offsets, and writes to isolated recovery directories. The
 historical filename is retained for command compatibility; it no longer
 enables the failed three-pass cascade bundle. The shared training protocol uses:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
 - Adam with learning rate `4e-4` and a 300k-step cosine decay.
-- Annealed pure-MRAE loss (`objective=mrae_annealed`, no L1 term): the
-  denominator floor starts stable, then decays to exact MST++/leaderboard MRAE.
+- Stabilized pure-MRAE loss (`objective=mrae_annealed`, no L1 term): the
+  denominator floor decays from `1e-2` to `1e-3` during the first 50k updates.
+  Exact leaderboard MRAE is still used for validation/checkpoint selection.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
 - A `0.01`-scaled final spectral projection so initial MRAE stays near the
   well-conditioned zero-prediction baseline instead of starting in the tens.
 - A first-update guard that aborts if training loss exceeds `10`, catching a
   pathological initialization before it consumes a long accelerator run.
+- No post-convolution or S-MSA-output GroupNorm and no clean-input denoising
+  residual in `sota_cascade`; all three are legacy checkpoint-compatibility
+  paths that limit brightness reconstruction in a fresh model.
 - Deployment-matched local/global spatial attention in both recommended
   configurations.
 - Deployment-matched 128x128 tiled validation with FP32 overlap blending and
@@ -96,10 +101,11 @@ python src/hsi_model/train_generator.py \
   memory_mode=standard
 ```
 
-Start this objective from a fresh checkpoint. Use `objective=mrae
-mrae_epsilon=1e-8` only to reproduce exact MST++ loss behavior from step 0. For
-final training, enable and tune `progressive_stages` in the config for the
-128 -> 256 -> 512 patch schedule.
+Start this objective from a fresh checkpoint. Once stabilized training
+plateaus, use `finetune_128_exact_mrae` from the saved best checkpoint to
+gradually remove the `1e-3` training floor at a much lower LR. Use
+`objective=mrae mrae_epsilon=1e-8` only to reproduce exact MST++ loss behavior
+from random initialization.
 
 ## Controlled Ablations
 
@@ -123,17 +129,22 @@ python src/hsi_model/train_generator.py --config-name ablation_axial      # axia
 python src/hsi_model/train_generator.py --config-name ablation_smsa_off  # smsa_output_norm=false only
 python src/hsi_model/train_generator.py --config-name ablation_cascade   # cascade_stages only
 
-# Resume a saturated 128x128 annealed-MRAE run for a short 128-only polish
-# (note the leading + — resume_checkpoint is not in the base config)
+# Start a new low-LR phase from a saturated 128x128 checkpoint
 python src/hsi_model/train_generator.py \
   --config-name finetune_128_polish_annealed \
-  +resume_checkpoint=/path/to/best_model.pth
+  finetune_checkpoint=/path/to/best_model.pth
+
+# Recommended for the 2026-07-25 stable-init run: load its 164k best checkpoint
+# (MRAE 0.5233), then anneal the training floor from 1e-3 to exact MRAE.
+python src/hsi_model/train_generator.py \
+  --config-name finetune_128_exact_mrae \
+  finetune_checkpoint=/path/to/sota_recovery_stable_init/best_model.pth
 
 # Experimental: 256/512 fine-tuning. Validate with a patch-size sweep first;
 # the 2026-06-25 run worsened 128-tile validation MRAE after the 256 switch.
 python src/hsi_model/train_generator.py \
   --config-name finetune_progressive_annealed \
-  +resume_checkpoint=/path/to/latest_checkpoint.pth
+  finetune_checkpoint=/path/to/best_model.pth
 ```
 
 > Two July runs must not be resumed: the 2026-07-21 true-CSWin/cascade-3 bundle
@@ -143,6 +154,11 @@ python src/hsi_model/train_generator.py \
 > frozen parameters. The active recipe uses a small output-head initialization,
 > a direct RGB spectral prior, and new output directories. Keep alternative
 > attention modes and multi-pass cascades as controlled one-lever ablations.
+>
+> The 2026-07-25 stable-initialization run is different: it learned normally
+> (0.769 MRAE at 1k -> 0.523 at 164k), then overfit while the stabilized
+> training objective continued to fall. Stop that run and keep its 164k
+> `best_model.pth`; use `finetune_128_exact_mrae` for the next phase.
 
 ### Attention-mode and recovery levers
 
@@ -150,17 +166,21 @@ python src/hsi_model/train_generator.py \
 | --- | --- | --- | --- |
 | `cswin_attention_mode` | `local_global`, `cswin`, `axial` | `local_global` | `cswin` and `axial` remain diagnostic modes; neither is recommended for the production run. |
 | `cascade_stages` | int | `1` | Values above one repeat the generator and materially increase activation memory; validate them as ablations. |
-| `smsa_output_norm` | bool | `true` | Keep enabled in the validated recipe. |
+| `smsa_output_norm` | bool | `true` (`false` in `sota_cascade`) | Legacy checkpoint path; disabling it preserves low-frequency S-MSA corrections in a fresh model. |
 | `output_head_init_scale` | float or null | `0.01` | Multiplies the fresh final projection initialization; checkpoint weights overwrite it on load. |
 | `use_spectral_input_skip` | bool | `false` (`true` in `sota_cascade`) | Adds a shallow radiometric RGB-to-HSI path; changing it requires a fresh checkpoint. |
+| `use_feature_norm` | bool | `true` (`false` in `sota_cascade`) | Legacy GroupNorm after embedding/sampling convolutions; disable only for a fresh radiometric run. |
+| `use_input_denoising` | bool | `true` (`false` in `sota_cascade`) | Legacy learned RGB perturbation; disable for clean ARAD input. |
 
 When a key is absent from the base `config.yaml`, set it in an experiment YAML
 or append it on the CLI with Hydra's `+key=value` form.
 
 These configurations use separate log/checkpoint directories and should start
-from random initialization except the fine-tune recipes, which are designed to
-resume existing annealed-MRAE checkpoints. The active config now uses the
-annealed-MRAE loss; the lite ablations additionally change decoder capacity.
+from random initialization except the fine-tune recipes. Use
+`finetune_checkpoint` to load model weights into a fresh optimizer/stage
+schedule. Reserve `resume_checkpoint` for continuing an interrupted run made
+with the same config; the two options are mutually exclusive. The lite
+ablations additionally change decoder capacity.
 
 ## GPU Preflight
 
