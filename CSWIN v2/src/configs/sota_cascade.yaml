@@ -16,8 +16,15 @@ defaults:
 # The base config now scales the final projection by 0.01. This recipe also
 # enables the already-implemented shallow RGB-to-HSI prior so training starts
 # near the well-conditioned zero-prediction MRAE baseline (~1) and has a direct
-# radiometric gradient path. The local/global attention, single body pass, and
-# MST++ training protocol otherwise stay unchanged.
+# radiometric gradient path.
+#
+# The 2026-07-25 run confirmed that initialization fix (MRAE 0.769 -> 0.523),
+# then stalled around PSNR 21 dB. Its active config still enabled three legacy
+# paths whose implementations explicitly remove low-frequency intensity:
+# GroupNorm after embedding/down/up convolutions, GroupNorm at the S-MSA output,
+# and a randomly initialized clean-input "denoising" residual. Disable all
+# three for the next FRESH run so the transformer body can carry brightness
+# information instead of leaving that job to the shallow 1x1 spectral skip.
 #
 # Do not resume either failed July checkpoint bundle. Enabling the spectral
 # prior adds parameters, and initialization changes only take effect on a fresh
@@ -29,14 +36,14 @@ cswin_attention_mode: local_global
 split_sizes: [7, 7, 7]
 stage_num_heads: null
 cswin_global_tokens: 1024
-use_feature_norm: true
-use_input_denoising: true
-smsa_output_norm: true
+use_feature_norm: false
+use_input_denoising: false
+smsa_output_norm: false
 cascade_stages: 1
 thick_output_head: false
 output_head_init_scale: 0.01
 use_spectral_input_skip: true
 refinement_blocks: 0
 
-log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_recovery_stable_init
-checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_recovery_stable_init
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_radiometric_fresh
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_radiometric_fresh

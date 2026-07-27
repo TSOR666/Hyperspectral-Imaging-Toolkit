@@ -1,0 +1,50 @@
+defaults:
+  - sota_cascade
+  - _self_
+
+# ============================================================================
+# Exact-MRAE recovery phase for the stable-initialization SOTA checkpoint.
+#
+# The 2026-07-25 run proved that the scaled head + RGB spectral skip fixed the
+# original learning failure: validation MRAE improved from 0.769 at 1k to
+# 0.523 at 164k.  It then exposed a second issue.  The stabilized training loss
+# (denominator floor 1e-3) kept falling while exact validation MRAE worsened to
+# 0.554 at 185k.  This phase starts from the saved 164k best checkpoint,
+# gradually removes that train/validation objective mismatch, and uses a
+# 20x-lower peak LR so dark-target gradients cannot erase the learned mapping.
+#
+# IMPORTANT: use finetune_checkpoint, not resume_checkpoint. A normal resume
+# restores stage_iter=164000 and the old optimizer state; with this 40k stage it
+# would be considered already complete.
+#
+#   python src/hsi_model/train_generator.py \
+#     --config-name finetune_128_exact_mrae \
+#     finetune_checkpoint=/path/to/sota_recovery_stable_init/best_model.pth
+# ============================================================================
+
+objective: mrae_annealed
+mrae_epsilon: 1.0e-3
+mrae_epsilon_start: 1.0e-3
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 20000
+
+# The source 2026-07-25 checkpoint predates the radiometric fresh-run changes
+# in sota_cascade. Keep its exact module graph so strict checkpoint loading is
+# safe; only a from-scratch run may disable these parameterized norms.
+use_feature_norm: true
+use_input_denoising: true
+smsa_output_norm: true
+
+progressive_stages:
+  - {patch_size: 128, iterations: 40000, init_lr: 2.0e-5, batch_size: 20, warmup_steps: 0}
+
+# Do not stop while the denominator floor is still moving. Once exact MRAE is
+# active, eight non-improving 1k validations end the polish while preserving
+# the best checkpoint.
+early_stopping_patience: 8
+early_stopping_min_delta: 5.0e-5
+early_stopping_warmup_epochs: 20
+early_stopping_final_stage_only: true
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_exact_mrae_polish
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_exact_mrae_polish

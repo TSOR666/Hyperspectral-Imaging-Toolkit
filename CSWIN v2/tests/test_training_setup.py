@@ -7,6 +7,7 @@ import torch
 
 from hsi_model.utils.training_setup import (
     GeneratorEMA,
+    load_finetune_weights,
     resolve_resume_stage_position,
     resume_training_state,
     setup_paths,
@@ -252,6 +253,57 @@ def test_resume_training_state_rejects_objective_mismatch():
                 device=torch.device("cpu"),
                 expected_objective="mrae",
             )
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def test_load_finetune_weights_resets_state_and_rebases_ema():
+    case_dir = _case_dir("finetune_weights")
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    with torch.no_grad():
+        source.weight.fill_(2.0)
+        source.bias.fill_(3.0)
+        target.weight.fill_(-4.0)
+        target.bias.fill_(-5.0)
+    ema = GeneratorEMA(target)
+    ckpt_path = case_dir / "best_model.pth"
+
+    try:
+        torch.save(
+            {
+                "state_dict": source.state_dict(),
+                "optimizer": {"must_not": "be_loaded"},
+                "iter": 164_000,
+                "epoch": 164,
+                "stage_idx": 0,
+                "stage_iter": 164_000,
+                "best_mrae": 0.523266,
+                "early_stopping_bad_epochs": 21,
+                "ema_applied": True,
+            },
+            ckpt_path,
+        )
+
+        info = load_finetune_weights(
+            checkpoint_path=str(ckpt_path),
+            model=target,
+            device=torch.device("cpu"),
+            ema=ema,
+        )
+
+        assert set(info) == {
+            "source_iteration",
+            "source_epoch",
+            "source_best_mrae",
+            "ema_applied",
+        }
+        assert info["source_iteration"] == 164_000
+        assert info["source_best_mrae"] == pytest.approx(0.523266)
+        assert info["ema_applied"] is True
+        for key, value in target.state_dict().items():
+            assert torch.allclose(value, source.state_dict()[key])
+            assert torch.allclose(ema.shadow[key], source.state_dict()[key])
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 

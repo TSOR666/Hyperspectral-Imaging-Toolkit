@@ -12,7 +12,11 @@ defaults:
 #
 #   python src/hsi_model/train_generator.py \
 #     --config-name finetune_128_polish_annealed \
-#     resume_checkpoint=/path/to/best_model.pth
+#     finetune_checkpoint=/path/to/best_model.pth
+#
+# Use ``finetune_checkpoint`` so this recipe starts its own 72k schedule at
+# stage iteration zero. ``resume_checkpoint`` is only for continuing an
+# interrupted run made with this same config.
 #
 progressive_stages:
   - {patch_size: 128, iterations: 72000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}

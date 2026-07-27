@@ -166,16 +166,16 @@ python ... data_dir=/your/actual/path/to/ARAD_1K
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `batch_size` | 32 | Batch size for training |
+| `batch_size` | 20 | Optimizer-step batch size for training |
 | `val_batch_size` | 1 | Batch size for validation |
 | `patch_size` | 128 | Size of image patches |
 | `epochs` | 300 | Number of single-stage training epochs |
 | `generator_lr` | 0.0004 | Generator learning rate |
 | `optimizer` | `adam` | MST++-aligned generator optimizer |
 | `weight_decay` | 0.0 | No weight decay |
-| `objective` | `mrae_annealed` | Pure MRAE with a denominator floor annealed to exact MRAE |
-| `mrae_epsilon_start` | 1e-3 | Initial denominator floor for stable early optimization |
-| `mrae_epsilon_end` | 1e-8 | Final MST++/leaderboard MRAE denominator floor |
+| `objective` | `mrae_annealed` | Pure MRAE with an annealed, stabilized training denominator |
+| `mrae_epsilon_start` | 1e-2 | Initial denominator floor for stable early optimization |
+| `mrae_epsilon_end` | 1e-3 | Final floor for the base 300k run; validation still reports exact MRAE |
 | `mrae_epsilon_anneal_iters` | 50000 | Updates used to decay the floor |
 | `mixed_precision` | true | Use automatic mixed precision |
 | `validation_clamp_output` | true | Match NTIRE `[0,1]` scoring |
@@ -229,8 +229,13 @@ print('✅ Installation verified!')
 - Start a fresh run after changing the objective to `mrae_annealed`
 - Use `--config-name sota_cascade` only for a fresh run. It now pins the
   local/global single-pass architecture, uses a small-initialized output head
-  plus an RGB spectral prior, and writes to separate recovery directories.
+  plus an RGB spectral prior, disables legacy radiometry-stripping
+  normalization/denoising paths, and writes to separate recovery directories.
   Never resume either failed July 2026 checkpoint bundle.
+- For the successful 2026-07-25 stable-init run, stop at the saved 164k best
+  checkpoint rather than the degraded 185k latest checkpoint. Start the
+  exact-objective phase with the `finetune_128_exact_mrae` config and set
+  `finetune_checkpoint=/path/to/best_model.pth`.
 - Treat 256/512 progressive fine-tuning as experimental unless a patch-size
   sweep shows it improves the deployed inference path
 - Track both deployed `mrae` and diagnostic `raw_mrae`
