@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import random
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 
 from .checkpoint import load_checkpoint_payload
-from .data import ARAD1KDataset
+from .data import ARAD1KDataset, load_arad_manifest
 from .losses import SpectralReconstructionLoss
 from .ntire import autocast_dtype, evaluate_loader, resolve_device
 from .presets import build_model, get_config
@@ -32,41 +34,68 @@ class TrainingStage:
     iterations: int
     batch_size: int
     learning_rate: float
+    stride: int | None = None
+    augment: bool = True
 
     def __post_init__(self) -> None:
         if min(self.patch_size, self.iterations, self.batch_size) < 1:
             raise ValueError("Stage sizes and iteration count must be positive.")
         if self.learning_rate <= 0:
             raise ValueError("Stage learning_rate must be positive.")
+        if self.stride is not None and self.stride < 1:
+            raise ValueError("Stage stride must be positive.")
 
 
 @dataclass(frozen=True)
 class LossConfig:
-    mrae_weight: float = 0.0
-    l1_weight: float = 1.0
-    sam_weight: float = 0.0
+    mrae_weight: float = 1.0
+    l1_weight: float = 0.0
+    sam_weight: float = 0.1
+    delta_e_weight: float = 0.1
+    mrae_denominator: str = "source_additive"
+    mrae_epsilon: float = 1e-5
+    sam_mode: str = "source"
+
+    def __post_init__(self) -> None:
+        if self.mrae_denominator not in {"clamp_abs", "source_additive"}:
+            raise ValueError("Unknown loss MRAE denominator.")
+        if self.mrae_epsilon <= 0:
+            raise ValueError("loss.mrae_epsilon must be positive.")
+        if self.sam_mode not in {"stable", "source"}:
+            raise ValueError("loss.sam_mode must be 'stable' or 'source'.")
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     data_root: str
-    output_dir: str = "runs/hsiformer_arad1k"
-    preset: str = "recommended_retrain"
+    output_dir: str = "runs/sstrans_source_arad1k"
+    preset: str = "source_reproduction"
     model: dict[str, Any] = field(default_factory=dict)
     stages: tuple[TrainingStage, ...] = (
-        TrainingStage(128, 300_000, 32, 4e-4),
-        TrainingStage(256, 50_000, 8, 4e-5),
-        TrainingStage(512, 50_000, 1, 4e-5),
+        # Seven exhaustive epochs: ceil(900 * 2254 / 32) * 7 updates.
+        TrainingStage(128, 443_758, 32, 4e-4, 8),
     )
     loss: LossConfig = LossConfig()
     min_learning_rate: float = 1e-6
-    crops_per_scene: int = 16
+    crops_per_scene: int = 1
+    train_sampling: str = "grid"
+    train_stride: int = 8
+    stage_from_best: bool = False
     num_workers: int = 8
     validation_every: int = 2_000
     checkpoint_every: int = 2_000
     log_every: int = 50
     validation_tile_size: int | None = None
     validation_overlap: int = 16
+    # The 0.1468 SSTrans result is an ARAD-origin full-frame score. A 128-pixel
+    # center crop belongs to a separate MST++/NTIRE protocol.
+    validation_crop_border: int = 0
+    validation_mrae_denominator: str = "source_additive"
+    validation_mrae_epsilon: float = 1e-5
+    validation_psnr_clip: bool = False
+    # Checkpoint selection should use deterministic fp32 predictions. Training
+    # autocast remains independently controlled by ``amp``.
+    validation_amp: bool = False
     # Per-image min-max, matching MST++'s (x-min)/(max-min) exactly. The earlier
     # scale_255 default was self-consistent across train/val/inference (not a
     # correctness bug) but deviated from the reference input distribution and
@@ -75,9 +104,13 @@ class TrainingConfig:
     train_manifest: str | None = None
     validation_manifest: str | None = None
     seed: int = 42
-    amp: bool = True
+    amp: bool = False
     amp_dtype: str = "bf16"
-    grad_clip_norm: float | None = 1.0
+    grad_clip_norm: float | None = None
+    # The reference run used PyTorch's fp32 defaults: no cuDNN autotuning and
+    # "highest" float32 matmul precision (that is, no TF32 approximation).
+    cudnn_benchmark: bool = False
+    float32_matmul_precision: str = "highest"
     warmup_steps: int = 0
     max_consecutive_nonfinite: int = 100
 
@@ -86,6 +119,10 @@ class TrainingConfig:
             raise ValueError("data_root is required.")
         if self.crops_per_scene < 1:
             raise ValueError("crops_per_scene must be positive.")
+        if self.train_sampling not in {"random", "grid"}:
+            raise ValueError("train_sampling must be 'random' or 'grid'.")
+        if self.train_stride < 1:
+            raise ValueError("train_stride must be positive.")
         if self.num_workers < 0:
             raise ValueError("num_workers cannot be negative.")
         if self.log_every < 1:
@@ -94,10 +131,23 @@ class TrainingConfig:
             raise ValueError("Validation and checkpoint intervals cannot be negative.")
         if self.validation_tile_size is not None and self.validation_tile_size < 1:
             raise ValueError("validation_tile_size must be positive.")
+        if self.validation_crop_border < 0:
+            raise ValueError("validation_crop_border cannot be negative.")
+        if self.validation_mrae_denominator not in {
+            "clamp_abs",
+            "source_additive",
+        }:
+            raise ValueError("Unknown validation MRAE denominator.")
+        if self.validation_mrae_epsilon <= 0:
+            raise ValueError("validation_mrae_epsilon must be positive.")
         if self.grad_clip_norm is not None and self.grad_clip_norm <= 0:
             raise ValueError("grad_clip_norm must be positive.")
         if self.amp_dtype not in {"bf16", "fp16"}:
             raise ValueError("amp_dtype must be 'bf16' or 'fp16'.")
+        if self.float32_matmul_precision not in {"highest", "high", "medium"}:
+            raise ValueError(
+                "float32_matmul_precision must be 'highest', 'high', or 'medium'."
+            )
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps cannot be negative.")
         if self.max_consecutive_nonfinite < 1:
@@ -131,7 +181,7 @@ def train(
     resume: str | Path | None = None,
     device: str | torch.device = "auto",
 ) -> Path:
-    """Run MST++-style iteration training and return the latest checkpoint."""
+    """Run iteration-based training and return the latest checkpoint."""
     if not config.stages:
         raise ValueError("At least one training stage is required.")
     if config.min_learning_rate < 0:
@@ -142,8 +192,8 @@ def train(
     )
     _seed_everything(config.seed)
     if selected_device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = config.cudnn_benchmark
+    torch.set_float32_matmul_precision(config.float32_matmul_precision)
 
     output_dir = Path(config.output_dir)
     checkpoint_dir = output_dir / "checkpoints"
@@ -160,7 +210,11 @@ def train(
         l1_weight=config.loss.l1_weight,
         mrae_weight=config.loss.mrae_weight,
         sam_weight=config.loss.sam_weight,
-    )
+        delta_e_weight=config.loss.delta_e_weight,
+        mrae_denominator=config.loss.mrae_denominator,
+        mrae_epsilon=config.loss.mrae_epsilon,
+        sam_mode=config.loss.sam_mode,
+    ).to(selected_device)
     amp_enabled = config.amp and selected_device.type == "cuda"
     amp_compute_dtype = (
         autocast_dtype(selected_device, config.amp_dtype)
@@ -201,7 +255,20 @@ def train(
         start_stage = int(loaded.get("stage_index", 0))
         start_stage_step = int(loaded.get("stage_step", 0))
         global_step = int(loaded.get("global_step", 0))
-        best_mrae = float(loaded.get("best_mrae", math.inf))
+        saved_protocol = _saved_validation_protocol(loaded)
+        current_protocol = _validation_protocol(config)
+        if saved_protocol == current_protocol:
+            best_mrae = float(loaded.get("best_mrae", math.inf))
+        else:
+            # Metrics from different crops, denominators, precision modes, or
+            # manifests are not comparable. Establish a fresh best checkpoint
+            # instead of carrying the old threshold forward.
+            best_mrae = math.inf
+            print(
+                "validation protocol changed on resume "
+                f"from {saved_protocol} to {current_protocol}; "
+                "resetting best MRAE"
+            )
 
     validation_loader = _build_validation_loader(config, selected_device)
     metrics_path = output_dir / "metrics.jsonl"
@@ -211,6 +278,25 @@ def train(
         if stage_index < start_stage:
             continue
         stage_step = start_stage_step if stage_index == start_stage else 0
+        resuming_this_stage = (
+            resume_payload is not None and stage_index == start_stage
+        )
+        if (
+            stage_index > 0
+            and config.stage_from_best
+            and not resuming_this_stage
+        ):
+            best_payload = load_checkpoint_payload(
+                checkpoint_dir / "best.pt",
+                map_location=selected_device,
+            )
+            if not isinstance(best_payload, Mapping):
+                raise TypeError("Best checkpoint must be a dictionary.")
+            model.load_state_dict(best_payload["model"])
+            print(
+                f"stage={stage_index + 1}: initialized from best validation "
+                f"checkpoint at global_step={best_payload.get('global_step')}"
+            )
         optimizer = Adam(
             model.parameters(),
             lr=stage.learning_rate,
@@ -268,7 +354,12 @@ def train(
                 grad_clip_norm=config.grad_clip_norm,
                 use_grad_scaler=use_grad_scaler,
             )
-            scheduler.step()
+            if stepped:
+                # Keep the LR schedule aligned with actual optimizer updates.
+                # Advancing it after a skipped non-finite batch both triggers
+                # PyTorch's scheduler-before-optimizer warning and silently
+                # spends learning-rate budget without changing the model.
+                scheduler.step()
 
             stage_step += 1
             global_step += 1
@@ -331,7 +422,11 @@ def train(
                     device=selected_device,
                     tile_size=config.validation_tile_size,
                     overlap=config.validation_overlap,
-                    amp=config.amp,
+                    amp=config.validation_amp,
+                    crop_border=config.validation_crop_border,
+                    mrae_denominator=config.validation_mrae_denominator,
+                    mrae_epsilon=config.validation_mrae_epsilon,
+                    psnr_clip=config.validation_psnr_clip,
                 )
                 validation_record = {
                     "type": "validation",
@@ -415,9 +510,10 @@ def _build_train_loader(
         split="train",
         manifest_path=config.train_manifest,
         crop_size=stage.patch_size,
-        random_crop=True,
+        stride=stage.stride or config.train_stride,
+        random_crop=config.train_sampling == "random",
         crops_per_scene=config.crops_per_scene,
-        augment=True,
+        augment=stage.augment,
         rgb_normalization=config.rgb_normalization,
     )
     generator = torch.Generator().manual_seed(config.seed + stage_index)
@@ -475,6 +571,7 @@ def _training_payload(
         "preset": config.preset,
         "model_config": model_config,
         "training_config": config.to_dict(),
+        "validation_protocol": _validation_protocol(config),
         "stage_index": stage_index,
         "stage_step": stage_step,
         "global_step": global_step,
@@ -491,6 +588,66 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
+
+
+def _validation_protocol(config: TrainingConfig) -> dict[str, Any]:
+    scene_ids = load_arad_manifest(
+        "validation",
+        config.validation_manifest,
+    )
+    manifest_digest = hashlib.sha256(
+        ("\n".join(scene_ids) + "\n").encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": 4,
+        "crop_border": int(config.validation_crop_border),
+        "amp": bool(config.validation_amp),
+        "cudnn_benchmark": bool(config.cudnn_benchmark),
+        "float32_matmul_precision": config.float32_matmul_precision,
+        "rgb_normalization": config.rgb_normalization,
+        "tile_size": config.validation_tile_size,
+        "overlap": (
+            int(config.validation_overlap)
+            if config.validation_tile_size is not None
+            else None
+        ),
+        "manifest_sha256": manifest_digest,
+        "mrae_denominator": config.validation_mrae_denominator,
+        "mrae_epsilon": float(config.validation_mrae_epsilon),
+        "psnr_clip": bool(config.validation_psnr_clip),
+    }
+
+
+def _saved_validation_protocol(payload: Mapping[str, Any]) -> dict[str, Any]:
+    protocol = payload.get("validation_protocol")
+    if isinstance(protocol, Mapping):
+        return dict(protocol)
+
+    # Checkpoints written before validation_protocol existed evaluated complete
+    # frames and reused the training AMP flag during validation.
+    training_config = payload.get("training_config")
+    if not isinstance(training_config, Mapping):
+        training_config = {}
+    return {
+        "version": 1,
+        "crop_border": int(training_config.get("validation_crop_border", 0)),
+        "amp": bool(
+            training_config.get(
+                "validation_amp",
+                training_config.get("amp", False),
+            )
+        ),
+        "rgb_normalization": training_config.get(
+            "rgb_normalization",
+            "scale_255",
+        ),
+        "tile_size": training_config.get("validation_tile_size"),
+        "overlap": training_config.get("validation_overlap", 16),
+        "manifest_sha256": None,
+        "mrae_denominator": "clamp_abs",
+        "mrae_epsilon": 1e-6,
+        "psnr_clip": False,
+    }
 
 
 def _seed_everything(seed: int) -> None:
@@ -555,7 +712,7 @@ def _optimization_step(
     skipped because the loss or gradients were non-finite. Skipping a bad batch
     (rather than stepping on NaN/Inf gradients) is what keeps a single overflow
     from poisoning the Adam moments and weights — the failure that turned a
-    transient spike into the permanent, unrecoverable collapse in the logs.
+        transient spike into a permanently poisoned optimizer state.
     """
     if not torch.isfinite(loss):
         return False

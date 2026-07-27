@@ -97,6 +97,7 @@ class Attention(nn.Module):
         self.dim = dim
         self.patch_size = to_2tuple(patch_size)
         self.num_heads = num_heads
+        self.source_eager_attention = False
         # Spatial cosine attention: initialise the scale above 1 so the
         # normalised-q/k logits are not near-uniform at init (see
         # _SPATIAL_COSINE_INIT_SCALE in attention.py).
@@ -163,6 +164,7 @@ class Attention(nn.Module):
             attention_bias=attention_bias,
             dropout_p=self.attn_drop.p,
             training=self.training,
+            source_eager=self.source_eager_attention,
         )
         x = x.transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj_drop(self.proj(x))

@@ -108,6 +108,11 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
             raise ValueError("random_crop requires crop_size.")
 
         self.image_size = image_size or self._read_image_size(self.scene_ids[0])
+        self.full_frame_crop = bool(
+            self.crop_size is not None
+            and self.crop_size[0] >= self.image_size[0]
+            and self.crop_size[1] >= self.image_size[1]
+        )
         self._crop_positions = self._build_crop_positions()
 
     def _rgb_path(self, scene_id: str) -> Path:
@@ -126,6 +131,8 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
 
     def _build_crop_positions(self) -> tuple[tuple[int, int], ...]:
         if self.crop_size is None or self.random_crop:
+            return ((0, 0),)
+        if self.full_frame_crop:
             return ((0, 0),)
         image_height, image_width = self.image_size
         crop_height, crop_width = self.crop_size
@@ -182,7 +189,7 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
 
         augment = self.augment
         active_crop_size: tuple[int, int] | None = None
-        if self.crop_size is not None:
+        if self.crop_size is not None and not self.full_frame_crop:
             crop_fits = (
                 self.crop_size[0] <= height and self.crop_size[1] <= width
             )

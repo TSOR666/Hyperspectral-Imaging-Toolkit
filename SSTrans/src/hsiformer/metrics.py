@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from torch.nn import functional as F
+
+MRAEDenominator = Literal["clamp_abs", "source_additive"]
 
 
 def mean_relative_absolute_error(
@@ -9,10 +13,19 @@ def mean_relative_absolute_error(
     target: torch.Tensor,
     *,
     eps: float = 1e-6,
+    denominator: MRAEDenominator = "clamp_abs",
 ) -> torch.Tensor:
     _check_shapes(prediction, target)
-    denominator = target.abs().clamp_min(eps)
-    return ((prediction - target).abs() / denominator).mean()
+    if denominator == "clamp_abs":
+        divisor = target.abs().clamp_min(eps)
+    elif denominator == "source_additive":
+        # The source SSTrans evaluator adds 1e-5 to both prediction and
+        # target whenever a scored tensor contains a zero. The numerator is
+        # unchanged, so this is equivalent to dividing by target + epsilon.
+        divisor = target if bool(torch.all(target != 0)) else target + eps
+    else:
+        raise ValueError(f"Unknown MRAE denominator: {denominator}")
+    return ((prediction - target).abs() / divisor).mean()
 
 
 def root_mean_squared_error(
@@ -63,12 +76,14 @@ def spectral_metrics(
     *,
     data_range: float = 1.0,
     eps: float = 1e-6,
+    mrae_denominator: MRAEDenominator = "clamp_abs",
 ) -> dict[str, torch.Tensor]:
     return {
         "mrae": mean_relative_absolute_error(
             prediction,
             target,
             eps=eps,
+            denominator=mrae_denominator,
         ),
         "rmse": root_mean_squared_error(prediction, target),
         "psnr": peak_signal_to_noise_ratio(
@@ -93,4 +108,3 @@ def _check_shapes(
             f"Prediction shape {prediction.shape} does not match target "
             f"shape {target.shape}."
         )
-

@@ -1,10 +1,16 @@
 from .checkpoint import (
     build_model_from_checkpoint,
+    checkpoint_rgb_normalization,
     load_checkpoint,
     load_checkpoint_payload,
 )
 from .data import ARAD1KDataset, RGBImageDataset, load_arad_manifest
-from .losses import MRAELoss, SAMLoss, SpectralReconstructionLoss
+from .losses import (
+    DeltaE2000Loss,
+    MRAELoss,
+    SAMLoss,
+    SpectralReconstructionLoss,
+)
 from .metrics import (
     mean_relative_absolute_error,
     peak_signal_to_noise_ratio,
@@ -31,6 +37,7 @@ __all__ = [
     "ARAD_BANDS_NM",
     "HSIFormer",
     "HSIFormerConfig",
+    "DeltaE2000Loss",
     "MRAELoss",
     "LossConfig",
     "RGBImageDataset",
@@ -42,6 +49,7 @@ __all__ = [
     "TrainingStage",
     "build_model",
     "build_model_from_checkpoint",
+    "checkpoint_rgb_normalization",
     "evaluate_loader",
     "get_config",
     "infer_loader",

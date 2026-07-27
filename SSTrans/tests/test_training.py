@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image
 
 from hsiformer import (
+    LossConfig,
     TrainingConfig,
     TrainingStage,
     build_model_from_checkpoint,
@@ -46,11 +47,24 @@ _TINY_MODEL = {
 }
 
 
-def test_default_training_config_enables_stability_guards() -> None:
+def test_default_training_config_matches_source_reproduction_contract() -> None:
     config = TrainingConfig.from_json("configs/train_arad1k.json")
-    assert config.grad_clip_norm == 1.0
-    assert config.amp_dtype == "bf16"
+    assert config.preset == "source_reproduction"
+    assert config.grad_clip_norm is None
+    assert config.amp is False
+    assert config.cudnn_benchmark is False
+    assert config.float32_matmul_precision == "highest"
     assert config.warmup_steps == 0
+    assert config.train_sampling == "grid"
+    assert len(config.stages) == 1
+    assert config.stages[0].iterations == 443_758
+    assert config.stages[0].stride == 8
+    assert config.stages[0].augment is True
+    assert config.stage_from_best is False
+    assert config.validation_crop_border == 0
+    assert config.validation_mrae_denominator == "source_additive"
+    assert config.validation_mrae_epsilon == 1e-5
+    assert config.validation_amp is False
 
 
 def test_autocast_dtype_is_float32_on_cpu() -> None:
@@ -95,6 +109,7 @@ def test_nonfinite_loss_is_skipped_without_corrupting_weights(
         train_manifest=str(manifest),
         validation_manifest=str(manifest),
         amp=False,
+        validation_crop_border=0,
     )
     latest = train(config, device="cpu")
 
@@ -113,6 +128,7 @@ def test_nonfinite_loss_is_skipped_without_corrupting_weights(
     ]
     train_records = [record for record in records if record["type"] == "train"]
     assert max(record.get("nonfinite_skips", 0) for record in train_records) >= 2
+    assert train_records[0]["learning_rate"] == train_records[1]["learning_rate"]
 
 
 def test_warmup_scheduler_ramps_then_decays(tmp_path) -> None:
@@ -122,6 +138,7 @@ def test_warmup_scheduler_ramps_then_decays(tmp_path) -> None:
         output_dir=str(tmp_path / "run"),
         model=_TINY_MODEL,
         stages=(TrainingStage(8, 12, 1, 1e-3),),
+        loss=LossConfig(mrae_weight=0.0, l1_weight=1.0, sam_weight=0.0),
         crops_per_scene=12,
         num_workers=0,
         validation_every=12,
@@ -130,6 +147,7 @@ def test_warmup_scheduler_ramps_then_decays(tmp_path) -> None:
         train_manifest=str(manifest),
         validation_manifest=str(manifest),
         amp=False,
+        validation_crop_border=0,
         warmup_steps=4,
     )
     latest = train(config, device="cpu")
@@ -180,6 +198,7 @@ def test_persistent_nonfinite_loss_trips_circuit_breaker(
         train_manifest=str(manifest),
         validation_manifest=str(manifest),
         amp=False,
+        validation_crop_border=0,
         max_consecutive_nonfinite=3,
     )
     with pytest.raises(RuntimeError, match="consecutive non-finite"):
@@ -203,6 +222,7 @@ def test_resume_rejects_nonfinite_checkpoint(tmp_path) -> None:
         train_manifest=str(manifest),
         validation_manifest=str(manifest),
         amp=False,
+        validation_crop_border=0,
     )
     latest = train(config, device="cpu")
 
@@ -229,15 +249,15 @@ def test_packaged_training_config_matches_repository_config() -> None:
     assert packaged == repository
 
 
-def test_published_training_config_uses_l1_loss() -> None:
-    # Paper section 4.2: "The L1 loss function is used during training." The
-    # earlier MRAE-only objective was a detour and measured worse (0.315 vs
-    # 0.2755); the reported 0.1468 comes from L1 plus the progressive
-    # 128 -> 256 -> 512 schedule.
+def test_source_training_config_uses_reported_composite_loss() -> None:
     config = TrainingConfig.from_json("configs/train_arad1k.json")
-    assert config.loss.l1_weight == 1.0
-    assert config.loss.mrae_weight == 0.0
-    assert config.loss.sam_weight == 0.0
+    assert config.loss.l1_weight == 0.0
+    assert config.loss.mrae_weight == 1.0
+    assert config.loss.sam_weight == 0.1
+    assert config.loss.delta_e_weight == 0.1
+    assert config.loss.mrae_denominator == "source_additive"
+    assert config.loss.mrae_epsilon == 1e-5
+    assert config.loss.sam_mode == "source"
 
 
 def test_one_iteration_training_cycle_saves_reusable_checkpoint(tmp_path) -> None:
@@ -277,6 +297,7 @@ def test_one_iteration_training_cycle_saves_reusable_checkpoint(tmp_path) -> Non
         train_manifest=str(manifest),
         validation_manifest=str(manifest),
         amp=False,
+        validation_crop_border=0,
     )
     latest = train(config, device="cpu")
 

@@ -5,7 +5,12 @@ from torch import nn
 from torch.nn import functional as F
 
 from hsiformer import build_model, load_checkpoint
-from hsiformer.attention import Spectral_MSA
+from hsiformer.attention import (
+    CSWinCrossAttention,
+    LePEAttentionCross,
+    Spectral_MSA,
+)
+from hsiformer.cat import Attention as CATAttention
 from hsiformer.model import SSTLayer, SSTransformer
 
 
@@ -103,6 +108,58 @@ def test_recommended_retrain_keeps_cat_rpe_only() -> None:
     assert any("relative_position_bias_table" in key for key in keys)
 
 
+def test_source_reproduction_matches_reported_no_rpe_architecture() -> None:
+    model = build_model("source_reproduction")
+    assert [len(stage[0].model) for stage in model.downblocks] == [2, 2]
+    assert model.bottle_layer.depth == 2
+    assert len(model.refine_sst.model) == 2
+
+    spectral_layouts = {
+        (module.qkv.in_channels, module.num_heads)
+        for module in model.modules()
+        if isinstance(module, Spectral_MSA)
+    }
+    assert spectral_layouts == {(32, 16), (64, 16), (128, 16)}
+    assert any(
+        key.endswith("s_msa.relative_bias")
+        for key in model.state_dict()
+    )
+    assert any(
+        "relative_position_bias_table" in key
+        for key in model.state_dict()
+    )
+    source_attention_modules = [
+        module
+        for module in model.modules()
+        if hasattr(module, "source_eager_attention")
+    ]
+    assert source_attention_modules
+    assert all(module.source_eager_attention for module in source_attention_modules)
+
+
+def test_source_reproduction_restores_source_init_and_spatial_scale() -> None:
+    torch.manual_seed(11)
+    model = _tiny_model("source_reproduction")
+    convolution_stds = [
+        float(module.weight.detach().std())
+        for module in model.modules()
+        if isinstance(module, nn.Conv2d) and module.weight.numel() > 1
+    ]
+    assert max(convolution_stds) < 0.03
+
+    spatial_scales = [
+        module.scale
+        for module in model.modules()
+        if isinstance(
+            module,
+            (LePEAttentionCross, CSWinCrossAttention, CATAttention),
+        )
+    ]
+    assert spatial_scales
+    for scale in spatial_scales:
+        torch.testing.assert_close(scale, torch.ones_like(scale))
+
+
 def test_branch_delta_is_identity_for_a_zero_transform_branch() -> None:
     layer = SSTLayer(
         dim=8,
@@ -192,5 +249,34 @@ def test_checkpoint_loader_accepts_wrapped_model_prefix(tmp_path) -> None:
 
     target = _tiny_model()
     incompatible = load_checkpoint(target, path)
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+
+
+def test_checkpoint_loader_accepts_upstream_uppercase_g_wrapper(tmp_path) -> None:
+    source = _tiny_model("legacy")
+    target = _tiny_model("legacy")
+    path = tmp_path / "upstream_converted.pt"
+    torch.save({"G": source.state_dict(), "optimG": {"ignored": True}}, path)
+
+    incompatible = load_checkpoint(target, path)
+
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+
+
+def test_checkpoint_loader_filters_lightning_loss_state(tmp_path) -> None:
+    source = _tiny_model("legacy")
+    target = _tiny_model("legacy")
+    prefixed = {
+        f"model.{key}": value
+        for key, value in source.state_dict().items()
+    }
+    prefixed["deltaE_criterion.model_hs2rgb.weight"] = torch.zeros(3, 31, 1, 1)
+    path = tmp_path / "lightning.ckpt"
+    torch.save({"state_dict": prefixed}, path)
+
+    incompatible = load_checkpoint(target, path)
+
     assert not incompatible.missing_keys
     assert not incompatible.unexpected_keys
