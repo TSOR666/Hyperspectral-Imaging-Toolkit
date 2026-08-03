@@ -81,6 +81,35 @@ class TestCascade:
         assert gen.cascade_gate.grad.abs().sum() > 0
 
 
+class TestSstbOuterResidualScale:
+    def test_default_preserves_legacy_unit_scale(self):
+        gen = _build(stage_depths=[1, 1, 1, 1, 1])
+
+        assert gen.encoder1[0].outer_residual_scale == pytest.approx(1.0)
+
+    def test_configured_scale_reaches_every_stage(self):
+        gen = _build(
+            stage_depths=[1, 1, 1, 1, 1],
+            sstb_outer_residual_scale=0.1,
+        )
+        blocks = [
+            gen.encoder1[0],
+            gen.encoder2[0],
+            gen.bottleneck[0],
+            gen.decoder1[0],
+            gen.decoder2[0],
+        ]
+
+        assert [block.outer_residual_scale for block in blocks] == pytest.approx(
+            [0.1] * 5
+        )
+
+    @pytest.mark.parametrize("scale", [-0.1, float("nan"), float("inf")])
+    def test_invalid_scale_fails_loudly(self, scale):
+        with pytest.raises(ValueError, match="sstb_outer_residual_scale"):
+            _build(sstb_outer_residual_scale=scale)
+
+
 class TestSmsaOutputNorm:
     def test_norm_replaced_by_identity(self):
         attn = SpectralMSA(16, num_heads=4, config=_config(smsa_output_norm=False))

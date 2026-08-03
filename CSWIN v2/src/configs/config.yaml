@@ -184,6 +184,11 @@ thick_output_head: false         # paper ToOut is a single conv
 # immediate gradients into the transformer body. Checkpoint loads overwrite it.
 output_head_init_scale: 0.01
 ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
+# Scale the complete gated SST branch before its outer residual. 1.0 preserves
+# historical checkpoints exactly; the fresh recovery recipe uses 0.1 to stop
+# 12 residual-heavy blocks from amplifying activations and starving the body
+# behind an artificially tiny output projection.
+sstb_outer_residual_scale: 1.0
 # Legacy stabilizer. Disable only in a fresh run: the transformer blocks are
 # already pre-normed, and extra GroupNorm after embedding/down/up convolutions
 # can erase low-frequency radiometric offsets that MRAE/PSNR need.

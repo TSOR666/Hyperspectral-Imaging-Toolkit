@@ -96,7 +96,8 @@ def test_tiny_config_exercises_stable_recovery_architecture():
     assert config["use_feature_norm"] is True
     assert config["use_input_denoising"] is True
     assert config["cascade_stages"] == 1
-    assert config["output_head_init_scale"] == pytest.approx(0.01)
+    assert config["sstb_outer_residual_scale"] == pytest.approx(0.1)
+    assert config["output_head_init_scale"] == pytest.approx(1.0)
     assert config["use_spectral_input_skip"] is True
 
 

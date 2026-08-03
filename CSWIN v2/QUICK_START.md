@@ -225,16 +225,23 @@ print('✅ Installation verified!')
 - Tune `lazy_cache_size` to trade RAM for random-access speed. Keep `memory_mode=standard` when throughput matters more than resident memory.
 
 ### For Better Quality:
-- Keep the full 300k-step cosine schedule; 28k steps is only about 9% complete
+- Use the 70k-step residual-balanced `sota_cascade` recipe. The June control
+  reached MRAE 0.2737 / PSNR 29.56 near the end of a 70k cosine schedule; the
+  later 300k schedule regressed after its midpoint while retaining a high LR.
 - Start a fresh run after changing the objective to `mrae_annealed`
 - Use `--config-name sota_cascade` only for a fresh run. It now pins the
-  local/global single-pass architecture, uses a small-initialized output head
-  plus an RGB spectral prior, disables legacy radiometry-stripping
+  local/global single-pass architecture, balances the SSTB outer residuals,
+  uses a normally initialized output head plus an RGB spectral prior, disables
+  legacy radiometry-stripping
   normalization/denoising paths, and writes to separate recovery directories.
   Never resume either failed July 2026 checkpoint bundle.
 - For the successful 2026-07-25 stable-init run, stop at the saved 164k best
   checkpoint rather than the degraded 185k latest checkpoint. Start the
   exact-objective phase with the `finetune_128_exact_mrae` config and set
+  `finetune_checkpoint=/path/to/best_model.pth`.
+- For the 2026-07-27 radiometric run, stop at the saved 115k best checkpoint
+  (MRAE 0.524619), not the 215k state (0.577060), and use
+  `--config-name finetune_radiometric_exact_mrae` with
   `finetune_checkpoint=/path/to/best_model.pth`.
 - Treat 256/512 progressive fine-tuning as experimental unless a patch-size
   sweep shows it improves the deployed inference path

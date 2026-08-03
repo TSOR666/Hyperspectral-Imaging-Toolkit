@@ -1,0 +1,38 @@
+defaults:
+  - sota_cascade
+  - _self_
+
+# Rescue the 2026-07-27 sota_radiometric_fresh run from its saved 115k
+# best_model.pth (validation MRAE 0.524619). This deliberately preserves that
+# checkpoint's exact graph and residual behavior; the new residual-balanced
+# architecture above is for a fresh run and must not be introduced mid-run.
+#
+# Use finetune_checkpoint, not resume_checkpoint, so optimizer state and the
+# exhausted 300k schedule are discarded:
+#
+#   python src/hsi_model/train_generator.py \
+#     --config-name finetune_radiometric_exact_mrae \
+#     finetune_checkpoint=/path/to/sota_radiometric_fresh/best_model.pth
+
+sstb_outer_residual_scale: 1.0
+use_feature_norm: false
+use_input_denoising: false
+smsa_output_norm: false
+use_spectral_input_skip: true
+
+objective: mrae_annealed
+mrae_epsilon: 1.0e-3
+mrae_epsilon_start: 1.0e-3
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 20000
+
+progressive_stages:
+  - {patch_size: 128, iterations: 30000, init_lr: 1.0e-5, batch_size: 20, warmup_steps: 0}
+
+early_stopping_patience: 6
+early_stopping_min_delta: 5.0e-5
+early_stopping_warmup_epochs: 20
+early_stopping_final_stage_only: true
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/radiometric_exact_rescue
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/radiometric_exact_rescue
