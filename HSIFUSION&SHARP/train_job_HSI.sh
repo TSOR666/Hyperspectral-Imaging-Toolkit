@@ -88,13 +88,18 @@ echo ""
 
 echo "=== Starting HSIFusion Training ==="
 echo "Timestamp: $(date)"
-echo "Using HSIFusion Lightning Pro configuration"
+echo "Using the canonical unified trainer (BF16-first AMP)"
 echo ""
 
 # Run training with optimized configuration
   
 
-python hsifusion_training.py --model_size base --data_root ./dataset --output_dir ./experiments/hsifusion
+python unified_training.py \
+    --model hsifusion \
+    --model_size base \
+    --data_root ./dataset \
+    --output_dir ./experiments/hsifusion \
+    --amp auto
 
 #python test_setup_script.py
 #python apply_all_fixes.py
@@ -127,14 +132,12 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo "=== Training completed successfully! ==="
     
     # Run quick validation on best model if available
-    if [ -f "checkpoints/arad1k/best.pth" ]; then
+    if [ -f "experiments/hsifusion/hsifusion_base/best.pth" ]; then
         echo "=== Running validation on best model ==="
-        python robust_test.py \
-            --checkpoint checkpoints/arad1k/best.pth \
-            --data_dir ./ARAD_1K_Efficient \
-            --output_dir ./validation_results \
-            --max_samples 10 \
-            --visualize
+        python unified_inference.py \
+            experiments/hsifusion/hsifusion_base/best.pth \
+            --data_root ./dataset \
+            --out_dir ./validation_results/hsifusion
     fi
     
 else
@@ -142,8 +145,8 @@ else
     
     # Save debug information
     echo "=== Saving debug information ==="
-    if [ -f "checkpoints/arad1k/emergency.pth" ]; then
-        echo "Emergency checkpoint saved"
+    if [ -f "experiments/hsifusion/hsifusion_base/last.pth" ]; then
+        echo "Recovery checkpoint: experiments/hsifusion/hsifusion_base/last.pth"
     fi
     
     # Show last few lines of log for quick diagnosis

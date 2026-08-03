@@ -67,7 +67,7 @@ The dataset root must already contain `Train_RGB/` images and matching `Train_Sp
 
 ## Unified training (canonical)
 
-`unified_training.py` trains either model with MST++/NTIRE-faithful defaults: Adam (`--optimizer adam`), lr `4e-4` with per-iteration cosine decay to `--eta_min 1e-6`, batch 20, 300 epochs, 128×128 patches with stride 8, no weight decay, no warmup, and the MRAE objective.
+`unified_training.py` trains either model with MST++/NTIRE-faithful optimizer and data defaults: Adam (`--optimizer adam`), lr `4e-4` with per-iteration cosine decay to `--eta_min 1e-6`, batch 20, 300 epochs, 128×128 patches with stride 8, no weight decay, and no warmup. Training uses an MRAE continuation floor that anneals from `1e-2` to `1e-3`; validation and best-model selection retain the exact `1e-6` MRAE floor. This prevents dark/zero target pixels from producing unusably large mixed-precision gradients without changing the reported benchmark metric.
 
 ```bash
 cd "HSIFUSION&SHARP"
@@ -89,14 +89,19 @@ Key flags (see `unified_training.py --help` for the full list):
 | `--epochs` / `--lr` / `--eta_min` | Schedule length and cosine bounds. | `300` / `4e-4` / `1e-6` |
 | `--optimizer {adam,adamw}` / `--weight_decay` | Optimizer family. | `adam` / `0.0` |
 | `--amp {auto,bf16,fp16,off}` | Mixed precision (`auto` prefers BF16). | `auto` |
+| `--train_mrae_eps_start` / `--train_mrae_eps_end` / `--train_mrae_eps_anneal_steps` | Stable training-only MRAE floor schedule. | `1e-2` / `1e-3` / `50000` |
+| `--mrae_eps` | Validation/selection MRAE floor. | `1e-6` |
 | `--ema_decay` | EMA of model weights (`0` disables). | `0.0` |
 | `--memory_mode {standard,float16,lazy}` / `--cache_size` | Dataloader caching. | `float16` / `4` |
 | `--accumulate_steps` / `--gradient_clip` | Effective batch / clipping. | `1` / `1.0` |
 | `--val_interval` / `--val_crop_border` | Validation cadence and MST++ crop. | `10` / `128` |
+| `--checkpoint_interval_steps` | Rolling mid-epoch resume checkpoint cadence (`0` disables). | `5000` |
 | `--compile` | Enable `torch.compile`. | off |
 | `--resume` | Trainer checkpoint to resume from. | – |
 
 Validation reports MRAE, RMSE, PSNR, SAM, SSIM, and MAE via the shared [`hsi_benchmark`](../hsi_benchmark) metrics package, under **both** the MST++ center-crop protocol and full-frame evaluation. Inputs are automatically padded to a multiple of 8 for SHARP (ARAD frames are 482×512, which SHARP's decoder cannot handle unpadded) and cropped back after the forward pass.
+
+`last.pth` is overwritten every 5,000 optimizer steps, after every epoch, and on recoverable training failure; `best.pth` is updated only by a finite validation-MRAE improvement. Periodic validation therefore no longer delays the first resume checkpoint.
 
 ## Unified inference (canonical)
 
@@ -104,11 +109,11 @@ Validation reports MRAE, RMSE, PSNR, SAM, SSIM, and MAE via the shared [`hsi_ben
 
 ```bash
 # Evaluate on a dataset (crop + full protocols, 6 metrics)
-python unified_inference.py experiments/unified/best_model.pth \
+python unified_inference.py experiments/unified/sharp_base/best.pth \
   --data_root ${HSI_DATA_DIR:-./data/ARAD_1K}
 
 # Reconstruct RGB images to NTIRE-style .mat cubes
-python unified_inference.py experiments/unified/best_model.pth \
+python unified_inference.py experiments/unified/sharp_base/best.pth \
   --rgb path/to/rgb_folder --out_dir outputs/cubes
 ```
 
@@ -239,8 +244,8 @@ The HSIFusion and SHARP implementations are distributed under the [MIT License](
 ## Training Overview
 
 - Unified (`unified_training.py`) — canonical
-  - One trainer for both models with MST++/NTIRE-faithful defaults (Adam, lr 4e-4, per-iteration cosine, batch 20, 300 epochs, MRAE loss, no weight decay/warmup).
-  - Non-finite gradients are skipped safely under AMP (`GradScaler` fix from pass 4); optional EMA; validation on crop + full protocols with the shared `hsi_benchmark` metrics.
+  - One trainer for both models with MST++/NTIRE-faithful defaults (Adam, lr 4e-4, per-iteration cosine, batch 20, 300 epochs, annealed-floor MRAE loss, no weight decay/warmup).
+  - BF16 is preferred automatically; FP16 uses a conservative initial loss scale. Persistent non-finite updates abort with a recovery checkpoint instead of being skipped forever. Validation on crop + full protocols remains exact FP32 MRAE.
 
 - HSIFusionNet (`hsifusion_training.py`)
   - Data: `optimized_dataloader.py` (MST++ compatible) with `memory_mode` (standard/float16/lazy).

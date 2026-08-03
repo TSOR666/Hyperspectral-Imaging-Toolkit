@@ -25,7 +25,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import GradScaler, autocast
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -74,6 +73,13 @@ try:
 except ImportError:
     print("Warning: Optimized dataloader not found. Using fallback implementation.")
     DATALOADER_AVAILABLE = False
+
+from training_stability import (
+    annealed_mrae_epsilon,
+    autocast_context,
+    make_grad_scaler,
+    resolve_amp_dtype,
+)
 
 
 def _torch_load_compat(path: str, map_location: torch.device):
@@ -165,6 +171,8 @@ class SHARPTrainingConfig:
     
     # Optimization
     use_amp: bool = True
+    amp: str = 'auto'                       # auto | bf16 | fp16 | off
+    fp16_init_scale: float = 1024.0
     compile_model: bool = True
     use_channels_last: bool = True
     accumulate_steps: int = 1
@@ -196,6 +204,9 @@ class SHARPTrainingConfig:
     rank: int = field(default=0, init=False)
     world_size: int = field(default=1, init=False)
     min_mrae_denom: float = 1e-6
+    train_mrae_eps_start: float = 1e-2
+    train_mrae_eps_end: float = 1e-3
+    train_mrae_eps_anneal_steps: int = 50_000
     max_consecutive_nonfinite: int = 8
     skip_oom_batches: bool = True
     
@@ -240,6 +251,19 @@ class SHARPTrainingConfig:
             raise ValueError("loss_type must be one of mrae/l1_curvature")
         if self.output_activation not in {'sigmoid', 'tanh', 'relu', 'softplus', 'none'}:
             raise ValueError("output_activation must be one of sigmoid/tanh/relu/softplus/none")
+        amp_mode = self.amp if self.use_amp else 'off'
+        if amp_mode not in {'auto', 'bf16', 'fp16', 'off'}:
+            raise ValueError("amp must be one of auto/bf16/fp16/off")
+        annealed_mrae_epsilon(
+            self.train_mrae_eps_start,
+            self.train_mrae_eps_end,
+            0,
+            self.train_mrae_eps_anneal_steps,
+        )
+        if not math.isfinite(self.min_mrae_denom) or self.min_mrae_denom <= 0:
+            raise ValueError("min_mrae_denom must be a finite positive number")
+        if self.max_consecutive_nonfinite <= 0:
+            raise ValueError("max_consecutive_nonfinite must be > 0")
 
 
 class SHARPLoss(nn.Module):
@@ -287,6 +311,9 @@ class DedicatedSHARPTrainer:
         self.config = config
         self._setup_distributed()
         self.device = self._resolve_device()
+        amp_mode = config.amp if config.use_amp else 'off'
+        self.amp_dtype = resolve_amp_dtype(amp_mode, self.device)
+        self.use_amp = self.amp_dtype is not None
         self.is_main_process = self.rank == 0
         
         # Set random seeds
@@ -327,6 +354,9 @@ class DedicatedSHARPTrainer:
                 gradient_clip=config.gradient_clip,
                 ema_decay=config.ema_decay,
                 use_amp=config.use_amp,
+                amp=config.amp,
+                fp16_init_scale=config.fp16_init_scale,
+                max_consecutive_nonfinite=config.max_consecutive_nonfinite,
                 ema_update_every=config.ema_update_every,
                 criterion=self._criterion,
             )
@@ -419,10 +449,12 @@ class DedicatedSHARPTrainer:
         # parameter tensor on the optimizer-step hot path.
         grads = [p.grad for p in self.model.parameters() if p.grad is not None]
         if not grads:
-            return True
+            return False
         return bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
 
     def _safe_mrae(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = pred.float()
+        target = target.float()
         denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
         return torch.mean(torch.abs(pred - target) / denom)
     
@@ -514,7 +546,7 @@ class DedicatedSHARPTrainer:
         if self.config.loss_type == 'mrae':
             if not DATALOADER_AVAILABLE:
                 raise RuntimeError("loss_type='mrae' requires optimized_dataloader.MSTPlusPlusLoss")
-            return MSTPlusPlusLoss(eps=self.config.min_mrae_denom)
+            return MSTPlusPlusLoss(eps=self.config.train_mrae_eps_start)
         return None  # 'l1_curvature' -> use model.compute_loss
 
     def _setup_training_components(self):
@@ -536,7 +568,9 @@ class DedicatedSHARPTrainer:
         self.scheduler = self._create_scheduler()
         
         # AMP scaler
-        self.scaler = GradScaler(enabled=self.config.use_amp)
+        self.scaler = make_grad_scaler(
+            self.device, self.amp_dtype, init_scale=self.config.fp16_init_scale
+        )
         
         # EMA
         self.ema_state = None
@@ -705,17 +739,34 @@ class DedicatedSHARPTrainer:
         
         for epoch in range(self.start_epoch, self.config.epochs):
             # Training phase
-            epoch_metrics = self._train_epoch(epoch)
+            try:
+                epoch_metrics = self._train_epoch(epoch)
+            except Exception:
+                if not self.distributed:
+                    # epoch-1 encodes the number of fully completed epochs; resume will
+                    # repeat the interrupted epoch with the last finite optimizer state.
+                    self._save_checkpoint(epoch - 1)
+                    self._print(
+                        f"Saved recovery checkpoint after failure in epoch {epoch + 1}"
+                    )
+                raise
+
+            is_best = False
+            should_stop = False
             
             # Validation phase
             if (epoch + 1) % self.config.val_interval == 0:
                 val_metrics = self._validate(epoch)
                 
                 # Save best model
-                if val_metrics['mrae'] < (self.best_mrae - self.config.early_stopping_min_delta):
+                if (
+                    math.isfinite(val_metrics['mrae'])
+                    and val_metrics['mrae']
+                    < (self.best_mrae - self.config.early_stopping_min_delta)
+                ):
                     self.best_mrae = val_metrics['mrae']
                     self.bad_val_epochs = 0
-                    self._save_checkpoint(epoch, is_best=True)
+                    is_best = True
                     self._print(f"New best model! MRAE: {self.best_mrae:.6f}")
                 else:
                     self.bad_val_epochs += 1
@@ -728,11 +779,20 @@ class DedicatedSHARPTrainer:
                         f"Early stopping triggered after {self.bad_val_epochs} validation checks "
                         f"without improvement > {self.config.early_stopping_min_delta}."
                     )
-                    break
-            
-            # Periodic checkpoint
-            if (epoch + 1) % self.config.save_interval == 0:
-                self._save_checkpoint(epoch)
+                    should_stop = True
+
+            # Always keep a rolling resume point. Periodic archives and best weights are
+            # additional files, not gates that can leave a long run with no checkpoint.
+            self._save_checkpoint(
+                epoch,
+                is_best=is_best,
+                archive=(
+                    self.config.save_interval > 0
+                    and (epoch + 1) % self.config.save_interval == 0
+                ),
+            )
+            if should_stop:
+                break
         
         # Training completed
         total_time = time.time() - start_time
@@ -757,6 +817,13 @@ class DedicatedSHARPTrainer:
             self.train_loader.sampler.set_epoch(epoch)
         
         for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
+            if self._criterion is not None:
+                self._criterion.eps = annealed_mrae_epsilon(
+                    self.config.train_mrae_eps_start,
+                    self.config.train_mrae_eps_end,
+                    self.iteration,
+                    self.config.train_mrae_eps_anneal_steps,
+                )
             try:
                 if self.use_sharp_trainer:
                     # Use built-in trainer
@@ -836,7 +903,7 @@ class DedicatedSHARPTrainer:
             hsi = hsi.to(self.device)
         
         # Forward pass
-        with autocast(enabled=self.config.use_amp):
+        with autocast_context(self.device, self.amp_dtype):
             pred = self.model(rgb)
             if isinstance(pred, tuple):
                 pred = pred[0]
@@ -858,7 +925,6 @@ class DedicatedSHARPTrainer:
                 'skipped': True,
             }
 
-        self.consecutive_nonfinite = 0
         loss = loss / self.config.accumulate_steps
 
         is_step = should_optimizer_step(batch_idx, len(self.train_loader), self.config.accumulate_steps) or is_last_batch
@@ -879,13 +945,13 @@ class DedicatedSHARPTrainer:
         # Gradient accumulation
         if is_step:
             self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip
-            )
             if not self._all_ranks_true(self._has_finite_gradients()):
                 self.consecutive_nonfinite += 1
-                warnings.warn(f"Non-finite gradients at batch={batch_idx+1}; skipping optimizer step.")
+                warnings.warn(
+                    f"Non-finite gradients at batch={batch_idx+1}, "
+                    f"train_mrae_eps={getattr(self._criterion, 'eps', float('nan')):.3g}, "
+                    f"loss_scale={self.scaler.get_scale():.3g}; skipping optimizer step."
+                )
                 self.optimizer.zero_grad(set_to_none=True)
                 # unscale_ already ran: reset scaler state (and lower scale) so the next
                 # step's unscale_ does not raise and abort the run.
@@ -899,10 +965,15 @@ class DedicatedSHARPTrainer:
                     'skipped': True,
                 }
 
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.gradient_clip
+            ) if self.config.gradient_clip > 0 else 0.0
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             self.scheduler.step()
+            self.consecutive_nonfinite = 0
 
             # Update EMA if available. Honor ema_update_every here too so the manual path
             # matches the built-in SHARPv32Trainer (otherwise the flag is silently ignored
@@ -990,7 +1061,7 @@ class DedicatedSHARPTrainer:
             rgb = rgb.to(self.device)
             hsi = hsi.to(self.device)
             
-            with autocast(enabled=self.config.use_amp):
+            with autocast_context(self.device, self.amp_dtype):
                 pred = self.model(rgb)
             
             # Center crop if enabled
@@ -1057,7 +1128,9 @@ class DedicatedSHARPTrainer:
         self.writer.add_scalar('train/lr', metrics['lr'], self.iteration)
         self.writer.add_scalar('train/grad_norm', metrics['grad_norm'], self.iteration)
     
-    def _save_checkpoint(self, epoch: int, is_best: bool = False):
+    def _save_checkpoint(
+        self, epoch: int, is_best: bool = False, archive: bool = False
+    ):
         """Save model checkpoint"""
         if not self.is_main_process:
             if self.distributed:
@@ -1071,8 +1144,12 @@ class DedicatedSHARPTrainer:
             'model_state_dict': model_state,
             'best_mrae': self.best_mrae,
             'bad_val_epochs': self.bad_val_epochs,
+            'consecutive_nonfinite': self.consecutive_nonfinite,
             'skipped_oom_batches': self.skipped_oom_batches,
             'skipped_nonfinite_batches': self.skipped_nonfinite_batches,
+            'train_mrae_eps': (
+                float(self._criterion.eps) if self._criterion is not None else None
+            ),
             'config': self.config,
             'sharp_version': '3.2.2'
         }
@@ -1101,13 +1178,13 @@ class DedicatedSHARPTrainer:
                         )
                 checkpoint['ema_model_state_dict'] = ema_model_state
         
+        last_path = self.exp_dir / 'last.pth'
+        torch.save(checkpoint, last_path)
+        self._print(f"Saved checkpoint to {last_path}")
         if is_best:
-            path = self.exp_dir / 'best_model.pth'
-        else:
-            path = self.exp_dir / f'checkpoint_epoch_{epoch+1}.pth'
-        
-        torch.save(checkpoint, path)
-        self._print(f"Saved checkpoint to {path}")
+            torch.save(checkpoint, self.exp_dir / 'best_model.pth')
+        if archive and epoch >= 0:
+            torch.save(checkpoint, self.exp_dir / f'checkpoint_epoch_{epoch+1}.pth')
         if self.distributed:
             dist.barrier()
     
@@ -1125,6 +1202,7 @@ class DedicatedSHARPTrainer:
         self.iteration = checkpoint.get('iteration', 0)
         self.best_mrae = checkpoint.get('best_mrae', float('inf'))
         self.bad_val_epochs = checkpoint.get('bad_val_epochs', 0)
+        self.consecutive_nonfinite = checkpoint.get('consecutive_nonfinite', 0)
         self.skipped_oom_batches = checkpoint.get('skipped_oom_batches', 0)
         self.skipped_nonfinite_batches = checkpoint.get('skipped_nonfinite_batches', 0)
         
@@ -1242,6 +1320,10 @@ def main():
     # Optimization
     parser.add_argument('--compile', '--compile_model', dest='compile', action='store_true',
                         help='Compile model with torch.compile')
+    parser.add_argument('--amp', choices=['auto', 'bf16', 'fp16', 'off'], default='auto',
+                        help='Mixed-precision mode; auto prefers BF16 when supported')
+    parser.add_argument('--fp16_init_scale', type=float, default=1024.0,
+                        help='Initial GradScaler scale used only for FP16 AMP')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable automatic mixed precision')
     parser.add_argument('--checkpoint', action='store_true',
@@ -1259,7 +1341,13 @@ def main():
     parser.add_argument('--psnr_data_range', type=float, default=1.0,
                         help='Reference intensity range used when reporting PSNR')
     parser.add_argument('--min_mrae_denom', type=float, default=1e-6,
-                        help='Clamp floor for MRAE denominator to avoid division by zero')
+                        help='Exact validation MRAE denominator floor')
+    parser.add_argument('--train_mrae_eps_start', type=float, default=1e-2,
+                        help='Initial stable denominator floor for training MRAE')
+    parser.add_argument('--train_mrae_eps_end', type=float, default=1e-3,
+                        help='Final denominator floor for training MRAE')
+    parser.add_argument('--train_mrae_eps_anneal_steps', type=int, default=50_000,
+                        help='Successful batches for log-linear MRAE-floor annealing')
     parser.add_argument('--max_consecutive_nonfinite', type=int, default=8,
                         help='Abort after this many consecutive non-finite batches')
     parser.add_argument('--disable_oom_skip', action='store_true',
@@ -1324,6 +1412,8 @@ def main():
         spectral_head_rank=args.spectral_head_rank,
         compile_model=args.compile,
         use_amp=not args.no_amp,
+        amp='off' if args.no_amp else args.amp,
+        fp16_init_scale=args.fp16_init_scale,
         use_checkpoint=args.checkpoint,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
@@ -1332,6 +1422,9 @@ def main():
         log_interval=args.log_interval,
         psnr_data_range=args.psnr_data_range,
         min_mrae_denom=args.min_mrae_denom,
+        train_mrae_eps_start=args.train_mrae_eps_start,
+        train_mrae_eps_end=args.train_mrae_eps_end,
+        train_mrae_eps_anneal_steps=args.train_mrae_eps_anneal_steps,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         skip_oom_batches=not args.disable_oom_skip,
         output_dir=args.output_dir,

@@ -556,14 +556,34 @@ class SpectralReconstructionLoss(nn.Module):
             )
         self.delta_e = DeltaE2000Loss(mode=delta_e_mode)
 
-    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def compute(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return the weighted total alongside each *unweighted* term.
+
+        The terms are reported unweighted so that a logged value can be compared
+        directly against the matching validation metric. Without this, the total
+        is uninterpretable: DeltaE2000 is expressed in CIE units of order 1-10,
+        so a nominal 0.1 weight can still make it the largest contributor, and
+        the training MRAE cannot be recovered from the total.
+        """
+        terms: dict[str, torch.Tensor] = {}
         loss = prediction.new_zeros(())
         if self.l1_weight:
-            loss = loss + self.l1_weight * F.l1_loss(prediction, target)
+            terms["l1"] = F.l1_loss(prediction, target)
+            loss = loss + self.l1_weight * terms["l1"]
         if self.mrae_weight:
-            loss = loss + self.mrae_weight * self.mrae(prediction, target)
+            terms["mrae"] = self.mrae(prediction, target)
+            loss = loss + self.mrae_weight * terms["mrae"]
         if self.sam_weight:
-            loss = loss + self.sam_weight * self.sam(prediction, target)
+            terms["sam"] = self.sam(prediction, target)
+            loss = loss + self.sam_weight * terms["sam"]
         if self.delta_e_weight:
-            loss = loss + self.delta_e_weight * self.delta_e(prediction, target)
-        return loss
+            terms["delta_e"] = self.delta_e(prediction, target)
+            loss = loss + self.delta_e_weight * terms["delta_e"]
+        return loss, terms
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self.compute(prediction, target)[0]

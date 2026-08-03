@@ -36,27 +36,23 @@ from common_utils_v32 import (
     sdpa_unified,
     validate_model_config,
 )
+from training_stability import autocast_context, make_grad_scaler, resolve_amp_dtype
 
 logger = logging.getLogger(__name__)
 
 
-def _make_grad_scaler(enabled: bool):
-    """Use the modern torch.amp API when available while keeping older PyTorch support."""
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        try:
-            return torch.amp.GradScaler("cuda", enabled=enabled)
-        except TypeError:
-            return torch.amp.GradScaler(enabled=enabled)
-    return torch.cuda.amp.GradScaler(enabled=enabled)
+def _make_grad_scaler(enabled: bool, init_scale: float = 1024.0):
+    """Backward-compatible FP16 scaler factory used by external callers/tests."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if enabled and device.type == "cuda" else None
+    return make_grad_scaler(device, dtype, init_scale=init_scale)
 
 
-def _autocast(enabled: bool):
-    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        try:
-            return torch.amp.autocast("cuda", enabled=enabled)
-        except TypeError:
-            return torch.amp.autocast(enabled=enabled)
-    return torch.cuda.amp.autocast(enabled=enabled)
+def _autocast(enabled: bool, dtype: Optional[torch.dtype] = None):
+    """Backward-compatible autocast factory with explicit BF16/FP16 selection."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved = (dtype or torch.float16) if enabled and device.type == "cuda" else None
+    return autocast_context(device, resolved)
 
 
 def robust_version_parse(version_str: str) -> Tuple[int, int, int]:
@@ -1508,6 +1504,9 @@ class SHARPv32Trainer:
         gradient_clip: float = 1.0,
         ema_decay: float = 0.999,
         use_amp: bool = True,
+        amp: str = "auto",
+        fp16_init_scale: float = 1024.0,
+        max_consecutive_nonfinite: int = 8,
         ema_update_every: Optional[int] = None,
         criterion: Optional[Callable] = None,
     ):
@@ -1536,8 +1535,16 @@ class SHARPv32Trainer:
         warmup_steps = int(total_steps * warmup_ratio)
         self.scheduler = self._create_scheduler(warmup_steps, total_steps)
         
-        self.use_amp = use_amp and torch.cuda.is_available()
-        self.scaler = _make_grad_scaler(enabled=self.use_amp)
+        amp_mode = amp if use_amp else "off"
+        self.amp_dtype = resolve_amp_dtype(amp_mode, self.device)
+        self.use_amp = self.amp_dtype is not None
+        self.scaler = make_grad_scaler(
+            self.device, self.amp_dtype, init_scale=fp16_init_scale
+        )
+        if max_consecutive_nonfinite <= 0:
+            raise ValueError("max_consecutive_nonfinite must be > 0")
+        self.max_consecutive_nonfinite = int(max_consecutive_nonfinite)
+        self.consecutive_nonfinite = 0
         
         self.ema_decay = ema_decay
         self.ema_state = self._create_ema_state() if ema_decay > 0 else None
@@ -1594,6 +1601,7 @@ class SHARPv32Trainer:
             "scaler_state_dict": self.scaler.state_dict(),
             "ema_state": self.ema_state,
             "step": self._step,
+            "consecutive_nonfinite": self.consecutive_nonfinite,
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -1603,6 +1611,7 @@ class SHARPv32Trainer:
         self.scaler.load_state_dict(state["scaler_state_dict"])
         self.ema_state = state.get("ema_state")
         self._step = int(state.get("step", 0))
+        self.consecutive_nonfinite = int(state.get("consecutive_nonfinite", 0))
         
     def _create_ema_state(self):
         """Create EMA state on CPU to save VRAM."""
@@ -1680,12 +1689,15 @@ class SHARPv32Trainer:
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         
-        with _autocast(enabled=self.use_amp):
+        with _autocast(enabled=self.use_amp, dtype=self.amp_dtype):
             outputs = self.model(inputs)
             loss = self._loss(outputs, targets)
 
         if not self._all_ranks_true(bool(torch.isfinite(loss).item())):
             self.optimizer.zero_grad(set_to_none=True)
+            self.consecutive_nonfinite += 1
+            if self.consecutive_nonfinite >= self.max_consecutive_nonfinite:
+                raise RuntimeError("Too many consecutive non-finite SHARP losses; aborting.")
             return {
                 'loss': float('nan'),
                 'grad_norm': 0.0,
@@ -1698,19 +1710,12 @@ class SHARPv32Trainer:
         
         self.scaler.unscale_(self.optimizer)
         
-        if self.gradient_clip > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.gradient_clip
-            )
-        else:
-            grad_norm = 0.0
-
         # Single fused reduction (one host-device sync) instead of one .all() sync per
         # parameter tensor on the hot path.
         grads = [p.grad for p in self.model.parameters() if p.grad is not None]
         has_finite_grads = (
             bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
-            if grads else True
+            if grads else False
         )
 
         if not self._all_ranks_true(has_finite_grads):
@@ -1719,6 +1724,13 @@ class SHARPv32Trainer:
             # resets its per-optimizer state (and lowers the scale). Without it the next
             # step's unscale_ raises and aborts the run on the first fp16 overflow.
             self.scaler.update()
+            self.consecutive_nonfinite += 1
+            logger.warning(
+                "Non-finite SHARP gradients at step %d (loss_scale=%.3g); skipping.",
+                self._step, self.scaler.get_scale(),
+            )
+            if self.consecutive_nonfinite >= self.max_consecutive_nonfinite:
+                raise RuntimeError("Too many consecutive non-finite SHARP gradients; aborting.")
             return {
                 'loss': float('nan'),
                 'grad_norm': 0.0,
@@ -1727,9 +1739,17 @@ class SHARPv32Trainer:
                 'skipped': True,
             }
         
+        if self.gradient_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.gradient_clip
+            )
+        else:
+            grad_norm = 0.0
+
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
+        self.consecutive_nonfinite = 0
         
         self.scheduler.step()
         self.update_ema()  # v3.2.2: Throttled by ema_update_every
@@ -1777,7 +1797,7 @@ class SHARPv32Trainer:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
-            with _autocast(enabled=self.use_amp):
+            with _autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = eval_model(inputs)
                 if crop_size is not None:
                     crop_h, crop_w = crop_size

@@ -93,6 +93,13 @@ class TrainingConfig:
     validation_mrae_denominator: str = "source_additive"
     validation_mrae_epsilon: float = 1e-5
     validation_psnr_clip: bool = False
+    # Number of TRAIN scenes to score through the identical full-frame
+    # validation path. The composite training loss cannot be compared against
+    # validation MRAE (different quantity, different resolution, augmented
+    # crops), so without this there is no way to tell a model that cannot fit
+    # the training set from one that fits it and fails to generalize. Those two
+    # diagnoses call for opposite fixes. 0 disables the extra pass.
+    train_eval_scenes: int = 0
     # Checkpoint selection should use deterministic fp32 predictions. Training
     # autocast remains independently controlled by ``amp``.
     validation_amp: bool = False
@@ -133,6 +140,8 @@ class TrainingConfig:
             raise ValueError("validation_tile_size must be positive.")
         if self.validation_crop_border < 0:
             raise ValueError("validation_crop_border cannot be negative.")
+        if self.train_eval_scenes < 0:
+            raise ValueError("train_eval_scenes cannot be negative.")
         if self.validation_mrae_denominator not in {
             "clamp_abs",
             "source_additive",
@@ -271,6 +280,11 @@ def train(
             )
 
     validation_loader = _build_validation_loader(config, selected_device)
+    train_eval_loader = _build_train_eval_loader(
+        config,
+        selected_device,
+        output_dir,
+    )
     metrics_path = output_dir / "metrics.jsonl"
     latest_path = checkpoint_dir / "latest.pt"
 
@@ -318,6 +332,7 @@ def train(
         )
         train_iterator = iter(train_loader)
         running_loss = torch.zeros((), device=selected_device)
+        running_terms: dict[str, torch.Tensor] = {}
         running_count = 0
         nonfinite_skips = 0
         consecutive_skips = 0
@@ -344,7 +359,7 @@ def train(
                 enabled=amp_enabled,
             ):
                 prediction = model(rgb)
-                loss = criterion(prediction, target)
+                loss, loss_terms = criterion.compute(prediction, target)
 
             stepped = _optimization_step(
                 loss,
@@ -365,6 +380,12 @@ def train(
             global_step += 1
             if stepped:
                 running_loss.add_(loss.detach())
+                for term_name, term_value in loss_terms.items():
+                    accumulator = running_terms.get(term_name)
+                    if accumulator is None:
+                        accumulator = torch.zeros((), device=selected_device)
+                        running_terms[term_name] = accumulator
+                    accumulator.add_(term_value.detach())
                 running_count += 1
                 consecutive_skips = 0
             else:
@@ -398,13 +419,26 @@ def train(
                     "learning_rate": optimizer.param_groups[0]["lr"],
                     "nonfinite_skips": nonfinite_skips,
                 }
+                if running_count:
+                    for term_name, accumulator in running_terms.items():
+                        train_record[f"loss_{term_name}"] = float(
+                            (accumulator / running_count).item()
+                        )
                 _append_jsonl(metrics_path, train_record)
+                term_summary = " ".join(
+                    f"{name}={train_record[f'loss_{name}']:.6f}"
+                    for name in running_terms
+                    if f"loss_{name}" in train_record
+                )
                 print(
                     f"step={global_step} stage_step={stage_step} "
                     f"loss={train_record['loss']:.6f} "
+                    f"{term_summary} "
                     f"lr={train_record['learning_rate']:.3e}"
                 )
                 running_loss.zero_()
+                for accumulator in running_terms.values():
+                    accumulator.zero_()
                 running_count = 0
 
             should_validate = (
@@ -441,6 +475,38 @@ def train(
                     f"mrae={summary['mrae']:.6f} rmse={summary['rmse']:.6f} "
                     f"psnr={summary['psnr']:.4f} sam={summary['sam']:.6f}"
                 )
+                if train_eval_loader is not None:
+                    train_summary, _ = evaluate_loader(
+                        model,
+                        train_eval_loader,
+                        device=selected_device,
+                        tile_size=config.validation_tile_size,
+                        overlap=config.validation_overlap,
+                        amp=config.validation_amp,
+                        crop_border=config.validation_crop_border,
+                        mrae_denominator=config.validation_mrae_denominator,
+                        mrae_epsilon=config.validation_mrae_epsilon,
+                        psnr_clip=config.validation_psnr_clip,
+                    )
+                    _append_jsonl(
+                        metrics_path,
+                        {
+                            "type": "train_eval",
+                            "global_step": global_step,
+                            "stage_index": stage_index,
+                            "stage_step": stage_step,
+                            **train_summary,
+                        },
+                    )
+                    print(
+                        "train_eval "
+                        f"mrae={train_summary['mrae']:.6f} "
+                        f"rmse={train_summary['rmse']:.6f} "
+                        f"psnr={train_summary['psnr']:.4f} "
+                        f"sam={train_summary['sam']:.6f}"
+                    )
+                # Checkpoint selection stays on the held-out split; the training
+                # pass above is diagnostic only.
                 improved = summary["mrae"] < best_mrae
                 if improved:
                     best_mrae = summary["mrae"]
@@ -537,6 +603,44 @@ def _build_validation_loader(
         config.data_root,
         split="validation",
         manifest_path=config.validation_manifest,
+        augment=False,
+        rgb_normalization=config.rgb_normalization,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=config.num_workers > 0,
+    )
+
+
+def _build_train_eval_loader(
+    config: TrainingConfig,
+    device: torch.device,
+    output_dir: Path,
+) -> DataLoader | None:
+    """Full-frame loader over a fixed slice of TRAIN scenes.
+
+    Deliberately mirrors :func:`_build_validation_loader` exactly except for the
+    manifest, so the resulting metrics are comparable to the validation numbers
+    without any protocol caveat.
+    """
+    if config.train_eval_scenes < 1:
+        return None
+    scene_ids = load_arad_manifest("train", config.train_manifest)
+    count = min(config.train_eval_scenes, len(scene_ids))
+    # Evenly spaced rather than the first N, so the subset is not biased toward
+    # one end of the manifest, and deterministic so it is stable across runs.
+    stride = len(scene_ids) / count
+    selected = [scene_ids[int(index * stride)] for index in range(count)]
+    manifest_path = output_dir / "train_eval_manifest.txt"
+    manifest_path.write_text("\n".join(selected) + "\n", encoding="utf-8")
+    dataset = ARAD1KDataset(
+        config.data_root,
+        split="train",
+        manifest_path=manifest_path,
         augment=False,
         rgb_normalization=config.rgb_normalization,
     )

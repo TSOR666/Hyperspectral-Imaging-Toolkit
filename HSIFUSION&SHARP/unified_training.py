@@ -10,7 +10,9 @@ MST++/ARAD-1K protocol defaults (NTIRE 2022 spectral reconstruction):
   - data: ARAD-1K layout (split_txt/{train,valid}_list.txt, Train_RGB/, Train_Spec/),
     128x128 patches on a stride-8 grid, random flips + k*90-degree rotations,
     RGB / 255, HSI cubes pre-normalized to [0, 1]
-  - objective: MRAE = mean(|pred - gt| / max(|gt|, eps)), eps = 1e-6
+  - objective: MRAE = mean(|pred - gt| / max(|gt|, eps)); the training floor
+    anneals from 1e-2 to 1e-3 so dark pixels cannot explode mixed-precision
+    gradients, while validation/selection retain the exact 1e-6 protocol floor
   - recipe: Adam(beta1=0.9, beta2=0.999), lr 4e-4, batch 20, 300 epochs,
     cosine annealing to eta_min = 1e-6 stepped PER ITERATION, no weight decay,
     no warmup (both available as opt-in deviations and reported in the config dump)
@@ -28,7 +30,6 @@ ARAD validation frames (482 is not divisible by 8), and HSIFusion enforces a
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
 import json
 import math
@@ -61,6 +62,12 @@ except ImportError as exc:  # pragma: no cover - depends on repo layout
     ) from exc
 
 from optimized_dataloader import MSTPlusPlusLoss, create_optimized_dataloaders
+from training_stability import (
+    annealed_mrae_epsilon,
+    autocast_context,
+    make_grad_scaler,
+    resolve_amp_dtype,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -111,7 +118,11 @@ class UnifiedTrainingConfig:
 
     # Precision / stability
     amp: str = "auto"                     # auto | bf16 | fp16 | off
+    fp16_init_scale: float = 1024.0         # conservative for relative-error gradients
     max_consecutive_nonfinite: int = 8
+    train_mrae_eps_start: float = 1e-2      # stable optimization floor
+    train_mrae_eps_end: float = 1e-3        # exact 1e-6 remains the validation metric
+    train_mrae_eps_anneal_steps: int = 50_000
 
     # Validation / selection
     val_interval: int = 10
@@ -123,6 +134,7 @@ class UnifiedTrainingConfig:
     output_dir: str = "./experiments/unified"
     experiment_name: Optional[str] = None
     resume_from: Optional[str] = None
+    checkpoint_interval_steps: int = 5_000  # rolling mid-epoch recovery; 0 disables
     log_interval: int = 100
     seed: int = 42
     device: str = "cuda"
@@ -134,8 +146,25 @@ class UnifiedTrainingConfig:
             raise ValueError("optimizer must be adam or adamw")
         if self.amp not in {"auto", "bf16", "fp16", "off"}:
             raise ValueError("amp must be auto/bf16/fp16/off")
+        if not math.isfinite(self.fp16_init_scale) or self.fp16_init_scale <= 0:
+            raise ValueError("fp16_init_scale must be a finite positive number")
+        # Validate all schedule values eagerly instead of failing after model construction.
+        annealed_mrae_epsilon(
+            self.train_mrae_eps_start,
+            self.train_mrae_eps_end,
+            0,
+            self.train_mrae_eps_anneal_steps,
+        )
+        if not math.isfinite(self.mrae_eps) or self.mrae_eps <= 0:
+            raise ValueError("mrae_eps must be a finite positive number")
         if self.accumulate_steps <= 0:
             raise ValueError("accumulate_steps must be > 0")
+        if self.val_interval <= 0:
+            raise ValueError("val_interval must be > 0")
+        if self.max_consecutive_nonfinite <= 0:
+            raise ValueError("max_consecutive_nonfinite must be > 0")
+        if self.checkpoint_interval_steps < 0:
+            raise ValueError("checkpoint_interval_steps must be >= 0")
         if self.val_crop_border < 0:
             raise ValueError("val_crop_border must be >= 0")
         if self.epochs <= 0:
@@ -273,11 +302,11 @@ class UnifiedTrainer:
         self.exp_dir = config.experiment_path()
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
-        self.criterion = MSTPlusPlusLoss(eps=config.mrae_eps)
-        self.amp_dtype = self._resolve_amp_dtype()
+        self.criterion = MSTPlusPlusLoss(eps=config.train_mrae_eps_start)
+        self.amp_dtype = resolve_amp_dtype(config.amp, self.device)
         self.use_amp = self.amp_dtype is not None
-        self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16
+        self.scaler = make_grad_scaler(
+            self.device, self.amp_dtype, init_scale=config.fp16_init_scale
         )
 
         self.model = build_model(
@@ -311,6 +340,7 @@ class UnifiedTrainer:
 
         self.start_epoch = 0
         self.iteration = 0
+        self.optimizer_step = 0
         self.best_mrae = math.inf
         self.consecutive_nonfinite = 0
 
@@ -327,20 +357,20 @@ class UnifiedTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    def _resolve_amp_dtype(self) -> Optional[torch.dtype]:
-        if self.config.amp == "off" or not torch.cuda.is_available():
-            return None
-        if self.config.amp == "bf16":
-            return torch.bfloat16
-        if self.config.amp == "fp16":
-            return torch.float16
-        # auto: prefer bf16 (no loss-scaling failure modes; see the SSTrans fp16 collapse)
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
     def _autocast(self, enabled: bool = True):
-        if not (enabled and self.use_amp):
-            return contextlib.nullcontext()
-        return torch.amp.autocast("cuda", dtype=self.amp_dtype)
+        return autocast_context(
+            self.device, self.amp_dtype if enabled and self.use_amp else None
+        )
+
+    def _set_training_mrae_epsilon(self) -> float:
+        eps = annealed_mrae_epsilon(
+            self.config.train_mrae_eps_start,
+            self.config.train_mrae_eps_end,
+            self.optimizer_step,
+            self.config.train_mrae_eps_anneal_steps,
+        )
+        self.criterion.eps = eps
+        return eps
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         cfg = self.config
@@ -397,6 +427,7 @@ class UnifiedTrainer:
             "trainable_parameters": params,
             "device": str(self.device),
             "amp_dtype": str(self.amp_dtype),
+            "rolling_checkpoint": str(self.exp_dir / "last.pth"),
             "train_batches_per_epoch": len(self.train_loader),
             "val_scenes": len(self.val_loader.dataset),
             "total_optimizer_steps": self.total_optimizer_steps,
@@ -423,24 +454,47 @@ class UnifiedTrainer:
     def train(self) -> Dict[str, float]:
         cfg = self.config
         last_metrics: Dict[str, float] = {}
-        for epoch in range(self.start_epoch, cfg.epochs):
-            epoch_loss = self._train_epoch(epoch)
-            print(
-                f"Epoch {epoch + 1}/{cfg.epochs} - loss {epoch_loss:.6f} - "
-                f"lr {self.optimizer.param_groups[0]['lr']:.2e}"
-            )
-            if (epoch + 1) % cfg.val_interval == 0 or (epoch + 1) == cfg.epochs:
-                metrics = self.validate(epoch + 1)
-                last_metrics = metrics
-                selection = metrics.get("crop/mrae", metrics.get("full/mrae", math.inf))
-                is_best = selection < self.best_mrae
-                if is_best:
-                    self.best_mrae = selection
-                    print(f"  New best selection MRAE: {self.best_mrae:.6f}")
+        try:
+            for epoch in range(self.start_epoch, cfg.epochs):
+                try:
+                    epoch_loss = self._train_epoch(epoch)
+                    print(
+                        f"Epoch {epoch + 1}/{cfg.epochs} - loss {epoch_loss:.6f} - "
+                        f"lr {self.optimizer.param_groups[0]['lr']:.2e}"
+                    )
+                    is_best = False
+                    if (epoch + 1) % cfg.val_interval == 0 or (epoch + 1) == cfg.epochs:
+                        metrics = self.validate(epoch + 1)
+                        last_metrics = metrics
+                        selection = metrics.get(
+                            "crop/mrae", metrics.get("full/mrae", math.inf)
+                        )
+                        is_best = math.isfinite(selection) and selection < self.best_mrae
+                        if is_best:
+                            self.best_mrae = selection
+                            print(f"  New best selection MRAE: {self.best_mrae:.6f}")
+                        elif not math.isfinite(selection):
+                            warnings.warn(
+                                "Validation selection MRAE is non-finite; retaining the "
+                                "previous best checkpoint."
+                            )
+                except Exception:
+                    # Keep the most recent finite model/optimizer state even when a run
+                    # aborts during its first epoch. Resume repeats the interrupted epoch.
+                    try:
+                        self._save_checkpoint(epoch, is_best=False)
+                        print(f"  Saved recovery checkpoint after failure in epoch {epoch + 1}")
+                    except Exception as save_exc:  # pragma: no cover - filesystem failure
+                        warnings.warn(f"Could not save recovery checkpoint: {save_exc}")
+                    raise
+
+                # A rolling checkpoint is written every epoch; validation cadence only
+                # controls expensive metrics and best-model selection.
                 self._save_checkpoint(epoch + 1, is_best=is_best)
-        print(f"Training complete. Best selection MRAE: {self.best_mrae:.6f}")
-        if self.writer is not None:
-            self.writer.close()
+            print(f"Training complete. Best selection MRAE: {self.best_mrae:.6f}")
+        finally:
+            if self.writer is not None:
+                self.writer.close()
         return last_metrics
 
     def _train_epoch(self, epoch: int) -> float:
@@ -453,6 +507,7 @@ class UnifiedTrainer:
         for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
             rgb = rgb.to(self.device, non_blocking=True)
             hsi = hsi.to(self.device, non_blocking=True)
+            active_mrae_eps = self._set_training_mrae_epsilon()
 
             with self._autocast():
                 outputs = self.model(rgb)
@@ -463,16 +518,16 @@ class UnifiedTrainer:
                 if callable(aux_fn):
                     loss = loss + aux_fn()
 
-            if not torch.isfinite(loss):
+            if not bool(torch.isfinite(loss).item()):
                 self.consecutive_nonfinite += 1
                 self.optimizer.zero_grad(set_to_none=True)
                 warnings.warn(
-                    f"Non-finite loss (epoch {epoch + 1}, batch {batch_idx + 1}); skipping."
+                    f"Non-finite loss (epoch {epoch + 1}, batch {batch_idx + 1}, "
+                    f"train_mrae_eps={active_mrae_eps:.3g}); skipping."
                 )
                 if self.consecutive_nonfinite >= cfg.max_consecutive_nonfinite:
                     raise RuntimeError("Too many consecutive non-finite losses; aborting.")
                 continue
-            self.consecutive_nonfinite = 0
 
             # Weight each micro-batch by its own accumulation-group size so the final
             # (possibly partial) group is not under-weighted.
@@ -484,26 +539,40 @@ class UnifiedTrainer:
             step_now = ((batch_idx + 1) % accum == 0) or (batch_idx + 1 == total_batches)
             if step_now:
                 self.scaler.unscale_(self.optimizer)
-                if cfg.gradient_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
                 grads = [p.grad for p in self.model.parameters() if p.grad is not None]
                 finite = (
                     bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
-                    if grads else True
+                    if grads else False
                 )
                 if not finite:
                     self.optimizer.zero_grad(set_to_none=True)
                     # unscale_ already ran: update() resets scaler state (pass-4 fix).
                     self.scaler.update()
                     self.consecutive_nonfinite += 1
+                    warnings.warn(
+                        f"Non-finite gradients (epoch {epoch + 1}, batch {batch_idx + 1}, "
+                        f"train_mrae_eps={active_mrae_eps:.3g}, "
+                        f"loss_scale={self.scaler.get_scale():.3g}); skipping optimizer step."
+                    )
                     if self.consecutive_nonfinite >= cfg.max_consecutive_nonfinite:
                         raise RuntimeError("Too many consecutive non-finite grads; aborting.")
                     continue
+                if cfg.gradient_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
                 self._update_ema()
+                self.optimizer_step += 1
+                self.consecutive_nonfinite = 0
+                if (
+                    cfg.checkpoint_interval_steps > 0
+                    and self.optimizer_step % cfg.checkpoint_interval_steps == 0
+                ):
+                    # `epoch` is the count of fully completed epochs, so resuming this
+                    # mid-epoch checkpoint safely repeats the interrupted epoch.
+                    self._save_checkpoint(epoch, is_best=False)
 
             running += loss.item()
             counted += 1
@@ -517,6 +586,9 @@ class UnifiedTrainer:
                 if self.writer is not None:
                     self.writer.add_scalar("train/loss", loss.item(), self.iteration)
                     self.writer.add_scalar("train/lr", lr, self.iteration)
+                    self.writer.add_scalar(
+                        "train/mrae_epsilon", active_mrae_eps, self.iteration
+                    )
         return running / max(1, counted)
 
     @torch.no_grad()
@@ -615,7 +687,9 @@ class UnifiedTrainer:
             "scaler_state_dict": self.scaler.state_dict(),
             "epoch": epoch,
             "iteration": self.iteration,
+            "optimizer_step": self.optimizer_step,
             "best_mrae": self.best_mrae,
+            "train_mrae_eps": float(self.criterion.eps),
         }
         ema_sd = self._ema_state_dict()
         if ema_sd is not None:
@@ -642,6 +716,9 @@ class UnifiedTrainer:
         self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         self.start_epoch = int(ckpt.get("epoch", 0))
         self.iteration = int(ckpt.get("iteration", 0))
+        self.optimizer_step = int(
+            ckpt.get("optimizer_step", max(0, self.scheduler.last_epoch))
+        )
         self.best_mrae = float(ckpt.get("best_mrae", math.inf))
         if self.ema_state is not None and "ema_shadow" in ckpt:
             self.ema_state = {k: v.float().cpu() for k, v in ckpt["ema_shadow"].items()}
@@ -683,12 +760,26 @@ def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
                         help="EMA decay (e.g. 0.999); 0 disables (MST++ faithful)")
     parser.add_argument("--amp", type=str, default="auto",
                         choices=["auto", "bf16", "fp16", "off"])
+    parser.add_argument("--fp16_init_scale", type=float, default=1024.0,
+                        help="Initial GradScaler scale used only for FP16 AMP")
+    parser.add_argument("--train_mrae_eps_start", type=float, default=1e-2,
+                        help="Initial denominator floor for the training MRAE")
+    parser.add_argument("--train_mrae_eps_end", type=float, default=1e-3,
+                        help="Final denominator floor for the training MRAE")
+    parser.add_argument("--train_mrae_eps_anneal_steps", type=int, default=50_000,
+                        help="Optimizer steps for log-linear MRAE-floor annealing")
+    parser.add_argument("--mrae_eps", type=float, default=1e-6,
+                        help="Exact validation/selection MRAE denominator floor")
+    parser.add_argument("--max_consecutive_nonfinite", type=int, default=8,
+                        help="Abort after this many failed optimizer attempts")
     parser.add_argument("--val_interval", type=int, default=10)
     parser.add_argument("--val_crop_border", type=int, default=128,
                         help="MST++ selection crop border (0 = full-frame selection)")
     parser.add_argument("--output_dir", type=str, default="./experiments/unified")
     parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--checkpoint_interval_steps", type=int, default=5_000,
+                        help="Rolling mid-epoch checkpoint cadence (0 disables)")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
@@ -722,11 +813,18 @@ def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
         gradient_clip=args.gradient_clip,
         ema_decay=args.ema_decay,
         amp=args.amp,
+        fp16_init_scale=args.fp16_init_scale,
+        train_mrae_eps_start=args.train_mrae_eps_start,
+        train_mrae_eps_end=args.train_mrae_eps_end,
+        train_mrae_eps_anneal_steps=args.train_mrae_eps_anneal_steps,
+        mrae_eps=args.mrae_eps,
+        max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         val_interval=args.val_interval,
         val_crop_border=args.val_crop_border,
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,
         resume_from=args.resume,
+        checkpoint_interval_steps=args.checkpoint_interval_steps,
         log_interval=args.log_interval,
         seed=args.seed,
         device=args.device,

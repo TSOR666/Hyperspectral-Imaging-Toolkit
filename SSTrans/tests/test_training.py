@@ -94,6 +94,9 @@ def test_nonfinite_loss_is_skipped_without_corrupting_weights(
                 return prediction.sum() * float("nan")
             return self._real(prediction, target)
 
+        def compute(self, prediction, target):
+            return self.forward(prediction, target), {}
+
     monkeypatch.setattr(training_module, "SpectralReconstructionLoss", FlakyLoss)
 
     config = TrainingConfig(
@@ -182,6 +185,9 @@ def test_persistent_nonfinite_loss_trips_circuit_breaker(
 
         def forward(self, prediction, target):
             return prediction.sum() * float("nan")
+
+        def compute(self, prediction, target):
+            return self.forward(prediction, target), {}
 
     monkeypatch.setattr(training_module, "SpectralReconstructionLoss", AlwaysNaNLoss)
 
