@@ -276,6 +276,13 @@ class DualTransformerBlock(nn.Module):
         if num_heads is None:
             num_heads = config.get("num_heads", 4)
         ffn_expansion = float(config.get("ffn_expansion", 2.66))
+        self.outer_residual_scale = float(
+            config.get("sstb_outer_residual_scale", 1.0)
+        )
+        if not torch.isfinite(torch.tensor(self.outer_residual_scale)):
+            raise ValueError("sstb_outer_residual_scale must be finite")
+        if self.outer_residual_scale < 0.0:
+            raise ValueError("sstb_outer_residual_scale must be non-negative")
 
         self.gate = CBAMChannelGate(channels, reduction=int(config.get("cbam_reduction", 4)))
         self.norm1 = ChannelLayerNorm(channels)
@@ -335,7 +342,17 @@ class DualTransformerBlock(nn.Module):
         h = h + self.gdfn(self.norm2(h))
         h = h + self.spatial_attn(self.norm3(h))     # Eq. 5 spatial pair
         h = h + self.sgfn(self.norm4(h))
-        return h + x                                  # Eq. 2 outer residual
+        # Each block already contains four inner residual additions and the
+        # channel gate passes roughly half of x at initialization.  Adding the
+        # whole branch at unit scale therefore behaves like ~1.5*x per block;
+        # the 12-block production network amplifies fresh features enough that
+        # the output head previously had to be shrunk 100x.  That workaround
+        # also shrank every body gradient 100x and left the RGB 1x1 skip doing
+        # most of the learning.  Residual-in-residual scaling keeps the block
+        # near identity while retaining direct gradients through a normally
+        # initialized output head.  The default remains 1.0 so existing
+        # checkpoints preserve their exact function.
+        return x + self.outer_residual_scale * h       # Eq. 2 outer residual
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         should_checkpoint = (

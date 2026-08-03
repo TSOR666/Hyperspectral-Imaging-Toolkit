@@ -804,9 +804,9 @@ def _run_stage(
                         "Initial training loss is pathologically high: "
                         f"{initial_loss:.6g} > max_initial_train_loss="
                         f"{max_initial_train_loss:.6g}. Refusing to optimize "
-                        "toward a collapsed low-output solution. Start a fresh "
-                        "model with output_head_init_scale=0.01 (the shipped "
-                        "config) and do not resume incompatible July checkpoints."
+                        "toward a collapsed low-output solution. Use the shipped "
+                        "residual-balanced fresh-run config and do not resume "
+                        "an architecture-incompatible checkpoint."
                     )
 
             if check_finite and not pred_is_finite:
@@ -1334,7 +1334,8 @@ def main(config: DictConfig) -> None:
                 "objective=%s, sampling=%s, spectral=%s, cswin=%s, "
                 "base_channels=%s, stage_depths=%s, cascade=%s, "
                 "input_skip=%s, feature_norm=%s, input_denoising=%s, "
-                "smsa_output_norm=%s, refinement_blocks=%s",
+                "smsa_output_norm=%s, sstb_residual_scale=%s, "
+                "output_head_init_scale=%s, refinement_blocks=%s",
                 cfg.get("objective", "mrae"),
                 cfg.get("sampling"),
                 cfg.get("spectral_attention_type"),
@@ -1346,6 +1347,8 @@ def main(config: DictConfig) -> None:
                 cfg.get("use_feature_norm", True),
                 cfg.get("use_input_denoising", True),
                 cfg.get("smsa_output_norm", True),
+                cfg.get("sstb_outer_residual_scale", 1.0),
+                cfg.get("output_head_init_scale"),
                 cfg.get("refinement_blocks", 0),
             )
             main_logger.info("=" * 60)

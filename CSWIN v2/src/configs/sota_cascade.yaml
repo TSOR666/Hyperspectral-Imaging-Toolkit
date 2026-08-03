@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 # ============================================================================
-# Stable-initialization recovery recipe. FRESH RUN ONLY.
+# Residual-balanced recovery recipe. FRESH RUN ONLY.
 #
 # The filename is retained for command compatibility; this is deliberately not
 # a three-stage cascade. A 2026-07-23 local/global run using the previous
@@ -18,13 +18,18 @@ defaults:
 # near the well-conditioned zero-prediction MRAE baseline (~1) and has a direct
 # radiometric gradient path.
 #
-# The 2026-07-25 run confirmed that initialization fix (MRAE 0.769 -> 0.523),
-# then stalled around PSNR 21 dB. Its active config still enabled three legacy
-# paths whose implementations explicitly remove low-frequency intensity:
-# GroupNorm after embedding/down/up convolutions, GroupNorm at the S-MSA output,
-# and a randomly initialized clean-input "denoising" residual. Disable all
-# three for the next FRESH run so the transformer body can carry brightness
-# information instead of leaving that job to the shallow 1x1 spectral skip.
+# Two subsequent runs with the 0.01-scaled output head reached only 0.5233 and
+# 0.5246 MRAE. Disabling all legacy normalization/denoising paths did not move
+# the optimum. A gradient probe explains the plateau: the tiny head made the
+# bottleneck gradient ~56,000x smaller than the head gradient, so the shallow
+# RGB skip learned while the transformer body was effectively starved.
+#
+# The June control run reached 0.2737 MRAE / 29.56 dB with a normally scaled
+# head and a 70k cosine horizon (LR ~1.8e-6 by 68k). The later 300k horizon was
+# still applying a large LR when validation began regressing. This recipe keeps
+# fresh activations bounded with a 0.1 residual-in-residual scale, restores the
+# full-gradient output head, and restores the empirically successful 70k
+# schedule. Exact MRAE is reached late in that decaying-LR schedule.
 #
 # Do not resume either failed July checkpoint bundle. Enabling the spectral
 # prior adds parameters, and initialization changes only take effect on a fresh
@@ -41,9 +46,24 @@ use_input_denoising: false
 smsa_output_norm: false
 cascade_stages: 1
 thick_output_head: false
-output_head_init_scale: 0.01
+sstb_outer_residual_scale: 0.1
+output_head_init_scale: 1.0
 use_spectral_input_skip: true
 refinement_blocks: 0
 
-log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_radiometric_fresh
-checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_radiometric_fresh
+objective: mrae_annealed
+mrae_epsilon: 1.0e-2
+mrae_epsilon_start: 1.0e-2
+mrae_epsilon_end: 1.0e-8
+mrae_epsilon_anneal_iters: 50000
+
+progressive_stages:
+  - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
+
+early_stopping_patience: 8
+early_stopping_min_delta: 5.0e-5
+early_stopping_warmup_epochs: 50
+early_stopping_final_stage_only: true
+
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_residual_balanced
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_residual_balanced
