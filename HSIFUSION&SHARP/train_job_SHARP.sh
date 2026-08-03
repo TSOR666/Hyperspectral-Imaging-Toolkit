@@ -90,7 +90,7 @@ echo ""
 
 echo "=== Starting Optimized MST++ Training ==="
 echo "Timestamp: $(date)"
-echo "Using MST++ compliant configuration with batch_size=20 and cosine restarts"
+echo "Using the canonical unified trainer with batch_size=20 and cosine decay"
 echo ""
 
 # Run training with optimized configuration
@@ -108,7 +108,12 @@ echo ""
 
 
 
-python sharp_training_script_fixed.py --data_root dataset
+python unified_training.py \
+    --model sharp \
+    --model_size base \
+    --data_root ./dataset \
+    --output_dir ./experiments/sharp \
+    --amp auto
 
 
 # Capture exit code
@@ -137,14 +142,12 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     echo "=== Training completed successfully! ==="
     
     # Run quick validation on best model if available
-    if [ -f "checkpoints/arad1k/best.pth" ]; then
+    if [ -f "experiments/sharp/sharp_base/best.pth" ]; then
         echo "=== Running validation on best model ==="
-        python robust_test.py \
-            --checkpoint checkpoints/arad1k/best.pth \
-            --data_dir ./ARAD_1K_Efficient \
-            --output_dir ./validation_results \
-            --max_samples 10 \
-            --visualize
+        python unified_inference.py \
+            experiments/sharp/sharp_base/best.pth \
+            --data_root ./dataset \
+            --out_dir ./validation_results/sharp
     fi
     
 else
@@ -152,8 +155,8 @@ else
     
     # Save debug information
     echo "=== Saving debug information ==="
-    if [ -f "checkpoints/arad1k/emergency.pth" ]; then
-        echo "Emergency checkpoint saved"
+    if [ -f "experiments/sharp/sharp_base/last.pth" ]; then
+        echo "Recovery checkpoint: experiments/sharp/sharp_base/last.pth"
     fi
     
     # Show last few lines of log for quick diagnosis

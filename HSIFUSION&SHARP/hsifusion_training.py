@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 try:
@@ -44,6 +43,12 @@ except ImportError:
 
 from hsifusion_v252_complete import create_hsifusion_lightning_pro
 from optimized_dataloader import MSTPlusPlusLoss, create_optimized_dataloaders
+from training_stability import (
+    annealed_mrae_epsilon,
+    autocast_context,
+    make_grad_scaler,
+    resolve_amp_dtype,
+)
 
 
 def _torch_load_compat(path: str, map_location: torch.device):
@@ -100,6 +105,8 @@ class HSIFusionTrainingConfig:
 
     # Runtime features
     use_amp: bool = True
+    amp: str = "auto"  # auto | bf16 | fp16 | off; use_amp=False remains a legacy alias
+    fp16_init_scale: float = 1024.0
     compile_model: bool = True
     use_channels_last: bool = True
     cross_attention_max_tokens: Optional[int] = 1024
@@ -126,6 +133,9 @@ class HSIFusionTrainingConfig:
     device: str = "cuda"
     seed: int = 42
     min_mrae_denom: float = 1e-6
+    train_mrae_eps_start: float = 1e-2
+    train_mrae_eps_end: float = 1e-3
+    train_mrae_eps_anneal_steps: int = 50_000
     max_consecutive_nonfinite: int = 8
     skip_oom_batches: bool = True
 
@@ -138,6 +148,19 @@ class HSIFusionTrainingConfig:
             raise ValueError("cross_attention_max_tokens must be positive or None")
         if self.spectral_min_bands_per_group < 1:
             raise ValueError("spectral_min_bands_per_group must be >= 1")
+        amp_mode = self.amp if self.use_amp else "off"
+        if amp_mode not in {"auto", "bf16", "fp16", "off"}:
+            raise ValueError("amp must be auto/bf16/fp16/off")
+        annealed_mrae_epsilon(
+            self.train_mrae_eps_start,
+            self.train_mrae_eps_end,
+            0,
+            self.train_mrae_eps_anneal_steps,
+        )
+        if not math.isfinite(self.min_mrae_denom) or self.min_mrae_denom <= 0:
+            raise ValueError("min_mrae_denom must be a finite positive number")
+        if self.max_consecutive_nonfinite <= 0:
+            raise ValueError("max_consecutive_nonfinite must be > 0")
 
     def experiment_path(self) -> Path:
         root = Path(self.output_dir)
@@ -158,9 +181,13 @@ class HSIFusionTrainer:
         (self.exp_dir / "checkpoints").mkdir(exist_ok=True)
 
         self.writer = SummaryWriter(log_dir=self.exp_dir / "tensorboard")
-        self.criterion = MSTPlusPlusLoss()
-        self.use_amp = config.use_amp and self.device.type == "cuda"
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.criterion = MSTPlusPlusLoss(eps=config.train_mrae_eps_start)
+        amp_mode = config.amp if config.use_amp else "off"
+        self.amp_dtype = resolve_amp_dtype(amp_mode, self.device)
+        self.use_amp = self.amp_dtype is not None
+        self.scaler = make_grad_scaler(
+            self.device, self.amp_dtype, init_scale=config.fp16_init_scale
+        )
 
         self.model = self._build_model()
         self.train_loader, self.val_loader = self._build_dataloaders()
@@ -168,6 +195,7 @@ class HSIFusionTrainer:
         self.optimizer, self.scheduler = self._build_optimisers(steps_per_epoch)
         self.start_epoch = 0
         self.iteration = 0
+        self.optimizer_step = 0
         self.best_mrae = math.inf
         self.bad_val_epochs = 0
         self.consecutive_nonfinite = 0
@@ -186,11 +214,13 @@ class HSIFusionTrainer:
         # (hundreds of serialized syncs on GPU). Mirrors the scaler's own inf check.
         grads = [p.grad for p in self.model.parameters() if p.grad is not None]
         if not grads:
-            return True
+            return False
         flags = torch.stack([torch.isfinite(g).all() for g in grads])
         return bool(flags.all().item())
 
     def _safe_mrae(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        prediction = prediction.float()
+        target = target.float()
         denom = torch.clamp_min(torch.abs(target), self.config.min_mrae_denom)
         return torch.mean(torch.abs(prediction - target) / denom)
 
@@ -262,6 +292,7 @@ class HSIFusionTrainer:
         checkpoint = {
             "epoch": epoch,
             "iteration": self.iteration,
+            "optimizer_step": self.optimizer_step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": self.scaler.state_dict(),
@@ -271,11 +302,15 @@ class HSIFusionTrainer:
             "consecutive_nonfinite": self.consecutive_nonfinite,
             "skipped_oom_batches": self.skipped_oom_batches,
             "skipped_nonfinite_batches": self.skipped_nonfinite_batches,
+            "train_mrae_eps": float(self.criterion.eps),
             "config": self.config,
         }
-        suffix = "best.pth" if is_best else f"epoch_{epoch:04d}.pth"
-        path = self.exp_dir / "checkpoints" / suffix
-        torch.save(checkpoint, path)
+        checkpoint_dir = self.exp_dir / "checkpoints"
+        torch.save(checkpoint, checkpoint_dir / "last.pth")
+        if is_best:
+            torch.save(checkpoint, checkpoint_dir / "best.pth")
+        if self.config.save_interval > 0 and epoch > 0 and epoch % self.config.save_interval == 0:
+            torch.save(checkpoint, checkpoint_dir / f"epoch_{epoch:04d}.pth")
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         ckpt = _torch_load_compat(checkpoint_path, self.device)
@@ -285,6 +320,9 @@ class HSIFusionTrainer:
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.start_epoch = ckpt.get("epoch", 0)
         self.iteration = ckpt.get("iteration", 0)
+        self.optimizer_step = int(
+            ckpt.get("optimizer_step", max(0, self.scheduler.last_epoch))
+        )
         self.best_mrae = ckpt.get("best_mrae", math.inf)
         self.bad_val_epochs = ckpt.get("bad_val_epochs", 0)
         self.consecutive_nonfinite = ckpt.get("consecutive_nonfinite", 0)
@@ -319,9 +357,16 @@ class HSIFusionTrainer:
             for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
                 rgb = rgb.to(self.device, non_blocking=True)
                 hsi = hsi.to(self.device, non_blocking=True)
+                active_mrae_eps = annealed_mrae_epsilon(
+                    self.config.train_mrae_eps_start,
+                    self.config.train_mrae_eps_end,
+                    self.optimizer_step,
+                    self.config.train_mrae_eps_anneal_steps,
+                )
+                self.criterion.eps = active_mrae_eps
 
                 try:
-                    with autocast(enabled=self.use_amp):
+                    with autocast_context(self.device, self.amp_dtype):
                         outputs = self.model(rgb)
                         if isinstance(outputs, tuple):
                             outputs, _ = outputs
@@ -342,21 +387,22 @@ class HSIFusionTrainer:
                         continue
                     raise
 
-                if not torch.isfinite(loss):
+                if not bool(torch.isfinite(loss).item()):
                     self.consecutive_nonfinite += 1
                     self.skipped_nonfinite_batches += 1
                     self.optimizer.zero_grad(set_to_none=True)
                     warnings.warn(
-                        f"Non-finite loss at epoch={epoch+1}, batch={batch_idx+1}; "
+                        f"Non-finite loss at epoch={epoch+1}, batch={batch_idx+1}, "
+                        f"train_mrae_eps={active_mrae_eps:.3g}; "
                         f"skipping update ({self.consecutive_nonfinite} consecutive)."
                     )
                     if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                        self._save_checkpoint(epoch, is_best=False)
                         raise RuntimeError(
                             "Exceeded maximum consecutive non-finite losses; aborting to avoid divergence."
                         )
                     continue
 
-                self.consecutive_nonfinite = 0
                 # Scale each micro-batch by the size of ITS OWN accumulation group: this is
                 # accumulate_steps for every full group, but only the remainder for the final
                 # partial group of the epoch. Using a constant accumulate_steps would shrink the
@@ -369,9 +415,7 @@ class HSIFusionTrainer:
                 self.scaler.scale(loss_scaled).backward()
 
                 if should_optimizer_step(batch_idx, total_steps, self.config.accumulate_steps):
-                    if self.config.gradient_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    self.scaler.unscale_(self.optimizer)
 
                     if not self._has_finite_gradients():
                         self.consecutive_nonfinite += 1
@@ -384,18 +428,28 @@ class HSIFusionTrainer:
                         # the whole run on the first fp16 overflow this guard exists to survive.
                         self.scaler.update()
                         warnings.warn(
-                            f"Non-finite gradients at epoch={epoch+1}, batch={batch_idx+1}; skipping optimizer step."
+                            f"Non-finite gradients at epoch={epoch+1}, batch={batch_idx+1}, "
+                            f"train_mrae_eps={active_mrae_eps:.3g}, "
+                            f"loss_scale={self.scaler.get_scale():.3g}; "
+                            "skipping optimizer step."
                         )
                         if self.consecutive_nonfinite >= self.config.max_consecutive_nonfinite:
+                            self._save_checkpoint(epoch, is_best=False)
                             raise RuntimeError(
                                 "Exceeded maximum consecutive non-finite gradients; aborting to avoid divergence."
                             )
                         continue
 
+                    if self.config.gradient_clip > 0:
+                        nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.gradient_clip
+                        )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     self._step_scheduler()
+                    self.optimizer_step += 1
+                    self.consecutive_nonfinite = 0
 
                 running_loss += loss.item()
                 successful_batches += 1
@@ -405,6 +459,9 @@ class HSIFusionTrainer:
                     current_lr = self.optimizer.param_groups[0]["lr"]
                     self.writer.add_scalar("train/loss", loss.item(), self.iteration)
                     self.writer.add_scalar("train/lr", current_lr, self.iteration)
+                    self.writer.add_scalar(
+                        "train/mrae_epsilon", active_mrae_eps, self.iteration
+                    )
 
             avg_loss = running_loss / max(1, successful_batches)
             print(f"Epoch {epoch+1}/{self.config.epochs} - train loss: {avg_loss:.6f}")
@@ -430,7 +487,7 @@ class HSIFusionTrainer:
                         f"without improvement > {self.config.early_stopping_min_delta}."
                     )
                     break
-            elif (epoch + 1) % self.config.save_interval == 0:
+            else:
                 self._save_checkpoint(epoch + 1, is_best=False)
 
         print("Training complete.")
@@ -453,7 +510,7 @@ class HSIFusionTrainer:
                 # best-checkpoint selection must be computed on fp32 predictions for
                 # comparability. Running the sparse per-image val set (batch_size=1) without
                 # AMP is cheap and removes fp16 rounding from the reported/selected metric.
-                with autocast(enabled=False):
+                with autocast_context(self.device, None):
                     outputs = self.model(rgb)
                     if isinstance(outputs, tuple):
                         outputs, _ = outputs
@@ -481,6 +538,10 @@ def parse_args() -> HSIFusionTrainingConfig:
     parser.add_argument("--gradient_clip", type=float, default=1.0)
     parser.add_argument("--accumulate_steps", type=int, default=1)
     parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto",
+                        help="Mixed-precision mode; auto prefers BF16 when supported")
+    parser.add_argument("--fp16_init_scale", type=float, default=1024.0,
+                        help="Initial GradScaler scale used only for FP16 AMP")
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--memory_mode", type=str, default="float16",
@@ -499,6 +560,9 @@ def parse_args() -> HSIFusionTrainingConfig:
     parser.add_argument("--spectral_min_bands_per_group", type=int, default=4,
                         help="Floor on spectral-attention per-band QK width (use 1 to resume pre-pass-5 checkpoints)")
     parser.add_argument("--min_mrae_denom", type=float, default=1e-6)
+    parser.add_argument("--train_mrae_eps_start", type=float, default=1e-2)
+    parser.add_argument("--train_mrae_eps_end", type=float, default=1e-3)
+    parser.add_argument("--train_mrae_eps_anneal_steps", type=int, default=50_000)
     parser.add_argument("--max_consecutive_nonfinite", type=int, default=8)
     parser.add_argument("--early_stopping_patience", type=int, default=40)
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-5)
@@ -524,6 +588,8 @@ def parse_args() -> HSIFusionTrainingConfig:
         accumulate_steps=args.accumulate_steps,
         warmup_epochs=args.warmup_epochs,
         use_amp=not args.no_amp,
+        amp="off" if args.no_amp else args.amp,
+        fp16_init_scale=args.fp16_init_scale,
         compile_model=not args.no_compile,
         memory_mode=args.memory_mode,
         patch_size=args.patch_size,
@@ -538,6 +604,9 @@ def parse_args() -> HSIFusionTrainingConfig:
         standard_attn_rope=not args.no_standard_attn_rope,
         spectral_min_bands_per_group=args.spectral_min_bands_per_group,
         min_mrae_denom=args.min_mrae_denom,
+        train_mrae_eps_start=args.train_mrae_eps_start,
+        train_mrae_eps_end=args.train_mrae_eps_end,
+        train_mrae_eps_anneal_steps=args.train_mrae_eps_anneal_steps,
         max_consecutive_nonfinite=args.max_consecutive_nonfinite,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,

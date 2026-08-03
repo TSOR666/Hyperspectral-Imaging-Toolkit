@@ -37,6 +37,7 @@
   "validation_mrae_denominator": "source_additive",
   "validation_mrae_epsilon": 0.00001,
   "validation_psnr_clip": false,
+  "train_eval_scenes": 50,
   "validation_amp": false,
   "rgb_normalization": "per_image",
   "seed": 42,

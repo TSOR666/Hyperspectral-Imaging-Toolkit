@@ -71,6 +71,18 @@ def _resolve_rgb_path(rgb_dir: str, name: str) -> Optional[str]:
 _HSI_RANGE_WARNED = False
 
 
+def _validate_hsi_is_finite(hsi: np.ndarray, path: str) -> None:
+    """Reject corrupt cubes before NaN/Inf values can poison an optimizer step."""
+    finite = np.isfinite(hsi)
+    if finite.all():
+        return
+    invalid = int(hsi.size - np.count_nonzero(finite))
+    raise ValueError(
+        f"HSI cube {path} contains {invalid} NaN/Inf value(s); "
+        "repair or exclude this sample before training."
+    )
+
+
 def _warn_if_hsi_out_of_range(hsi: np.ndarray, path: str) -> None:
     """Emit a single loud warning if an HSI cube is not in the expected [0, 1] range.
 
@@ -233,6 +245,8 @@ class OptimizedTrainDataset(Dataset):
         with h5py.File(self.hsi_files[idx], 'r') as f:
             hsi = np.array(f['cube'], dtype=np.float32)
         hsi = np.transpose(hsi, [0, 2, 1])  # [31, H, W]
+
+        _validate_hsi_is_finite(hsi, self.hsi_files[idx])
 
         # The pipeline assumes HSI cubes are pre-normalized to [0, 1] (MST++/ARAD-1K convention):
         # RGB is /255, the model output activations target [0,1], and PSNR uses data_range=1.0.
@@ -458,6 +472,7 @@ class OptimizedValDataset(Dataset):
             with h5py.File(self.hsi_files[i], 'r') as f:
                 hsi = np.array(f['cube'], dtype=np.float32)
             hsi = np.transpose(hsi, [0, 2, 1])
+            _validate_hsi_is_finite(hsi, self.hsi_files[i])
             _warn_if_hsi_out_of_range(hsi, self.hsi_files[i])
 
             # Apply memory mode
@@ -492,12 +507,16 @@ class MSTPlusPlusLoss(torch.nn.Module):
     
     def __init__(self, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("MRAE epsilon must be a finite positive number")
+        self.eps = float(eps)
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute MRAE loss"""
-        denom = torch.clamp_min(torch.abs(target), self.eps)
-        return torch.mean(torch.abs(pred - target) / denom)
+        """Compute MRAE in FP32 so AMP cannot overflow the relative-error reduction."""
+        pred_fp32 = pred.float()
+        target_fp32 = target.float()
+        denom = torch.clamp_min(torch.abs(target_fp32), self.eps)
+        return torch.mean(torch.abs(pred_fp32 - target_fp32) / denom)
 
 
 def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None) -> Tuple[DataLoader, DataLoader]:
