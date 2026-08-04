@@ -225,16 +225,21 @@ print('✅ Installation verified!')
 - Tune `lazy_cache_size` to trade RAM for random-access speed. Keep `memory_mode=standard` when throughput matters more than resident memory.
 
 ### For Better Quality:
-- Use the 70k-step residual-balanced `sota_cascade` recipe. The June control
-  reached MRAE 0.2737 / PSNR 29.56 near the end of a 70k cosine schedule; the
-  later 300k schedule regressed after its midpoint while retaining a high LR.
+- Use the full 300k-step residual-balanced `sota_cascade` recipe, matching the
+  MST++ training horizon. The shorter June run was a useful diagnostic control,
+  not the production schedule. Early stopping is disabled for this phase.
+- Keep the annealed training denominator at its `1e-3` floor. Exact `1e-8`
+  MRAE remains the validation/checkpoint metric and belongs in a later
+  low-learning-rate fine-tune, not the fresh-model phase.
 - Start a fresh run after changing the objective to `mrae_annealed`
 - Use `--config-name sota_cascade` only for a fresh run. It now pins the
   local/global single-pass architecture, balances the SSTB outer residuals,
   uses a normally initialized output head plus an RGB spectral prior, disables
   legacy radiometry-stripping
   normalization/denoising paths, and writes to separate recovery directories.
-  Never resume either failed July 2026 checkpoint bundle.
+  It verifies the 300k horizon, stable floor, and disabled early stopping before
+  loading data, then records the resolved config plus fingerprint in the log
+  directory. Never resume either failed July 2026 checkpoint bundle.
 - For the successful 2026-07-25 stable-init run, stop at the saved 164k best
   checkpoint rather than the degraded 185k latest checkpoint. Start the
   exact-objective phase with the `finetune_128_exact_mrae` config and set

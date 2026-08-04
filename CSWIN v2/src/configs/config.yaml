@@ -122,6 +122,10 @@ resume_checkpoint: null
 finetune_checkpoint: null
 optimizer: adam          # matches MST++ training
 weight_decay: 0.0
+# Configurable for diagnostics; 0 disables clipping while still measuring and
+# checking the total gradient norm. Keep 1.0 as the checkpoint-compatible
+# behavior used by this trainer and its successful control run.
+gradient_clip_norm: 1.0
 # The MRAE denominator floor. IMPORTANT: epsilon=1e-8 is the leaderboard
 # *metric* floor, NOT a trainable objective. Annealing the *training* floor down
 # to 1e-8 makes the loss ill-conditioned: ARAD [0,1] targets have a heavy
