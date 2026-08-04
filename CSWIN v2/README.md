@@ -67,20 +67,27 @@ historical filename is retained for command compatibility; it no longer
 enables the failed three-pass cascade bundle. The shared training protocol uses:
 
 - RGB input `(B, 3, H, W)` and HSI output `(B, 31, H, W)`.
-- Adam with learning rate `4e-4` and a 70k-step cosine decay. This restores the
-  horizon of the June control run that reached MRAE 0.2737 / PSNR 29.56;
-  extending this model to a 300k horizon kept the LR high while validation
-  regressed.
+- Adam with learning rate `4e-4` and the benchmark-aligned MST++ 300k-step
+  cosine decay. A shorter June diagnostic reached MRAE 0.2737 / PSNR 29.56,
+  but it is architecture evidence rather than a replacement training horizon.
 - Stabilized pure-MRAE loss (`objective=mrae_annealed`, no L1 term): the
-  denominator floor decays from `1e-2` to exact `1e-8` during the first 50k
-  updates. Exact leaderboard MRAE is also used for validation/checkpoint
-  selection.
+  denominator floor decays from `1e-2` to `1e-3` during the first 50k
+  updates. Exact leaderboard MRAE (`1e-8`) is still used for
+  validation/checkpoint selection; move to an exact-objective fine-tune only
+  after the stable-floor phase converges.
+- Gradient norms and the configured clipping threshold are logged. The fresh
+  recipe and checkpoint fine-tunes retain the historical `1.0` clip used by
+  the trainer's successful control run.
 - BF16 on Ampere-or-newer CUDA devices, FP16 on older Tensor Core GPUs.
 - EMA weights for validation and best-checkpoint export.
 - A `0.1` outer SSTB residual scale keeps fresh activations bounded while the
   normally initialized output projection preserves gradients into the body.
 - A first-update guard that aborts if training loss exceeds `10`, catching a
   pathological initialization before it consumes a long accelerator run.
+- A named training contract verifies the full 300k stage, stable objective,
+  disabled early stopping, and critical architecture values before dataset
+  loading. Every run also writes the resolved Hydra configuration and a
+  fingerprint to `resolved_config.yaml` in its log directory.
 - No post-convolution or S-MSA-output GroupNorm and no clean-input denoising
   residual in `sota_cascade`; all three are legacy checkpoint-compatibility
   paths that limit brightness reconstruction in a fresh model.
@@ -124,7 +131,7 @@ python src/hsi_model/train_generator.py --config-name ablation_decoder_lite
 # Combined annealed-MRAE and decoder experiment
 python src/hsi_model/train_generator.py --config-name ablation_stable_lite
 
-# Fresh residual-balanced recovery with a 70k cosine horizon
+# Fresh residual-balanced recovery with the full MST++ 300k cosine horizon
 python src/hsi_model/train_generator.py --config-name sota_cascade
 
 # Isolate the three CSWin recovery levers one at a time
@@ -174,7 +181,15 @@ python src/hsi_model/train_generator.py \
 > regressed to 0.577060 at 215k while PSNR continued rising. Stop it, retain the
 > 115k `best_model.pth`, and use `finetune_radiometric_exact_mrae` if salvaging
 > that checkpoint. The fresh `sota_cascade` recipe addresses the underlying
-> body-gradient starvation and overly long LR horizon.
+> body-gradient starvation while preserving the benchmark training horizon.
+>
+> The 2026-08-03 residual-balanced run in `train_generator 17.log` correctly
+> resolved the 300k MST++ horizon; LR `3.58e-4` at 64k was therefore expected.
+> Its actual recipe mismatches were annealing the training denominator to
+> `1e-8` at 50k and enabling early stopping after epoch 50. It plateaued at
+> MRAE 0.573183 and stopped at 64k, only 21% through the intended optimization.
+> The active recipe holds a `1e-3` floor, disables early stopping, and rejects
+> a shortened horizon or either unstable override before training.
 
 ### Attention-mode and recovery levers
 

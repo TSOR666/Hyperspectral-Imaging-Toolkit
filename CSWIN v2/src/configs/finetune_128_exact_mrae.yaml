@@ -27,10 +27,17 @@ mrae_epsilon: 1.0e-3
 mrae_epsilon_start: 1.0e-3
 mrae_epsilon_end: 1.0e-8
 mrae_epsilon_anneal_iters: 20000
+# This is intentionally a different, low-LR phase from the guarded fresh-run
+# recipe. Keep clipping enabled while the exact dark-target gradients come in.
+gradient_clip_norm: 1.0
+training_contract: null
 
 # The source 2026-07-25 checkpoint predates the radiometric fresh-run changes
 # in sota_cascade. Keep its exact module graph so strict checkpoint loading is
-# safe; only a from-scratch run may disable these parameterized norms.
+# safe; only a from-scratch run may disable these parameterized norms. Residual
+# scale is runtime behavior rather than checkpoint state, so it must also be
+# restored explicitly instead of inheriting the fresh recipe's 0.1 value.
+sstb_outer_residual_scale: 1.0
 use_feature_norm: true
 use_input_denoising: true
 smsa_output_norm: true

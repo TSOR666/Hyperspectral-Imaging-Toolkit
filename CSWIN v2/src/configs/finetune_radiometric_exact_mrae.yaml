@@ -25,6 +25,8 @@ mrae_epsilon: 1.0e-3
 mrae_epsilon_start: 1.0e-3
 mrae_epsilon_end: 1.0e-8
 mrae_epsilon_anneal_iters: 20000
+gradient_clip_norm: 1.0
+training_contract: null
 
 progressive_stages:
   - {patch_size: 128, iterations: 30000, init_lr: 1.0e-5, batch_size: 20, warmup_steps: 0}

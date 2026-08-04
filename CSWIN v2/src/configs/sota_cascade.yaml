@@ -24,12 +24,19 @@ defaults:
 # bottleneck gradient ~56,000x smaller than the head gradient, so the shallow
 # RGB skip learned while the transformer body was effectively starved.
 #
-# The June control run reached 0.2737 MRAE / 29.56 dB with a normally scaled
-# head and a 70k cosine horizon (LR ~1.8e-6 by 68k). The later 300k horizon was
-# still applying a large LR when validation began regressing. This recipe keeps
-# fresh activations bounded with a 0.1 residual-in-residual scale, restores the
-# full-gradient output head, and restores the empirically successful 70k
-# schedule. Exact MRAE is reached late in that decaying-LR schedule.
+# A shorter June diagnostic reached 0.2737 MRAE / 29.56 dB with a normally
+# scaled head, but the benchmark training target remains the MST++ 300k cosine
+# recipe. This configuration keeps fresh activations bounded with a 0.1
+# residual-in-residual scale and restores the full-gradient output head while
+# preserving that full schedule. Keep the training denominator well
+# conditioned through this phase; exact-MRAE optimization is a separate low-LR
+# fine-tune, not part of the fresh high-LR run.
+#
+# The 2026-08-03 residual-balanced job correctly resolved the 300k horizon, but
+# annealed epsilon to 1e-8 and enabled early stopping after epoch 50. It
+# plateaued at MRAE 0.573 and stopped at 64k, completing only 21% of the intended
+# optimization. The contract below now rejects an exact training floor, a
+# shortened horizon, or premature early stopping before the dataset is loaded.
 #
 # Do not resume either failed July checkpoint bundle. Enabling the spectral
 # prior adds parameters, and initialization changes only take effect on a fresh
@@ -54,16 +61,41 @@ refinement_blocks: 0
 objective: mrae_annealed
 mrae_epsilon: 1.0e-2
 mrae_epsilon_start: 1.0e-2
-mrae_epsilon_end: 1.0e-8
+mrae_epsilon_end: 1.0e-3
 mrae_epsilon_anneal_iters: 50000
+gradient_clip_norm: 1.0
 
 progressive_stages:
-  - {patch_size: 128, iterations: 70000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
+  - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
 
-early_stopping_patience: 8
+# Protect the named production recipe from a shortened diagnostic schedule, an
+# ill-conditioned exact-MRAE training floor, or early stopping before the full
+# MST++ horizon. Set this to null only for an intentional ablation, and use a
+# distinct output directory.
+training_contract:
+  name: residual_balanced_mstpp_300k_v2
+  expected:
+    objective: mrae_annealed
+    mrae_epsilon_start: 1.0e-2
+    mrae_epsilon_end: 1.0e-3
+    mrae_epsilon_anneal_iters: 50000
+    gradient_clip_norm: 1.0
+    cswin_attention_mode: local_global
+    use_feature_norm: false
+    use_input_denoising: false
+    smsa_output_norm: false
+    cascade_stages: 1
+    sstb_outer_residual_scale: 0.1
+    output_head_init_scale: 1.0
+    use_spectral_input_skip: true
+    early_stopping_patience: 0
+  stages:
+    - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 1000}
+
+early_stopping_patience: 0
 early_stopping_min_delta: 5.0e-5
 early_stopping_warmup_epochs: 50
 early_stopping_final_stage_only: true
 
-log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_residual_balanced
-checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_residual_balanced
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/sota_residual_balanced_mstpp_300k
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/sota_residual_balanced_mstpp_300k

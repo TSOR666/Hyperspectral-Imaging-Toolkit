@@ -21,11 +21,12 @@ inference:
     gen.load_state_dict(ckpt['state_dict'])   # use best_model.pth for EMA weights
 """
 
-import os
-import sys
+import hashlib
 import logging
 import math
+import os
 import statistics
+import sys
 import time
 import traceback
 from collections import deque
@@ -331,6 +332,93 @@ def _resolve_stages(config: Dict[str, Any]) -> list:
         "batch_size": int(config.get("batch_size", 20)),
         "warmup_steps": default_warmup,
     }]
+
+
+def _contract_value_matches(actual: Any, expected: Any) -> bool:
+    """Compare resolved config values without making YAML numeric types brittle."""
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        try:
+            return math.isclose(
+                float(actual),
+                float(expected),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        except (TypeError, ValueError):
+            return False
+    return actual == expected
+
+
+def _validate_training_contract(config: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Fail early when a named recipe silently resolves to another experiment.
+
+    Hydra overrides are intentionally flexible, but that flexibility can make
+    a named production run resolve to a shortened diagnostic schedule or an
+    incompatible objective. A recipe can opt into this guard with
+    ``training_contract``. Intentional ablations may set that key to ``null``
+    (or update the expected values explicitly).
+    """
+    stages = _resolve_stages(config)
+    contract = config.get("training_contract")
+    if not contract:
+        return stages
+
+    contract = dict(contract)
+    name = str(contract.get("name", "unnamed"))
+    errors: list[str] = []
+
+    expected_values = dict(contract.get("expected", {}))
+    for key, expected in expected_values.items():
+        actual = config.get(key)
+        if not _contract_value_matches(actual, expected):
+            errors.append(f"{key}={actual!r} (expected {expected!r})")
+
+    expected_stages = contract.get("stages")
+    if expected_stages is not None:
+        expected_stages = [dict(stage) for stage in expected_stages]
+        if len(stages) != len(expected_stages):
+            errors.append(
+                f"stage_count={len(stages)} (expected {len(expected_stages)})"
+            )
+        else:
+            for index, (actual_stage, expected_stage) in enumerate(
+                zip(stages, expected_stages)
+            ):
+                for key, expected in expected_stage.items():
+                    actual = actual_stage.get(key)
+                    if not _contract_value_matches(actual, expected):
+                        errors.append(
+                            f"stage[{index}].{key}={actual!r} "
+                            f"(expected {expected!r})"
+                        )
+
+    if errors:
+        details = "; ".join(errors)
+        raise ValueError(
+            f"Resolved training configuration violates contract {name!r}: "
+            f"{details}. Refusing to launch a mislabeled run. For an "
+            "intentional ablation, set training_contract=null or update the "
+            "contract together with the overrides."
+        )
+    return stages
+
+
+def _persist_resolved_config(config: Dict[str, Any]) -> tuple[str, Path]:
+    """Atomically persist the exact resolved run config and return its hash."""
+    fingerprint_config = dict(config)
+    fingerprint_config.pop("config_fingerprint", None)
+    config_text = OmegaConf.to_yaml(
+        OmegaConf.create(fingerprint_config), resolve=True
+    )
+    fingerprint = hashlib.sha256(config_text.encode("utf-8")).hexdigest()[:12]
+    config["config_fingerprint"] = fingerprint
+    config_text = OmegaConf.to_yaml(OmegaConf.create(config), resolve=True)
+
+    output_path = Path(str(config["log_dir"])) / "resolved_config.yaml"
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary_path.write_text(config_text, encoding="utf-8")
+    os.replace(temporary_path, output_path)
+    return fingerprint, output_path
 
 
 _WARNED_RESIDENT_SPAWN = False
@@ -664,6 +752,17 @@ def _run_stage(
     early_stopping_patience = max(0, int(config.get("early_stopping_patience", 0)))
     early_stopping_min_delta = max(0.0, float(config.get("early_stopping_min_delta", 0.0)))
     early_stopping_warmup_epochs = max(0, int(config.get("early_stopping_warmup_epochs", 0)))
+    gradient_clip_norm = float(
+        config.get("gradient_clip_norm", DEFAULT_GRADIENT_CLIP_NORM)
+    )
+    if not math.isfinite(gradient_clip_norm) or gradient_clip_norm < 0.0:
+        raise ValueError("gradient_clip_norm must be finite and non-negative")
+    # clip_grad_norm_(..., inf) still computes the total norm (and catches
+    # NaN/Inf) without changing gradients. This preserves the existing finite
+    # guard while allowing the benchmark recipe to disable clipping explicitly.
+    effective_clip_norm = (
+        gradient_clip_norm if gradient_clip_norm > 0.0 else float("inf")
+    )
 
     # Divergence tripwire (see config.yaml). Auto-disabled under DDP, where a
     # per-rank loss spike cannot be acted on without a cross-rank collective.
@@ -836,7 +935,7 @@ def _run_stage(
             # per-step host-device sync on the loss here.
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                net.parameters(), max_norm=DEFAULT_GRADIENT_CLIP_NORM
+                net.parameters(), max_norm=effective_clip_norm
             )
             if not torch.isfinite(grad_norm):
                 consecutive_nonfinite += 1
@@ -963,7 +1062,12 @@ def _run_stage(
                     "Iter[%06d] Epoch[%06d] TrainLoss[%s]: %.6f ValMRAE: %.6f",
                     iteration, epoch_num, objective_name, avg_train_loss, current_mrae,
                 )
-                train_scalars = {"train_loss": avg_train_loss, "lr": lr}
+                train_scalars = {
+                    "train_loss": avg_train_loss,
+                    "lr": lr,
+                    "grad_norm": float(grad_norm.detach().item()),
+                    "gradient_clip_norm": gradient_clip_norm,
+                }
                 if scheduled_epsilon is not None:
                     train_scalars["mrae_epsilon"] = scheduled_epsilon
                 metrics_logger.log_scalars(
@@ -1327,7 +1431,31 @@ def main(config: DictConfig) -> None:
 
         log_level = getattr(logging, cfg.get("log_level", "INFO"))
         main_logger = setup_logging(cfg["log_dir"], log_level, rank)
+        resolved_stages = _validate_training_contract(cfg)
         if rank == 0:
+            config_fingerprint, resolved_config_path = _persist_resolved_config(cfg)
+            stage_summary = ", ".join(
+                (
+                    f"{stage['patch_size']}px/{stage['iterations']} steps/"
+                    f"lr={stage['init_lr']:.3g}/batch={stage['batch_size']}/"
+                    f"warmup={stage['warmup_steps']}"
+                )
+                for stage in resolved_stages
+            )
+            contract = cfg.get("training_contract") or {}
+            main_logger.info(
+                "Resolved config: fingerprint=%s, recipe=%s, stages=[%s], "
+                "mrae_epsilon=%s->%s over %s steps, gradient_clip_norm=%s; "
+                "saved to %s",
+                config_fingerprint,
+                contract.get("name", "unconstrained"),
+                stage_summary,
+                cfg.get("mrae_epsilon_start", cfg.get("mrae_epsilon")),
+                cfg.get("mrae_epsilon_end", cfg.get("mrae_epsilon")),
+                cfg.get("mrae_epsilon_anneal_iters", 0),
+                cfg.get("gradient_clip_norm", DEFAULT_GRADIENT_CLIP_NORM),
+                resolved_config_path,
+            )
             main_logger.info("=" * 60)
             main_logger.info("GENERATOR-ONLY (NO-GAN) RECONSTRUCTION TRAINING")
             main_logger.info(
