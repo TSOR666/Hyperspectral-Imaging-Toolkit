@@ -5,12 +5,15 @@ hsi_viz_suite/
   requirements.txt
   scripts/
     result_layout.py
+    hsi_io.py
+    metrics_io.py
     visualization_utils.py
     visualize_results.py
     generate_error_maps.py
     create_comparison_grid.py
     plot_spectral_curves.py
     plot_metrics_statistics.py
+    plot_publication_figures.py
     generate_all_visualizations.py
   examples/
     example_usage.py
