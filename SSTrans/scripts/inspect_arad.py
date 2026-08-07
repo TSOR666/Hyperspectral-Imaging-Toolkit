@@ -27,12 +27,25 @@ def main() -> None:
         crop_size=args.crop_size,
         random_crop=False,
         augment=False,
+        # Diagnostics should report unusable ground truth, not fail on it.
+        require_targets=False,
+        probe_targets=True,
     )
     sample = dataset[0]
     print(f"split={args.split} samples={len(dataset)}")
+    print(f"rgb_dir={dataset.rgb_root} spectral_dir={dataset.spectral_root}")
     print(f"scene={sample['scene_id']}")
     print(f"cond={tuple(sample['cond'].shape)}")
-    print(f"label={tuple(sample['label'].shape)}")
+    label = sample.get("label")
+    print(f"label={tuple(label.shape) if label is not None else 'unavailable'}")
+
+    if dataset.unusable_targets:
+        print(
+            f"scenes without ground truth: {len(dataset.unusable_targets)}/"
+            f"{len(dataset.scene_ids)}"
+        )
+        for scene_id, reason in list(dataset.unusable_targets.items())[:3]:
+            print(f"  {scene_id}: {reason}")
 
 
 if __name__ == "__main__":

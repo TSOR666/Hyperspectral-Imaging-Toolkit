@@ -238,3 +238,174 @@ def test_spectral_metrics_match_simple_reference() -> None:
 def test_dataset_rejects_missing_layout(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         ARAD1KDataset(tmp_path)
+
+
+def _write_arad_test_scene(
+    root,
+    scene_id: str,
+    *,
+    spectral_key: str | None = "cube",
+    rgb_dir: str = "Test_RGB",
+    spectral_dir: str = "Test_Spec",
+    suffix: str = ".jpg",
+):
+    rgb_root = root / rgb_dir
+    spectral_root = root / spectral_dir
+    rgb_root.mkdir(parents=True, exist_ok=True)
+    spectral_root.mkdir(parents=True, exist_ok=True)
+
+    height, width = 6, 8
+    rgb = np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3)
+    Image.fromarray(rgb, mode="RGB").save(rgb_root / f"{scene_id}{suffix}")
+
+    cube = np.arange(31 * height * width, dtype=np.float32).reshape(31, height, width)
+    with h5py.File(spectral_root / f"{scene_id}.mat", "w") as handle:
+        if spectral_key is None:
+            # The official ARAD-1K Test_Spec payload: a raw MSFA mosaic.
+            handle.create_dataset("mosaic", data=np.zeros((height, width), np.uint16))
+        else:
+            handle.create_dataset(spectral_key, data=cube.transpose(0, 2, 1))
+    return cube
+
+
+def test_dataset_reads_arad_test_split_directories(tmp_path) -> None:
+    expected_cube = _write_arad_test_scene(tmp_path, "ARAD_1K_0951")
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+    )
+
+    assert dataset.rgb_root == tmp_path / "Test_RGB"
+    assert dataset.spectral_root == tmp_path / "Test_Spec"
+    torch.testing.assert_close(
+        dataset[0]["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
+def test_dataset_accepts_cube_key_aliases_and_png_rgb(tmp_path) -> None:
+    expected_cube = _write_arad_test_scene(
+        tmp_path,
+        "ARAD_1K_0951",
+        spectral_key="rad",
+        suffix=".png",
+    )
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+    )
+
+    torch.testing.assert_close(
+        dataset[0]["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
+def test_mosaic_only_test_spec_is_reported_not_silently_scored(tmp_path) -> None:
+    _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="No usable ground-truth cube"):
+        ARAD1KDataset(tmp_path, split="test", manifest_path=manifest)
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+        require_targets=False,
+    )
+    assert dataset.scene_ids_with_targets == ()
+    assert "mosaic" in dataset.unusable_targets["ARAD_1K_0951"]
+    sample = dataset[0]
+    assert "label" not in sample
+    assert sample["cond"].shape == (3, 6, 8)
+
+
+def test_mosaic_file_does_not_shadow_a_cube_in_another_directory(
+    tmp_path,
+) -> None:
+    _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
+    expected_cube = _write_arad_test_scene(
+        tmp_path,
+        "ARAD_1K_0951",
+        spectral_dir="Test_spectral",
+    )
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(tmp_path, split="test", manifest_path=manifest,
+                            augment=False)
+
+    assert dataset.spectral_root == tmp_path / "Test_spectral"
+    torch.testing.assert_close(
+        dataset[0]["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
+def test_explicit_spectral_dir_overrides_the_standard_search(tmp_path) -> None:
+    _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
+    expected_cube = _write_arad_test_scene(
+        tmp_path,
+        "ARAD_1K_0951",
+        spectral_dir="cubes_elsewhere",
+    )
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+        spectral_dirs=[str(tmp_path / "cubes_elsewhere")],
+    )
+
+    assert dataset.spectral_root == tmp_path / "cubes_elsewhere"
+    torch.testing.assert_close(
+        dataset[0]["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
+def test_missing_spectral_file_is_a_missing_target_not_a_crash(tmp_path) -> None:
+    _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
+    (tmp_path / "Test_Spec" / "ARAD_1K_0951.mat").unlink()
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+        require_targets=False,
+    )
+    assert dataset.unusable_targets["ARAD_1K_0951"].startswith("no spectral file")
+    assert "label" not in dataset[0]
+
+
+def test_split_directory_resolution_falls_back_to_train(tmp_path) -> None:
+    _write_scene(tmp_path, "ARAD_1K_0901")
+    assert (
+        data_module.resolve_arad_directory(tmp_path, "validation")
+        == tmp_path / "Train_RGB"
+    )
+    assert (
+        data_module.resolve_arad_directory(tmp_path, "validation", kind="spectral")
+        == tmp_path / "Train_spectral"
+    )
+    with pytest.raises(FileNotFoundError):
+        data_module.resolve_arad_directory(tmp_path / "empty", "test")

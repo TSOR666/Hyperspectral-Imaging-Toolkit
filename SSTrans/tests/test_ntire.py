@@ -77,6 +77,48 @@ def test_evaluation_writes_ntire_cubes_and_zero_error_metrics(tmp_path) -> None:
     assert (tmp_path / "scene_1.mat").is_file()
 
 
+def test_evaluation_exports_target_less_scenes_without_scoring_them(
+    tmp_path,
+) -> None:
+    rgb = torch.full((3, 4, 4), 0.5)
+    label = rgb[:1].repeat(31, 1, 1)
+    loader = DataLoader(
+        [
+            {"cond": rgb, "label": label, "scene_id": "scene_1"},
+            {"cond": rgb, "scene_id": "scene_2"},
+        ],
+        batch_size=1,
+    )
+
+    summary, rows = evaluate_loader(
+        _RepeatModel(),
+        loader,
+        device=torch.device("cpu"),
+        output_dir=tmp_path,
+    )
+
+    assert summary["count"] == 1.0
+    assert summary["skipped"] == 1.0
+    assert [row["scene_id"] for row in rows] == ["scene_1"]
+    assert (tmp_path / "scene_2.mat").is_file()
+
+
+def test_evaluation_without_any_ground_truth_is_an_actionable_error(
+    tmp_path,
+) -> None:
+    loader = DataLoader(
+        [{"cond": torch.full((3, 4, 4), 0.5), "scene_id": "scene_1"}],
+        batch_size=1,
+    )
+    with np.testing.assert_raises_regex(ValueError, "infer_loader"):
+        evaluate_loader(
+            _RepeatModel(),
+            loader,
+            device=torch.device("cpu"),
+            output_dir=tmp_path,
+        )
+
+
 def test_evaluation_uses_ntire_center_crop_but_exports_full_cube(tmp_path) -> None:
     rgb = torch.zeros(3, 6, 8)
     rgb[0, 1:-1, 1:-1] = 1.0

@@ -4,7 +4,12 @@ from .checkpoint import (
     load_checkpoint,
     load_checkpoint_payload,
 )
-from .data import ARAD1KDataset, RGBImageDataset, load_arad_manifest
+from .data import (
+    ARAD1KDataset,
+    RGBImageDataset,
+    load_arad_manifest,
+    resolve_arad_directory,
+)
 from .losses import (
     DeltaE2000Loss,
     MRAELoss,
@@ -60,6 +65,7 @@ __all__ = [
     "mean_relative_absolute_error",
     "peak_signal_to_noise_ratio",
     "predict_hsi",
+    "resolve_arad_directory",
     "resolve_device",
     "root_mean_squared_error",
     "save_ntire_cube",
