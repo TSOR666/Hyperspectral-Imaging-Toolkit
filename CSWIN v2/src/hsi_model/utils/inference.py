@@ -8,7 +8,9 @@ inference, and also accept the legacy GAN checkpoint format (full model with
 ``generator.``/``discriminator.`` prefixed keys).
 
 Public API:
-    load_generator(checkpoint)        -> (NoiseRobustCSWinGenerator, info)
+    load_generator(checkpoint_or_weights) -> (NoiseRobustCSWinGenerator, info)
+    load_generator_from_weights(weights)  -> (NoiseRobustCSWinGenerator, info)
+    convert_checkpoint_to_weights(...)    -> info
     build_patch_inference(checkpoint) -> PatchInference wrapping the generator
     geometric_self_ensemble(fn, img)  -> x8 flip/rotate test-time augmentation
 
@@ -18,8 +20,11 @@ checkpoint (latest_checkpoint.pth) the EMA shadow is applied when
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Callable, Dict, Optional, Tuple
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -27,6 +32,130 @@ from ..models.generator_v3 import NoiseRobustCSWinGenerator
 from .patch_inference import PatchInference
 
 logger = logging.getLogger(__name__)
+
+ArchitectureConfig = Union[Mapping[str, Any], str, Path]
+GENERATOR_WEIGHTS_FORMAT = "cswin_generator_weights_v1"
+
+
+def load_architecture_config(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a generator architecture config from JSON or YAML."""
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Architecture config does not exist: {config_path}")
+
+    suffix = config_path.suffix.lower()
+    with config_path.open("r", encoding="utf-8") as handle:
+        if suffix == ".json":
+            config = json.load(handle)
+        elif suffix in {".yaml", ".yml"}:
+            try:
+                import yaml
+            except ImportError as exc:  # pragma: no cover - project dependency
+                raise ImportError(
+                    "PyYAML is required to load YAML architecture configs."
+                ) from exc
+            config = yaml.safe_load(handle)
+        else:
+            raise ValueError(
+                f"Unsupported architecture config format {config_path.suffix!r}; "
+                "use .json, .yaml, or .yml."
+            )
+
+    if not isinstance(config, Mapping):
+        raise ValueError(
+            f"Architecture config {config_path} must contain a mapping at its root."
+        )
+    return dict(config)
+
+
+def _resolve_architecture_config(
+    checkpoint: Mapping[str, Any],
+    config: Optional[ArchitectureConfig],
+    architecture_config: Optional[ArchitectureConfig],
+    checkpoint_path: Union[str, Path],
+) -> Tuple[Mapping[str, Any], str]:
+    """Resolve an explicit config or the config embedded in a checkpoint."""
+    if config is not None and architecture_config is not None:
+        raise ValueError("Pass only one of config= and architecture_config=.")
+
+    supplied = config if config is not None else architecture_config
+    if supplied is not None:
+        if isinstance(supplied, (str, Path)):
+            return load_architecture_config(supplied), "external_file"
+        if isinstance(supplied, Mapping):
+            return supplied, "explicit_mapping"
+        raise TypeError(
+            "Architecture config must be a mapping or a JSON/YAML path; "
+            f"received {type(supplied)!r}."
+        )
+
+    for key in ("config", "architecture_config", "model_config"):
+        embedded = checkpoint.get(key)
+        if isinstance(embedded, Mapping):
+            return embedded, f"checkpoint:{key}"
+
+    raise ValueError(
+        f"Weights file {checkpoint_path} has no embedded architecture config; "
+        "pass architecture_config=... (a mapping or JSON/YAML path) so the "
+        "known CSWIN architecture can be rebuilt exactly."
+    )
+
+
+def _tensor_state_dict(candidate: Any) -> Optional[Dict[str, torch.Tensor]]:
+    """Return tensor entries from a state-dict-like mapping, if present."""
+    if not isinstance(candidate, Mapping):
+        return None
+    state = {
+        str(key): value
+        for key, value in candidate.items()
+        if isinstance(value, torch.Tensor)
+    }
+    return state or None
+
+
+def _extract_state_dict(checkpoint: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+    """Find a tensor state dict in common checkpoint and weights layouts."""
+    for key in (
+        "state_dict",
+        "model_state_dict",
+        "generator_state_dict",
+        "weights",
+        "generator_weights",
+        "ema_state_dict",
+        "ema_weights",
+    ):
+        state = _tensor_state_dict(checkpoint.get(key))
+        if state is not None:
+            return state
+
+    # A few older exports nested the state dict under ``model`` or
+    # ``generator`` instead of naming it explicitly.
+    for key in ("model", "generator", "netG"):
+        nested = checkpoint.get(key)
+        if isinstance(nested, Mapping):
+            state = _tensor_state_dict(nested)
+            if state is not None:
+                return state
+
+    # EMA-only exports are also useful inference artifacts.
+    ema_payload = checkpoint.get("ema")
+    if isinstance(ema_payload, Mapping):
+        for key in ("shadow", "state_dict", "weights"):
+            state = _tensor_state_dict(ema_payload.get(key))
+            if state is not None:
+                return state
+
+    # A bare torch.save(model.state_dict(), path) is itself a mapping.
+    state = _tensor_state_dict(checkpoint)
+    if state is not None:
+        return state
+
+    available = list(checkpoint.keys())[:20]
+    raise ValueError(
+        "No tensor state_dict found in the weights/checkpoint. Expected a bare "
+        "state dict or one of state_dict, model_state_dict, generator_state_dict, "
+        f"or weights; available keys: {available}"
+    )
 
 
 def _normalize_generator_state(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -36,23 +165,53 @@ def _normalize_generator_state(state_dict: Dict[str, torch.Tensor]) -> Dict[str,
     generator weights are prefixed with ``generator.`` (and a discriminator is
     also present).
     """
-    if any(k.startswith("module.") for k in state_dict):
-        state_dict = {
-            (k[len("module."):] if k.startswith("module.") else k): v
-            for k, v in state_dict.items()
+    state = _tensor_state_dict(state_dict)
+    if state is None:
+        raise ValueError("The selected state dict contains no tensor weights.")
+
+    cleaned: Dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        normalized_key = key
+        # DDP and torch.compile wrappers can be stacked.
+        while normalized_key.startswith(("module.", "_orig_mod.")):
+            if normalized_key.startswith("module."):
+                normalized_key = normalized_key[len("module."):]
+            else:
+                normalized_key = normalized_key[len("_orig_mod."):]
+        # Full-model exports sometimes have model.generator.* keys.
+        if normalized_key.startswith("model."):
+            normalized_key = normalized_key[len("model."):]
+        cleaned[normalized_key] = value
+
+    # Legacy full-model checkpoints use a generator/netG prefix and may also
+    # contain discriminator weights.  Select only the generator branch.
+    for prefix in ("generator.", "netG.", "G."):
+        prefixed = {
+            key[len(prefix):]: value
+            for key, value in cleaned.items()
+            if key.startswith(prefix)
         }
-    gen_keys = [k for k in state_dict if k.startswith("generator.")]
-    if gen_keys:
-        return {k[len("generator."):]: v for k, v in state_dict.items() if k.startswith("generator.")}
-    return dict(state_dict)
+        if prefixed:
+            return prefixed
+    return cleaned
+
+
+def _plain_config(value: Any) -> Any:
+    """Convert common config container types into torch-save-friendly values."""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_config(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config(item) for item in value]
+    return value
 
 
 def load_generator(
     checkpoint_path: str,
     device: Optional[torch.device] = None,
-    config: Optional[Dict[str, Any]] = None,
+    config: Optional[ArchitectureConfig] = None,
     prefer_ema: bool = True,
     strict: bool = True,
+    architecture_config: Optional[ArchitectureConfig] = None,
 ) -> Tuple[NoiseRobustCSWinGenerator, Dict[str, Any]]:
     """Rebuild and load the generator from a checkpoint.
 
@@ -72,20 +231,19 @@ def load_generator(
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if not isinstance(ck, dict):
+    if not isinstance(ck, Mapping):
         raise ValueError(f"Unexpected checkpoint object in {checkpoint_path}: {type(ck)}")
 
-    cfg = config if config is not None else ck.get("config")
-    if cfg is None:
-        raise ValueError(
-            f"Checkpoint {checkpoint_path} has no 'config'; pass config=... so the "
-            "generator architecture can be rebuilt to match the weights."
-        )
+    cfg, config_source = _resolve_architecture_config(
+        ck,
+        config=config,
+        architecture_config=architecture_config,
+        checkpoint_path=checkpoint_path,
+    )
 
     generator = NoiseRobustCSWinGenerator(cfg).to(device)
 
-    raw_state = ck.get("state_dict") or ck.get("model_state_dict") or ck
-    state = _normalize_generator_state(raw_state)
+    state = _normalize_generator_state(_extract_state_dict(ck))
 
     if strict:
         generator.load_state_dict(state, strict=True)
@@ -105,8 +263,17 @@ def load_generator(
     # Apply EMA shadow for raw checkpoints that carry one (best_model already has
     # EMA baked into state_dict and is flagged ema_applied=True).
     applied_ema = bool(ck.get("ema_applied", False))
-    if prefer_ema and not applied_ema and ck.get("ema"):
-        shadow = (ck["ema"] or {}).get("shadow", {})
+    ema_payload = ck.get("ema")
+    shadow: Any = {}
+    if isinstance(ema_payload, Mapping):
+        shadow = ema_payload.get("shadow", {})
+    if not shadow:
+        shadow = ck.get("ema_state_dict", {})
+    if prefer_ema and not applied_ema and shadow:
+        try:
+            shadow = _normalize_generator_state(shadow)
+        except ValueError:
+            shadow = {}
         own = {
             name: param
             for name, param in generator.named_parameters()
@@ -155,12 +322,108 @@ def load_generator(
         "ema_applied": applied_ema,
         "epoch": ck.get("epoch"),
         "val_metrics": ck.get("val_metrics"),
+        "config_source": config_source,
+        "state_dict_keys": len(state),
+        "source_format": ck.get("format", "raw_state_dict"),
     }
     logger.info(
         "Loaded generator from %s (ema_applied=%s, output_activation=%s).",
         checkpoint_path, applied_ema, out_act,
     )
     return generator, info
+
+
+def load_generator_from_weights(
+    weights_path: str,
+    architecture_config: Optional[ArchitectureConfig] = None,
+    device: Optional[torch.device] = None,
+    prefer_ema: bool = True,
+    strict: bool = True,
+) -> Tuple[NoiseRobustCSWinGenerator, Dict[str, Any]]:
+    """Load a generator directly from raw or converted weights.
+
+    ``architecture_config`` is required for a bare state dict unless the
+    weights bundle already embeds a config. This explicit entry point is useful
+    for older CSWIN architectures whose file contains tensors but no config.
+    """
+    return load_generator(
+        weights_path,
+        device=device,
+        architecture_config=architecture_config,
+        prefer_ema=prefer_ema,
+        strict=strict,
+    )
+
+
+def convert_checkpoint_to_weights(
+    checkpoint_path: str,
+    output_path: str,
+    *,
+    architecture_config: Optional[ArchitectureConfig] = None,
+    config: Optional[ArchitectureConfig] = None,
+    device: Optional[torch.device] = None,
+    prefer_ema: bool = True,
+    strict: bool = True,
+    embed_config: bool = True,
+) -> Dict[str, Any]:
+    """Convert a CSWIN checkpoint into a generator-only weights artifact.
+
+    The default output is a compact, self-contained bundle containing only
+    generator ``state_dict`` tensors and the architecture config. Set
+    ``embed_config=False`` to write a bare state dict instead; that file must
+    be loaded with ``architecture_config=...`` later.
+    """
+    load_device = device or torch.device("cpu")
+    generator, info = load_generator(
+        checkpoint_path,
+        device=load_device,
+        config=config,
+        architecture_config=architecture_config,
+        prefer_ema=prefer_ema,
+        strict=strict,
+    )
+    state_dict = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in generator.state_dict().items()
+        if isinstance(tensor, torch.Tensor)
+    }
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if embed_config:
+        payload: Any = {
+            "format": GENERATOR_WEIGHTS_FORMAT,
+            "state_dict": state_dict,
+            "config": _plain_config(info["config"]),
+            "ema_applied": bool(info.get("ema_applied", False)),
+            "metadata": {
+                "source_checkpoint": str(checkpoint_path),
+                "state_dict_keys": len(state_dict),
+                "ema_applied": bool(info.get("ema_applied", False)),
+            },
+        }
+    else:
+        payload = state_dict
+    torch.save(payload, destination)
+
+    result = dict(info)
+    result.update(
+        {
+            "output_path": str(destination),
+            "weights_format": (
+                GENERATOR_WEIGHTS_FORMAT if embed_config else "raw_state_dict"
+            ),
+            "weights_keys": len(state_dict),
+        }
+    )
+    logger.info(
+        "Converted %s to generator weights at %s (%d tensors, embedded_config=%s).",
+        checkpoint_path,
+        destination,
+        len(state_dict),
+        embed_config,
+    )
+    return result
 
 
 def build_patch_inference(
@@ -170,9 +433,11 @@ def build_patch_inference(
     overlap: int = 16,
     batch_size: int = 4,
     use_fp16: bool = False,
-    config: Optional[Dict[str, Any]] = None,
+    config: Optional[ArchitectureConfig] = None,
     prefer_ema: bool = True,
     amp_dtype: Optional[torch.dtype] = None,
+    architecture_config: Optional[ArchitectureConfig] = None,
+    strict: bool = True,
 ) -> PatchInference:
     """Convenience: load the generator and wrap it in :class:`PatchInference`.
 
@@ -180,7 +445,12 @@ def build_patch_inference(
     linear head output reflectance directly, so no extra activation is applied.
     """
     generator, _info = load_generator(
-        checkpoint_path, device=device, config=config, prefer_ema=prefer_ema
+        checkpoint_path,
+        device=device,
+        config=config,
+        architecture_config=architecture_config,
+        prefer_ema=prefer_ema,
+        strict=strict,
     )
     return PatchInference(
         model=generator,
@@ -244,7 +514,11 @@ def geometric_self_ensemble(
 
 
 __all__ = [
+    "GENERATOR_WEIGHTS_FORMAT",
+    "load_architecture_config",
     "load_generator",
+    "load_generator_from_weights",
+    "convert_checkpoint_to_weights",
     "build_patch_inference",
     "geometric_self_ensemble",
 ]

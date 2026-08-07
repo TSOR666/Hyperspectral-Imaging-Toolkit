@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 import torch
@@ -5,6 +6,8 @@ import torch
 from hsi_model.utils.patch_inference import PatchInference
 from hsi_model.utils.inference import (
     load_generator,
+    load_generator_from_weights,
+    convert_checkpoint_to_weights,
     build_patch_inference,
     geometric_self_ensemble,
 )
@@ -35,6 +38,60 @@ def test_load_generator_roundtrip_bare_checkpoint(tmp_path):
     with torch.no_grad():
         assert torch.allclose(gen(x), loaded(x), atol=1e-6)
     assert info["applies_own_activation"] is True
+
+
+def test_load_generator_direct_bare_weights_with_external_architecture_config(tmp_path):
+    gen = _build_gen(seed=6)
+    weights = tmp_path / "legacy_generator_weights.pth"
+    architecture = tmp_path / "legacy_architecture.json"
+    torch.save(gen.state_dict(), weights)
+    architecture.write_text(json.dumps(_GEN_CFG), encoding="utf-8")
+
+    loaded, info = load_generator_from_weights(
+        str(weights),
+        architecture_config=str(architecture),
+        device=torch.device("cpu"),
+    )
+    x = torch.rand(1, 3, 16, 16)
+    with torch.no_grad():
+        assert torch.allclose(gen(x), loaded(x), atol=1e-6)
+    assert info["config_source"] == "external_file"
+    assert info["source_format"] == "raw_state_dict"
+
+
+def test_convert_checkpoint_to_self_contained_and_raw_weights(tmp_path):
+    gen = _build_gen(seed=7)
+    checkpoint = tmp_path / "full_checkpoint.pth"
+    bundled = tmp_path / "generator_weights.pth"
+    raw = tmp_path / "generator_weights_raw.pth"
+    torch.save({"state_dict": gen.state_dict(), "config": _GEN_CFG}, checkpoint)
+
+    info = convert_checkpoint_to_weights(str(checkpoint), str(bundled))
+    assert info["weights_format"] == "cswin_generator_weights_v1"
+    payload = torch.load(bundled, map_location="cpu", weights_only=False)
+    assert payload["format"] == "cswin_generator_weights_v1"
+    assert "optimizer_g" not in payload
+    assert "config" in payload
+
+    bundled_gen, _ = load_generator(str(bundled), device=torch.device("cpu"))
+    raw_info = convert_checkpoint_to_weights(
+        str(checkpoint),
+        str(raw),
+        architecture_config=_GEN_CFG,
+        embed_config=False,
+    )
+    assert raw_info["weights_format"] == "raw_state_dict"
+    raw_gen, _ = load_generator_from_weights(
+        str(raw),
+        architecture_config=_GEN_CFG,
+        device=torch.device("cpu"),
+    )
+
+    x = torch.rand(1, 3, 16, 16)
+    with torch.no_grad():
+        expected = gen(x)
+        assert torch.allclose(expected, bundled_gen(x), atol=1e-6)
+        assert torch.allclose(expected, raw_gen(x), atol=1e-6)
 
 
 def test_load_generator_legacy_full_model_checkpoint(tmp_path):

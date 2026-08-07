@@ -49,6 +49,7 @@ from hsi_model.utils.data.mst_dataset import (  # noqa: E402
     _align_hyper_to_rgb,
     _load_mst_cube,
     _normalize_mst_rgb_hwc,
+    _resolve_cube_key,
 )
 
 
@@ -82,6 +83,7 @@ SPLIT_FILES = {
 class TestConfig:
     model_path: str
     data_root: str
+    architecture_config: Optional[str] = None
     output_dir: str = "./cswin_test_results"
     split: str = "auto"
     device: str = "cuda"
@@ -223,9 +225,45 @@ def _collect_pairs(
         target_path = _find_existing_file(data_root, stem, SPEC_DIRS[split_name], SPEC_SUFFIXES)
         if target_path is None:
             missing_gt.append(stem)
+        else:
+            valid_target, reason = _probe_hsi_target(target_path)
+            if not valid_target:
+                LOGGER.warning(
+                    "Ignoring %s as ground truth for %s: %s",
+                    target_path,
+                    stem,
+                    reason,
+                )
+                target_path = None
+                missing_gt.append(stem)
         pairs.append((stem, rgb_path, target_path))
 
     return pairs, missing_rgb, missing_gt
+
+
+def _probe_hsi_target(path: Path) -> Tuple[bool, str]:
+    """Check that an HDF5/MAT file contains a usable 31-band HSI cube.
+
+    ARAD test distributions sometimes place a raw MSFA payload named
+    ``mosaic`` in ``Test_Spec``.  It is a valid auxiliary file but not a
+    spectral-recovery target.  Checking the dataset shape during pairing lets
+    ``split=auto`` fall back to validation instead of failing later in
+    ``__getitem__`` with an opaque cube-key/shape error.
+    """
+    try:
+        with h5py.File(path, "r") as mat:
+            key = _resolve_cube_key(mat, path)
+            shape = tuple(int(value) for value in mat[key].shape)
+    except Exception as exc:
+        return False, f"not a readable HSI cube ({exc})"
+
+    if len(shape) != 3 or ARAD1K_NUM_BANDS not in shape:
+        return (
+            False,
+            f"dataset {key!r} has shape {shape}; expected a 3D cube with "
+            f"one axis equal to {ARAD1K_NUM_BANDS}",
+        )
+    return True, ""
 
 
 def _load_rgb(path: Path, bgr2rgb: bool, normalization: str) -> np.ndarray:
@@ -482,6 +520,7 @@ class CSWINNTIRETester:
         self.generator, self.checkpoint_info = load_generator(
             config.model_path,
             device=self.device,
+            architecture_config=config.architecture_config,
             prefer_ema=config.prefer_ema,
             strict=config.strict_load,
         )
@@ -697,7 +736,25 @@ def parse_args() -> TestConfig:
     parser = argparse.ArgumentParser(
         description="NTIRE/ARAD-1K patch inference tester for CSWIN v2."
     )
-    parser.add_argument("--model_path", type=str, required=True, help="Path to CSWIN generator checkpoint.")
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Path to a CSWIN checkpoint or generator weights file.",
+    )
+    parser.add_argument(
+        "--weights_path",
+        type=str,
+        default=None,
+        help="Alias for --model_path when the input is a weights-only file.",
+    )
+    parser.add_argument(
+        "--architecture_config",
+        type=str,
+        default=None,
+        help="JSON/YAML architecture config for raw weights or checkpoints "
+             "without an embedded config.",
+    )
     parser.add_argument("--data_root", type=str, required=True, help="ARAD/MST-style data root.")
     parser.add_argument("--output_dir", type=str, default="./cswin_test_results")
     parser.add_argument("--split", type=str, default="auto", choices=["auto", "test", "valid", "train"])
@@ -742,7 +799,13 @@ def parse_args() -> TestConfig:
     parser.add_argument("--require_gt", action="store_true")
     parser.add_argument("--quiet_patches", action="store_true")
     args = parser.parse_args()
-    return TestConfig(**vars(args))
+    if args.model_path and args.weights_path:
+        parser.error("Use only one of --model_path and --weights_path.")
+    if not args.model_path and not args.weights_path:
+        parser.error("Provide --model_path or --weights_path.")
+    values = vars(args)
+    values["model_path"] = values.pop("model_path") or values.pop("weights_path")
+    return TestConfig(**values)
 
 
 def main() -> None:
