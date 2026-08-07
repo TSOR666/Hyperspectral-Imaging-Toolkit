@@ -34,8 +34,23 @@ ARAD_1K/
     `-- ARAD_1K_0001.mat
 ```
 
-Spectral `.mat` files must contain a `cube` dataset. Data is loaded lazily, so
-the complete dataset is not held in memory.
+Split-specific directories are resolved per scene, so redistributed copies also
+work: `Test_RGB`/`Test_Spec`, `Valid_RGB`/`Valid_spectral`, `Validation_*`, and
+`Val_Spec` are all searched before falling back to `Train_*`. RGB files may be
+`.jpg`, `.png`, `.bmp`, or `.tif`.
+
+Spectral `.mat` files should contain a `cube` dataset; the aliases
+`reflectance`, `rad`, `hsi`, `hyper`, `data`, and `image` are accepted, as is a
+single 31-band 3D dataset under any other name. Data is loaded lazily, so the
+complete dataset is not held in memory.
+
+The official ARAD-1K test release ships `Test_Spec/*.mat` files holding the raw
+MSFA `mosaic` payload instead of a spectral cube. A mosaic file never shadows a
+real cube: every candidate directory is probed, so cubes kept in, say,
+`Test_spectral` alongside a mosaic `Test_Spec` are found and used. Point
+`--spectral-dir` at any other location (a name under the root or an absolute
+path). Scenes with no cube anywhere are reconstructed and exported but never
+scored; see [Public Test](#public-test).
 
 Check a local dataset:
 
@@ -163,6 +178,18 @@ python scripts/infer.py `
   --amp
 ```
 
+Or point at an ARAD-1K root and let the split select its RGB directory:
+
+```powershell
+python scripts/infer.py `
+  --checkpoint "runs\hsiformer_arad1k\checkpoints\best.pt" `
+  --data-root "D:\datasets\ARAD_1K" `
+  --split test `
+  --output-dir "outputs\test_cubes" `
+  --device cuda `
+  --amp
+```
+
 After installation, the equivalent command is `hsiformer-infer`.
 
 Each output is an NTIRE-compatible HDF5 `.mat` file containing `cube`, `bands`,
@@ -195,6 +222,28 @@ python scripts/test_ntire.py `
 
 For the distinct 50-image public test split, use `--split test` and a separate
 output directory. Its score must not be compared directly with `0.1468`.
+
+If the cubes for 0951-1000 sit outside the standard directories, name that
+location once:
+
+```powershell
+python scripts/test_ntire.py `
+  --checkpoint "runs\sstrans_source_arad1k\checkpoints\latest.pt" `
+  --data-root "/work3/<user>/dataset" `
+  --output-dir "outputs\public_test" `
+  --split test `
+  --spectral-dir "Test_spectral" `
+  --require-targets
+```
+
+If that split carries no spectral ground truth — the official release puts an
+MSFA `mosaic` payload in `Test_Spec` — the run prints which scenes are
+unscorable, reconstructs every scene, writes the cubes plus `inference.json`,
+and skips `summary.json`/`metrics.csv` instead of failing. Pass
+`--require-targets` to make missing ground truth a hard error, and use
+`--split validation` when metrics are the point. Partially annotated roots are
+scored on the scenes that do have cubes; `summary.json` reports both `count`
+and `skipped`.
 
 After installation, the equivalent command is `hsiformer-test`.
 The upstream result notebook loads the Lightning `last.ckpt`, so the matching

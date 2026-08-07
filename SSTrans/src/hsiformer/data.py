@@ -15,6 +15,74 @@ from torch.utils.data import Dataset
 Split = Literal["train", "validation", "test"]
 RGBNormalization = Literal["scale_255", "per_image"]
 
+RGB_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+SPECTRAL_SUFFIXES = (".mat",)
+
+# Redistributed ARAD-1K copies disagree on directory names, and some keep every
+# scene inside Train_*. Lookup is per scene: the first directory that actually
+# holds the file wins, so a Train-only root still serves validation and test.
+RGB_DIRS: dict[str, tuple[str, ...]] = {
+    "train": ("Train_RGB", "Train_rgb"),
+    "validation": ("Valid_RGB", "Validation_RGB", "Val_RGB", "Train_RGB"),
+    "test": ("Test_RGB", "Testing_RGB", "Valid_RGB", "Train_RGB"),
+}
+SPECTRAL_DIRS: dict[str, tuple[str, ...]] = {
+    "train": ("Train_spectral", "Train_Spec", "Train_Spectral"),
+    "validation": (
+        "Valid_spectral",
+        "Valid_Spec",
+        "Validation_spectral",
+        "Validation_Spec",
+        "Val_Spec",
+        "Train_spectral",
+        "Train_Spec",
+    ),
+    "test": (
+        "Test_spectral",
+        "Test_Spec",
+        "Testing_Spec",
+        "Train_spectral",
+        "Train_Spec",
+    ),
+}
+
+# Variable names seen in ARAD-1K/NTIRE redistributions, lower-cased.
+CUBE_DATASET_KEYS = (
+    "cube",
+    "reflectance",
+    "rad",
+    "hsi",
+    "hyper",
+    "data",
+    "image",
+)
+
+
+def resolve_arad_directory(
+    root: str | Path,
+    split: Split,
+    kind: Literal["rgb", "spectral"] = "rgb",
+) -> Path:
+    """Locate the ARAD-1K directory holding ``split`` data of ``kind``."""
+    if split not in RGB_DIRS:
+        raise ValueError(f"Unknown ARAD split: {split}")
+    base = Path(root)
+    candidates = RGB_DIRS[split] if kind == "rgb" else SPECTRAL_DIRS[split]
+    suffixes = RGB_SUFFIXES if kind == "rgb" else SPECTRAL_SUFFIXES
+    for name in candidates:
+        directory = base / name
+        if not directory.is_dir():
+            continue
+        if any(
+            path.is_file() and path.suffix.lower() in suffixes
+            for path in directory.iterdir()
+        ):
+            return directory
+    raise FileNotFoundError(
+        f"No {kind} directory with {split} data under {base}. Searched "
+        f"{list(candidates)}."
+    )
+
 
 def load_arad_manifest(
     split: Split,
@@ -51,6 +119,10 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         |-- Train_RGB/ARAD_1K_0001.jpg
         `-- Train_spectral/ARAD_1K_0001.mat
 
+    Split-specific directories (``Test_RGB``/``Test_Spec``,
+    ``Valid_RGB``/``Valid_spectral``, ...) are resolved per scene, so a root
+    that keeps everything under ``Train_*`` still works.
+
     Spectral files are read only when requested, avoiding the tens of gigabytes
     of RAM used by the original eager dataset.
     """
@@ -71,18 +143,21 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         spectral_channels: int = 31,
         cube_key: str = "cube",
         image_size: tuple[int, int] | None = None,
+        require_targets: bool = True,
+        probe_targets: bool | None = None,
+        rgb_dirs: Sequence[str] | None = None,
+        spectral_dirs: Sequence[str] | None = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
-        self.rgb_root = self.root / "Train_RGB"
-        self.spectral_root = self.root / "Train_spectral"
-        if not self.rgb_root.is_dir() or not self.spectral_root.is_dir():
-            raise FileNotFoundError(
-                "Expected ARAD directories 'Train_RGB' and 'Train_spectral' "
-                f"under {self.root}."
-            )
+        if split not in RGB_DIRS:
+            raise ValueError(f"Unknown ARAD split: {split}")
 
         self.split = split
+        # Explicit directories are searched first; names may also be absolute
+        # paths, for roots that keep cubes outside the ARAD tree.
+        self.rgb_dirs = (*(rgb_dirs or ()), *RGB_DIRS[split])
+        self.spectral_dirs = (*(spectral_dirs or ()), *SPECTRAL_DIRS[split])
         self.scene_ids = load_arad_manifest(split, manifest_path)
         self.crop_size = _pair(crop_size) if crop_size is not None else None
         self.stride = _pair(stride or crop_size or 1)
@@ -107,6 +182,9 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         if self.random_crop and self.crop_size is None:
             raise ValueError("random_crop requires crop_size.")
 
+        self._resolve_scene_files()
+        self._resolve_targets(require_targets, probe_targets)
+
         self.image_size = image_size or self._read_image_size(self.scene_ids[0])
         self.full_frame_crop = bool(
             self.crop_size is not None
@@ -115,11 +193,116 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         )
         self._crop_positions = self._build_crop_positions()
 
-    def _rgb_path(self, scene_id: str) -> Path:
-        return self.rgb_root / f"{scene_id}.jpg"
+    def _resolve_scene_files(self) -> None:
+        """Bind every manifest scene to a concrete RGB and spectral file."""
+        self._rgb_paths: dict[str, Path] = {}
+        # Every candidate is kept: a mosaic-only Test_Spec entry must not hide
+        # a real cube stored under a later directory name.
+        self._spectral_candidates: dict[str, tuple[Path, ...]] = {}
+        self._spectral_paths: dict[str, Path | None] = {}
+        missing_rgb: list[str] = []
 
-    def _spectral_path(self, scene_id: str) -> Path:
-        return self.spectral_root / f"{scene_id}.mat"
+        for scene_id in self.scene_ids:
+            rgb_path = _find_scene_file(
+                self.root,
+                scene_id,
+                self.rgb_dirs,
+                RGB_SUFFIXES,
+            )
+            if rgb_path is None:
+                missing_rgb.append(scene_id)
+                continue
+            self._rgb_paths[scene_id] = rgb_path
+            candidates = _find_scene_files(
+                self.root,
+                scene_id,
+                self.spectral_dirs,
+                SPECTRAL_SUFFIXES,
+            )
+            self._spectral_candidates[scene_id] = candidates
+            self._spectral_paths[scene_id] = candidates[0] if candidates else None
+
+        if missing_rgb:
+            raise FileNotFoundError(
+                f"No RGB file for {len(missing_rgb)} {self.split} scenes under "
+                f"{self.root} (searched {list(self.rgb_dirs)} with suffixes "
+                f"{list(RGB_SUFFIXES)}); first missing: {missing_rgb[:5]}."
+            )
+
+        self.rgb_root = next(iter(self._rgb_paths.values())).parent
+
+    def _resolve_targets(
+        self,
+        require_targets: bool,
+        probe_targets: bool | None,
+    ) -> None:
+        """Record which scenes carry a usable ground-truth cube.
+
+        The official ARAD-1K test release ships ``Test_Spec`` files that hold
+        only the raw MSFA ``mosaic`` payload, not a 31-band cube. Probing every
+        candidate directory both recovers a cube stored elsewhere in the root
+        and turns a genuinely absent target into an explicit, actionable state
+        instead of an opaque cube-key ``KeyError`` mid-evaluation.
+        """
+        # Train_spectral is always cube data; skip 900 file opens at startup.
+        probe = self.split != "train" if probe_targets is None else probe_targets
+        self.unusable_targets: dict[str, str] = {}
+
+        for scene_id in self.scene_ids:
+            candidates = self._spectral_candidates[scene_id]
+            if not candidates:
+                self.unusable_targets[scene_id] = (
+                    f"no spectral file found in {list(self.spectral_dirs)}"
+                )
+                continue
+            if not probe:
+                continue
+
+            reasons: list[str] = []
+            for candidate in candidates:
+                reason = _probe_cube_file(candidate, self.spectral_channels)
+                if reason is None:
+                    self._spectral_paths[scene_id] = candidate
+                    break
+                reasons.append(reason)
+            else:
+                self.unusable_targets[scene_id] = reasons[0]
+
+        spectral_parents = [
+            self._spectral_paths[scene_id].parent
+            for scene_id in self.scene_ids
+            if self.has_target(scene_id)
+            and self._spectral_paths[scene_id] is not None
+        ]
+        self.spectral_root = spectral_parents[0] if spectral_parents else None
+        self.scene_ids_with_targets = tuple(
+            scene_id
+            for scene_id in self.scene_ids
+            if scene_id not in self.unusable_targets
+        )
+        if require_targets and self.unusable_targets:
+            examples = "; ".join(
+                f"{scene_id}: {reason}"
+                for scene_id, reason in list(self.unusable_targets.items())[:3]
+            )
+            raise FileNotFoundError(
+                f"No usable ground-truth cube for "
+                f"{len(self.unusable_targets)}/{len(self.scene_ids)} "
+                f"{self.split} scenes under {self.root} (searched "
+                f"{list(self.spectral_dirs)}). {examples}. Point "
+                "spectral_dirs at the directory holding the cubes, pass "
+                "require_targets=False to reconstruct without metrics, or "
+                "evaluate a split that ships cubes (e.g. validation)."
+            )
+
+    def has_target(self, scene_id: str) -> bool:
+        return scene_id not in self.unusable_targets
+
+    def _rgb_path(self, scene_id: str) -> Path:
+        return self._rgb_paths[scene_id]
+
+    def _spectral_path(self, scene_id: str) -> Path | None:
+        return self._spectral_paths[scene_id]
 
     def _read_image_size(self, scene_id: str) -> tuple[int, int]:
         path = self._rgb_path(scene_id)
@@ -208,19 +391,28 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
                         self.crop_size,
                     )
 
-        label = self._load_cube(
-            scene_id,
-            height,
-            width,
-            crop_position=crop_position if active_crop_size is not None else None,
-            crop_size=active_crop_size,
+        label = (
+            self._load_cube(
+                scene_id,
+                height,
+                width,
+                crop_position=(
+                    crop_position if active_crop_size is not None else None
+                ),
+                crop_size=active_crop_size,
+            )
+            if self.has_target(scene_id)
+            else None
         )
 
         sample: dict[str, torch.Tensor | str] = {
             "cond": cond,
-            "label": label,
             "scene_id": scene_id,
         }
+        # Ground-truth-less scenes (ARAD-1K test) omit the key entirely so
+        # consumers fail loudly rather than scoring against a placeholder.
+        if label is not None:
+            sample["label"] = label
         if self.include_ycrcb:
             if ycrcb is None:
                 raise RuntimeError("YCbCr input was requested but not loaded.")
@@ -259,12 +451,19 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
         crop_size: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         path = self._spectral_path(scene_id)
-        if not path.is_file():
-            raise FileNotFoundError(path)
+        if path is None or not path.is_file():
+            raise FileNotFoundError(
+                f"No spectral file for scene '{scene_id}' under {self.root}."
+            )
         with h5py.File(path, "r") as handle:
-            if self.cube_key not in handle:
-                raise KeyError(f"{path} does not contain '{self.cube_key}'.")
-            dataset = handle[self.cube_key]
+            dataset = handle[
+                _resolve_cube_key(
+                    handle,
+                    path,
+                    channels=self.spectral_channels,
+                    preferred=self.cube_key,
+                )
+            ]
             cube = None
             if crop_position is not None and crop_size is not None:
                 cube = _read_cube_crop(
@@ -365,6 +564,109 @@ class RGBImageDataset(Dataset[dict[str, torch.Tensor | str]]):
             "scene_id": path.stem,
             "source_path": str(path),
         }
+
+
+def _find_scene_files(
+    root: Path,
+    scene_id: str,
+    subdirs: Sequence[str],
+    suffixes: Sequence[str],
+) -> tuple[Path, ...]:
+    """Return every file matching ``scene_id``, in candidate-directory order."""
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for subdir in subdirs:
+        # An absolute subdir replaces root, so callers may pass full paths.
+        directory = root / subdir
+        if not directory.is_dir():
+            continue
+        for suffix in suffixes:
+            candidate = directory / f"{scene_id}{suffix}"
+            resolved = candidate.resolve()
+            if candidate.is_file() and resolved not in seen:
+                seen.add(resolved)
+                matches.append(candidate)
+    return tuple(matches)
+
+
+def _find_scene_file(
+    root: Path,
+    scene_id: str,
+    subdirs: Sequence[str],
+    suffixes: Sequence[str],
+) -> Path | None:
+    matches = _find_scene_files(root, scene_id, subdirs, suffixes)
+    return matches[0] if matches else None
+
+
+def _resolve_cube_key(
+    handle: h5py.File,
+    path: Path,
+    *,
+    channels: int = 31,
+    preferred: str | None = "cube",
+) -> str:
+    """Return the name of the HDF5 dataset holding the HSI cube.
+
+    Prefers the canonical ``cube`` key, then known aliases (case-insensitive),
+    then any 3D dataset with a matching spectral axis, then a lone 3D dataset.
+    Raises a descriptive ``KeyError`` listing the available datasets when none
+    qualifies, so a wrong or MSFA-only file is diagnosable.
+    """
+    available = [
+        key
+        for key in handle.keys()
+        if not key.startswith("#") and isinstance(handle[key], h5py.Dataset)
+    ]
+    by_lower = {key.lower(): key for key in available}
+    candidates = CUBE_DATASET_KEYS
+    if preferred:
+        candidates = (preferred.lower(), *CUBE_DATASET_KEYS)
+    for candidate in candidates:
+        if candidate in by_lower:
+            return by_lower[candidate]
+
+    banded = [
+        key
+        for key in available
+        if handle[key].ndim == 3
+        and channels in tuple(int(value) for value in handle[key].shape)
+    ]
+    if banded:
+        return banded[0]
+    cubes = [key for key in available if handle[key].ndim == 3]
+    if len(cubes) == 1:
+        return cubes[0]
+
+    hint = ""
+    if "mosaic" in by_lower:
+        hint = (
+            " This file holds the ARAD-1K MSFA 'mosaic' payload; the official "
+            "test split ships without spectral ground truth, so it can only be "
+            "reconstructed, not scored."
+        )
+    raise KeyError(
+        f"No HSI cube dataset found in {path}. Expected a variable named "
+        f"'cube' (ARAD-1K/NTIRE convention) or one of {CUBE_DATASET_KEYS}; "
+        f"available datasets: {available or '<none>'}.{hint}"
+    )
+
+
+def _probe_cube_file(path: Path, channels: int) -> str | None:
+    """Return why ``path`` is unusable as a target, or ``None`` if it is fine."""
+    try:
+        with h5py.File(path, "r") as handle:
+            key = _resolve_cube_key(handle, path, channels=channels)
+            shape = tuple(int(value) for value in handle[key].shape)
+    except (OSError, KeyError, ValueError) as error:
+        # KeyError's str() escapes its message; args[0] keeps paths readable.
+        return str(error.args[0]) if error.args else str(error)
+    if len(shape) != 3 or channels not in shape:
+        return (
+            f"dataset '{key}' in {path} has shape {shape}; expected a 3D cube "
+            f"with a {channels}-band axis"
+        )
+    return None
 
 
 def _to_chw(

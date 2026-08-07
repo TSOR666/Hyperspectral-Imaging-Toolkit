@@ -103,6 +103,7 @@ def evaluate_loader(
 
     model.eval()
     rows: list[dict[str, float | str]] = []
+    skipped: list[str] = []
     cube_dir = Path(output_dir) if output_dir is not None else None
     if cube_dir is not None:
         cube_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +111,13 @@ def evaluate_loader(
     with torch.inference_mode():
         for batch in loader:
             rgb = _require_tensor(batch, "cond").to(device, non_blocking=True)
-            target = _require_tensor(batch, "label").to(device, non_blocking=True)
+            # ARAD-1K test batches carry no cube; they are reconstructed and
+            # exported, then excluded from the metric average.
+            target = (
+                _require_tensor(batch, "label").to(device, non_blocking=True)
+                if "label" in batch
+                else None
+            )
             scene_ids = _scene_ids(batch["scene_id"], rgb.shape[0])
             amp_enabled = amp and device.type == "cuda"
             with torch.autocast(
@@ -126,6 +133,18 @@ def evaluate_loader(
                 )
             for index, scene_id in enumerate(scene_ids):
                 predicted_scene = prediction[index : index + 1].float()
+                if target is None:
+                    skipped.append(scene_id)
+                    if cube_dir is not None:
+                        save_ntire_cube(
+                            cube_dir / f"{scene_id}.mat",
+                            (
+                                predicted_scene.clamp(0.0, 1.0)
+                                if clip
+                                else predicted_scene
+                            )[0],
+                        )
+                    continue
                 target_scene = target[index : index + 1].float()
                 metric_prediction, metric_target = _crop_metric_region(
                     predicted_scene,
@@ -169,12 +188,18 @@ def evaluate_loader(
                     )
 
     if not rows:
+        if skipped:
+            raise ValueError(
+                f"None of the {len(skipped)} evaluated scenes carry a "
+                "ground-truth cube; use infer_loader for prediction-only runs."
+            )
         raise ValueError("Evaluation loader produced no samples.")
     summary = {
         name: float(np.mean([float(row[name]) for row in rows]))
         for name in ("mrae", "rmse", "psnr", "sam")
     }
     summary["count"] = float(len(rows))
+    summary["skipped"] = float(len(skipped))
     summary["crop_border"] = float(crop_border)
     return summary, rows
 
