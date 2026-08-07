@@ -143,3 +143,63 @@ def test_ntire_dataset_uses_train_directories_as_compatibility_fallback(tmp_path
 
     dataset = tool.NTIRESplitDataset(data_root=str(case_dir), split="valid")
     assert dataset[0].target is not None
+
+
+def test_ntire_dataset_ignores_test_mosaic_as_ground_truth(tmp_path):
+    tool = _load_tool_module()
+    case_dir = tmp_path / f"case_{uuid.uuid4().hex}"
+    test_rgb_dir = case_dir / "Test_RGB"
+    test_spec_dir = case_dir / "Test_Spec"
+    valid_rgb_dir = case_dir / "Valid_RGB"
+    valid_spec_dir = case_dir / "Valid_Spec"
+    split_dir = case_dir / "split_txt"
+    for directory in (
+        test_rgb_dir,
+        test_spec_dir,
+        valid_rgb_dir,
+        valid_spec_dir,
+        split_dir,
+    ):
+        directory.mkdir(parents=True)
+
+    test_scene = "ARAD_1K_0951"
+    valid_scene = "ARAD_1K_0904"
+    (split_dir / "test_list.txt").write_text(f"{test_scene}\n", encoding="utf-8")
+    (split_dir / "valid_list.txt").write_text(f"{valid_scene}\n", encoding="utf-8")
+
+    rgb = np.random.randint(0, 255, (4, 5, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(test_rgb_dir / f"{test_scene}.jpg"), rgb)
+    assert cv2.imwrite(str(valid_rgb_dir / f"{valid_scene}.jpg"), rgb)
+    with h5py.File(test_spec_dir / f"{test_scene}.mat", "w") as mat:
+        mat.create_dataset("mosaic", data=np.random.rand(4, 5).astype(np.float32))
+    with h5py.File(valid_spec_dir / f"{valid_scene}.mat", "w") as mat:
+        mat.create_dataset("cube", data=np.random.rand(31, 5, 4).astype(np.float32))
+
+    dataset = tool.NTIRESplitDataset(data_root=str(case_dir), split="auto")
+    sample = dataset[0]
+
+    assert dataset.split_name == "valid"
+    assert sample.name == valid_scene
+    assert sample.target is not None
+
+
+def test_ntire_cli_accepts_weights_path_and_external_architecture(monkeypatch):
+    tool = _load_tool_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cswin_test_ntire.py",
+            "--weights_path",
+            "legacy_weights.pth",
+            "--architecture_config",
+            "legacy_architecture.yaml",
+            "--data_root",
+            "data",
+        ],
+    )
+
+    config = tool.parse_args()
+
+    assert config.model_path == "legacy_weights.pth"
+    assert config.architecture_config == "legacy_architecture.yaml"

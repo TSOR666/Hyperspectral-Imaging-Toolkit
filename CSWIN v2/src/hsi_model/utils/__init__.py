@@ -34,6 +34,15 @@ from .metrics import (
     compute_rmse,
 )
 from .patch_inference import PatchInference
+from .inference import (
+    GENERATOR_WEIGHTS_FORMAT,
+    load_architecture_config,
+    load_generator,
+    load_generator_from_weights,
+    convert_checkpoint_to_weights,
+    build_patch_inference,
+    geometric_self_ensemble,
+)
 
 # Data utilities (re-export for backwards compatibility)
 from .data import (
@@ -68,6 +77,13 @@ __all__ = [
     "compute_metrics",
     "validate_model_architecture",
     "PatchInference",
+    "GENERATOR_WEIGHTS_FORMAT",
+    "load_architecture_config",
+    "load_generator",
+    "load_generator_from_weights",
+    "convert_checkpoint_to_weights",
+    "build_patch_inference",
+    "geometric_self_ensemble",
     "compute_psnr",
     "get_cached_cmf",
     "create_error_report",

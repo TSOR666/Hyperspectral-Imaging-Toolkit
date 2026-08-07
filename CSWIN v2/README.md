@@ -255,6 +255,35 @@ python cswin_test_ntire.py \
   --output_dir ./cswin_test_results
 ```
 
+Inference also accepts a bare `torch.save(model.state_dict(), path)` file. For
+an older known architecture, provide its matching JSON/YAML config explicitly:
+
+```bash
+python cswin_test_ntire.py \
+  --weights_path /path/to/legacy_generator_weights.pth \
+  --architecture_config /path/to/legacy_architecture.yaml \
+  --data_root /path/to/ARAD_1K
+```
+
+To remove optimizer, discriminator, and training-only data from a checkpoint,
+convert it to a standalone generator artifact first. The default converted
+file embeds the architecture config and can be passed directly to the tester:
+
+```bash
+python convert_cswin_checkpoint.py \
+  --checkpoint /path/to/latest_checkpoint.pth \
+  --output /path/to/cswin_generator_weights.pth
+
+python cswin_test_ntire.py \
+  --weights_path /path/to/cswin_generator_weights.pth \
+  --data_root /path/to/ARAD_1K
+```
+
+If the source checkpoint has no config, add
+`--architecture_config /path/to/known_architecture.yaml` to the conversion
+command. Use `--raw_state_dict` only when a pure tensor mapping is required;
+that output must be loaded with `--architecture_config`.
+
 Patch inference uses overlap blending and inference mode. Add
 `--ensemble_mode d4` for the eight-way geometric self-ensemble.
 `--amp_dtype auto` selects BF16 on Ampere-or-newer GPUs and FP16 on older
