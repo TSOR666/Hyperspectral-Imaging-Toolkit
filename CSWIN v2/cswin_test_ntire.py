@@ -34,7 +34,11 @@ from hsi_model.utils.inference import (  # noqa: E402
     geometric_self_ensemble,
     load_generator,
 )
-from hsi_model.utils.metrics import compute_metrics, crop_center_arad1k  # noqa: E402
+from hsi_model.utils.metrics import (  # noqa: E402
+    compute_metrics,
+    compute_mrae,
+    crop_center_arad1k,
+)
 
 # ARAD-1K / MST++ center-crop window (NTIRE-2022 scoring region).
 _ARAD_CROP_H = 226
@@ -54,13 +58,17 @@ RGB_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 SPEC_SUFFIXES = (".mat",)
 
 RGB_DIRS = {
-    "test": ("Test_RGB", "Testing_RGB", "Valid_RGB", "Validation_RGB", "Val_RGB"),
-    "valid": ("Valid_RGB", "Validation_RGB", "Val_RGB", "Test_RGB"),
+    # Keep the same compatibility order as mswr_v2/dataloader.py.  Some
+    # redistributed ARAD-1K copies keep the split lists but put the actual
+    # files in Train_RGB, so treating that directory as a final fallback is
+    # important for both validation and test evaluation.
+    "test": ("Test_RGB", "Testing_RGB", "Valid_RGB", "Validation_RGB", "Val_RGB", "Train_RGB"),
+    "valid": ("Valid_RGB", "Validation_RGB", "Val_RGB", "Test_RGB", "Train_RGB"),
     "train": ("Train_RGB",),
 }
 SPEC_DIRS = {
-    "test": ("Test_Spec", "Testing_Spec", "Valid_Spec", "Validation_Spec", "Val_Spec"),
-    "valid": ("Valid_Spec", "Validation_Spec", "Val_Spec", "Test_Spec"),
+    "test": ("Test_Spec", "Testing_Spec", "Valid_Spec", "Validation_Spec", "Val_Spec", "Train_Spec"),
+    "valid": ("Valid_Spec", "Validation_Spec", "Val_Spec", "Test_Spec", "Train_Spec"),
     "train": ("Train_Spec",),
 }
 SPLIT_FILES = {
@@ -148,28 +156,76 @@ def _discover_stems_from_rgb(data_root: Path, split_name: str) -> List[str]:
     return stems
 
 
-def _resolve_split(data_root: Path, requested_split: str) -> Tuple[str, List[str], Optional[Path]]:
+def _iter_split_candidates(
+    data_root: Path,
+    requested_split: str,
+) -> Iterable[Tuple[str, List[str], Optional[Path]]]:
+    """Yield available split candidates in the same order as MSWR.
+
+    ``auto`` must not stop merely because a test RGB directory exists.  The
+    public ARAD test split is often RGB-only, while the local validation split
+    contains the HSI targets needed for metrics.  The dataset constructor uses
+    this iterator to decide whether it should fall back to validation; keeping
+    candidate discovery separate also preserves the small public
+    ``_resolve_split`` helper used by callers and tests.
+    """
     split_dir = data_root / "split_txt"
     split_order = ("test", "valid") if requested_split == "auto" else (requested_split,)
 
     for split_name in split_order:
         if split_name not in SPLIT_FILES:
             raise ValueError(f"Unsupported split {split_name!r}")
+
         if split_dir.exists():
             for split_file in SPLIT_FILES[split_name]:
                 candidate = split_dir / split_file
                 if candidate.exists():
                     stems = _read_split_stems(candidate)
                     if stems:
-                        return split_name, stems, candidate
-        stems = _discover_stems_from_rgb(data_root, split_name)
-        if stems:
-            return split_name, stems, None
+                        yield split_name, stems, candidate
+                        break
+            else:
+                stems = _discover_stems_from_rgb(data_root, split_name)
+                if stems:
+                    yield split_name, stems, None
+        else:
+            stems = _discover_stems_from_rgb(data_root, split_name)
+            if stems:
+                yield split_name, stems, None
+
+
+def _resolve_split(data_root: Path, requested_split: str) -> Tuple[str, List[str], Optional[Path]]:
+    for candidate in _iter_split_candidates(data_root, requested_split):
+        return candidate
 
     raise FileNotFoundError(
         f"Could not resolve split={requested_split!r} under {data_root}. "
         "Expected split_txt/{test,valid}_list.txt or RGB files in a known split directory."
     )
+
+
+def _collect_pairs(
+    data_root: Path,
+    split_name: str,
+    stems: Sequence[str],
+) -> Tuple[List[Tuple[str, Path, Optional[Path]]], List[str], List[str]]:
+    """Resolve RGB/HSI pairs for one split and retain useful diagnostics."""
+    pairs: List[Tuple[str, Path, Optional[Path]]] = []
+    missing_rgb: List[str] = []
+    missing_gt: List[str] = []
+
+    for stem in stems:
+        rgb_path = _find_existing_file(data_root, stem, RGB_DIRS[split_name], RGB_SUFFIXES)
+        if rgb_path is None:
+            missing_rgb.append(stem)
+            continue
+
+        target_path = _find_existing_file(data_root, stem, SPEC_DIRS[split_name], SPEC_SUFFIXES)
+        if target_path is None:
+            missing_gt.append(stem)
+        pairs.append((stem, rgb_path, target_path))
+
+    return pairs, missing_rgb, missing_gt
 
 
 def _load_rgb(path: Path, bgr2rgb: bool, normalization: str) -> np.ndarray:
@@ -217,40 +273,108 @@ class NTIRESplitDataset:
         self.rgb_normalization = rgb_normalization
         self.require_gt = require_gt
 
-        split_name, stems, split_file = _resolve_split(self.data_root, split)
         if start_idx < 0:
             raise ValueError("start_idx must be non-negative")
         if max_samples is not None and max_samples < 0:
             raise ValueError("max_samples must be non-negative")
 
         end_idx = None if max_samples is None else start_idx + max_samples
-        self.stems = stems[start_idx:end_idx]
+        requested_split = split.lower()
+        if requested_split not in {"auto", "test", "valid", "train"}:
+            raise ValueError("split must be one of: auto, test, valid, train")
+
+        selected: Optional[
+            Tuple[str, List[Tuple[str, Path, Optional[Path]]], List[str], List[str], Optional[Path]]
+        ] = None
+        rgb_only_fallback: Optional[
+            Tuple[str, List[Tuple[str, Path, Optional[Path]]], List[str], List[str], Optional[Path]]
+        ] = None
+        candidate_errors: List[str] = []
+
+        for split_name, all_stems, split_file in _iter_split_candidates(
+            self.data_root, requested_split
+        ):
+            candidate_stems = all_stems[start_idx:end_idx]
+            pairs, missing_rgb, missing_gt = _collect_pairs(
+                self.data_root, split_name, candidate_stems
+            )
+            if not pairs:
+                candidate_errors.append(
+                    f"{split_name}: no RGB files matched {len(candidate_stems)} split entries"
+                )
+                continue
+
+            candidate = (split_name, pairs, missing_rgb, missing_gt, split_file)
+            has_complete_target = any(target is not None for _, _, target in pairs)
+            is_complete = not missing_gt
+
+            if rgb_only_fallback is None:
+                rgb_only_fallback = candidate
+
+            if requested_split == "auto":
+                # Mirror mswr_v2: when auto discovers a public RGB-only test
+                # split, continue to validation so metrics can use its HSI
+                # targets.  Keep the RGB-only candidate as a final fallback so
+                # official submission/test RGB still works when no local GT is
+                # available anywhere.
+                if has_complete_target and (not require_gt or is_complete):
+                    selected = candidate
+                    break
+                candidate_errors.append(
+                    f"{split_name}: RGB matched {len(pairs)} entries but no usable "
+                    f"ground-truth pair was found"
+                )
+                continue
+
+            if require_gt and not is_complete:
+                candidate_errors.append(
+                    f"{split_name}: ground truth missing for {len(missing_gt)} entries"
+                )
+                continue
+            selected = candidate
+            break
+
+        if selected is None and not require_gt and rgb_only_fallback is not None:
+            selected = rgb_only_fallback
+            if requested_split == "auto":
+                LOGGER.info(
+                    "No ground-truth pairs were found in the auto candidates; "
+                    "using the first RGB-only split for prediction-only inference."
+                )
+
+        if selected is None:
+            detail = "; ".join(candidate_errors)
+            message = (
+                f"No usable samples with the requested split={split!r} "
+                f"under {self.data_root}."
+            )
+            if detail:
+                message = f"{message} {detail}"
+            raise FileNotFoundError(message)
+
+        split_name, self.pairs, missing_rgb, missing_gt, split_file = selected
+        self.stems = [stem for stem, _, _ in self.pairs]
         self.split_name = split_name
         self.split_file = split_file
 
-        self.pairs: List[Tuple[str, Path, Optional[Path]]] = []
-        missing_rgb: List[str] = []
-        missing_gt: List[str] = []
-        for stem in self.stems:
-            rgb_path = _find_existing_file(self.data_root, stem, RGB_DIRS[split_name], RGB_SUFFIXES)
-            if rgb_path is None:
-                missing_rgb.append(stem)
-                continue
-            target_path = _find_existing_file(self.data_root, stem, SPEC_DIRS[split_name], SPEC_SUFFIXES)
-            if target_path is None:
-                missing_gt.append(stem)
-                if require_gt:
-                    continue
-            self.pairs.append((stem, rgb_path, target_path))
-
         if missing_rgb:
-            LOGGER.warning("Missing RGB files for %d stems; first few: %s", len(missing_rgb), missing_rgb[:5])
+            LOGGER.warning(
+                "Missing RGB files for %d stems in split %s; first few: %s",
+                len(missing_rgb),
+                split_name,
+                missing_rgb[:5],
+            )
         if missing_gt:
-            LOGGER.info("Ground truth missing for %d stems; metrics will be skipped for those.", len(missing_gt))
+            LOGGER.info(
+                "Ground truth missing for %d stems in split %s; metrics will be skipped for those.",
+                len(missing_gt),
+                split_name,
+            )
         if require_gt and missing_gt:
-            raise FileNotFoundError(f"Missing ground truth for {len(missing_gt)} samples; first few: {missing_gt[:5]}")
-        if not self.pairs:
-            raise FileNotFoundError(f"No usable samples found in {self.data_root} for split={split_name}")
+            raise FileNotFoundError(
+                f"Missing ground truth for {len(missing_gt)} samples in split {split_name}; "
+                f"first few: {missing_gt[:5]}"
+            )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -469,11 +593,21 @@ class CSWINNTIRETester:
 
             if sample.target is not None:
                 target = sample.target.unsqueeze(0).to(self.device)
-                pred_for_metrics = pred.clamp(0.0, 1.0)
+                # Keep both views: the clamped metrics describe the
+                # reflectance-domain output, while raw MRAE is the quantity
+                # used by MST++/NTIRE and by the CSWIN training checkpoints.
+                pred_unclamped = pred.float()
+                pred_for_metrics = pred_unclamped.clamp(0.0, 1.0)
                 target_for_metrics = target.float()
+                pred_unclamped, target_for_metrics = _crop_for_metrics(
+                    pred_unclamped,
+                    target_for_metrics,
+                    self.config.crop_border,
+                    self.config.crop_mode,
+                )
                 pred_for_metrics, target_for_metrics = _crop_for_metrics(
                     pred_for_metrics,
-                    target_for_metrics,
+                    target,
                     self.config.crop_border,
                     self.config.crop_mode,
                 )
@@ -482,6 +616,10 @@ class CSWINNTIRETester:
                     target_for_metrics,
                     compute_all=self.config.compute_all_metrics,
                 )
+                metrics["mrae_unclamped"] = compute_mrae(
+                    pred_unclamped,
+                    target_for_metrics,
+                ).item()
                 sample_result["metrics"] = metrics
 
             if self.config.save_predictions:
@@ -538,7 +676,15 @@ class CSWINNTIRETester:
         metric_count = int(metrics.get("count", 0))
         if metric_count > 0 and any(k in metrics for k in ("mrae", "rmse", "psnr")):
             print("\nMetrics:")
-            for key in ("mrae", "rmse", "psnr", "ssim", "sam", "mae"):
+            for key in (
+                "mrae_unclamped",
+                "mrae",
+                "rmse",
+                "psnr",
+                "ssim",
+                "sam",
+                "mae",
+            ):
                 if key in metrics:
                     val = metrics[key]
                     print(f"{key.upper():8s}: {val['mean']:.6f} +/- {val['std']:.6f}")
