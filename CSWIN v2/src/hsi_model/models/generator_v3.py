@@ -368,6 +368,83 @@ class DualTransformerBlock(nn.Module):
         return checkpoint(self._forward_impl, x)
 
 
+class LegacyDualTransformerBlock(nn.Module):
+    """The pre-HSIFormer transformer block, kept only so old weights load.
+
+    Checkpoints trained before the SSTB rewrite (commit ``17c847c``) were built
+    from a block with three GroupNorms, a plain feed-forward network and an
+    optional :class:`NoiseAwareBlock`::
+
+        x = x + spectral_attn(norm1(x))
+        x = x + spatial_attn(norm2(x))
+        x = x + ffn(norm3(x))
+        x = noise_block(x)            # optional
+
+    :class:`DualTransformerBlock` replaced that with the CBAM-gated SSTB, so its
+    ``state_dict`` keys (``gate.*``, ``gdfn.*``, ``sgfn.*``, ``norm4.*``, and
+    ``ChannelLayerNorm`` instead of ``GroupNorm``) no longer match those weights
+    under any config. Select this variant with ``block_variant: legacy_dtb`` —
+    ``hsi_model.utils.onnx_export`` detects it automatically from the tensor
+    keys. Do not use it for new training; it exists to make historical
+    checkpoints exportable and evaluable.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        split_size: int = 7,
+        num_heads: int = 4,
+        config: Optional[ConfigDict] = None,
+    ) -> None:
+        super().__init__()
+
+        if config is None:
+            raise ValueError("config cannot be None for LegacyDualTransformerBlock")
+        if num_heads is None:
+            num_heads = config.get("num_heads", 4)
+
+        base_groups = config.get("norm_groups", 8)
+        self.norm1 = adaptive_group_norm(channels, base_groups)
+        self.norm2 = adaptive_group_norm(channels, base_groups)
+        self.norm3 = adaptive_group_norm(channels, base_groups)
+
+        # The legacy era defaulted to the pre-pooled gate, not S-MSA.
+        spectral_type = str(config.get("spectral_attention_type", "efficient")).lower()
+        if spectral_type in ("s_msa", "smsa", "spectral_msa", "mdta"):
+            spectral_attn = SpectralMSA(channels, num_heads=num_heads, config=config)
+        else:
+            spectral_attn = EfficientSpectralAttention(
+                channels, num_heads=num_heads, config=config
+            )
+        self.spectral_attn = NaNSafeAttention(spectral_attn)
+
+        spatial_attn = CSWinAttentionBlock(
+            channels, num_heads=num_heads, split_size=split_size, config=config
+        )
+        self.spatial_attn = NaNSafeAttention(spatial_attn)
+
+        # The legacy FFN hard-coded a 4x expansion; it is exposed here because
+        # the exporter recovers it from ``ffn.net.0.weight``.
+        self.ffn = FeedForwardNetwork(
+            channels,
+            expansion_factor=max(1, int(config.get("legacy_ffn_expansion_factor", 4))),
+            config=config,
+        )
+
+        self.use_noise_block = bool(config.get("use_noise_block", True))
+        self.noise_block = (
+            NoiseAwareBlock(channels, config=config) if self.use_noise_block else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.spectral_attn(self.norm1(x))
+        x = x + self.spatial_attn(self.norm2(x))
+        x = x + self.ffn(self.norm3(x))
+        if self.noise_block is not None:
+            x = self.noise_block(x)
+        return x
+
+
 class DynamicDownsampleBlock(nn.Module):
     """Downsampling block with adaptive normalization."""
     def __init__(
@@ -594,12 +671,35 @@ class NoiseRobustCSWinGenerator(nn.Module):
         out_channels = config.get("out_channels", 31)
         base_channels = config.get("base_channels", 64)
         split_sizes = list(config.get("split_sizes", [7, 7, 7]))
-        if bool(config.get("use_noise_block", False)):
+
+        # Transformer block generation. 'sstb' is the current HSIFormer block;
+        # 'legacy_dtb' rebuilds the pre-17c847c block so historical checkpoints
+        # stay loadable for export/evaluation (see LegacyDualTransformerBlock).
+        block_variant = str(config.get("block_variant", "sstb")).strip().lower()
+        if block_variant in ("sstb", "hsiformer", "dual", "default", ""):
+            block_variant = "sstb"
+        elif block_variant in ("legacy_dtb", "legacy", "pre_sstb", "v1"):
+            block_variant = "legacy_dtb"
+        else:
+            raise ValueError(
+                "block_variant must be 'sstb' or 'legacy_dtb', got "
+                f"{config.get('block_variant')!r}"
+            )
+        self._block_variant = block_variant
+        BlockClass = (
+            DualTransformerBlock
+            if block_variant == "sstb"
+            else LegacyDualTransformerBlock
+        )
+
+        if block_variant == "sstb" and bool(config.get("use_noise_block", False)):
             raise ValueError(
                 "use_noise_block is a legacy GAN-era flag that is not wired "
                 "into NoiseRobustCSWinGenerator. Use use_input_denoising for "
                 "the shallow input denoising residual, or leave both disabled "
-                "for clean RGB->HSI benchmark runs."
+                "for clean RGB->HSI benchmark runs. Historical checkpoints that "
+                "do contain noise_block weights must also set "
+                "block_variant: legacy_dtb."
             )
         if len(split_sizes) == 0:
             raise ValueError("split_sizes must contain at least one value")
@@ -677,7 +777,7 @@ class NoiseRobustCSWinGenerator(nn.Module):
 
         def make_stage(ch: int, split: int, n_blocks: int, heads: int) -> nn.Sequential:
             return nn.Sequential(*[
-                DualTransformerBlock(ch, split_size=split, num_heads=heads, config=config)
+                BlockClass(ch, split_size=split, num_heads=heads, config=config)
                 for _ in range(n_blocks)
             ])
 
