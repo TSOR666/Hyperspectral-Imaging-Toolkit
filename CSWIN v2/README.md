@@ -291,6 +291,65 @@ Tensor Core GPUs; use `--amp_dtype fp32` for full-precision inference. Tile
 outputs are streamed directly into the FP32 overlap accumulator, so retained
 tile memory is bounded by the configured patch batch size.
 
+## ONNX Export (architecture-independent inference)
+
+`load_generator` rebuilds the model from the config stored in the checkpoint, so
+it fails on weights that predate a code change: default values moved
+(`spectral_attention_type`, `cswin_bias_mode`, ...), the transformer block was
+replaced by the SSTB at commit `17c847c`, and `iteration_count` changed shape.
+`export_onnx.py` sidesteps all of it by recovering the architecture from the
+checkpoint's own tensor keys and shapes, rebuilding a matching generator
+(including the pre-SSTB block via `block_variant: legacy_dtb`) and freezing the
+result into ONNX. After export, inference needs no code from this repository.
+
+```bash
+pip install onnx onnxruntime        # onnxruntime-gpu for CUDA
+
+# See what the weights say the architecture is, without writing anything
+python export_onnx.py --checkpoint /path/to/old_best.pth --inspect
+
+# Freeze it. Export at the size you will run inference at.
+python export_onnx.py \
+  --checkpoint /path/to/old_best.pth \
+  --output artifacts/onnx/old_best_fp16.onnx \
+  --height 128 --width 128 --precision fp16
+```
+
+`--precision fp32|fp16` chooses the stored weight precision; graph inputs and
+outputs stay fp32 either way unless you pass `--fp16-io`. Every export runs an
+eager-vs-ONNX parity check (relative L2 against the PyTorch model) and writes a
+sidecar `.json` manifest recording the recovered config, where each value came
+from (`tensors` / `checkpoint` / `default` / `override`), any place the embedded
+config disagreed with the weights, and the parity numbers.
+
+A few knobs leave no fingerprint in the weights - `norm_groups`,
+`output_activation`, `cascade_stages`, `sstb_outer_residual_scale`. They are
+taken from the embedded config when the checkpoint has one, otherwise defaulted
+and listed under "Not recoverable from the weights". Correct any of them with
+`--set KEY=VALUE` (JSON values, e.g. `--set norm_groups=8`).
+
+The spatial size is baked into the graph because the model's reflect-padding to
+a multiple of `split_size` is data-dependent control flow. The batch axis stays
+dynamic. `--dynamic-hw` exists but is only valid across sizes that need
+identical padding decisions.
+
+Score the exported graph on ARAD-1K with the same protocol as
+`cswin_test_ntire.py` (same split resolution, MST++ RGB normalization, 226x256
+center-crop window, and metric implementations):
+
+```bash
+python onnx_test_ntire.py \
+  --onnx artifacts/onnx/old_best_fp16.onnx \
+  --data_root /path/to/ARAD_1K \
+  --output_dir ./onnx_test_results
+```
+
+Tiling is inferred from the graph: a graph frozen at 128x128 is tiled with the
+same overlap-blend as `PatchInference`; one frozen at the full image size runs in
+a single pass. Add `--compare_checkpoint /path/to/old_best.pth` to evaluate the
+original PyTorch weights alongside and print the per-metric delta the export
+introduced.
+
 ## Verification
 
 ```bash
@@ -316,7 +375,10 @@ src/hsi_model/models/attention.py
 src/hsi_model/models/losses_consolidated.py
 src/hsi_model/utils/data/
 src/hsi_model/utils/inference.py
+src/hsi_model/utils/onnx_export.py
 src/hsi_model/utils/patch_inference.py
+export_onnx.py
+onnx_test_ntire.py
 ```
 
 See the config headers in `src/configs/*.yaml` and the probe scripts under

@@ -28,6 +28,17 @@ packaging>=21.0        # Version checks in attention utilities
 opencv-python>=4.5.0   # MST/ARAD image loading utilities
 
 # ============================================================================
+# Optional - ONNX export and architecture-independent inference
+# ============================================================================
+# Needed by export_onnx.py / onnx_test_ntire.py only.
+#   pip install onnx onnxruntime          # CPU
+#   pip install onnx onnxruntime-gpu      # CUDA
+# fp16 export uses onnxruntime.transformers.float16; onnxconverter-common is a
+# fallback. --exporter dynamo additionally needs onnxscript.
+onnx>=1.15.0           # ONNX graph IO
+onnxruntime>=1.17.0    # ONNX inference + fp16 graph conversion
+
+# ============================================================================
 # Optional - Logging and Visualization
 # ============================================================================
 wandb>=0.13.0          # Weights & Biases logging (optional but recommended)

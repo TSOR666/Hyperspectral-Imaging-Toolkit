@@ -43,6 +43,15 @@ from .inference import (
     build_patch_inference,
     geometric_self_ensemble,
 )
+# Architecture recovery + ONNX freezing for checkpoints the current code can no
+# longer rebuild from their embedded config. Import-safe without onnx installed;
+# only the export/verify calls need it.
+from .onnx_export import (
+    export_checkpoint_to_onnx,
+    load_generator_from_any_checkpoint,
+    rebuild_generator,
+    recover_architecture,
+)
 
 # Data utilities (re-export for backwards compatibility)
 from .data import (
@@ -84,6 +93,11 @@ __all__ = [
     "convert_checkpoint_to_weights",
     "build_patch_inference",
     "geometric_self_ensemble",
+    # ONNX export / architecture recovery
+    "export_checkpoint_to_onnx",
+    "load_generator_from_any_checkpoint",
+    "rebuild_generator",
+    "recover_architecture",
     "compute_psnr",
     "get_cached_cmf",
     "create_error_report",
