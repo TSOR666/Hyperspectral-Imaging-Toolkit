@@ -385,6 +385,7 @@ def test_main(argv: Sequence[str] | None = None) -> None:
             rgb_normalization=rgb_normalization,
             rgb_dir=dataset.rgb_root,
             scene_ids=exported,
+            target_dir=None,
         )
         _maybe_generate_visualizations(
             args,
@@ -413,6 +414,7 @@ def test_main(argv: Sequence[str] | None = None) -> None:
         **summary,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "split": args.split,
+        "target_dir": str(Path(dataset.spectral_root).resolve()),
         "rgb_normalization": rgb_normalization,
         "tile_size": args.tile_size,
         "overlap": args.overlap if args.tile_size is not None else None,
@@ -469,6 +471,7 @@ def _write_inference_report(
     rgb_normalization: str,
     rgb_dir: str | Path | None,
     scene_ids: Sequence[str],
+    target_dir: str | Path | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "inference.json").write_text(
@@ -476,6 +479,11 @@ def _write_inference_report(
             {
                 "checkpoint": str(Path(checkpoint).resolve()),
                 "rgb_dir": str(rgb_dir) if rgb_dir is not None else None,
+                "target_dir": (
+                    str(Path(target_dir).resolve())
+                    if target_dir is not None
+                    else None
+                ),
                 "rgb_normalization": rgb_normalization,
                 "count": len(scene_ids),
                 "scene_ids": list(scene_ids),

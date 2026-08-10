@@ -235,6 +235,8 @@ pip install -r ..\hsi_viz_suite\requirements.txt
 Use `--viz-output`, `--viz-max-samples`, `--viz-dpi`, or `--viz-style` to
 customize that handoff. An installed SSTrans package can locate a sibling suite
 checkout automatically; otherwise pass `--hsi-viz-suite <path-to-hsi_viz_suite>`.
+Scored `summary.json` files also record the absolute reference directory, so a
+later direct suite invocation can recover the target cubes automatically.
 
 For the distinct 50-image public test split, use `--split test` and a separate
 output directory. Its score must not be compared directly with `0.1468`.

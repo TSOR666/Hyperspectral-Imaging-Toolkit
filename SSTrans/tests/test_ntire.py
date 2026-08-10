@@ -401,6 +401,7 @@ def test_test_cli_runs_paired_metrics_then_visualization(tmp_path, monkeypatch) 
     assert summary["count"] == 1.0
     assert summary["sam_unit"] == "radians"
     assert summary["ssim"] == 1.0
+    assert summary["target_dir"] == str(target_dir.resolve())
 
 
 def test_test_cli_visualizes_blind_export_without_claiming_metrics(
@@ -471,5 +472,7 @@ def test_test_cli_visualizes_blind_export_without_claiming_metrics(
     assert observed["target_dir"] is None
     assert (output_dir / "cubes" / "scene_1.mat").is_file()
     assert (output_dir / "inference.json").is_file()
+    inference = json.loads((output_dir / "inference.json").read_text(encoding="utf-8"))
+    assert inference["target_dir"] is None
     assert not (output_dir / "metrics.csv").exists()
     assert not (output_dir / "summary.json").exists()
