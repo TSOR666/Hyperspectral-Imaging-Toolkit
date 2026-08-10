@@ -243,11 +243,11 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
     ) -> None:
         """Record which scenes carry a usable ground-truth cube.
 
-        The official ARAD-1K test release ships ``Test_Spec`` files that hold
-        only the raw MSFA ``mosaic`` payload, not a 31-band cube. Probing every
-        candidate directory both recovers a cube stored elsewhere in the root
-        and turns a genuinely absent target into an explicit, actionable state
-        instead of an opaque cube-key ``KeyError`` mid-evaluation.
+        Some ARAD-1K test releases ship ``Test_Spec`` files that hold only the
+        raw MSFA ``mosaic`` payload, not a 31-band cube. Probing every candidate
+        directory both recovers a cube stored elsewhere in the root and turns a
+        genuinely absent target into an explicit, actionable state instead of
+        an opaque cube-key ``KeyError`` mid-evaluation.
         """
         # Train_spectral is always cube data; skip 900 file opens at startup.
         probe = self.split != "train" if probe_targets is None else probe_targets
@@ -290,15 +290,32 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
                 f"{scene_id}: {reason}"
                 for scene_id, reason in list(self.unusable_targets.items())[:3]
             )
-            raise FileNotFoundError(
+            message = (
                 f"No usable ground-truth cube for "
                 f"{len(self.unusable_targets)}/{len(self.scene_ids)} "
                 f"{self.split} scenes under {self.root} (searched "
-                f"{list(self.spectral_dirs)}). {examples}. Point "
-                "spectral_dirs at the directory holding the cubes, pass "
-                "require_targets=False to reconstruct without metrics, or "
-                "evaluate a split that ships cubes (e.g. validation)."
+                f"{list(self.spectral_dirs)}). {examples}."
             )
+            has_mosaic_only_files = any(
+                "mosaic" in reason.lower()
+                for reason in self.unusable_targets.values()
+            )
+            if has_mosaic_only_files:
+                message += (
+                    " The selected files contain only the MSFA 'mosaic' payload, "
+                    "not 31-band references. Do not use Test_Spec as --target-dir; "
+                    "point it at a directory containing the matching cubes "
+                    "(often Train_spectral or Test_spectral). If no such test "
+                    "references exist, remove --require-targets for inference-only "
+                    "export; metrics and error maps cannot be computed locally."
+                )
+            else:
+                message += (
+                    " Point --target-dir/--spectral-dir at the directory holding "
+                    "the matching 31-band cubes, or pass require_targets=False "
+                    "to reconstruct without metrics."
+                )
+            raise FileNotFoundError(message)
 
     def has_target(self, scene_id: str) -> bool:
         return scene_id not in self.unusable_targets
