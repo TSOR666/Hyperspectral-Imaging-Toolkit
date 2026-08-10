@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from hsi_io import load_hsi
+import generate_all_visualizations as visualization_pipeline
+from generate_all_visualizations import (
+    _normalize_results_directory,
+    _reported_target_directory,
+)
 from metrics_io import load_metric_for_sample, load_metric_rows
 from result_layout import find_prediction_samples, find_sample_pairs, prediction_path
 
@@ -123,3 +129,71 @@ def test_sstrans_radian_sam_is_normalized_for_paper_figures(tmp_path: Path) -> N
     assert float(row["sam"]) == pytest.approx(90.0)
     assert row["sam_unit"] == "degrees"
     assert float(row["sam_radians"]) == pytest.approx(np.pi / 2)
+
+
+def test_sstrans_summary_discovers_reference_directory(tmp_path: Path) -> None:
+    target_dir = tmp_path / "Train_spectral"
+    target_dir.mkdir()
+    (tmp_path / "summary.json").write_text(
+        '{"target_dir": "' + str(target_dir).replace("\\", "\\\\") + '"}\n',
+        encoding="utf-8",
+    )
+
+    assert _reported_target_directory(tmp_path) == target_dir.resolve()
+
+
+def test_results_argument_may_point_at_sstrans_cubes_child(tmp_path: Path) -> None:
+    cubes_dir = tmp_path / "cubes"
+    cubes_dir.mkdir()
+    (tmp_path / "metrics.csv").write_text("scene_id,mrae\n", encoding="utf-8")
+
+    assert _normalize_results_directory(cubes_dir) == tmp_path.resolve()
+
+
+def test_one_shot_pipeline_autodiscovers_sstrans_pairs_and_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "evaluation"
+    cubes_dir = run_dir / "cubes"
+    target_dir = tmp_path / "Train_spectral"
+    cubes_dir.mkdir(parents=True)
+    target_dir.mkdir()
+    np.save(cubes_dir / "scene_01.npy", np.zeros((2, 3, 4), dtype=np.float32))
+    np.save(target_dir / "scene_01.npy", np.zeros((2, 3, 4), dtype=np.float32))
+    (run_dir / "summary.json").write_text(
+        json.dumps({"target_dir": str(target_dir.resolve())}) + "\n",
+        encoding="utf-8",
+    )
+    with (run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["scene_id", "mrae"])
+        writer.writeheader()
+        writer.writerow({"scene_id": "scene_01", "mrae": "0.12"})
+
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_run_script(script: str, args: list[str]) -> None:
+        calls.append((script, args))
+
+    monkeypatch.setattr(visualization_pipeline, "run_script", fake_run_script)
+    monkeypatch.setattr(
+        visualization_pipeline.sys,
+        "argv",
+        [
+            "generate_all_visualizations.py",
+            "--results",
+            str(cubes_dir),
+            "--output",
+            str(tmp_path / "figures"),
+        ],
+    )
+
+    visualization_pipeline.main()
+
+    scripts = [script for script, _ in calls]
+    assert "generate_error_maps.py" in scripts
+    assert "plot_metrics_statistics.py" in scripts
+    error_args = dict(zip(calls[scripts.index("generate_error_maps.py")][1][::2], calls[scripts.index("generate_error_maps.py")][1][1::2]))
+    assert error_args["--targets"] == str(target_dir.resolve())
+    stats_args = calls[scripts.index("plot_metrics_statistics.py")][1]
+    assert str(run_dir.resolve()) in stats_args

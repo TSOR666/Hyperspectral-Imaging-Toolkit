@@ -34,7 +34,7 @@ python scripts/generate_all_visualizations.py \
   --style paper
 ```
 
-For an SSTrans evaluation or inference folder, point `--results` at the folder containing `cubes/`. Targets are optional for prediction-only figures; provide the ARAD spectral directory to enable error maps and paired plots:
+For an SSTrans evaluation or inference folder, point `--results` at the folder containing `cubes/` (the `cubes/` child itself is also accepted). Targets are optional for prediction-only figures; provide the ARAD spectral directory to enable error maps and paired plots:
 
 ```bash
 python scripts/generate_all_visualizations.py \
@@ -43,6 +43,13 @@ python scripts/generate_all_visualizations.py \
   --output figs/sstrans \
   --dpi 300
 ```
+
+Scored SSTrans runs record the reference directory in `summary.json`, so the
+`--targets` argument can be omitted when that directory still exists. The
+alias `--target-dir` is accepted as well. The pipeline prints the number of
+prediction samples, metric rows, and paired targets it discovered; it stops
+with the exact results/target paths when a requested target directory cannot
+be paired.
 
 SSTrans' `scripts/test_ntire.py --visualize` runs this exact command
 automatically after cube export. Its reports retain native SAM radians while
@@ -77,7 +84,7 @@ Key arguments exposed by the wrapper script:
 | Flag | Description | Default |
 | --- | --- | --- |
 | `--max-samples` | Maximum number of samples processed per figure type. | `10` |
-| `--targets` | Optional target directory; supports a direct scene-file directory such as `Train_spectral`. | `None` |
+| `--targets`, `--target-dir` | Optional target directory; supports a direct scene-file directory such as `Train_spectral`. Scored SSTrans reports are auto-discovered when omitted. | `None` |
 | `--dpi` | Rendering resolution for saved figures. | `300` |
 | `--style` | Matplotlib style sheet (`paper`, `poster`, etc.). | `paper` |
 | `--methods` | Additional result directories for comparisons. | `None` |
