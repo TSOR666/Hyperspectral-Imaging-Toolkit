@@ -19,6 +19,10 @@ Tiling is chosen from the graph itself: a graph frozen at 128x128 is tiled with
 the same overlap-blend as ``PatchInference``; a graph frozen at the full image
 size runs in one pass. ``--compare_checkpoint`` additionally runs the original
 PyTorch weights so you can see exactly what the export cost you.
+
+On CPU, a legacy FP16 graph whose internal half-precision arithmetic overflows
+is automatically retried once from an in-memory FP32 conversion. Disable this
+recovery with ``--no-fp32-fallback`` when diagnosing the original graph.
 """
 
 from __future__ import annotations
@@ -105,6 +109,10 @@ class OnnxTestConfig:
     # The official ARAD-1K Test_Spec files contain a raw MSFA mosaic, not HSI
     # ground truth. Prediction-only inference must therefore be the default.
     require_gt: bool = False
+    # CPU execution of some legacy FP16 graphs can overflow in half-precision
+    # intermediates even when the graph I/O is float32. Retry such graphs with
+    # an in-memory FP32 conversion before failing.
+    fp32_fallback: bool = True
     quiet_patches: bool = True
     compare_checkpoint: Optional[str] = None
 
@@ -123,6 +131,7 @@ class OnnxGenerator(nn.Module):
         onnx_path: str,
         providers: Optional[Sequence[str]] = None,
         intra_op_threads: int = 0,
+        fp32_fallback: bool = True,
     ) -> None:
         super().__init__()
         try:
@@ -133,9 +142,14 @@ class OnnxGenerator(nn.Module):
                 "(or onnxruntime-gpu for CUDA)"
             ) from exc
 
-        options = ort.SessionOptions()
-        if intra_op_threads > 0:
-            options.intra_op_num_threads = int(intra_op_threads)
+        self._ort = ort
+        self._onnx_path = Path(onnx_path)
+        self._intra_op_threads = int(intra_op_threads)
+        self.fp32_fallback_enabled = bool(fp32_fallback)
+        self.fp32_fallback_used = False
+        self._fp32_fallback_attempted = False
+
+        options = self._session_options()
 
         resolved = list(providers) if providers else None
         if resolved is None:
@@ -169,6 +183,12 @@ class OnnxGenerator(nn.Module):
             int(spec_out.shape[1]) if isinstance(spec_out.shape[1], int) else None
         )
 
+    def _session_options(self):
+        options = self._ort.SessionOptions()
+        if self._intra_op_threads > 0:
+            options.intra_op_num_threads = self._intra_op_threads
+        return options
+
     @staticmethod
     def _static_hw(shape: Sequence[Any]) -> Optional[Tuple[int, int]]:
         if len(shape) != 4:
@@ -178,6 +198,58 @@ class OnnxGenerator(nn.Module):
             return int(height), int(width)
         return None
 
+    def _run_checked(
+        self,
+        session: Any,
+        array: np.ndarray,
+        source: str,
+        *,
+        output_numpy_dtype: Optional[Any] = None,
+        input_onnx_type: Optional[str] = None,
+        output_onnx_type: Optional[str] = None,
+    ) -> torch.Tensor:
+        output = session.run([self.output_name], {self.input_name: array})[0]
+        output = np.ascontiguousarray(
+            output, dtype=output_numpy_dtype or self.output_numpy_dtype
+        )
+        # Patch stitching and metrics deliberately run in float32 even when
+        # the graph boundary is fp16, matching the PyTorch inference path.
+        prediction = torch.from_numpy(output).to(dtype=torch.float32)
+        non_finite_count = int((~torch.isfinite(prediction)).sum().item())
+        if non_finite_count:
+            raise FloatingPointError(
+                f"{source} produced {non_finite_count} non-finite values "
+                f"(input={input_onnx_type or self.input_onnx_type}, "
+                f"output={output_onnx_type or self.output_onnx_type})."
+            )
+        return prediction
+
+    def _make_fp32_fallback_session(self) -> Optional[Any]:
+        """Build a CPU-safe session from the source graph, if applicable."""
+        if (
+            not self.fp32_fallback_enabled
+            or self._fp32_fallback_attempted
+            or "CPUExecutionProvider" not in self.providers
+            or not self._onnx_path.is_file()
+        ):
+            return None
+
+        self._fp32_fallback_attempted = True
+        from hsi_model.utils.onnx_export import convert_onnx_fp16_to_fp32
+
+        graph_bytes, converted_count = convert_onnx_fp16_to_fp32(self._onnx_path)
+        if converted_count == 0:
+            return None
+        LOGGER.warning(
+            "ONNX CPU graph produced non-finite output; retrying once with an "
+            "in-memory FP32 conversion of its FP16 tensors/casts."
+        )
+        return self._ort.InferenceSession(
+            graph_bytes,
+            sess_options=self._session_options(),
+            providers=self.providers,
+        )
+
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
         # Make both dtype and memory layout explicit. This is important for
         # float16/double ONNX graphs and avoids a PyTorch-view stride leaking
@@ -185,20 +257,68 @@ class OnnxGenerator(nn.Module):
         array = np.ascontiguousarray(
             rgb.detach().cpu().numpy(), dtype=self.input_numpy_dtype
         )
-        output = self.session.run([self.output_name], {self.input_name: array})[0]
-        output = np.ascontiguousarray(output, dtype=self.output_numpy_dtype)
-        # Patch stitching and metrics deliberately run in float32 even when
-        # the graph boundary is fp16, matching the PyTorch inference path.
-        prediction = torch.from_numpy(output).to(dtype=torch.float32)
-        non_finite_count = int((~torch.isfinite(prediction)).sum().item())
-        if non_finite_count:
-            raise FloatingPointError(
-                f"ONNX graph produced {non_finite_count} non-finite values "
-                f"(input={self.input_onnx_type}, output={self.output_onnx_type}). "
-                "Re-export or check the graph's precision conversion instead of "
-                "scoring NaN predictions."
+        try:
+            return self._run_checked(self.session, array, "ONNX graph")
+        except FloatingPointError as original_error:
+            try:
+                fallback_session = self._make_fp32_fallback_session()
+            except Exception as fallback_error:
+                raise FloatingPointError(
+                    f"{original_error} Automatic CPU FP32 fallback failed: "
+                    f"{type(fallback_error).__name__}: {fallback_error}. "
+                    "Re-export with --precision fp32 or use a provider with "
+                    "reliable FP16 support."
+                ) from fallback_error
+            if fallback_session is None:
+                raise FloatingPointError(
+                    f"{original_error} Re-export with --precision fp32 or use a "
+                    "provider with reliable FP16 support."
+                ) from original_error
+            fallback_input = fallback_session.get_inputs()[0]
+            fallback_output = fallback_session.get_outputs()[0]
+            fallback_input_type = str(fallback_input.type)
+            fallback_output_type = str(fallback_output.type)
+            fallback_input_dtype = _numpy_dtype_for_onnx_tensor(
+                fallback_input_type, role="fallback input"
             )
-        return prediction
+            fallback_output_dtype = _numpy_dtype_for_onnx_tensor(
+                fallback_output_type, role="fallback output"
+            )
+            fallback_array = np.ascontiguousarray(
+                rgb.detach().cpu().numpy(), dtype=fallback_input_dtype
+            )
+            try:
+                prediction = self._run_checked(
+                    fallback_session,
+                    fallback_array,
+                    "In-memory FP32 fallback graph",
+                    output_numpy_dtype=fallback_output_dtype,
+                    input_onnx_type=fallback_input_type,
+                    output_onnx_type=fallback_output_type,
+                )
+            except FloatingPointError as fallback_error:
+                raise FloatingPointError(
+                    f"{original_error} The in-memory FP32 fallback also produced "
+                    f"non-finite output: {fallback_error}. Check the checkpoint "
+                    "or re-export with --precision fp32."
+                ) from fallback_error
+
+            self.session = fallback_session
+            self.input_name = fallback_input.name
+            self.output_name = fallback_output.name
+            self.input_onnx_type = fallback_input_type
+            self.output_onnx_type = fallback_output_type
+            self.input_numpy_dtype = fallback_input_dtype
+            self.output_numpy_dtype = fallback_output_dtype
+            self.input_shape = list(fallback_input.shape)
+            self.static_hw = self._static_hw(self.input_shape)
+            self.out_channels = (
+                int(fallback_output.shape[1])
+                if isinstance(fallback_output.shape[1], int)
+                else None
+            )
+            self.fp32_fallback_used = True
+            return prediction
 
 
 class OnnxNTIRETester:
@@ -220,6 +340,7 @@ class OnnxNTIRETester:
             config.onnx_path,
             providers=config.providers,
             intra_op_threads=config.intra_op_threads,
+            fp32_fallback=config.fp32_fallback,
         )
         LOGGER.info(
             "ONNX session providers=%s input=%s type=%s output_type=%s",
@@ -431,6 +552,8 @@ class OnnxNTIRETester:
                 "input_onnx_type": self.model.input_onnx_type,
                 "output_dtype": self.model.output_numpy_dtype.__name__,
                 "output_onnx_type": self.model.output_onnx_type,
+                "fp32_fallback_enabled": self.model.fp32_fallback_enabled,
+                "fp32_fallback_used": self.model.fp32_fallback_used,
                 "precision": self.manifest.get("export", {}).get("precision"),
                 "clamped_in_graph": self.manifest.get("export", {}).get(
                     "clamp_output"
@@ -536,6 +659,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Compatibility alias; missing targets are allowed by default.",
     )
     parser.set_defaults(require_gt=False)
+    parser.add_argument(
+        "--no-fp32-fallback",
+        "--no_fp32_fallback",
+        dest="fp32_fallback",
+        action="store_false",
+        help="Do not retry non-finite CPU FP16 graphs using an in-memory FP32 graph.",
+    )
+    parser.set_defaults(fp32_fallback=True)
     parser.add_argument("--show_patch_progress", action="store_true")
     parser.add_argument(
         "--compare_checkpoint",
@@ -576,6 +707,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_samples=args.max_samples,
         start_idx=args.start_idx,
         require_gt=args.require_gt,
+        fp32_fallback=args.fp32_fallback,
         quiet_patches=not args.show_patch_progress,
         compare_checkpoint=args.compare_checkpoint,
     )

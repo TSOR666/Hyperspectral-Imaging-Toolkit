@@ -24,6 +24,10 @@ Half precision (weights stored as fp16, inputs/outputs stay fp32)::
 
 Then score it on ARAD-1K with ``onnx_test_ntire.py``.
 
+The exporter verifies that the ONNX output is finite. If a legacy FP16 graph
+fails that check on CPU, re-export with ``--precision fp32``; the NTIRE tester
+also has an in-memory CPU FP32 recovery for existing FP16 artifacts.
+
 Notes
 -----
 * The spatial size is baked into the graph: the model's reflect-padding to a
