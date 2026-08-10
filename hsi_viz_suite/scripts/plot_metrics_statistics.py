@@ -12,6 +12,17 @@ from metrics_io import load_metric_rows
 from visualization_utils import save_figure, setup_publication_style
 
 
+def _metric_label(metric: str) -> str:
+    labels = {
+        "mrae": "MRAE",
+        "rmse": "RMSE",
+        "psnr": "PSNR (dB)",
+        "sam": "SAM (degrees)",
+        "ssim": "SSIM",
+    }
+    return labels.get(metric.lower(), metric.upper())
+
+
 class MetricsStatisticsPlotter:
     """Publication-quality distribution and summary plots for scalar metrics."""
 
@@ -36,11 +47,20 @@ class MetricsStatisticsPlotter:
                 data.append(enriched)
         return pd.DataFrame(data)
 
+    def _available_metrics(self, metrics: List[str]) -> List[str]:
+        """Keep only metrics with at least one finite numeric observation."""
+        return [
+            metric
+            for metric in metrics
+            if metric in self.df.columns
+            and pd.to_numeric(self.df[metric], errors="coerce").notna().any()
+        ]
+
     def violin(self, metrics: List[str] | None = None) -> None:
         """Save violin distributions with median and sample observations."""
         if metrics is None:
-            metrics = ["mrae", "rmse", "psnr", "sam"]
-        available = [metric for metric in metrics if metric in self.df.columns]
+            metrics = ["mrae", "rmse", "psnr", "sam", "ssim"]
+        available = self._available_metrics(metrics)
         if not available or self.df.empty:
             return
         fig, axes = plt.subplots(
@@ -87,7 +107,7 @@ class MetricsStatisticsPlotter:
                 )
                 ax.scatter(x, np.median(values), marker="_", s=180, color="black", linewidth=1.2, zorder=4)
             ax.set_xticks(range(1, len(labels) + 1), labels, rotation=40, ha="right")
-            ax.set_title(metric.upper(), fontweight="bold")
+            ax.set_title(_metric_label(metric), fontweight="bold")
             ax.grid(True, axis="y", alpha=0.25)
         fig.supxlabel("Method")
         fig.supylabel("Metric value")
@@ -96,8 +116,8 @@ class MetricsStatisticsPlotter:
     def ecdf(self, metrics: List[str] | None = None) -> None:
         """Save empirical CDFs, useful when aggregate means hide outliers."""
         if metrics is None:
-            metrics = ["mrae", "rmse", "psnr", "sam"]
-        available = [metric for metric in metrics if metric in self.df.columns]
+            metrics = ["mrae", "rmse", "psnr", "sam", "ssim"]
+        available = self._available_metrics(metrics)
         if not available or self.df.empty:
             return
         fig, axes = plt.subplots(
@@ -122,7 +142,7 @@ class MetricsStatisticsPlotter:
                         label=method,
                         color=colors[method_index % len(colors)],
                     )
-            ax.set_title(metric.upper(), fontweight="bold")
+            ax.set_title(_metric_label(metric), fontweight="bold")
             ax.set_ylim(0, 1.02)
             ax.grid(True, alpha=0.25)
         axes[0, 0].legend(frameon=False, loc="lower right")
@@ -133,8 +153,8 @@ class MetricsStatisticsPlotter:
     def summary_table(self, metrics: List[str] | None = None) -> None:
         """Save a mean ± standard deviation heatmap and CSV summary."""
         if metrics is None:
-            metrics = ["mrae", "rmse", "psnr", "sam"]
-        valid_metrics = [metric for metric in metrics if metric in self.df.columns]
+            metrics = ["mrae", "rmse", "psnr", "sam", "ssim"]
+        valid_metrics = self._available_metrics(metrics)
         if not valid_metrics or self.df.empty:
             return
         rows: list[dict[str, object]] = []
@@ -163,7 +183,10 @@ class MetricsStatisticsPlotter:
         masked = np.ma.masked_invalid(image)
         cmap = "mako" if "mako" in plt.colormaps() else "viridis"
         im = ax.imshow(masked, cmap=cmap, aspect="auto")
-        ax.set_xticks(range(len(valid_metrics)), [metric.upper() for metric in valid_metrics])
+        ax.set_xticks(
+            range(len(valid_metrics)),
+            [_metric_label(metric) for metric in valid_metrics],
+        )
         ax.set_yticks(range(len(rows)), [str(row["method"]) for row in rows])
         for r, annotation_row in enumerate(annotations):
             for c, label in enumerate(annotation_row):
@@ -179,7 +202,11 @@ def main() -> None:
     ap.add_argument("--names", nargs="+", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--metrics", nargs="*", default=["mrae", "rmse", "psnr", "sam"])
+    ap.add_argument(
+        "--metrics",
+        nargs="*",
+        default=["mrae", "rmse", "psnr", "sam", "ssim"],
+    )
     args = ap.parse_args()
     if len(args.names) != len(args.results):
         raise SystemExit("--names and --results must contain the same number of entries")

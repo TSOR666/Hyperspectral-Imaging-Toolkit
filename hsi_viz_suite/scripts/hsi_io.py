@@ -1,8 +1,9 @@
 """Input adapters for common hyperspectral reconstruction result formats.
 
-SSTrans exports NTIRE-compatible HDF5 ``.mat`` files.  The stored ``cube``
-dataset is transposed before writing, so this module reverses that convention
-and exposes every loaded sample as a channel-first ``(C,H,W)`` cube.
+SSTrans exports NTIRE-compatible HDF5 ``.mat`` files, and ARAD ground-truth
+``.mat`` cubes use MATLAB v7.3's reversed HDF5 storage axes. This module
+reverses that convention and exposes every loaded sample as a channel-first
+``(C,H,W)`` cube.
 """
 
 from __future__ import annotations
@@ -97,16 +98,25 @@ def _load_mat_or_hdf5(
                 raise KeyError(f"{path} contains no three-dimensional HSI dataset.")
             array = np.asarray(handle[key], dtype=np.float32)
             bands = np.asarray(handle["bands"]) if "bands" in handle else None
+            is_matlab_hdf5 = path.suffix.lower() == ".mat"
             metadata: dict[str, Any] = {
-                "format": "ntire_hdf5" if "bands" in handle else "hdf5",
+                "format": (
+                    "ntire_hdf5"
+                    if "bands" in handle
+                    else ("matlab_hdf5" if is_matlab_hdf5 else "hdf5")
+                ),
             }
             if "norm_factor" in handle:
                 metadata["norm_factor"] = float(
                     np.asarray(handle["norm_factor"]).squeeze()
                 )
-            # SSTrans writes an HWC cube as array.T.  ``.T`` is intentionally
-            # used here to preserve rectangular-frame orientation as well.
-            if "bands" in handle and key == cube_key:
+            # MATLAB v7.3 stores matrix axes in the reverse order. SSTrans
+            # explicitly writes an HWC cube as ``array.T`` and records bands,
+            # while ARAD reference cubes use the same HDF5/MATLAB convention
+            # without a ``bands`` dataset. In both cases ``.T`` restores HWC
+            # before ``to_chw`` normalizes the cube, including rectangular
+            # frames where a simple axis guess would rotate the target.
+            if "bands" in handle or is_matlab_hdf5:
                 array = array.T
             return array, bands, metadata
     except (OSError, KeyError, ValueError):
@@ -140,4 +150,3 @@ def _first_3d_dataset(handle: Any) -> Optional[str]:
 
     handle.visititems(visit)
     return found
-

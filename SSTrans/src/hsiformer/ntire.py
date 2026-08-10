@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
+import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from .metrics import (
 )
 
 ARAD_BANDS_NM = np.arange(400, 701, 10, dtype=np.int32)
+SAM_DEGREES_PER_RADIAN = 180.0 / np.pi
 
 
 def save_ntire_cube(
@@ -88,13 +91,16 @@ def evaluate_loader(
     mrae_denominator: MRAEDenominator = "clamp_abs",
     mrae_epsilon: float = 1e-6,
     psnr_clip: bool = False,
+    include_ssim: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, float | str]]]:
     """Evaluate predictions under an explicitly selected metric protocol.
 
     The reported SSTrans ``0.1468`` result uses full ARAD-origin frames and
     the source evaluator's additive ``1e-5`` denominator. A 128-pixel center
     crop is a separate NTIRE/MST++ protocol. Exported cubes always retain the
-    complete prediction regardless of the metric crop.
+    complete prediction regardless of the metric crop. MRAE/RMSE/PSNR/SAM are
+    always reported; callers can opt into the MSWR-compatible SSIM diagnostic
+    without adding its pooling cost to training-time validation.
     """
     if crop_border < 0:
         raise ValueError("crop_border cannot be negative.")
@@ -166,6 +172,7 @@ def evaluate_loader(
                     metric_target,
                     eps=mrae_epsilon,
                     mrae_denominator=mrae_denominator,
+                    include_ssim=include_ssim,
                 )
                 if psnr_clip:
                     metrics["psnr"] = peak_signal_to_noise_ratio(
@@ -194,9 +201,12 @@ def evaluate_loader(
                 "ground-truth cube; use infer_loader for prediction-only runs."
             )
         raise ValueError("Evaluation loader produced no samples.")
+    metric_names = ("mrae", "rmse", "psnr", "sam")
+    if include_ssim:
+        metric_names = (*metric_names, "ssim")
     summary = {
         name: float(np.mean([float(row[name]) for row in rows]))
-        for name in ("mrae", "rmse", "psnr", "sam")
+        for name in metric_names
     }
     summary["count"] = float(len(rows))
     summary["skipped"] = float(len(skipped))
@@ -251,12 +261,21 @@ def write_metric_reports(
     summary: Mapping[str, Any],
     rows: list[Mapping[str, float | str]],
 ) -> None:
+    """Write machine-readable benchmark reports and paper-friendly SAM units.
+
+    ``spectral_angle_mapper`` follows PyTorch's convention and returns radians.
+    Keeping that native value in ``sam`` preserves SSTrans' source metric, while
+    ``sam_degrees`` makes cross-method paper figures unambiguous (and matches
+    the unit used by :mod:`hsi_viz_suite` spatial SAM maps).
+    """
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+    report_summary = _with_sam_units(summary, include_metadata=True)
     (destination / "summary.json").write_text(
-        json.dumps(dict(summary), indent=2) + "\n",
+        json.dumps(report_summary, indent=2) + "\n",
         encoding="utf-8",
     )
+    report_rows = [_with_sam_units(row) for row in rows]
     with (destination / "metrics.csv").open(
         "w",
         newline="",
@@ -264,10 +283,162 @@ def write_metric_reports(
     ) as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("scene_id", "mrae", "rmse", "psnr", "sam"),
+            fieldnames=(
+                "scene_id",
+                "mrae",
+                "rmse",
+                "psnr",
+                "sam",
+                "ssim",
+                "sam_degrees",
+                "sam_unit",
+            ),
         )
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(report_rows)
+
+
+def run_hsi_viz_suite(
+    results_dir: str | Path,
+    *,
+    target_dir: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    suite_path: str | Path | None = None,
+    max_samples: int = 10,
+    dpi: int = 300,
+    style: str = "paper",
+) -> Path:
+    """Run the repository's publication-grade visualization suite.
+
+    The handoff deliberately uses SSTrans' normal evaluation layout:
+    ``results_dir/cubes/*.mat`` and ``results_dir/metrics.csv``.  Passing a
+    target directory enables paired colour/error/spectral figures; omitting it
+    remains useful for an official blind-test export and produces prediction-
+    only figures without inventing metrics.
+    """
+    result_root = Path(results_dir).resolve()
+    if not result_root.is_dir():
+        raise FileNotFoundError(
+            f"Cannot visualize missing SSTrans results directory: {result_root}"
+        )
+    target_root = Path(target_dir).resolve() if target_dir is not None else None
+    if target_root is not None and not target_root.is_dir():
+        raise FileNotFoundError(
+            f"Cannot visualize with missing target directory: {target_dir}"
+        )
+    if max_samples < 1:
+        raise ValueError("max_samples must be at least one.")
+    if dpi < 1:
+        raise ValueError("dpi must be at least one.")
+
+    entrypoint = resolve_hsi_viz_entrypoint(suite_path)
+    figure_root = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else result_root / "figures"
+    )
+    command = [
+        sys.executable,
+        str(entrypoint),
+        "--results",
+        str(result_root),
+        "--output",
+        str(figure_root),
+        "--max-samples",
+        str(max_samples),
+        "--dpi",
+        str(dpi),
+        "--style",
+        style,
+    ]
+    if target_root is not None:
+        command.extend(("--targets", str(target_root)))
+
+    # Run from the suite root so its local hsi_model package and scripts work
+    # equally from an editable SSTrans checkout or an installed SSTrans wheel.
+    subprocess.run(
+        command,
+        check=True,
+        cwd=str(entrypoint.parents[1]),
+    )
+    return figure_root
+
+
+def resolve_hsi_viz_entrypoint(
+    suite_path: str | Path | None = None,
+) -> Path:
+    """Find ``hsi_viz_suite/scripts/generate_all_visualizations.py`` safely."""
+    script_name = "generate_all_visualizations.py"
+    candidates: list[Path] = []
+    if suite_path is not None:
+        supplied = Path(suite_path)
+        candidates.extend(
+            (
+                supplied,
+                supplied / script_name,
+                supplied / "scripts" / script_name,
+            )
+        )
+    else:
+        # A source checkout has SSTrans and hsi_viz_suite as sibling folders.
+        # Also inspect the caller's directory tree so a user can run the
+        # console entry point from the repository root without extra flags.
+        anchors = (Path(__file__).resolve(), Path.cwd().resolve())
+        for anchor in anchors:
+            roots = (
+                anchor.parents
+                if anchor.is_file()
+                else (anchor, *anchor.parents)
+            )
+            candidates.extend(
+                parent / "hsi_viz_suite" / "scripts" / script_name
+                for parent in roots
+            )
+
+    for candidate in candidates:
+        if candidate.is_file() and candidate.name == script_name:
+            return candidate.resolve()
+    location_hint = (
+        f" at {suite_path}" if suite_path is not None else " beside this checkout"
+    )
+    raise FileNotFoundError(
+        "Could not find hsi_viz_suite/scripts/generate_all_visualizations.py"
+        f"{location_hint}. Pass --hsi-viz-suite <suite root, scripts dir, or "
+        "generate_all_visualizations.py path>."
+    )
+
+
+def _with_sam_units(
+    values: Mapping[str, Any],
+    *,
+    include_metadata: bool = False,
+) -> dict[str, Any]:
+    """Add an explicit paper-friendly SAM degree value to metric records."""
+    report = dict(values)
+    if "sam" in report and report["sam"] not in (None, ""):
+        unit = str(report.get("sam_unit", "radians")).strip().lower()
+        if unit in {"rad", "radian", "radians"}:
+            report["sam_unit"] = "radians"
+            scale = SAM_DEGREES_PER_RADIAN
+        elif unit in {"degree", "degrees", "deg"}:
+            report["sam_unit"] = "degrees"
+            scale = 1.0
+        else:
+            raise ValueError(
+                "sam_unit must be 'radians' or 'degrees', "
+                f"got {report['sam_unit']!r}."
+            )
+        report.setdefault("sam_degrees", float(report["sam"]) * scale)
+    if include_metadata:
+        metric_units = dict(report.get("metric_units", {}))
+        metric_units.setdefault("mrae", "unitless")
+        metric_units.setdefault("rmse", "reflectance")
+        metric_units.setdefault("psnr", "dB")
+        metric_units.setdefault("sam", report.get("sam_unit", "radians"))
+        metric_units.setdefault("sam_degrees", "degrees")
+        metric_units.setdefault("ssim", "unitless")
+        report["metric_units"] = metric_units
+    return report
 
 
 def resolve_device(value: str = "auto") -> torch.device:

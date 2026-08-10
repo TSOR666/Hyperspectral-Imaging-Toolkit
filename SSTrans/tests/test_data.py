@@ -233,6 +233,10 @@ def test_spectral_metrics_match_simple_reference() -> None:
         metrics["sam"],
         torch.tensor(torch.pi / 2),
     )
+    torch.testing.assert_close(
+        spectral_metrics(target, target)["ssim"],
+        torch.tensor(1.0),
+    )
 
 
 def test_dataset_rejects_missing_layout(tmp_path) -> None:

@@ -22,6 +22,7 @@ from .metrics import (
     root_mean_squared_error,
     spectral_angle_mapper,
     spectral_metrics,
+    structural_similarity_index,
 )
 from .model import HSIFormer, SST_Multi_Stage, SSTransformer
 from .ntire import (
@@ -31,6 +32,7 @@ from .ntire import (
     load_ntire_cube,
     predict_hsi,
     resolve_device,
+    run_hsi_viz_suite,
     save_ntire_cube,
     write_metric_reports,
 )
@@ -68,9 +70,11 @@ __all__ = [
     "resolve_arad_directory",
     "resolve_device",
     "root_mean_squared_error",
+    "run_hsi_viz_suite",
     "save_ntire_cube",
     "spectral_angle_mapper",
     "spectral_metrics",
+    "structural_similarity_index",
     "train",
     "write_metric_reports",
 ]

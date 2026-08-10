@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import csv
+import json
 from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader
+
+import hsiformer.cli as cli
+import hsiformer.ntire as ntire_module
 
 from hsiformer import (
     RGBImageDataset,
@@ -18,7 +24,9 @@ from hsiformer import (
     load_ntire_cube,
     mean_relative_absolute_error,
     predict_hsi,
+    run_hsi_viz_suite,
     save_ntire_cube,
+    write_metric_reports,
 )
 
 
@@ -70,9 +78,11 @@ def test_evaluation_writes_ntire_cubes_and_zero_error_metrics(tmp_path) -> None:
         loader,
         device=torch.device("cpu"),
         output_dir=tmp_path,
+        include_ssim=True,
     )
     assert summary["mrae"] == 0.0
     assert summary["rmse"] == 0.0
+    assert summary["ssim"] == 1.0
     assert rows[0]["scene_id"] == "scene_1"
     assert (tmp_path / "scene_1.mat").is_file()
 
@@ -99,6 +109,7 @@ def test_evaluation_exports_target_less_scenes_without_scoring_them(
 
     assert summary["count"] == 1.0
     assert summary["skipped"] == 1.0
+    assert "ssim" not in summary
     assert [row["scene_id"] for row in rows] == ["scene_1"]
     assert (tmp_path / "scene_2.mat").is_file()
 
@@ -247,3 +258,218 @@ def test_checkpoint_metadata_reconstructs_tiny_model(tmp_path) -> None:
     with torch.inference_mode():
         output = restored(torch.rand(1, 3, 9, 11))
     assert output.shape == (1, 31, 9, 11)
+
+
+def test_metric_reports_preserve_native_sam_and_add_degrees(tmp_path) -> None:
+    write_metric_reports(
+        tmp_path,
+        {"sam": float(np.pi / 2)},
+        [
+            {
+                "scene_id": "scene_1",
+                "mrae": 0.1,
+                "rmse": 0.02,
+                "psnr": 30.0,
+                "sam": float(np.pi / 2),
+                "ssim": 0.9,
+            }
+        ],
+    )
+
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    with (tmp_path / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+
+    assert summary["sam"] == np.pi / 2
+    assert summary["sam_degrees"] == 90.0
+    assert summary["sam_unit"] == "radians"
+    assert summary["metric_units"]["sam_degrees"] == "degrees"
+    assert float(row["sam"]) == np.pi / 2
+    assert float(row["sam_degrees"]) == 90.0
+    assert row["sam_unit"] == "radians"
+    assert float(row["ssim"]) == 0.9
+
+
+def test_hsi_viz_handoff_uses_shared_suite_with_paired_targets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    results_dir = Path("evaluation")
+    target_dir = Path("targets")
+    suite_dir = tmp_path / "hsi_viz_suite"
+    entrypoint = suite_dir / "scripts" / "generate_all_visualizations.py"
+    results_dir.mkdir()
+    target_dir.mkdir()
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# test entrypoint\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs) -> None:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(ntire_module.subprocess, "run", fake_run)
+    figures = run_hsi_viz_suite(
+        results_dir,
+        target_dir=target_dir,
+        suite_path=suite_dir,
+        max_samples=3,
+        dpi=240,
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[1] == str(entrypoint.resolve())
+    assert command[command.index("--results") + 1] == str(results_dir.resolve())
+    assert command[command.index("--targets") + 1] == str(target_dir.resolve())
+    assert command[command.index("--max-samples") + 1] == "3"
+    assert command[command.index("--dpi") + 1] == "240"
+    assert captured["kwargs"] == {"check": True, "cwd": str(suite_dir)}
+    assert figures == results_dir.resolve() / "figures"
+
+
+def test_test_cli_runs_paired_metrics_then_visualization(tmp_path, monkeypatch) -> None:
+    target_dir = tmp_path / "targets"
+    target_dir.mkdir()
+
+    class SingleSceneDataset:
+        scene_ids = ("scene_1",)
+        scene_ids_with_targets = ("scene_1",)
+        unusable_targets: dict[str, str] = {}
+        spectral_root = target_dir
+        rgb_root = tmp_path / "rgb"
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int):
+            assert index == 0
+            rgb = torch.full((3, 4, 4), 0.5)
+            return {
+                "cond": rgb,
+                "label": rgb[:1].repeat(31, 1, 1),
+                "scene_id": "scene_1",
+            }
+
+    dataset = SingleSceneDataset()
+    observed: dict[str, object] = {}
+
+    def fake_visualizer(results_dir, **kwargs):
+        observed["results_dir"] = results_dir
+        observed.update(kwargs)
+        return Path(results_dir) / "figures"
+
+    monkeypatch.setattr(cli, "ARAD1KDataset", lambda *args, **kwargs: dataset)
+    monkeypatch.setattr(
+        cli,
+        "build_model_from_checkpoint",
+        lambda *args, **kwargs: (_RepeatModel(), {}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "checkpoint_rgb_normalization",
+        lambda payload: "scale_255",
+    )
+    monkeypatch.setattr(cli, "run_hsi_viz_suite", fake_visualizer)
+
+    output_dir = tmp_path / "evaluation"
+    cli.test_main(
+        [
+            "--checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--data-root",
+            str(tmp_path / "arad"),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--workers",
+            "0",
+            "--visualize",
+            "--viz-max-samples",
+            "2",
+        ]
+    )
+
+    assert observed["results_dir"] == output_dir
+    assert observed["target_dir"] == target_dir
+    assert observed["max_samples"] == 2
+    assert (output_dir / "cubes" / "scene_1.mat").is_file()
+    assert (output_dir / "metrics.csv").is_file()
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["count"] == 1.0
+    assert summary["sam_unit"] == "radians"
+    assert summary["ssim"] == 1.0
+
+
+def test_test_cli_visualizes_blind_export_without_claiming_metrics(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class BlindSceneDataset:
+        scene_ids = ("scene_1",)
+        scene_ids_with_targets: tuple[str, ...] = ()
+        unusable_targets = {"scene_1": "Test_Spec contains only mosaic"}
+        spectral_root = None
+        rgb_root = tmp_path / "rgb"
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int):
+            assert index == 0
+            return {
+                "cond": torch.full((3, 4, 4), 0.5),
+                "scene_id": "scene_1",
+            }
+
+    observed: dict[str, object] = {}
+
+    def fake_visualizer(results_dir, **kwargs):
+        observed["results_dir"] = results_dir
+        observed.update(kwargs)
+        return Path(results_dir) / "figures"
+
+    monkeypatch.setattr(
+        cli,
+        "ARAD1KDataset",
+        lambda *args, **kwargs: BlindSceneDataset(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_model_from_checkpoint",
+        lambda *args, **kwargs: (_RepeatModel(), {}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "checkpoint_rgb_normalization",
+        lambda payload: "scale_255",
+    )
+    monkeypatch.setattr(cli, "run_hsi_viz_suite", fake_visualizer)
+
+    output_dir = tmp_path / "blind_evaluation"
+    cli.test_main(
+        [
+            "--checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--data-root",
+            str(tmp_path / "arad"),
+            "--output-dir",
+            str(output_dir),
+            "--split",
+            "test",
+            "--device",
+            "cpu",
+            "--workers",
+            "0",
+            "--visualize",
+        ]
+    )
+
+    assert observed["results_dir"] == output_dir
+    assert observed["target_dir"] is None
+    assert (output_dir / "cubes" / "scene_1.mat").is_file()
+    assert (output_dir / "inference.json").is_file()
+    assert not (output_dir / "metrics.csv").exists()
+    assert not (output_dir / "summary.json").exists()

@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -145,8 +146,9 @@ def test_ntire_dataset_uses_train_directories_as_compatibility_fallback(tmp_path
     assert dataset[0].target is not None
 
 
-def test_ntire_dataset_ignores_test_mosaic_as_ground_truth(tmp_path):
+def test_ntire_dataset_ignores_test_mosaic_as_ground_truth(tmp_path, caplog):
     tool = _load_tool_module()
+    caplog.set_level(logging.WARNING, logger="cswin_test_ntire")
     case_dir = tmp_path / f"case_{uuid.uuid4().hex}"
     test_rgb_dir = case_dir / "Test_RGB"
     test_spec_dir = case_dir / "Test_Spec"
@@ -181,6 +183,10 @@ def test_ntire_dataset_ignores_test_mosaic_as_ground_truth(tmp_path):
     assert dataset.split_name == "valid"
     assert sample.name == valid_scene
     assert sample.target is not None
+    assert not any(
+        "raw MSFA 'mosaic' payload" in record.message
+        for record in caplog.records
+    )
 
 
 def test_ntire_cli_accepts_weights_path_and_external_architecture(monkeypatch):
