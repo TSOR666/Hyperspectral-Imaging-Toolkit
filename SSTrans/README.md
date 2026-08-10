@@ -44,13 +44,14 @@ Spectral `.mat` files should contain a `cube` dataset; the aliases
 single 31-band 3D dataset under any other name. Data is loaded lazily, so the
 complete dataset is not held in memory.
 
-The official ARAD-1K test release ships `Test_Spec/*.mat` files holding the raw
-MSFA `mosaic` payload instead of a spectral cube. A mosaic file never shadows a
-real cube: every candidate directory is probed, so cubes kept in, say,
-`Test_spectral` alongside a mosaic `Test_Spec` are found and used. Point
-`--spectral-dir` at any other location (a name under the root or an absolute
-path). Scenes with no cube anywhere are reconstructed and exported but never
-scored; see [Public Test](#public-test).
+Some public ARAD-1K redistributions ship `Test_Spec/*.mat` files holding only
+the raw MSFA `mosaic` payload instead of a spectral cube. A mosaic file never
+shadows a real cube: every candidate directory is probed, so a complete
+1,000-scene copy with 31-band references for `ARAD_1K_0951`--`ARAD_1K_1000`
+(for example under `Train_spectral` or `Test_spectral`) is fully scoreable.
+Point `--spectral-dir`/`--target-dir` at any other reference location (a name
+under the root or an absolute path). Only scenes with no usable cube anywhere
+are exported without metrics; see [Public Test](#public-test).
 
 Check a local dataset:
 
@@ -238,11 +239,11 @@ checkout automatically; otherwise pass `--hsi-viz-suite <path-to-hsi_viz_suite>`
 Scored `summary.json` files also record the absolute reference directory, so a
 later direct suite invocation can recover the target cubes automatically.
 
-For the distinct 50-image public test split, use `--split test` and a separate
-output directory. Its score must not be compared directly with `0.1468`.
-
-If the cubes for 0951-1000 sit outside the standard directories, name that
-location once:
+For the held-out 50-image test split (`ARAD_1K_0951`--`ARAD_1K_1000`), use
+`--split test` and a separate output directory. When your full ARAD-1K copy
+contains those 31-band references, this is the correct local metrics and
+visualization run. Set `--target-dir` to the directory containing the
+31-band references, for example `Train_spectral`:
 
 ```powershell
 python scripts/test_ntire.py `
@@ -250,7 +251,8 @@ python scripts/test_ntire.py `
   --data-root "/work3/<user>/dataset" `
   --output-dir "outputs\public_test" `
   --split test `
-  --target-dir "Test_spectral" `
+  --target-dir "Train_spectral" `
+  --visualize `
   --require-targets
 ```
 
@@ -258,16 +260,15 @@ If that split carries no spectral ground truth — the official release puts an
 MSFA `mosaic` payload in `Test_Spec` — the run prints which scenes are
 unscorable, reconstructs every scene, writes the cubes plus `inference.json`,
 and skips `summary.json`/`metrics.csv` instead of failing. Pass
-`--require-targets` to make missing ground truth a hard error, and use
-`--split validation` when metrics are the point. Partially annotated roots are
+`--require-targets` to make missing ground truth a hard error. With a complete
+1,000-scene copy, `--split test` is the metrics split; partially annotated roots are
 scored on the scenes that do have cubes; `summary.json` reports both `count`
 and `skipped`.
 
-This is the unavoidable boundary between local benchmarking and a blind
-leaderboard: SSTrans can compute metrics for any test manifest only when you
-provide the matching 31-band reference cubes (via `--target-dir`, also accepted
-as `--spectral-dir`). The official mosaic-only test release can be submitted or
-visualized with `--visualize`, but its leaderboard score is computed only by the
+SSTrans computes local metrics for the test manifest whenever matching 31-band
+reference cubes are present (via `--target-dir`, also accepted as
+`--spectral-dir`). A mosaic-only test release remains inference-only and can be
+submitted or visualized, but its leaderboard score is computed only by the
 challenge server after submission.
 
 After installation, the equivalent command is `hsiformer-test`.
@@ -297,8 +298,10 @@ reported alongside the four common reconstruction metrics using the same
 box-filter convention as the MSWR NTIRE tester.
 
 The `0.1468` artifact is a validation/ARAD-origin result, not the held-out test
-split. The command above makes both the split and metric protocol explicit;
-the CLI also defaults to this matching pair.
+score. The test command above makes the held-out split, reference directory,
+metric protocol, and publication visualization explicit. The CLI defaults to
+the held-out `test` split; pass `--split validation` when reproducing the
+historical reference result.
 
 ## Package API
 
