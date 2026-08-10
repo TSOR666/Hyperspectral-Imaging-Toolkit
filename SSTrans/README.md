@@ -39,10 +39,11 @@ work: `Test_RGB`/`Test_Spec`, `Valid_RGB`/`Valid_spectral`, `Validation_*`, and
 `Val_Spec` are all searched before falling back to `Train_*`. RGB files may be
 `.jpg`, `.png`, `.bmp`, or `.tif`.
 
-Spectral `.mat` files should contain a `cube` dataset; the aliases
-`reflectance`, `rad`, `hsi`, `hyper`, `data`, and `image` are accepted, as is a
-single 31-band 3D dataset under any other name. Data is loaded lazily, so the
-complete dataset is not held in memory.
+Spectral `.mat` files may be HDF5/MATLAB v7.3 or classic MATLAB files. They
+should contain a `cube` variable/dataset; the aliases `reflectance`, `rad`,
+`hsi`, `hyper`, `data`, and `image` are accepted, as is a single 31-band 3D
+variable under any other name. Data is loaded lazily, so the complete dataset
+is not held in memory.
 
 Some public ARAD-1K redistributions ship `Test_Spec/*.mat` files holding only
 the raw MSFA `mosaic` payload instead of a spectral cube. A mosaic file never

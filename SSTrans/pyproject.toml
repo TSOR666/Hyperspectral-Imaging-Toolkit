@@ -13,6 +13,7 @@ dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
     "pillow>=10",
+    "scipy>=1.10",
     "torch>=2.1",
 ]
 

@@ -477,41 +477,63 @@ class ARAD1KDataset(Dataset[dict[str, torch.Tensor | str]]):
             raise FileNotFoundError(
                 f"No spectral file for scene '{scene_id}' under {self.root}."
             )
-        with h5py.File(path, "r") as handle:
-            dataset = handle[
-                _resolve_cube_key(
-                    handle,
+        try:
+            with h5py.File(path, "r") as handle:
+                dataset = handle[
+                    _resolve_cube_key(
+                        handle,
+                        path,
+                        channels=self.spectral_channels,
+                        preferred=self.cube_key,
+                    )
+                ]
+                cube = None
+                if crop_position is not None and crop_size is not None:
+                    cube = _read_cube_crop(
+                        dataset,
+                        self.spectral_channels,
+                        height,
+                        width,
+                        crop_position,
+                        crop_size,
+                    )
+                if cube is None:
+                    cube = np.asarray(dataset, dtype=np.float32).squeeze()
+                    cube = _to_chw(
+                        cube,
+                        self.spectral_channels,
+                        height,
+                        width,
+                    )
+                    if crop_position is not None and crop_size is not None:
+                        row, column = crop_position
+                        crop_height, crop_width = crop_size
+                        cube = cube[
+                            :,
+                            row : row + crop_height,
+                            column : column + crop_width,
+                        ]
+        except OSError:
+            # MATLAB v5 files are not HDF5. They are common in redistributed
+            # ARAD-1K test references, so use scipy's reader as a fallback.
+            cube = _to_chw(
+                _load_classic_mat_cube(
                     path,
                     channels=self.spectral_channels,
                     preferred=self.cube_key,
-                )
-            ]
-            cube = None
+                ),
+                self.spectral_channels,
+                height,
+                width,
+            )
             if crop_position is not None and crop_size is not None:
-                cube = _read_cube_crop(
-                    dataset,
-                    self.spectral_channels,
-                    height,
-                    width,
-                    crop_position,
-                    crop_size,
-                )
-            if cube is None:
-                cube = np.asarray(dataset, dtype=np.float32).squeeze()
-                cube = _to_chw(
-                    cube,
-                    self.spectral_channels,
-                    height,
-                    width,
-                )
-                if crop_position is not None and crop_size is not None:
-                    row, column = crop_position
-                    crop_height, crop_width = crop_size
-                    cube = cube[
-                        :,
-                        row : row + crop_height,
-                        column : column + crop_width,
-                    ]
+                row, column = crop_position
+                crop_height, crop_width = crop_size
+                cube = cube[
+                    :,
+                    row : row + crop_height,
+                    column : column + crop_width,
+                ]
         return torch.from_numpy(np.ascontiguousarray(cube))
 
 
@@ -688,7 +710,13 @@ def _probe_cube_file(path: Path, channels: int) -> str | None:
         with h5py.File(path, "r") as handle:
             key = _resolve_cube_key(handle, path, channels=channels)
             shape = tuple(int(value) for value in handle[key].shape)
-    except (OSError, KeyError, ValueError) as error:
+    except OSError:
+        try:
+            shape = _load_classic_mat_cube(path, channels=channels).shape
+            key = "MATLAB variable"
+        except (OSError, KeyError, ValueError) as error:
+            return str(error.args[0]) if error.args else str(error)
+    except (KeyError, ValueError) as error:
         # KeyError's str() escapes its message; args[0] keeps paths readable.
         return str(error.args[0]) if error.args else str(error)
     if len(shape) != 3 or channels not in shape:
@@ -697,6 +725,66 @@ def _probe_cube_file(path: Path, channels: int) -> str | None:
             f"with a {channels}-band axis"
         )
     return None
+
+
+def _load_classic_mat_cube(
+    path: Path,
+    *,
+    channels: int = 31,
+    preferred: str | None = "cube",
+) -> np.ndarray:
+    """Load a cube from a classic MATLAB v5 ``.mat`` file."""
+    try:
+        from scipy.io import loadmat
+    except ImportError as error:
+        raise OSError(
+            "Classic MATLAB target detected but scipy is unavailable; "
+            "install SSTrans visualization/data dependencies with "
+            "'pip install scipy'."
+        ) from error
+
+    payload = loadmat(path)
+    arrays = {
+        name: np.asarray(value)
+        for name, value in payload.items()
+        if not name.startswith("__") and isinstance(value, np.ndarray)
+    }
+    by_lower = {name.lower(): (name, value) for name, value in arrays.items()}
+    candidates = CUBE_DATASET_KEYS
+    if preferred:
+        candidates = (preferred.lower(), *CUBE_DATASET_KEYS)
+    for candidate in candidates:
+        entry = by_lower.get(candidate)
+        if entry is not None and candidate not in NON_CUBE_DATASET_KEYS:
+            return entry[1]
+
+    banded = [
+        value
+        for name, value in arrays.items()
+        if name.lower() not in NON_CUBE_DATASET_KEYS
+        and value.ndim == 3
+        and channels in value.shape
+    ]
+    if banded:
+        return banded[0]
+    cubes = [
+        value
+        for name, value in arrays.items()
+        if name.lower() not in NON_CUBE_DATASET_KEYS and value.ndim == 3
+    ]
+    if len(cubes) == 1:
+        return cubes[0]
+
+    available = list(arrays)
+    hint = (
+        " This file contains an MSFA 'mosaic' payload, not a 31-band cube."
+        if "mosaic" in by_lower
+        else ""
+    )
+    raise KeyError(
+        f"No HSI cube dataset found in classic MATLAB file {path}; "
+        f"available variables: {available or '<none>'}.{hint}"
+    )
 
 
 def _to_chw(
