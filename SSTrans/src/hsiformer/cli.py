@@ -194,11 +194,11 @@ def test_main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--split",
         choices=("validation", "test"),
-        default="validation",
+        default="test",
         help=(
-            "ARAD manifest to evaluate. The reported 0.1468 result is on "
-            "validation/ARAD-origin (the default); pass test for the public "
-            "held-out split."
+            "ARAD manifest to evaluate. The default is the held-out "
+            "0951-1000 test split; pass validation explicitly to reproduce the "
+            "reported 0.1468 ARAD-origin result."
         ),
     )
     parser.add_argument("--manifest")
