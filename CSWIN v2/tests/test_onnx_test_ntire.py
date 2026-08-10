@@ -147,11 +147,57 @@ def test_onnx_generator_rejects_non_finite_output(monkeypatch):
         model(torch.rand(1, 3, 4, 5))
 
 
+def test_onnx_generator_retries_cpu_fp16_graph_as_fp32(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from onnx import TensorProto, helper, numpy_helper
+
+    input_info = helper.make_tensor_value_info(
+        "rgb", TensorProto.FLOAT, [None, 3, 4, 5]
+    )
+    output_info = helper.make_tensor_value_info(
+        "hsi", TensorProto.FLOAT, [None, 3, 4, 5]
+    )
+    scale = numpy_helper.from_array(np.array(2.0, dtype=np.float16), name="scale")
+    graph = helper.make_graph(
+        [
+            helper.make_node("Cast", ["rgb"], ["half"], to=TensorProto.FLOAT16),
+            helper.make_node("Mul", ["half", "scale"], ["scaled"]),
+            helper.make_node("Cast", ["scaled"], ["hsi"], to=TensorProto.FLOAT),
+        ],
+        "fp16_overflow",
+        [input_info],
+        [output_info],
+        [scale],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 17)],
+    )
+    onnx.checker.check_model(model)
+    graph_path = tmp_path / "fp16_overflow.onnx"
+    onnx.save(model, graph_path)
+
+    tool = _load_onnx_tester_module()
+    generator = tool.OnnxGenerator(
+        str(graph_path), providers=["CPUExecutionProvider"]
+    )
+    generator.session.run = lambda _names, _feeds: [
+        np.full((1, 31, 4, 5), np.nan, dtype=np.float32)
+    ]
+    prediction = generator(torch.ones(1, 3, 4, 5))
+
+    assert generator.fp32_fallback_used is True
+    assert torch.isfinite(prediction).all()
+    torch.testing.assert_close(prediction, torch.full_like(prediction, 2.0))
+
+
 def test_onnx_tester_allows_public_test_mosaics_by_default():
     tool = _load_onnx_tester_module()
 
     args = tool.parse_args(["--onnx", "model.onnx", "--data_root", "dataset"])
     assert args.require_gt is False
+    assert args.fp32_fallback is True
 
     strict = tool.parse_args(
         ["--onnx", "model.onnx", "--data_root", "dataset", "--require_gt"]

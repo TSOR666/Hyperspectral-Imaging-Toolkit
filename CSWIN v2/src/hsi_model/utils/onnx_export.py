@@ -932,6 +932,88 @@ def _convert_onnx_to_fp16(onnx_path: Path, keep_io_fp32: bool) -> str:
     )
 
 
+def convert_onnx_fp16_to_fp32(onnx_path: Union[str, Path]) -> Tuple[bytes, int]:
+    """Return an in-memory FP32 version of an ONNX graph containing FP16.
+
+    Some CPU ONNX Runtime builds execute converted FP16 convolution/attention
+    subgraphs with FP16 intermediates. Large activations can then overflow even
+    when the graph input and output types are both ``tensor(float)``. This
+    recovery path restores FP32 tensor types, initializers, and ``Cast`` targets
+    without modifying the source file, allowing an existing FP16 artifact to be
+    evaluated safely on CPU. The original FP16 rounding cannot be recovered, but
+    the arithmetic no longer overflows solely because of the reduced exponent
+    range.
+
+    Returns ``(serialized_model, converted_item_count)``. A zero count means the
+    graph did not contain FP16 tensors or casts and should not be retried.
+    """
+    try:
+        import onnx
+        from onnx import AttributeProto, TensorProto, numpy_helper
+    except ImportError as exc:  # pragma: no cover - optional inference fallback
+        raise ImportError(
+            "CPU FP32 fallback needs the 'onnx' package; re-export with "
+            "--precision fp32 or install onnx."
+        ) from exc
+
+    model = onnx.load(str(onnx_path), load_external_data=True)
+    converted = 0
+
+    def convert_tensor(tensor: Any) -> None:
+        nonlocal converted
+        if tensor.data_type != TensorProto.FLOAT16:
+            return
+        array = numpy_helper.to_array(tensor).astype("float32", copy=False)
+        replacement = numpy_helper.from_array(array, name=tensor.name)
+        tensor.CopyFrom(replacement)
+        converted += 1
+
+    def convert_value_info(value_info: Any) -> None:
+        nonlocal converted
+        if not value_info.type.HasField("tensor_type"):
+            return
+        tensor_type = value_info.type.tensor_type
+        if tensor_type.elem_type == TensorProto.FLOAT16:
+            tensor_type.elem_type = TensorProto.FLOAT
+            converted += 1
+
+    def convert_graph(graph: Any) -> None:
+        nonlocal converted
+        for initializer in graph.initializer:
+            convert_tensor(initializer)
+        for sparse in getattr(graph, "sparse_initializer", ()):
+            convert_tensor(sparse.values)
+        for value_info in (
+            list(graph.input) + list(graph.output) + list(graph.value_info)
+        ):
+            convert_value_info(value_info)
+
+        for node in graph.node:
+            if node.op_type == "Cast":
+                for attribute in node.attribute:
+                    if (
+                        attribute.name == "to"
+                        and attribute.type == AttributeProto.INT
+                        and attribute.i == TensorProto.FLOAT16
+                    ):
+                        attribute.i = TensorProto.FLOAT
+                        converted += 1
+            for attribute in node.attribute:
+                if attribute.type == AttributeProto.TENSOR:
+                    convert_tensor(attribute.t)
+                elif attribute.type == AttributeProto.TENSORS:
+                    for tensor in attribute.tensors:
+                        convert_tensor(tensor)
+                elif attribute.type == AttributeProto.GRAPH:
+                    convert_graph(attribute.g)
+                elif attribute.type == AttributeProto.GRAPHS:
+                    for nested in attribute.graphs:
+                        convert_graph(nested)
+
+    convert_graph(model.graph)
+    return model.SerializeToString(), converted
+
+
 @dataclass
 class OnnxExportResult:
     onnx_path: Path
@@ -1066,6 +1148,11 @@ def verify_onnx_against_torch(
         reference = generator(example).float()
         if clamp_output:
             reference = reference.clamp(0.0, 1.0)
+    if not torch.isfinite(reference).all():
+        raise RuntimeError(
+            "The eager generator produced non-finite output during ONNX parity "
+            "verification; check the checkpoint before exporting."
+        )
 
     session = ort.InferenceSession(
         str(onnx_path),
@@ -1077,6 +1164,13 @@ def verify_onnx_against_torch(
     if "float16" in input_dtype:
         feed = feed.astype("float16")
     actual = torch.from_numpy(session.run(None, {input_name: feed})[0]).float()
+
+    if not torch.isfinite(actual).all():
+        raise RuntimeError(
+            "The exported ONNX graph produced non-finite output during parity "
+            "verification. Re-export with --precision fp32 or use a provider "
+            "with reliable FP16 support."
+        )
 
     if actual.shape != reference.shape:
         raise RuntimeError(
@@ -1243,6 +1337,7 @@ __all__ = [
     "OnnxExportResult",
     "export_checkpoint_to_onnx",
     "export_generator_to_onnx",
+    "convert_onnx_fp16_to_fp32",
     "load_checkpoint_payload",
     "load_generator_from_any_checkpoint",
     "rebuild_generator",
