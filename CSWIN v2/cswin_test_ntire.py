@@ -228,12 +228,25 @@ def _collect_pairs(
         else:
             valid_target, reason = _probe_hsi_target(target_path)
             if not valid_target:
-                LOGGER.warning(
-                    "Ignoring %s as ground truth for %s: %s",
-                    target_path,
-                    stem,
-                    reason,
-                )
+                # ``Test_Spec`` in the public ARAD-1K release contains a
+                # 2-D, often uint16, raw MSFA mosaic. It is expected input
+                # material, not a malformed HSI target. Avoid emitting one
+                # warning per public-test scene; dataset construction reports
+                # the aggregate missing-target count below instead.
+                if "raw MSFA 'mosaic' payload" in reason:
+                    LOGGER.debug(
+                        "Ignoring %s as ground truth for %s: %s",
+                        target_path,
+                        stem,
+                        reason,
+                    )
+                else:
+                    LOGGER.warning(
+                        "Ignoring %s as ground truth for %s: %s",
+                        target_path,
+                        stem,
+                        reason,
+                    )
                 target_path = None
                 missing_gt.append(stem)
         pairs.append((stem, rgb_path, target_path))
@@ -252,7 +265,21 @@ def _probe_hsi_target(path: Path) -> Tuple[bool, str]:
     """
     try:
         with h5py.File(path, "r") as mat:
-            key = _resolve_cube_key(mat, path)
+            available = [
+                key
+                for key in mat.keys()
+                if not key.startswith("#") and isinstance(mat[key], h5py.Dataset)
+            ]
+            try:
+                key = _resolve_cube_key(mat, path)
+            except KeyError as exc:
+                if "mosaic" in {name.lower() for name in available}:
+                    return (
+                        False,
+                        "raw MSFA 'mosaic' payload (expected in public ARAD-1K "
+                        "Test_Spec; not a 31-band HSI ground-truth cube)",
+                    )
+                return False, f"not a readable HSI cube ({exc})"
             shape = tuple(int(value) for value in mat[key].shape)
     except Exception as exc:
         return False, f"not a readable HSI cube ({exc})"

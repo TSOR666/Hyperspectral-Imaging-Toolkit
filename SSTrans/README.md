@@ -208,7 +208,7 @@ unclipped.
 ## Public Test
 
 Reproduce the reported validation/ARAD-origin comparison, export cubes, and
-compute per-scene plus mean MRAE, RMSE, PSNR, and SAM:
+compute per-scene plus mean MRAE, RMSE, PSNR, SAM, and SSIM:
 
 ```powershell
 python scripts/test_ntire.py `
@@ -217,8 +217,24 @@ python scripts/test_ntire.py `
   --output-dir "outputs\source_validation" `
   --split validation `
   --metric-profile source_arad_origin `
+  --visualize `
   --device cuda
 ```
+
+`--visualize` hands the exported `cubes/*.mat` and `metrics.csv` directly to
+the repository-level [`hsi_viz_suite`](../hsi_viz_suite). It writes 300-DPI
+PNG/PDF qualitative panels, MRAE/SAM/RMSE maps, spectral/residual plots,
+bandwise summaries, metric ECDFs, and a reconstruction scatter under
+`outputs/source_validation/figures/`. Install its plotting dependencies once
+if needed:
+
+```powershell
+pip install -r ..\hsi_viz_suite\requirements.txt
+```
+
+Use `--viz-output`, `--viz-max-samples`, `--viz-dpi`, or `--viz-style` to
+customize that handoff. An installed SSTrans package can locate a sibling suite
+checkout automatically; otherwise pass `--hsi-viz-suite <path-to-hsi_viz_suite>`.
 
 For the distinct 50-image public test split, use `--split test` and a separate
 output directory. Its score must not be compared directly with `0.1468`.
@@ -232,7 +248,7 @@ python scripts/test_ntire.py `
   --data-root "/work3/<user>/dataset" `
   --output-dir "outputs\public_test" `
   --split test `
-  --spectral-dir "Test_spectral" `
+  --target-dir "Test_spectral" `
   --require-targets
 ```
 
@@ -245,6 +261,13 @@ and skips `summary.json`/`metrics.csv` instead of failing. Pass
 scored on the scenes that do have cubes; `summary.json` reports both `count`
 and `skipped`.
 
+This is the unavoidable boundary between local benchmarking and a blind
+leaderboard: SSTrans can compute metrics for any test manifest only when you
+provide the matching 31-band reference cubes (via `--target-dir`, also accepted
+as `--spectral-dir`). The official mosaic-only test release can be submitted or
+visualized with `--visualize`, but its leaderboard score is computed only by the
+challenge server after submission.
+
 After installation, the equivalent command is `hsiformer-test`.
 The upstream result notebook loads the Lightning `last.ckpt`, so the matching
 local artifact is `latest.pt`; `best.pt` is retained as a useful additional
@@ -256,7 +279,8 @@ Outputs:
 outputs/public_test/
 |-- cubes/*.mat
 |-- metrics.csv
-`-- summary.json
+|-- summary.json
+`-- figures/                 # when --visualize is passed
 ```
 
 The default `--metric-profile source_arad_origin` reproduces the full-frame
@@ -265,6 +289,10 @@ protocol used by the reported SSTrans `0.1468` line. Use
 MST++/NTIRE comparison, or `--metric-profile legacy_full` to inspect older
 full-frame `clamp_min(1e-6)` logs. `summary.json` records the named profile,
 crop, denominator, RGB normalization, precision, tiling, and export clipping.
+The native `sam` value is radians; each report also includes `sam_degrees` and
+`sam_unit` so publication plots consistently display SAM in degrees. `ssim` is
+reported alongside the four common reconstruction metrics using the same
+box-filter convention as the MSWR NTIRE tester.
 
 The `0.1468` artifact is a validation/ARAD-origin result, not the held-out test
 split. The command above makes both the split and metric protocol explicit;

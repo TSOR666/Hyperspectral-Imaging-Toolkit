@@ -53,6 +53,33 @@ from hsi_model.utils.patch_inference import PatchInference  # noqa: E402
 LOGGER = logging.getLogger("onnx_test_ntire")
 
 
+_ONNX_FLOAT_DTYPES = {
+    "tensor(float)": np.float32,
+    "tensor(float16)": np.float16,
+    "tensor(double)": np.float64,
+}
+
+
+def _numpy_dtype_for_onnx_tensor(onnx_type: str, *, role: str):
+    """Return the exact NumPy dtype required by an ONNX graph boundary.
+
+    ONNX Runtime rejects a feed whose dtype differs from the graph declaration.
+    In particular, a graph exported with ``--fp16-io`` needs float16 input,
+    while a legacy double graph needs float64. Do not silently coerce unknown
+    types to float32: that turns a clear export/runtime incompatibility into an
+    opaque ONNX Runtime ``Unexpected input data type`` error.
+    """
+    normalized = str(onnx_type).strip().lower()
+    dtype = _ONNX_FLOAT_DTYPES.get(normalized)
+    if dtype is not None:
+        return dtype
+    raise TypeError(
+        f"Unsupported ONNX {role} type {onnx_type!r}. This tester supports "
+        "tensor(float), tensor(float16), and tensor(double). Re-export the "
+        "model with export_onnx.py using fp32 or fp16 I/O."
+    )
+
+
 @dataclass
 class OnnxTestConfig:
     onnx_path: str
@@ -75,7 +102,9 @@ class OnnxTestConfig:
     save_format: str = "mat"
     max_samples: Optional[int] = None
     start_idx: int = 0
-    require_gt: bool = True
+    # The official ARAD-1K Test_Spec files contain a raw MSFA mosaic, not HSI
+    # ground truth. Prediction-only inference must therefore be the default.
+    require_gt: bool = False
     quiet_patches: bool = True
     compare_checkpoint: Optional[str] = None
 
@@ -126,8 +155,13 @@ class OnnxGenerator(nn.Module):
         spec_out = self.session.get_outputs()[0]
         self.input_name = spec_in.name
         self.output_name = spec_out.name
-        self.input_numpy_dtype = (
-            np.float16 if "float16" in spec_in.type else np.float32
+        self.input_onnx_type = str(spec_in.type)
+        self.output_onnx_type = str(spec_out.type)
+        self.input_numpy_dtype = _numpy_dtype_for_onnx_tensor(
+            self.input_onnx_type, role="input"
+        )
+        self.output_numpy_dtype = _numpy_dtype_for_onnx_tensor(
+            self.output_onnx_type, role="output"
         )
         self.input_shape = list(spec_in.shape)
         self.static_hw = self._static_hw(self.input_shape)
@@ -145,9 +179,17 @@ class OnnxGenerator(nn.Module):
         return None
 
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
-        array = rgb.detach().cpu().numpy().astype(self.input_numpy_dtype, copy=False)
+        # Make both dtype and memory layout explicit. This is important for
+        # float16/double ONNX graphs and avoids a PyTorch-view stride leaking
+        # into ORT's C-array feed.
+        array = np.ascontiguousarray(
+            rgb.detach().cpu().numpy(), dtype=self.input_numpy_dtype
+        )
         output = self.session.run([self.output_name], {self.input_name: array})[0]
-        return torch.from_numpy(np.asarray(output, dtype=np.float32))
+        output = np.ascontiguousarray(output, dtype=self.output_numpy_dtype)
+        # Patch stitching and metrics deliberately run in float32 even when
+        # the graph boundary is fp16, matching the PyTorch inference path.
+        return torch.from_numpy(output).to(dtype=torch.float32)
 
 
 class OnnxNTIRETester:
@@ -171,10 +213,11 @@ class OnnxNTIRETester:
             intra_op_threads=config.intra_op_threads,
         )
         LOGGER.info(
-            "ONNX session providers=%s input=%s dtype=%s",
+            "ONNX session providers=%s input=%s type=%s output_type=%s",
             self.model.providers,
             self.model.input_shape,
-            self.model.input_numpy_dtype.__name__,
+            self.model.input_onnx_type,
+            self.model.output_onnx_type,
         )
 
         self.manifest = self._load_manifest(Path(config.onnx_path))
@@ -364,7 +407,7 @@ class OnnxNTIRETester:
             per_sample.append(record)
 
         if scored == 0:
-            LOGGER.warning(
+            LOGGER.info(
                 "No ground-truth cubes were found; predictions were produced but "
                 "no ARAD-1K metrics could be computed."
             )
@@ -376,6 +419,9 @@ class OnnxNTIRETester:
                 "providers": self.model.providers,
                 "input_shape": self.model.input_shape,
                 "input_dtype": self.model.input_numpy_dtype.__name__,
+                "input_onnx_type": self.model.input_onnx_type,
+                "output_dtype": self.model.output_numpy_dtype.__name__,
+                "output_onnx_type": self.model.output_onnx_type,
                 "precision": self.manifest.get("export", {}).get("precision"),
                 "clamped_in_graph": self.manifest.get("export", {}).get(
                     "clamp_output"
@@ -468,11 +514,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--save_format", default="mat", choices=["mat", "npy", "h5"])
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--start_idx", type=int, default=0)
-    parser.add_argument(
-        "--allow_missing_gt",
+    target_mode = parser.add_mutually_exclusive_group()
+    target_mode.add_argument(
+        "--require_gt",
         action="store_true",
-        help="Do not fail when some samples have no ground-truth cube.",
+        help="Fail unless every selected scene has a 31-band ground-truth cube.",
     )
+    target_mode.add_argument(
+        "--allow_missing_gt",
+        dest="require_gt",
+        action="store_false",
+        help="Compatibility alias; missing targets are allowed by default.",
+    )
+    parser.set_defaults(require_gt=False)
     parser.add_argument("--show_patch_progress", action="store_true")
     parser.add_argument(
         "--compare_checkpoint",
@@ -512,7 +566,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         save_format=args.save_format,
         max_samples=args.max_samples,
         start_idx=args.start_idx,
-        require_gt=not args.allow_missing_gt,
+        require_gt=args.require_gt,
         quiet_patches=not args.show_patch_progress,
         compare_checkpoint=args.compare_checkpoint,
     )

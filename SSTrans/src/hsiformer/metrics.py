@@ -70,6 +70,54 @@ def spectral_angle_mapper(
     return torch.acos(cosine.clamp(-1.0, 1.0)).mean()
 
 
+def structural_similarity_index(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float = 1.0,
+    window_size: int = 11,
+) -> torch.Tensor:
+    """Mean spectral-band SSIM using the NTIRE/MSWR box-filter convention."""
+    _check_shapes(prediction, target)
+    if prediction.ndim != 4:
+        raise ValueError("SSIM expects BCHW tensors.")
+    if window_size < 1 or window_size % 2 == 0:
+        raise ValueError("window_size must be a positive odd integer.")
+
+    padding = window_size // 2
+    prediction = prediction.float()
+    target = target.float()
+    mu_prediction = F.avg_pool2d(prediction, window_size, 1, padding)
+    mu_target = F.avg_pool2d(target, window_size, 1, padding)
+    mu_prediction_sq = mu_prediction.square()
+    mu_target_sq = mu_target.square()
+    mu_product = mu_prediction * mu_target
+
+    variance_prediction = (
+        F.avg_pool2d(prediction.square(), window_size, 1, padding)
+        - mu_prediction_sq
+    )
+    variance_target = (
+        F.avg_pool2d(target.square(), window_size, 1, padding)
+        - mu_target_sq
+    )
+    covariance = (
+        F.avg_pool2d(prediction * target, window_size, 1, padding)
+        - mu_product
+    )
+    epsilon = torch.finfo(prediction.dtype).eps * 10
+    variance_prediction = variance_prediction.clamp_min(epsilon)
+    variance_target = variance_target.clamp_min(epsilon)
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    numerator = (2 * mu_product + c1) * (2 * covariance + c2)
+    denominator = (
+        (mu_prediction_sq + mu_target_sq + c1)
+        * (variance_prediction + variance_target + c2)
+    )
+    return (numerator / denominator.clamp_min(epsilon)).mean()
+
+
 def spectral_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -77,8 +125,9 @@ def spectral_metrics(
     data_range: float = 1.0,
     eps: float = 1e-6,
     mrae_denominator: MRAEDenominator = "clamp_abs",
+    include_ssim: bool = True,
 ) -> dict[str, torch.Tensor]:
-    return {
+    metrics = {
         "mrae": mean_relative_absolute_error(
             prediction,
             target,
@@ -97,6 +146,13 @@ def spectral_metrics(
             eps=eps,
         ),
     }
+    if include_ssim:
+        metrics["ssim"] = structural_similarity_index(
+            prediction,
+            target,
+            data_range=data_range,
+        )
+    return metrics
 
 
 def _check_shapes(

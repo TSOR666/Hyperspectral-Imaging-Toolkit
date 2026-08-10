@@ -350,6 +350,13 @@ a single pass. Add `--compare_checkpoint /path/to/old_best.pth` to evaluate the
 original PyTorch weights alongside and print the per-metric delta the export
 introduced.
 
+The public ARAD-1K `Test_Spec` files contain a 2-D, frequently `uint16`, MSFA
+`mosaic`, not a 31-band ground-truth cube. The ONNX tester therefore exports
+predictions without metrics when no real cube is available; use `--require_gt`
+to make target availability mandatory. It reads the graph's declared I/O type,
+so exports made with `--fp16-io` are fed `float16` automatically (while metric
+and tile blending remain `float32`).
+
 ## Verification
 
 ```bash

@@ -22,6 +22,7 @@ from .ntire import (
     evaluate_loader,
     infer_loader,
     resolve_device,
+    run_hsi_viz_suite,
     write_metric_reports,
 )
 from .training import TrainingConfig, train
@@ -209,6 +210,13 @@ def test_main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--clip", action="store_true")
     parser.add_argument(
+        "--no-ssim",
+        dest="include_ssim",
+        action="store_false",
+        default=True,
+        help="Skip SSIM to reduce evaluation overhead (enabled by default).",
+    )
+    parser.add_argument(
         "--metric-profile",
         choices=("source_arad_origin", "ntire_center", "legacy_full"),
         default="source_arad_origin",
@@ -236,6 +244,7 @@ def test_main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument(
         "--spectral-dir",
+        "--target-dir",
         action="append",
         metavar="DIR",
         help=(
@@ -253,6 +262,46 @@ def test_main(argv: Sequence[str] | None = None) -> None:
             "split ships no spectral cubes (ARAD-1K Test_Spec holds the MSFA "
             "'mosaic' payload, not ground truth)."
         ),
+    )
+    parser.add_argument(
+        "--visualize",
+        "--generate-viz",
+        dest="visualize",
+        action="store_true",
+        help=(
+            "After export, invoke hsi_viz_suite to generate publication-grade "
+            "PNG/PDF figures. With a labelled split it includes paired error "
+            "and spectral plots; blind test exports receive prediction-only "
+            "figures."
+        ),
+    )
+    parser.add_argument(
+        "--viz-output",
+        help="Figure directory (default: <output-dir>/figures).",
+    )
+    parser.add_argument(
+        "--hsi-viz-suite",
+        help=(
+            "Path to hsi_viz_suite (its root, scripts directory, or "
+            "generate_all_visualizations.py). Defaults to a sibling checkout."
+        ),
+    )
+    parser.add_argument(
+        "--viz-max-samples",
+        type=int,
+        default=10,
+        help="Maximum scenes sent to hsi_viz_suite per figure type (default: 10).",
+    )
+    parser.add_argument(
+        "--viz-dpi",
+        type=int,
+        default=300,
+        help="Output DPI for paper figures (default: 300).",
+    )
+    parser.add_argument(
+        "--viz-style",
+        default="paper",
+        help="hsi_viz_suite style name (default: paper).",
     )
     args = parser.parse_args(argv)
 
@@ -337,6 +386,11 @@ def test_main(argv: Sequence[str] | None = None) -> None:
             rgb_dir=dataset.rgb_root,
             scene_ids=exported,
         )
+        _maybe_generate_visualizations(
+            args,
+            output_dir,
+            target_dir=None,
+        )
         print(
             f"no ground truth in split={args.split}; saved {len(exported)} "
             f"cubes to {output_dir / 'cubes'} without metrics"
@@ -352,6 +406,7 @@ def test_main(argv: Sequence[str] | None = None) -> None:
         amp=args.amp,
         output_dir=output_dir / "cubes",
         clip=args.clip,
+        include_ssim=args.include_ssim,
         **metric_protocol,
     )
     report_summary = {
@@ -363,17 +418,48 @@ def test_main(argv: Sequence[str] | None = None) -> None:
         "overlap": args.overlap if args.tile_size is not None else None,
         "amp": args.amp,
         "export_clip": args.clip,
+        "include_ssim": args.include_ssim,
         "metric_profile": args.metric_profile,
         **metric_protocol,
     }
     write_metric_reports(output_dir, report_summary, rows)
-    print(
+    _maybe_generate_visualizations(
+        args,
+        output_dir,
+        target_dir=dataset.spectral_root,
+    )
+    metric_line = (
         f"test scenes={int(summary['count'])} "
         f"skipped={int(summary.get('skipped', 0.0))} "
         f"crop_border={int(summary['crop_border'])} "
         f"MRAE={summary['mrae']:.6f} RMSE={summary['rmse']:.6f} "
-        f"PSNR={summary['psnr']:.4f} SAM={summary['sam']:.6f}"
+        f"PSNR={summary['psnr']:.4f} SAM(rad)={summary['sam']:.6f}"
     )
+    if "ssim" in summary:
+        metric_line += f" SSIM={summary['ssim']:.6f}"
+    print(metric_line)
+
+
+def _maybe_generate_visualizations(
+    args: argparse.Namespace,
+    output_dir: Path,
+    *,
+    target_dir: Path | None,
+) -> None:
+    """Run the optional shared visualization suite after a test/export run."""
+    if not args.visualize:
+        return
+    figure_dir = run_hsi_viz_suite(
+        output_dir,
+        target_dir=target_dir,
+        output_dir=args.viz_output,
+        suite_path=args.hsi_viz_suite,
+        max_samples=args.viz_max_samples,
+        dpi=args.viz_dpi,
+        style=args.viz_style,
+    )
+    kind = "paired" if target_dir is not None else "prediction-only"
+    print(f"generated {kind} paper figures under {figure_dir}")
 
 
 def _write_inference_report(

@@ -44,6 +44,11 @@ python scripts/generate_all_visualizations.py \
   --dpi 300
 ```
 
+SSTrans' `scripts/test_ntire.py --visualize` runs this exact command
+automatically after cube export. Its reports retain native SAM radians while
+also writing `sam_degrees`; the suite uses the degree-normalized value in
+qualitative annotations and cross-method statistics.
+
 This command will:
 
 1. Render qualitative reconstructions under `figs/main_figures/`.
