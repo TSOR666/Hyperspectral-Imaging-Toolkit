@@ -189,6 +189,48 @@ def test_ntire_dataset_ignores_test_mosaic_as_ground_truth(tmp_path, caplog):
     )
 
 
+def test_ntire_dataset_never_scores_a_cube_shaped_mosaic(tmp_path):
+    """A 31-axis raw mosaic must not bypass the generic cube fallback."""
+    tool = _load_tool_module()
+    case_dir = tmp_path / f"case_{uuid.uuid4().hex}"
+    rgb_dir = case_dir / "Test_RGB"
+    spec_dir = case_dir / "Test_Spec"
+    split_dir = case_dir / "split_txt"
+    for directory in (rgb_dir, spec_dir, split_dir):
+        directory.mkdir(parents=True)
+
+    scene = "ARAD_1K_0951"
+    (split_dir / "test_list.txt").write_text(f"{scene}\n", encoding="utf-8")
+    rgb = np.random.randint(0, 255, (4, 5, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(rgb_dir / f"{scene}.jpg"), rgb)
+    with h5py.File(spec_dir / f"{scene}.mat", "w") as mat:
+        # Deliberately matches the C,W,H shape of an ARAD HSI cube.
+        mat.create_dataset("mosaic", data=np.zeros((31, 5, 4), np.uint16))
+
+    dataset = tool.NTIRESplitDataset(
+        data_root=str(case_dir), split="test", require_gt=False
+    )
+
+    assert dataset.split_name == "test"
+    assert dataset[0].target is None
+    with pytest.raises(FileNotFoundError, match="ground truth"):
+        tool.NTIRESplitDataset(data_root=str(case_dir), split="test", require_gt=True)
+
+
+def test_metric_summary_counts_only_scored_samples():
+    tool = _load_tool_module()
+
+    summary = tool._summarize_metrics(
+        [
+            {"name": "prediction_only"},
+            {"name": "scored", "metrics": {"mrae": 0.25}},
+        ]
+    )
+
+    assert summary["count"] == 1
+    assert summary["mrae"] == {"mean": 0.25, "std": 0.0}
+
+
 def test_ntire_cli_accepts_weights_path_and_external_architecture(monkeypatch):
     tool = _load_tool_module()
     monkeypatch.setattr(

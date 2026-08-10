@@ -280,6 +280,14 @@ def _probe_hsi_target(path: Path) -> Tuple[bool, str]:
                         "Test_Spec; not a 31-band HSI ground-truth cube)",
                     )
                 return False, f"not a readable HSI cube ({exc})"
+            if key.lower() == "mosaic":
+                # Defence in depth for old or externally supplied cube-key
+                # resolvers: a raw MSFA payload is never a scoring target.
+                return (
+                    False,
+                    "raw MSFA 'mosaic' payload (expected in public ARAD-1K "
+                    "Test_Spec; not a 31-band HSI ground-truth cube)",
+                )
             shape = tuple(int(value) for value in mat[key].shape)
     except Exception as exc:
         return False, f"not a readable HSI cube ({exc})"
@@ -514,15 +522,20 @@ def _mean_std(values: Iterable[float]) -> Dict[str, float]:
 
 
 def _summarize_metrics(per_sample: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scored_samples = [sample for sample in per_sample if sample.get("metrics")]
     metric_names = sorted(
-        {metric for sample in per_sample for metric in sample.get("metrics", {}).keys()}
+        {
+            metric
+            for sample in scored_samples
+            for metric in sample["metrics"].keys()
+        }
     )
-    summary: Dict[str, Any] = {"count": len(per_sample)}
+    summary: Dict[str, Any] = {"count": len(scored_samples)}
     for metric in metric_names:
         values = [
             float(sample["metrics"][metric])
-            for sample in per_sample
-            if metric in sample.get("metrics", {})
+            for sample in scored_samples
+            if metric in sample["metrics"]
         ]
         summary[metric] = _mean_std(values)
     return summary

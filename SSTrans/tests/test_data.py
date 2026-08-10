@@ -337,6 +337,28 @@ def test_mosaic_only_test_spec_is_reported_not_silently_scored(tmp_path) -> None
     assert sample["cond"].shape == (3, 6, 8)
 
 
+def test_cube_shaped_mosaic_is_never_a_target(tmp_path) -> None:
+    """A raw mosaic named ``mosaic`` cannot bypass shape-based cube lookup."""
+    _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
+    mosaic_path = tmp_path / "Test_Spec" / "ARAD_1K_0951.mat"
+    with h5py.File(mosaic_path, "w") as handle:
+        handle.create_dataset("mosaic", data=np.zeros((31, 8, 6), np.uint16))
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+        require_targets=False,
+    )
+
+    assert dataset.scene_ids_with_targets == ()
+    assert "mosaic" in dataset.unusable_targets["ARAD_1K_0951"]
+    assert "label" not in dataset[0]
+
+
 def test_mosaic_file_does_not_shadow_a_cube_in_another_directory(
     tmp_path,
 ) -> None:
