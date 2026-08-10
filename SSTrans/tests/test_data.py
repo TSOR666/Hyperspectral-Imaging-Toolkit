@@ -315,6 +315,36 @@ def test_dataset_accepts_cube_key_aliases_and_png_rgb(tmp_path) -> None:
     )
 
 
+def test_dataset_reads_classic_matlab_test_reference(tmp_path) -> None:
+    scipy_io = pytest.importorskip("scipy.io")
+    expected_cube = _write_arad_test_scene(
+        tmp_path,
+        "ARAD_1K_0951",
+        spectral_key="cube",
+    )
+    path = tmp_path / "Test_Spec" / "ARAD_1K_0951.mat"
+    scipy_io.savemat(
+        path,
+        {"rad": expected_cube.transpose(1, 2, 0)},
+        do_compression=False,
+    )
+    manifest = tmp_path / "split.txt"
+    manifest.write_text("ARAD_1K_0951\n", encoding="utf-8")
+
+    dataset = ARAD1KDataset(
+        tmp_path,
+        split="test",
+        manifest_path=manifest,
+        augment=False,
+    )
+
+    assert dataset.scene_ids_with_targets == ("ARAD_1K_0951",)
+    torch.testing.assert_close(
+        dataset[0]["label"],
+        torch.from_numpy(expected_cube),
+    )
+
+
 def test_mosaic_only_test_spec_is_reported_not_silently_scored(tmp_path) -> None:
     _write_arad_test_scene(tmp_path, "ARAD_1K_0951", spectral_key=None)
     manifest = tmp_path / "split.txt"
