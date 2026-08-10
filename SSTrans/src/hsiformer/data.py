@@ -57,6 +57,11 @@ CUBE_DATASET_KEYS = (
     "image",
 )
 
+# ARAD-1K's public ``Test_Spec`` uses this name for a raw MSFA measurement,
+# not for a reconstructed 31-band cube. Exclude it before any shape-based
+# fallback so a repackaged, cube-shaped mosaic cannot become a false target.
+NON_CUBE_DATASET_KEYS = frozenset({"mosaic"})
+
 
 def resolve_arad_directory(
     root: str | Path,
@@ -609,9 +614,10 @@ def _resolve_cube_key(
     """Return the name of the HDF5 dataset holding the HSI cube.
 
     Prefers the canonical ``cube`` key, then known aliases (case-insensitive),
-    then any 3D dataset with a matching spectral axis, then a lone 3D dataset.
-    Raises a descriptive ``KeyError`` listing the available datasets when none
-    qualifies, so a wrong or MSFA-only file is diagnosable.
+    then any non-mosaic 3D dataset with a matching spectral axis, then a lone
+    non-mosaic 3D dataset. Raises a descriptive ``KeyError`` listing the
+    available datasets when none qualifies, so a wrong or MSFA-only file is
+    diagnosable.
     """
     available = [
         key
@@ -623,18 +629,25 @@ def _resolve_cube_key(
     if preferred:
         candidates = (preferred.lower(), *CUBE_DATASET_KEYS)
     for candidate in candidates:
+        if candidate in NON_CUBE_DATASET_KEYS:
+            continue
         if candidate in by_lower:
             return by_lower[candidate]
 
     banded = [
         key
         for key in available
-        if handle[key].ndim == 3
+        if key.lower() not in NON_CUBE_DATASET_KEYS
+        and handle[key].ndim == 3
         and channels in tuple(int(value) for value in handle[key].shape)
     ]
     if banded:
         return banded[0]
-    cubes = [key for key in available if handle[key].ndim == 3]
+    cubes = [
+        key
+        for key in available
+        if key.lower() not in NON_CUBE_DATASET_KEYS and handle[key].ndim == 3
+    ]
     if len(cubes) == 1:
         return cubes[0]
 

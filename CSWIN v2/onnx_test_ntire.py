@@ -189,7 +189,16 @@ class OnnxGenerator(nn.Module):
         output = np.ascontiguousarray(output, dtype=self.output_numpy_dtype)
         # Patch stitching and metrics deliberately run in float32 even when
         # the graph boundary is fp16, matching the PyTorch inference path.
-        return torch.from_numpy(output).to(dtype=torch.float32)
+        prediction = torch.from_numpy(output).to(dtype=torch.float32)
+        non_finite_count = int((~torch.isfinite(prediction)).sum().item())
+        if non_finite_count:
+            raise FloatingPointError(
+                f"ONNX graph produced {non_finite_count} non-finite values "
+                f"(input={self.input_onnx_type}, output={self.output_onnx_type}). "
+                "Re-export or check the graph's precision conversion instead of "
+                "scoring NaN predictions."
+            )
+        return prediction
 
 
 class OnnxNTIRETester:
@@ -579,12 +588,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{results['split']['num_scored']}/{results['split']['num_samples']} scored, "
         f"crop={config.crop_mode})"
     )
-    for metric in ("mrae", "mrae_unclamped", "rmse", "psnr", "sam", "ssim", "mae"):
-        if metric in summary:
-            print(
-                f"  {metric:16s} {summary[metric]['mean']:.6f} "
-                f"+/- {summary[metric]['std']:.6f}"
-            )
+    if results["split"]["num_scored"] == 0:
+        print("  Metrics unavailable: no 31-band ground-truth cubes were found.")
+    else:
+        for metric in ("mrae", "mrae_unclamped", "rmse", "psnr", "sam", "ssim", "mae"):
+            if metric in summary:
+                print(
+                    f"  {metric:16s} {summary[metric]['mean']:.6f} "
+                    f"+/- {summary[metric]['std']:.6f}"
+                )
 
     if "export_delta" in results:
         print("\nONNX minus PyTorch checkpoint (negative = ONNX better)")

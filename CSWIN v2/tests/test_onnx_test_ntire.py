@@ -130,6 +130,23 @@ def test_onnx_tester_rejects_unknown_graph_dtype():
         tool._numpy_dtype_for_onnx_tensor("tensor(bfloat16)", role="input")
 
 
+def test_onnx_generator_rejects_non_finite_output(monkeypatch):
+    tool = _load_onnx_tester_module()
+    observed: dict[str, object] = {}
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        _fake_onnxruntime("tensor(float)", "tensor(float)", observed),
+    )
+    model = tool.OnnxGenerator("fake.onnx")
+    model.session.run = lambda _names, _feeds: [
+        np.full((1, 31, 4, 5), np.nan, dtype=np.float32)
+    ]
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        model(torch.rand(1, 3, 4, 5))
+
+
 def test_onnx_tester_allows_public_test_mosaics_by_default():
     tool = _load_onnx_tester_module()
 
@@ -140,3 +157,25 @@ def test_onnx_tester_allows_public_test_mosaics_by_default():
         ["--onnx", "model.onnx", "--data_root", "dataset", "--require_gt"]
     )
     assert strict.require_gt is True
+
+
+def test_onnx_tester_prints_a_prediction_only_summary_without_nan(monkeypatch, capsys):
+    tool = _load_onnx_tester_module()
+
+    class FakeTester:
+        def __init__(self, _config) -> None:
+            pass
+
+        def run(self):
+            return {
+                "metrics": {"count": 0},
+                "split": {"resolved": "test", "num_scored": 0, "num_samples": 50},
+            }
+
+    monkeypatch.setattr(tool, "OnnxNTIRETester", FakeTester)
+
+    assert tool.main(["--onnx", "model.onnx", "--data_root", "dataset"]) == 0
+    output = capsys.readouterr().out.lower()
+    assert "0/50 scored" in output
+    assert "metrics unavailable" in output
+    assert "nan" not in output

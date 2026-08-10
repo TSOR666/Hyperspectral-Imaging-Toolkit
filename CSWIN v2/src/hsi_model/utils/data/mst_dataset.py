@@ -125,15 +125,19 @@ def _cube_to_chw(cube: np.ndarray, source: Path) -> np.ndarray:
 # different name; mirror the tolerant key resolution already used by
 # ``hsi_benchmark.data`` and ``arad_dataset`` instead of hard-failing.
 _CUBE_DATASET_KEYS = ("cube", "reflectance", "rad", "hsi", "hyper", "data", "image")
+# ``mosaic`` is the raw MSFA measurement distributed in ARAD-1K ``Test_Spec``.
+# Its storage layout is not an HSI ground-truth convention, even if a
+# repackaged file happens to give it three dimensions and a length-31 axis.
+_NON_CUBE_DATASET_KEYS = frozenset({"mosaic"})
 
 
 def _resolve_cube_key(mat: h5py.File, source: Path) -> str:
     """Return the name of the HDF5 dataset holding the HSI cube.
 
     Prefers the canonical ``cube`` key, then known aliases (case-insensitive),
-    then any 3D dataset with a 31-band axis, then a lone 3D dataset. Raises a
-    descriptive ``KeyError`` listing the available datasets when none qualifies,
-    so a wrong/empty file is diagnosable instead of opaque.
+    then any non-mosaic 3D dataset with a 31-band axis, then a lone non-mosaic
+    3D dataset. Raises a descriptive ``KeyError`` listing the available datasets
+    when none qualifies, so a wrong/empty file is diagnosable instead of opaque.
     """
     available = [
         key
@@ -147,18 +151,30 @@ def _resolve_cube_key(mat: h5py.File, source: Path) -> str:
     banded = [
         key
         for key in available
-        if mat[key].ndim == 3
+        if key.lower() not in _NON_CUBE_DATASET_KEYS
+        and mat[key].ndim == 3
         and ARAD1K_NUM_BANDS in tuple(int(s) for s in mat[key].shape)
     ]
     if banded:
         return banded[0]
-    cubes = [key for key in available if mat[key].ndim == 3]
+    cubes = [
+        key
+        for key in available
+        if key.lower() not in _NON_CUBE_DATASET_KEYS and mat[key].ndim == 3
+    ]
     if len(cubes) == 1:
         return cubes[0]
+    hint = ""
+    if "mosaic" in by_lower:
+        hint = (
+            " This file holds the ARAD-1K MSFA 'mosaic' payload; the public "
+            "test split has no spectral ground truth and can be reconstructed, "
+            "but not scored."
+        )
     raise KeyError(
         f"No HSI cube dataset found in {source}. Expected a variable named "
         f"'cube' (ARAD-1K/NTIRE convention) or one of {_CUBE_DATASET_KEYS}; "
-        f"available datasets: {available or '<none>'}."
+        f"available datasets: {available or '<none>'}.{hint}"
     )
 
 
