@@ -45,19 +45,22 @@ wavelet_type: db2
 
 # ---- LOSS: MST++-faithful, MRAE only ----
 use_enhanced_loss: false     # criterion = Loss_MRAE()
+mrae_epsilon: 0.0           # unfloored positive-target reference objective
+validation_clamp_output: false
+validation_crop_border: 128
 
 # ---- optimizer / schedule (matches MST++) ----
 optimizer: adam              # MST++ uses Adam, not AdamW
 scheduler: cosine
 init_lr: 4.0e-4              # MST++ default
 min_lr: 1.0e-6
-warmup_epochs: 5
+warmup_epochs: 0
 weight_decay: 0.0            # MST++ uses no weight decay
-gradient_clip: 1.0
+gradient_clip: 0.0
 gradient_accumulation_steps: 1
 
-# ---- precision / mem (orthogonal to fairness; faster training) ----
-use_amp: true
+# ---- FP32 reference precision ----
+use_amp: false
 amp_dtype: auto              # prefers bf16 on Ampere/Hopper
 channels_last: true
 memory_monitoring: true

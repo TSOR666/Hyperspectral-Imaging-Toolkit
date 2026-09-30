@@ -40,6 +40,8 @@ def compute_mst_center_crop_metrics(
     criterion: torch.nn.Module = None,
     clamp_prediction: bool = False,
     report_raw_mrae: bool = False,
+    mrae_epsilon: float = 1e-8,
+    crop_border: int = None,
 ) -> Dict[str, float]:
     """
     Compute metrics using the MST++ center-crop evaluation protocol.
@@ -59,7 +61,15 @@ def compute_mst_center_crop_metrics(
         )
 
     height, width = pred_hsi.shape[-2:]
-    if height >= _ARAD_CROP_H and width >= _ARAD_CROP_W:
+    if crop_border is not None:
+        if crop_border < 0 or min(height, width) <= 2 * crop_border:
+            raise ValueError("crop_border leaves an empty scoring region")
+        if crop_border:
+            pred_crop = pred_hsi[..., crop_border:-crop_border, crop_border:-crop_border]
+            target_crop = target_hsi[..., crop_border:-crop_border, crop_border:-crop_border]
+        else:
+            pred_crop, target_crop = pred_hsi, target_hsi
+    elif height >= _ARAD_CROP_H and width >= _ARAD_CROP_W:
         pred_crop = crop_center_arad1k(pred_hsi, _ARAD_CROP_H, _ARAD_CROP_W)
         target_crop = crop_center_arad1k(target_hsi, _ARAD_CROP_H, _ARAD_CROP_W)
     else:
@@ -83,6 +93,7 @@ def compute_mst_center_crop_metrics(
         else raw_pred_crop
     )
     metrics = compute_metrics(metric_pred_crop, target_crop, compute_all=True)
+    metrics["mrae"] = compute_mrae(metric_pred_crop, target_crop, epsilon=mrae_epsilon).item()
 
     if clamp_prediction:
         out_of_range = (raw_pred_crop < 0.0) | (raw_pred_crop > 1.0)
@@ -91,6 +102,7 @@ def compute_mst_center_crop_metrics(
             metrics["raw_mrae"] = compute_mrae(
                 raw_pred_crop,
                 target_crop,
+                epsilon=mrae_epsilon,
             ).item()
 
     if criterion is not None:

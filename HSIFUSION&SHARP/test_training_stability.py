@@ -53,7 +53,12 @@ def _fake_unified_trainer(epochs: int, val_interval: int):
     from unified_training import UnifiedTrainer
 
     trainer = object.__new__(UnifiedTrainer)
-    trainer.config = SimpleNamespace(epochs=epochs, val_interval=val_interval)
+    trainer.config = SimpleNamespace(updates_per_epoch=1, val_interval_steps=val_interval)
+    trainer.total_optimizer_steps = epochs
+    trainer.optimizer_step = 0
+    trainer.health = None
+    trainer._last_metrics = {}
+    trainer._last_validation_step = -1
     trainer.start_epoch = 0
     trainer.optimizer = SimpleNamespace(param_groups=[{"lr": 4e-4}])
     trainer.best_mrae = float("inf")
@@ -61,16 +66,21 @@ def _fake_unified_trainer(epochs: int, val_interval: int):
     return trainer
 
 
-def test_unified_trainer_writes_last_checkpoint_each_epoch() -> None:
+def test_unified_trainer_writes_checkpoint_at_update_cadence() -> None:
     trainer = _fake_unified_trainer(epochs=3, val_interval=2)
-    trainer._train_epoch = lambda epoch: float(epoch + 1)
+    def advance(epoch):
+        trainer.optimizer_step += 1
+        if trainer.optimizer_step % 2 == 0 or trainer.optimizer_step == trainer.total_optimizer_steps:
+            trainer._validate_and_checkpoint()
+        return float(epoch + 1)
+    trainer._train_epoch = advance
     trainer.validate = lambda epoch: {"full/mrae": 1.0 / epoch}
     saves = []
     trainer._save_checkpoint = lambda epoch, is_best: saves.append((epoch, is_best))
 
     trainer.train()
 
-    assert saves == [(1, False), (2, True), (3, True)]
+    assert saves == [(2, True), (3, True)]
 
 
 def test_unified_trainer_writes_recovery_checkpoint_on_first_epoch_failure() -> None:
@@ -102,6 +112,8 @@ def test_unified_trainer_aborts_on_persistent_nonfinite_gradients() -> None:
     trainer = object.__new__(UnifiedTrainer)
     trainer.config = SimpleNamespace(
         accumulate_steps=1,
+        updates_per_epoch=1,
+        auxiliary_loss=True,
         gradient_clip=1.0,
         max_consecutive_nonfinite=3,
         log_interval=100,
@@ -124,6 +136,10 @@ def test_unified_trainer_aborts_on_persistent_nonfinite_gradients() -> None:
     trainer.iteration = 0
     trainer.consecutive_nonfinite = 0
     trainer.writer = None
+    trainer.health = None
+    trainer.total_optimizer_steps = 1
+    trainer._data_iterator = None
+    trainer.loader_cycles = 0
     trainer.train_loader = [
         (torch.rand(1, 3, 2, 2), torch.rand(1, 31, 2, 2).clamp_min(0.1))
         for _ in range(3)

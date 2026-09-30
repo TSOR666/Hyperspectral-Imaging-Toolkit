@@ -66,6 +66,7 @@ def _make_config(model: str, mini_arad: Path, out_dir: Path, **overrides):
         num_workers=0,
         memory_mode="standard",
         epochs=1,
+        updates_per_epoch=2,
         val_interval=1,
         val_crop_border=128,  # too large for 64x64 scenes -> exercises the fallback
         amp="off",
@@ -109,7 +110,9 @@ def test_unified_trainer_end_to_end(model, mini_arad, tmp_path):
     # Checkpoints written and self-describing
     ckpt = torch.load(exp_dir / "best.pth", map_location="cpu", weights_only=False)
     assert ckpt["model"] == model
-    assert ckpt["unified_version"] == 1
+    assert ckpt["unified_version"] == 2
+    assert ckpt['optimizer_step'] == config.max_optimizer_steps == 2
+    assert 'resolved_model_config' in ckpt and 'run_manifest' in ckpt
     if config.ema_decay > 0:
         assert "ema_model_state_dict" in ckpt
 
@@ -192,6 +195,8 @@ def test_defaults_match_mstpp_recipe():
     assert cfg.optimizer == "adam" and cfg.weight_decay == 0.0
     assert cfg.warmup_epochs == 0.0 and cfg.ema_decay == 0.0
     assert cfg.epochs == 300
+    assert cfg.max_optimizer_steps == 300000
+    assert cfg.val_interval_steps == 1000
     assert cfg.val_crop_border == 128  # [..., 128:-128, 128:-128] selection
     assert cfg.mrae_eps == 1e-6
 

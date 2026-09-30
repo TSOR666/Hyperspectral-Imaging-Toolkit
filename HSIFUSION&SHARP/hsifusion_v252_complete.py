@@ -45,6 +45,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from reconstruction_layers import FullResolutionSpectralBlock, unpack_grouped_projection
 
 # Import optimized common utilities
 from common_utils_v32 import (
@@ -569,6 +570,8 @@ class RobustEnhancedSpectralAttention(nn.Module):
         pool_sizes: Optional[List[int]] = None,
         spectral_basis_rank: Optional[int] = None,
         min_bands_per_group: int = 1,
+        qkv_layout: str = "legacy",
+        strict_failures: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -577,6 +580,8 @@ class RobustEnhancedSpectralAttention(nn.Module):
         self.scale_failures = 0
         self.total_attempts = 0  # Exact tracking
         self.spectral_basis_rank = spectral_basis_rank
+        self.qkv_layout = qkv_layout
+        self.strict_failures = strict_failures
         if spectral_basis_rank is not None:
             if spectral_basis_rank <= 0 or spectral_basis_rank >= num_bands:
                 raise ValueError(
@@ -683,6 +688,8 @@ class RobustEnhancedSpectralAttention(nn.Module):
         """
         B, C, H, W = x.shape
         identity = x
+        if self.strict_failures and not torch.isfinite(x).all():
+            raise FloatingPointError("Non-finite spectral attention input")
         
         scale_outputs = []
         
@@ -694,7 +701,7 @@ class RobustEnhancedSpectralAttention(nn.Module):
                 
                 # Generate Q, K, V
                 qkv = conv(x_pooled)  # (B, C, h_p, w_p) -> (B, 3*rd, h_p, w_p)
-                q, k, v = qkv.chunk(3, dim=1)  # each: (B, rd, h_p, w_p)
+                q, k, v = unpack_grouped_projection(qkv, conv.groups, 3, self.qkv_layout)
                 
                 # Validate shapes
                 _, rd, h_p, w_p = q.shape
@@ -703,6 +710,8 @@ class RobustEnhancedSpectralAttention(nn.Module):
                 
                 # Double-check divisibility
                 if bands_per_group <= 0 or rd % self.num_bands != 0:
+                    if self.strict_failures:
+                        raise ValueError("Invalid pooled spectral projection shape")
                     self.scale_failures += 1
                     throttled_warning(
                         f"Spectral attention scale {pool.output_size} failed: "
@@ -752,7 +761,7 @@ class RobustEnhancedSpectralAttention(nn.Module):
                 scale_outputs.append(out)
                 
             except RuntimeError as e:
-                if "out of memory" in str(e):
+                if self.strict_failures or "out of memory" in str(e):
                     raise  # Re-raise OOM errors
                 # Log other errors with details
                 self.scale_failures += 1
@@ -774,6 +783,8 @@ class RobustEnhancedSpectralAttention(nn.Module):
             )
             output = identity
         
+        if self.strict_failures and not torch.isfinite(output).all():
+            raise FloatingPointError("Non-finite spectral attention output")
         return output
 
 
@@ -801,6 +812,9 @@ class LightningProBlock(nn.Module):
         spectral_basis_rank: Optional[int] = None,
         standard_attn_rope: bool = False,
         spectral_min_bands_per_group: int = 1,
+        qkv_layout: str = "legacy",
+        strict_spectral_failures: bool = False,
+        layer_scale_init: float = 1e-5,
     ) -> None:
         super().__init__()
         
@@ -841,6 +855,8 @@ class LightningProBlock(nn.Module):
                 dim=dim,
                 spectral_basis_rank=spectral_basis_rank,
                 min_bands_per_group=spectral_min_bands_per_group,
+                qkv_layout=qkv_layout,
+                strict_failures=strict_spectral_failures,
             )
         
         # MLP or MoE
@@ -858,9 +874,9 @@ class LightningProBlock(nn.Module):
             )
         
         # Layer scale
-        self.ls1 = nn.Parameter(torch.ones(dim) * 1e-5)  # (C,)
-        self.ls2 = nn.Parameter(torch.ones(dim) * 1e-5) if use_spectral else None  # (C,)
-        self.ls3 = nn.Parameter(torch.ones(dim) * 1e-5)  # (C,)
+        self.ls1 = nn.Parameter(torch.ones(dim) * layer_scale_init)
+        self.ls2 = nn.Parameter(torch.ones(dim) * layer_scale_init) if use_spectral else None
+        self.ls3 = nn.Parameter(torch.ones(dim) * layer_scale_init)
         
         # Drop path
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -996,6 +1012,19 @@ class LightningProConfig:
     
     # Memory
     min_input_size: int = 64
+    qkv_layout: str = "legacy"
+    strict_spectral_failures: bool = False
+    conv_norm: bool = True
+    rgb_skip: bool = False
+    fullres_spectral: bool = False
+    spectral_gate_init: float = 0.01
+    layer_scale_init: float = 1e-5
+
+    def __post_init__(self):
+        if self.qkv_layout not in {"legacy", "group_major"}:
+            raise ValueError("qkv_layout must be legacy/group_major")
+        if not math.isfinite(self.layer_scale_init) or self.layer_scale_init <= 0:
+            raise ValueError("layer_scale_init must be finite and positive")
 
 
 # ============================================================================
@@ -1068,6 +1097,9 @@ class HSIFusionNetV25LightningPro(nn.Module):
                     spectral_min_bands_per_group=getattr(
                         config, 'spectral_min_bands_per_group', 1
                     ),
+                    qkv_layout=getattr(config, 'qkv_layout', 'legacy'),
+                    strict_spectral_failures=getattr(config, 'strict_spectral_failures', False),
+                    layer_scale_init=getattr(config, 'layer_scale_init', 1e-5),
                 )
                 blocks.append(block)
             
@@ -1115,6 +1147,21 @@ class HSIFusionNetV25LightningPro(nn.Module):
             nn.GELU(),
             nn.Conv2d(config.base_channels // 2, config.out_channels, 1)
         )
+        # Remove only convolution-path norms; transformer branch pre-norms remain.
+        if not getattr(config, 'conv_norm', True):
+            paths = [self.stem, self.downsample_layers, self.upsample_layers,
+                     self.decoder_stages, self.output_head]
+            def remove_norms(module):
+                for name, child in list(module.named_children()):
+                    if isinstance(child, (nn.BatchNorm2d, nn.GroupNorm)):
+                        setattr(module, name, nn.Identity())
+                    else:
+                        remove_norms(child)
+            for path in paths:
+                remove_norms(path)
+        self.input_skip = nn.Conv2d(config.in_channels, config.out_channels, 1) if getattr(config, 'rgb_skip', False) else None
+        self.spectral_output = (FullResolutionSpectralBlock(config.base_channels, gate_init=config.spectral_gate_init)
+                                if getattr(config, 'fullres_spectral', False) else None)
         
         # Uncertainty head
         if config.estimate_uncertainty:
@@ -1277,6 +1324,7 @@ class HSIFusionNetV25LightningPro(nn.Module):
             raise ValueError(f"Expected 4D input (NCHW), got {x.ndim}D")
         
         B, C, H, W = x.shape
+        rgb = x
         if H < self.config.min_input_size or W < self.config.min_input_size:
             raise ValueError(f"Input size {H}x{W} below minimum {self.config.min_input_size}")
         
@@ -1291,7 +1339,11 @@ class HSIFusionNetV25LightningPro(nn.Module):
         x = self.forward_decoder(x, encoder_features)  # (B, base_channels, H, W)
         
         # Output
+        if self.spectral_output is not None:
+            x = self.spectral_output(x)
         output = self.output_head(x)  # (B, base_channels, H, W) -> (B, out_channels, H, W)
+        if self.input_skip is not None:
+            output = output + self.input_skip(rgb)
         
         # Uncertainty estimation
         if self.config.estimate_uncertainty and hasattr(self, 'uncertainty_head'):

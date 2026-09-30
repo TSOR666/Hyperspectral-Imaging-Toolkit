@@ -1,5 +1,10 @@
 # CSWIN v2
 
+Fresh assessment experiments add a correction-only residual mode, fixed local
+attention, exact-MRAE controls, and a shared reference training loop. See
+[assessment experiments](../ASSESSMENT_IMPROVEMENTS.md) for the isolated recipes
+and diagnostic commands. Historical checkpoints retain legacy behavior.
+
 CSWIN v2 reconstructs a 31-band hyperspectral cube from an RGB image. The
 active model is a generator-only hierarchical U-Net/Transformer hybrid
 (~11.4M trainable parameters at `base_channels: 48`) with spectral

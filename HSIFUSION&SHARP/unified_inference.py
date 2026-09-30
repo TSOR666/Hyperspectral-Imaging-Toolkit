@@ -38,10 +38,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from hsi_benchmark.metrics import summarize_metric_rows
 
-from optimized_dataloader import OptimizedValDataset
+from optimized_dataloader import OptimizedValDataset, normalize_rgb
 from unified_training import (
     METRIC_KEYS,
     build_model,
+    build_model_from_config,
     evaluate_scene,
     format_metric_table,
     forward_reconstruction,
@@ -116,7 +117,13 @@ def load_checkpoint_model(
     info: Dict[str, Any] = {"model": family, "checkpoint": str(checkpoint_path)}
     if checkpoint.get("unified_version"):
         size = model_size_override or checkpoint.get("model_size", "base")
-        model = build_model(family, size, checkpoint.get("model_kwargs") or {}, False)
+        resolved = checkpoint.get('resolved_model_config')
+        if resolved:
+            if family != checkpoint['model'] or size != checkpoint['model_size']:
+                raise ValueError("Model overrides conflict with the checkpoint's resolved architecture")
+            model = build_model_from_config(family, resolved)
+        else:
+            model = build_model(family, size, checkpoint.get("model_kwargs") or {}, False)
         state = (
             checkpoint.get("ema_model_state_dict")
             if prefer_ema and checkpoint.get("ema_model_state_dict")
@@ -125,6 +132,8 @@ def load_checkpoint_model(
         info["ema_weights"] = prefer_ema and bool(checkpoint.get("ema_model_state_dict"))
         info["model_size"] = size
         info["epoch"] = checkpoint.get("epoch")
+        info['optimizer_step'] = checkpoint.get('optimizer_step')
+        info['run_manifest'] = checkpoint.get('run_manifest', {})
         unwrap_model(model).load_state_dict(state)
     elif family == "hsifusion":
         # Legacy HSIFusion checkpoints know how to rebuild themselves.
@@ -139,6 +148,7 @@ def load_checkpoint_model(
         info["legacy"] = True
 
     model.eval()
+    model._evaluation_policy = info.get('run_manifest', {})
     return model, info
 
 
@@ -151,11 +161,20 @@ def evaluate(
     model: torch.nn.Module,
     data_root: str,
     device: torch.device,
-    crop_border: int = 128,
-    mrae_eps: float = 1e-6,
+    crop_border: Optional[int] = None,
+    mrae_eps: Optional[float] = None,
     out_dir: Optional[Path] = None,
+    rgb_normalization: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
-    dataset = OptimizedValDataset(data_root=data_root, memory_mode="standard")
+    policy = getattr(model, '_evaluation_policy', {})
+    data, protocol = policy.get('data', {}), policy.get('protocol', {})
+    crop_border = protocol.get('val_crop_border', 128) if crop_border is None else crop_border
+    mrae_eps = protocol.get('selection_epsilon', 1e-6) if mrae_eps is None else mrae_eps
+    rgb_normalization = rgb_normalization or data.get('rgb_normalization', 'divide_255')
+    dataset = OptimizedValDataset(data_root=data_root, memory_mode="standard",
+                                  rgb_normalization=rgb_normalization,
+                                  strict_files=data.get('strict_files', True),
+                                  exclude_samples=data.get('exclude_samples', []))
     model = model.to(device)
     scene_rows: Dict[str, List[Dict[str, float]]] = {"full": [], "crop": []}
     per_scene_records: List[Dict[str, Any]] = []
@@ -165,6 +184,8 @@ def evaluate(
         rgb, hsi = dataset[idx]
         pred = forward_reconstruction(model, rgb.unsqueeze(0).to(device))
         rows = evaluate_scene(pred, hsi.unsqueeze(0), crop_border, mrae_eps)
+        if crop_border > 0 and 'crop' not in rows and protocol.get('strict_selection_crop', False):
+            raise ValueError("Validation scene is too small for the checkpoint's required selection crop")
         name = Path(dataset.hsi_files[idx]).stem
         for proto, row in rows.items():
             scene_rows[proto].append(row)
@@ -177,6 +198,8 @@ def evaluate(
     elapsed = time.time() - start
 
     summary: Dict[str, Dict[str, float]] = {}
+    if scene_rows['crop'] and len(scene_rows['crop']) != len(scene_rows['full']):
+        scene_rows['crop'].clear()
     detailed: Dict[str, Dict[str, Dict[str, float]]] = {}
     for proto, rows in scene_rows.items():
         if not rows:
@@ -237,7 +260,8 @@ def reconstruct(
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             raise RuntimeError(f"Failed to read RGB image {path}")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        rgb = normalize_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                            getattr(model, '_evaluation_policy', {}).get('data', {}).get('rgb_normalization', 'divide_255'))
         tensor = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0).to(device)
         cube = forward_reconstruction(model, tensor)[0].float().cpu().numpy()
         # MST++/NTIRE submission layout: (H, W, 31) float32 under 'cube'.
@@ -270,8 +294,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                         help="RGB image or directory; enables reconstruct mode")
     parser.add_argument("--out_dir", type=str, default=None,
                         help="Where to write metrics dumps / reconstructed cubes")
-    parser.add_argument("--crop_border", type=int, default=128,
+    parser.add_argument("--crop_border", type=int, default=None,
                         help="MST++ selection crop border for evaluate mode")
+    parser.add_argument('--mrae_eps', type=float, default=None, help='Override saved metric floor; 0 requires positive targets')
+    parser.add_argument('--rgb_normalization', choices=['divide_255', 'scene_minmax'], default=None)
     parser.add_argument("--no_ema", action="store_true",
                         help="Use raw weights even when EMA weights are stored")
     parser.add_argument("--device", type=str, default="cuda")
@@ -299,6 +325,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         evaluate(
             model, args.data_root, device,
             crop_border=args.crop_border, out_dir=out_dir,
+            mrae_eps=args.mrae_eps, rgb_normalization=args.rgb_normalization,
         )
     if args.rgb:
         reconstruct(model, Path(args.rgb), out_dir or Path("./reconstructed"), device)

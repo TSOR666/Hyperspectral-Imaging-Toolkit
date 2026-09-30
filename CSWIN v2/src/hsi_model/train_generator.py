@@ -166,6 +166,8 @@ def _sync_early_stopping_state(
 def build_criterion(config: Dict[str, Any]) -> nn.Module:
     """Build the configured reconstruction criterion (MRAE by default)."""
     objective = str(config.get("objective", "mrae")).lower()
+    if objective == "exact_mrae":
+        return MRAELoss(epsilon=0.0)
     if objective in ("l1", "mae"):
         # HSIFormer/SS-Transformer (paper Sec 4.2) trains with L1 on [0,1]
         # targets; this is the validated objective for this architecture.
@@ -194,7 +196,7 @@ def build_criterion(config: Dict[str, Any]) -> nn.Module:
             denominator_epsilon=float(config.get("relative_mrae_epsilon", 1e-2))
         )
     raise ValueError(
-        f"Unknown objective={objective!r}. Expected one of: l1, mrae, mrae_stable, "
+        f"Unknown objective={objective!r}. Expected one of: l1, exact_mrae, mrae, mrae_stable, "
         "mrae_annealed, mrae_l1, "
         "l1_with_mrae, relative_mrae (a typo here silently changed the training "
         "objective in earlier versions; failing loudly instead)."
@@ -492,6 +494,27 @@ def validate_generator(
     seed: int,
     rank: int,
 ) -> Dict[str, float]:
+    eval_net = net.module if hasattr(net, "module") else net
+    was_training = eval_net.training
+    try:
+        return _validate_generator_impl(
+            net, val_dataset, criterion, device, iteration, config, distributed, seed, rank
+        )
+    finally:
+        eval_net.train(was_training)
+
+
+def _validate_generator_impl(
+    net: nn.Module,
+    val_dataset: Any,
+    criterion: nn.Module,
+    device: torch.device,
+    iteration: int,
+    config: Dict[str, Any],
+    distributed: bool,
+    seed: int,
+    rank: int,
+) -> Dict[str, float]:
     """MST++-protocol validation for the bare generator (temporary DataLoader)."""
     update_mrae_epsilon_schedule(criterion, config, iteration)
     # DDP forward may broadcast buffers. Non-padding validation shards can have
@@ -601,6 +624,8 @@ def validate_generator(
                     criterion=criterion,
                     clamp_prediction=clamp_prediction,
                     report_raw_mrae=report_raw_mrae,
+                    mrae_epsilon=float(config.get("validation_mrae_epsilon", 1e-8)),
+                    crop_border=config.get("validation_crop_border", None),
                 )
                 if "loss" not in metrics:
                     raise RuntimeError("Validation criterion did not produce a loss.")

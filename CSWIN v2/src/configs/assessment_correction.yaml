@@ -1,0 +1,8 @@
+defaults:
+  - assessment_control
+  - _self_
+
+# Isolated residual-conditioning experiment; FRESH TRAINING ONLY.
+sstb_residual_mode: correction
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/assessment_correction
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/assessment_correction

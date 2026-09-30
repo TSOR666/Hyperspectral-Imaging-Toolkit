@@ -99,6 +99,8 @@ python unified_training.py \
     --model_size base \
     --data_root ./dataset \
     --output_dir ./experiments/hsifusion \
+    --max_optimizer_steps 300000 \
+    --val_interval_steps 1000 \
     --amp auto
 
 #python test_setup_script.py

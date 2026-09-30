@@ -1,5 +1,9 @@
 # Unified Checkpoint Benchmarking
 
+For matched ARAD training and strict raw MRAE diagnostics for MSWR, CSWIN, and
+MST++, use the [assessment reference pipeline](ASSESSMENT_IMPROVEMENTS.md).
+The scripts below also support broader cross-dataset evaluation protocols.
+
 `benchmark_hsi.py` evaluates RGB-to-HSI checkpoints from this repository and
 the official MST++ model zoo on CAVE, ICVL, BGU, or custom hyperspectral
 datasets. It produces aligned predictions, full-reference metrics, per-band

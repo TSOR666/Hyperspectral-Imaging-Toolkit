@@ -139,8 +139,7 @@ def test_distributed_eval_sampler_does_not_pad() -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed unavailable")
-def test_two_process_sharp_ddp_cpu_smoke() -> None:
-    tmp_path = Path(".pytest_cache") / f"sharp_ddp_scaling_{os.getpid()}"
+def test_two_process_sharp_ddp_cpu_smoke(tmp_path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     for name in ("init", "rank_0.pt", "rank_1.pt"):
         path = tmp_path / name

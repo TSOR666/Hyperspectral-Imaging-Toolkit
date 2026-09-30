@@ -125,16 +125,23 @@ class Loss_MRAE(nn.Module):
     """
     Mean Relative Absolute Error Loss
     FIXED: Use reshape instead of view for non-contiguous tensors
-    FIXED: Promote metric arithmetic to fp32 and clamp the denominator.
+    FP32 arithmetic with an explicit floor. epsilon=0 uses unfloored MRAE
+    and requires finite predictions and strictly positive targets.
     """
     def __init__(self, epsilon: float = MRAE_EPSILON):
         super(Loss_MRAE, self).__init__()
         self.epsilon = float(epsilon)
+        if not np.isfinite(self.epsilon) or self.epsilon < 0:
+            raise ValueError("MRAE epsilon must be finite and non-negative")
 
     def forward(self, outputs: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         outputs, label = _metric_tensors(outputs, label)
-
-        # Clamp to ensure a minimum denominator for all-zero or near-zero labels.
+        if self.epsilon == 0:
+            if not torch.isfinite(outputs).all() or not torch.isfinite(label).all():
+                raise FloatingPointError("Exact MRAE requires finite predictions and targets")
+            if (label <= 0).any():
+                raise ValueError("Exact MRAE requires strictly positive targets; choose an explicit floor for zeros")
+        # epsilon=0 is the unfloored positive-target reference objective.
         denominator = torch.clamp_min(torch.abs(label), self.epsilon)
         error = torch.abs(outputs - label) / denominator
         # FIXED: Use reshape instead of view to handle non-contiguous tensors

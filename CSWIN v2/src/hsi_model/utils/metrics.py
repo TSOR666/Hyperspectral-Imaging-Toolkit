@@ -539,6 +539,14 @@ def compute_mrae(pred: torch.Tensor, target: torch.Tensor, epsilon: float = 1e-8
     Returns:
         MRAE value
     """
+    if not np.isfinite(epsilon) or epsilon < 0:
+        raise ValueError("MRAE epsilon must be finite and non-negative")
+    pred, target = pred.float(), target.float()
+    if epsilon == 0:
+        if not torch.isfinite(pred).all() or not torch.isfinite(target).all():
+            raise FloatingPointError("Exact MRAE requires finite predictions and targets")
+        if (target <= 0).any():
+            raise ValueError("Exact MRAE requires strictly positive targets; choose an explicit floor for zeros")
     denominator = target.abs().clamp_min(epsilon)
     return torch.mean(torch.abs(pred - target) / denominator)
 

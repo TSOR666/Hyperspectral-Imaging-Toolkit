@@ -113,6 +113,7 @@ ARCHITECTURE_CONFIG_KEYS = frozenset(
         "ffn_expansion",
         "cbam_reduction",
         "sstb_outer_residual_scale",
+        "sstb_residual_mode",
         "spectral_attention_type",
         "activation_checkpointing",
         "activation_checkpoint_min_tokens",
@@ -138,6 +139,7 @@ ARCHITECTURE_CONFIG_KEYS = frozenset(
 #: If the checkpoint has no embedded config these fall back to code defaults and
 #: are reported so a wrong guess is visible rather than silent.
 UNRECOVERABLE_KEYS: Tuple[Tuple[str, Any, str], ...] = (
+    ("sstb_residual_mode", "legacy", "correction subtraction leaves no fingerprint in the weights"),
     ("norm_groups", 8, "GroupNorm group count is not stored in the weights"),
     (
         "output_activation",
@@ -567,11 +569,12 @@ def recover_architecture(
         evidence[key] = "default"
         # Only warn about knobs this architecture actually reads, so the
         # assumption list stays a signal rather than boilerplate.
-        if key == "sstb_outer_residual_scale" and config.get("block_variant") != "sstb":
+        if key in ("sstb_outer_residual_scale", "sstb_residual_mode") and config.get("block_variant") != "sstb":
             continue
         if key == "cswin_global_tokens" and config.get("cswin_attention_mode") in (
             "cswin",
             "axial",
+            "local",
         ):
             continue
         assumed[key] = f"{key}={default!r} (code default): {reason}."

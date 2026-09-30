@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Unified MST++/NTIRE-faithful trainer for HSIFusion v2.5.3 and SHARP v3.2.2.
+"""Unified optimizer-update trainer for HSIFusion v2.5.3 and SHARP v3.2.2.
 
 One trainer, one protocol, switched by ``--model {hsifusion,sharp}``. Replaces the
 per-model scripts (hsifusion_training.py / sharp_training_script_fixed.py) as the
@@ -9,12 +9,12 @@ tests pin their internals.
 MST++/ARAD-1K protocol defaults (NTIRE 2022 spectral reconstruction):
   - data: ARAD-1K layout (split_txt/{train,valid}_list.txt, Train_RGB/, Train_Spec/),
     128x128 patches on a stride-8 grid, random flips + k*90-degree rotations,
-    RGB / 255, HSI cubes pre-normalized to [0, 1]
+    explicit RGB normalization/patch-grid/augmentation policies; HSI unchanged
   - objective: MRAE = mean(|pred - gt| / max(|gt|, eps)); the training floor
     anneals from 1e-2 to 1e-3 so dark pixels cannot explode mixed-precision
-    gradients, while validation/selection retain the exact 1e-6 protocol floor
-  - recipe: Adam(beta1=0.9, beta2=0.999), lr 4e-4, batch 20, 300 epochs,
-    cosine annealing to eta_min = 1e-6 stepped PER ITERATION, no weight decay,
+    gradients, while validation/selection use an explicitly selected floor; exact mode uses zero
+  - recipe: Adam(beta1=0.9, beta2=0.999), lr 4e-4, batch 20, 300,000 successful optimizer updates,
+    cosine annealing to eta_min = 1e-6 stepped PER OPTIMIZER UPDATE, no weight decay,
     no warmup (both available as opt-in deviations and reported in the config dump)
   - validation: full scenes at batch 1; the SELECTION metric is MRAE on the MST++
     center region (crop_border=128: 482x512 -> 226x256, i.e. [..., 128:-128, 128:-128]);
@@ -32,9 +32,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import hashlib
 import math
 import random
 import sys
+import subprocess
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -53,7 +55,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 try:
-    from hsi_benchmark.metrics import compute_hsi_metrics
+    from hsi_benchmark.metrics import compute_hsi_metrics, mrae_breakdown
+    from hsi_benchmark.training_health import TrainingHealthMonitor
 except ImportError as exc:  # pragma: no cover - depends on repo layout
     raise ImportError(
         "unified_training requires the repo-root hsi_benchmark package for its "
@@ -101,12 +104,20 @@ class UnifiedTrainingConfig:
     patch_size: int = 128
     stride: int = 8
     augment: bool = True
+    augmentation_policy: str = 'legacy'
     num_workers: int = 4
     memory_mode: str = "float16"          # standard | float16 | lazy
     cache_size: int = 4
+    rgb_normalization: str = "divide_255"
+    patch_grid: str = "ceil"
+    strict_files: bool = True
+    exclude_samples: List[str] = field(default_factory=list)
 
     # Recipe (MST++ defaults; deviations are opt-in and visible in the config dump)
     epochs: int = 300
+    updates_per_epoch: int = 1000         # logical epoch, independent of loader length
+    max_optimizer_steps: Optional[int] = None  # defaults to 300 * 1000
+    warmup_steps: Optional[int] = None
     learning_rate: float = 4e-4
     eta_min: float = 1e-6                 # cosine floor, stepped per iteration
     optimizer: str = "adam"               # adam (MST++) | adamw (deviation)
@@ -121,11 +132,16 @@ class UnifiedTrainingConfig:
     fp16_init_scale: float = 1024.0         # conservative for relative-error gradients
     max_consecutive_nonfinite: int = 8
     train_mrae_eps_start: float = 1e-2      # stable optimization floor
-    train_mrae_eps_end: float = 1e-3        # exact 1e-6 remains the validation metric
+    train_mrae_eps_end: float = 1e-3        # validation floor is independently configured
     train_mrae_eps_anneal_steps: int = 50_000
+    loss_mode: str = "floored"            # exact: strictly positive targets, epsilon=0
+    auxiliary_loss: bool = True
+    health_interval_steps: int = 0        # 0 disables instrumentation
 
     # Validation / selection
-    val_interval: int = 10
+    val_interval: Optional[int] = None    # deprecated logical-epoch cadence
+    val_interval_steps: int = 1000
+    strict_selection_crop: bool = False
     val_crop_border: int = 128            # MST++ [..., 128:-128, 128:-128]; auto-skipped
                                           # (with a warning) for scenes too small to crop
     mrae_eps: float = 1e-6
@@ -149,18 +165,42 @@ class UnifiedTrainingConfig:
         if not math.isfinite(self.fp16_init_scale) or self.fp16_init_scale <= 0:
             raise ValueError("fp16_init_scale must be a finite positive number")
         # Validate all schedule values eagerly instead of failing after model construction.
+        if self.loss_mode not in {"exact", "floored"}:
+            raise ValueError("loss_mode must be exact/floored")
         annealed_mrae_epsilon(
             self.train_mrae_eps_start,
             self.train_mrae_eps_end,
             0,
             self.train_mrae_eps_anneal_steps,
         )
-        if not math.isfinite(self.mrae_eps) or self.mrae_eps <= 0:
-            raise ValueError("mrae_eps must be a finite positive number")
+        if not math.isfinite(self.mrae_eps) or self.mrae_eps < 0:
+            raise ValueError("mrae_eps must be finite and nonnegative")
         if self.accumulate_steps <= 0:
             raise ValueError("accumulate_steps must be > 0")
-        if self.val_interval <= 0:
-            raise ValueError("val_interval must be > 0")
+        if self.updates_per_epoch <= 0 or self.epochs <= 0:
+            raise ValueError("epochs and updates_per_epoch must be > 0")
+        if self.max_optimizer_steps is None:
+            self.max_optimizer_steps = self.epochs * self.updates_per_epoch
+        if self.max_optimizer_steps <= 0:
+            raise ValueError("max_optimizer_steps must be > 0")
+        if self.val_interval is not None:
+            if self.val_interval <= 0:
+                raise ValueError("val_interval must be > 0")
+            self.val_interval_steps = self.val_interval * self.updates_per_epoch
+        if self.val_interval_steps <= 0:
+            raise ValueError("val_interval_steps must be > 0")
+        if self.warmup_steps is None:
+            self.warmup_steps = round(self.warmup_epochs * self.updates_per_epoch)
+        if not 0 <= self.warmup_steps < self.max_optimizer_steps:
+            raise ValueError("warmup_steps must be >= 0 and below max_optimizer_steps")
+        if self.health_interval_steps < 0 or self.log_interval <= 0:
+            raise ValueError("health interval must be >= 0 and log_interval > 0")
+        if self.rgb_normalization not in {"divide_255", "scene_minmax"} or self.patch_grid not in {"floor", "ceil"}:
+            raise ValueError("Unknown RGB normalization or patch grid")
+        if self.augmentation_policy not in {'legacy', 'mst'}:
+            raise ValueError("augmentation_policy must be legacy/mst")
+        if self.loss_mode == "exact" and self.memory_mode == "float16":
+            raise ValueError("Exact MRAE requires standard or lazy FP32 target storage")
         if self.max_consecutive_nonfinite <= 0:
             raise ValueError("max_consecutive_nonfinite must be > 0")
         if self.checkpoint_interval_steps < 0:
@@ -171,6 +211,12 @@ class UnifiedTrainingConfig:
             raise ValueError("epochs must be > 0")
         if not isinstance(self.model_kwargs, dict):
             raise ValueError("model_kwargs must be a JSON object")
+        if not (0 < self.eta_min <= self.learning_rate < math.inf):
+            raise ValueError("Learning rates must satisfy 0 < eta_min <= learning_rate")
+        if not math.isfinite(self.ema_decay) or not 0 <= self.ema_decay < 1:
+            raise ValueError("ema_decay must be in [0, 1)")
+        if not math.isfinite(self.gradient_clip) or self.gradient_clip < 0:
+            raise ValueError("gradient_clip must be finite and nonnegative")
 
     # Attributes create_optimized_dataloaders reads via getattr
     distributed: bool = field(default=False, init=False)
@@ -222,6 +268,17 @@ def build_model(
 def unwrap_model(model: nn.Module) -> nn.Module:
     model = getattr(model, "module", model)     # DDP
     return getattr(model, "_orig_mod", model)   # torch.compile
+
+
+def build_model_from_config(family: str, resolved: Dict[str, Any]) -> nn.Module:
+    """Reconstruct every saved architecture field, including output-changing controls."""
+    if family == 'hsifusion':
+        from hsifusion_v252_complete import HSIFusionNetV25LightningPro, LightningProConfig
+        return HSIFusionNetV25LightningPro(LightningProConfig(**resolved))
+    if family == 'sharp':
+        from sharp_v322_hardened import SHARPv32, SHARPv32Config
+        return SHARPv32(SHARPv32Config(**resolved))
+    raise ValueError(f"Unknown model family {family!r}")
 
 
 def pad_to_multiple(
@@ -302,7 +359,7 @@ class UnifiedTrainer:
         self.exp_dir = config.experiment_path()
         self.exp_dir.mkdir(parents=True, exist_ok=True)
 
-        self.criterion = MSTPlusPlusLoss(eps=config.train_mrae_eps_start)
+        self.criterion = MSTPlusPlusLoss(eps=0.0 if config.loss_mode == "exact" else config.train_mrae_eps_start)
         self.amp_dtype = resolve_amp_dtype(config.amp, self.device)
         self.use_amp = self.amp_dtype is not None
         self.scaler = make_grad_scaler(
@@ -315,9 +372,17 @@ class UnifiedTrainer:
         self._orig_model = unwrap_model(self.model)
 
         self.train_loader, self.val_loader = create_optimized_dataloaders(config)
-        steps_per_epoch = max(1, len(self.train_loader))
-        self.optimizer_steps_per_epoch = math.ceil(steps_per_epoch / config.accumulate_steps)
-        self.total_optimizer_steps = self.optimizer_steps_per_epoch * config.epochs
+        if len(self.train_loader) == 0:
+            raise ValueError("Training loader has no batches; reduce batch_size")
+        self.optimizer_steps_per_epoch = config.updates_per_epoch
+        self.total_optimizer_steps = config.max_optimizer_steps
+        self._data_iterator = None
+        self.loader_cycles = 0
+        self.resolved_model_config = json.loads(json.dumps(dataclasses.asdict(self._orig_model.config), default=str))
+        self.run_manifest = self._build_manifest()
+        self.health = TrainingHealthMonitor(self._orig_model) if config.health_interval_steps else None
+        self._last_metrics = {}
+        self._last_validation_step = -1
 
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
@@ -344,9 +409,11 @@ class UnifiedTrainer:
         self.best_mrae = math.inf
         self.consecutive_nonfinite = 0
 
-        self._dump_config()
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
+        elif (self.exp_dir / 'last.pth').exists():
+            raise FileExistsError("Experiment already has a checkpoint; use --resume or a new experiment_name")
+        self._dump_config()
 
     # ------------------------------------------------------------------ setup
     @staticmethod
@@ -363,6 +430,9 @@ class UnifiedTrainer:
         )
 
     def _set_training_mrae_epsilon(self) -> float:
+        if getattr(self.config, 'loss_mode', 'floored') == 'exact':
+            self.criterion.eps = 0.0
+            return 0.0
         eps = annealed_mrae_epsilon(
             self.config.train_mrae_eps_start,
             self.config.train_mrae_eps_end,
@@ -404,10 +474,10 @@ class UnifiedTrainer:
 
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LambdaLR:
         """MST++ cosine annealing to eta_min, stepped per optimizer step, with an
-        optional linear warmup prefix (warmup_epochs=0 keeps the exact MST++ schedule)."""
+        optional linear warmup prefix (warmup_steps=0 has no warmup)."""
         cfg = self.config
         total = max(1, self.total_optimizer_steps)
-        warmup = int(round(cfg.warmup_epochs * self.optimizer_steps_per_epoch))
+        warmup = cfg.warmup_steps
         floor = cfg.eta_min / cfg.learning_rate
 
         def lr_lambda(step: int) -> float:
@@ -448,147 +518,177 @@ class UnifiedTrainer:
             print(f"    {key:<28}: {cfg_dict[key]}")
         print("=" * 78, flush=True)
         with (self.exp_dir / "config.json").open("w", encoding="utf-8") as handle:
-            json.dump({**cfg_dict, **banner}, handle, indent=2, default=str)
+            json.dump({**cfg_dict, **banner, 'resolved_model_config': self.resolved_model_config,
+                       'run_manifest': self.run_manifest}, handle, indent=2, default=str)
+
+    def _build_manifest(self):
+        splits = {}
+        for split, loader in [('train', self.train_loader), ('valid', self.val_loader)]:
+            path = Path(self.config.data_root) / 'split_txt' / (split + '_list.txt')
+            scenes = [Path(path).stem for path in loader.dataset.hsi_files]
+            splits[split] = {'split_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                             'effective_scenes': scenes,
+                             'effective_sha256': hashlib.sha256('\n'.join(scenes).encode()).hexdigest()}
+        def git(*args):
+            result = subprocess.run(['git', *args], cwd=_REPO_ROOT, capture_output=True, text=True)
+            return result.stdout.strip() if result.returncode == 0 else None
+        return {'code_revision': git('rev-parse', 'HEAD'),
+                'code_dirty': bool(git('status', '--porcelain')),
+                'source_sha256': {str(path.relative_to(_REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                                  for path in [Path(__file__), Path(__file__).with_name('optimized_dataloader.py'),
+                                               Path(__file__).with_name('reconstruction_layers.py'),
+                                               Path(__file__).with_name('common_utils_v32.py'),
+                                               Path(__file__).with_name('hsifusion_v252_complete.py'),
+                                               Path(__file__).with_name('sharp_v322_hardened.py'),
+                                               _REPO_ROOT / 'hsi_benchmark' / 'metrics.py']},
+                'data': {'splits': splits, 'rgb_normalization': self.config.rgb_normalization,
+                         'patch_grid': self.config.patch_grid, 'patch_size': self.config.patch_size,
+                         'stride': self.config.stride, 'augment': self.config.augment,
+                         'augmentation_policy': self.config.augmentation_policy,
+                         'strict_files': self.config.strict_files,
+                         'exclude_samples': self.config.exclude_samples,
+                         'training_storage': 'float16' if self.config.memory_mode == 'float16' else 'float32',
+                         'validation_storage': 'float32'},
+                'protocol': {'loss_mode': self.config.loss_mode, 'selection_epsilon': self.config.mrae_eps,
+                             'effective_amp': str(self.amp_dtype) if self.use_amp else 'off',
+                             'optimizer': self.config.optimizer,
+                             'effective_weight_decay': self.config.weight_decay if self.config.optimizer == 'adamw' else 0.,
+                             'strict_selection_crop': self.config.strict_selection_crop,
+                             'val_crop_border': self.config.val_crop_border,
+                             'selection_output': 'raw', 'counter': 'successful_optimizer_updates'}}
 
     # ----------------------------------------------------------------- train
-    def train(self) -> Dict[str, float]:
-        cfg = self.config
-        last_metrics: Dict[str, float] = {}
+    def _next_batch(self):
+        if self._data_iterator is None:
+            self._data_iterator = iter(self.train_loader)
         try:
-            for epoch in range(self.start_epoch, cfg.epochs):
-                try:
-                    epoch_loss = self._train_epoch(epoch)
-                    print(
-                        f"Epoch {epoch + 1}/{cfg.epochs} - loss {epoch_loss:.6f} - "
-                        f"lr {self.optimizer.param_groups[0]['lr']:.2e}"
-                    )
-                    is_best = False
-                    if (epoch + 1) % cfg.val_interval == 0 or (epoch + 1) == cfg.epochs:
-                        metrics = self.validate(epoch + 1)
-                        last_metrics = metrics
-                        selection = metrics.get(
-                            "crop/mrae", metrics.get("full/mrae", math.inf)
-                        )
-                        is_best = math.isfinite(selection) and selection < self.best_mrae
-                        if is_best:
-                            self.best_mrae = selection
-                            print(f"  New best selection MRAE: {self.best_mrae:.6f}")
-                        elif not math.isfinite(selection):
-                            warnings.warn(
-                                "Validation selection MRAE is non-finite; retaining the "
-                                "previous best checkpoint."
-                            )
-                except Exception:
-                    # Keep the most recent finite model/optimizer state even when a run
-                    # aborts during its first epoch. Resume repeats the interrupted epoch.
-                    try:
-                        self._save_checkpoint(epoch, is_best=False)
-                        print(f"  Saved recovery checkpoint after failure in epoch {epoch + 1}")
-                    except Exception as save_exc:  # pragma: no cover - filesystem failure
-                        warnings.warn(f"Could not save recovery checkpoint: {save_exc}")
-                    raise
+            return next(self._data_iterator)
+        except StopIteration:
+            self.loader_cycles += 1
+            sampler = getattr(self.train_loader, "sampler", None)
+            if callable(getattr(sampler, "set_epoch", None)):
+                sampler.set_epoch(self.loader_cycles)
+            self._data_iterator = iter(self.train_loader)
+            return next(self._data_iterator)
 
-                # A rolling checkpoint is written every epoch; validation cadence only
-                # controls expensive metrics and best-model selection.
-                self._save_checkpoint(epoch + 1, is_best=is_best)
+    def _validate_and_checkpoint(self):
+        metrics = self.validate(self.optimizer_step)
+        self._last_metrics = metrics
+        self._last_validation_step = self.optimizer_step
+        # Require the same selection population at every validation.
+        selection = metrics.get("crop/mrae", metrics["full/mrae"])
+        if not math.isfinite(selection):
+            raise FloatingPointError("Non-finite validation selection MRAE")
+        is_best = selection < self.best_mrae
+        if is_best:
+            self.best_mrae = selection
+        self._save_checkpoint(self.optimizer_step // self.config.updates_per_epoch, is_best)
+
+    def train(self) -> Dict[str, float]:
+        try:
+            while self.optimizer_step < self.total_optimizer_steps:
+                logical_epoch = self.optimizer_step // self.config.updates_per_epoch
+                loss = self._train_epoch(logical_epoch)
+                print(f"Update {self.optimizer_step}/{self.total_optimizer_steps}: "
+                      f"loss {loss:.6f}, lr {self.optimizer.param_groups[0]['lr']:.2e}", flush=True)
+            if self._last_validation_step != self.optimizer_step:
+                self._validate_and_checkpoint()
             print(f"Training complete. Best selection MRAE: {self.best_mrae:.6f}")
+            return self._last_metrics
+        except Exception:
+            try:
+                self._save_checkpoint(self.optimizer_step // self.config.updates_per_epoch, False)
+                print(f"Saved recovery checkpoint at optimizer update {self.optimizer_step}")
+            except Exception as exc:
+                warnings.warn(f"Could not save recovery checkpoint: {exc}")
+            raise
         finally:
             if self.writer is not None:
                 self.writer.close()
-        return last_metrics
+            if self.health is not None:
+                self.health.close()
 
     def _train_epoch(self, epoch: int) -> float:
+        """Train one logical block of successful updates; recycle data as needed."""
         cfg = self.config
+        goal = min((epoch + 1) * cfg.updates_per_epoch, self.total_optimizer_steps)
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        total_batches = max(1, len(self.train_loader))
         running, counted = 0.0, 0
-
-        for batch_idx, (rgb, hsi) in enumerate(self.train_loader):
-            rgb = rgb.to(self.device, non_blocking=True)
-            hsi = hsi.to(self.device, non_blocking=True)
+        while self.optimizer_step < goal:
+            self.optimizer.zero_grad(set_to_none=True)
             active_mrae_eps = self._set_training_mrae_epsilon()
-
-            with self._autocast():
-                outputs = self.model(rgb)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-                loss = self.criterion(outputs, hsi)
-                aux_fn = getattr(self._orig_model, "get_auxiliary_loss", None)
-                if callable(aux_fn):
-                    loss = loss + aux_fn()
-
-            if not bool(torch.isfinite(loss).item()):
-                self.consecutive_nonfinite += 1
-                self.optimizer.zero_grad(set_to_none=True)
-                warnings.warn(
-                    f"Non-finite loss (epoch {epoch + 1}, batch {batch_idx + 1}, "
-                    f"train_mrae_eps={active_mrae_eps:.3g}); skipping."
-                )
-                if self.consecutive_nonfinite >= cfg.max_consecutive_nonfinite:
-                    raise RuntimeError("Too many consecutive non-finite losses; aborting.")
-                continue
-
-            # Weight each micro-batch by its own accumulation-group size so the final
-            # (possibly partial) group is not under-weighted.
-            accum = cfg.accumulate_steps
-            n_full = (total_batches // accum) * accum
-            group = accum if batch_idx < n_full else max(1, total_batches - n_full)
-            self.scaler.scale(loss / group).backward()
-
-            step_now = ((batch_idx + 1) % accum == 0) or (batch_idx + 1 == total_batches)
-            if step_now:
+            sampled = self.health is not None and (
+                self.optimizer_step == 0 or (self.optimizer_step + 1) % cfg.health_interval_steps == 0)
+            if self.health is not None:
+                self.health.enabled = sampled
+                self.health.activations.clear()
+            failed = False
+            group_loss = 0.0
+            for _ in range(cfg.accumulate_steps):
+                rgb, hsi = self._next_batch()
+                self.iteration += 1
+                rgb, hsi = rgb.to(self.device), hsi.to(self.device)
+                with self._autocast():
+                    output = self.model(rgb)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    loss = self.criterion(output, hsi)
+                    aux_fn = getattr(self._orig_model, "get_auxiliary_loss", None)
+                    if cfg.auxiliary_loss and callable(aux_fn):
+                        loss = loss + aux_fn()
+                if not torch.isfinite(loss).item():
+                    failed = True
+                    break
+                self.scaler.scale(loss / cfg.accumulate_steps).backward()
+                group_loss += loss.detach().item() / cfg.accumulate_steps
+            if not failed:
                 self.scaler.unscale_(self.optimizer)
                 grads = [p.grad for p in self.model.parameters() if p.grad is not None]
-                finite = (
-                    bool(torch.stack([torch.isfinite(g).all() for g in grads]).all().item())
-                    if grads else False
-                )
-                if not finite:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    # unscale_ already ran: update() resets scaler state (pass-4 fix).
+                failed = not grads or not all(torch.isfinite(g).all().item() for g in grads)
+                # GradScaler state must be reset after unscale even when the step fails.
+                if failed:
                     self.scaler.update()
-                    self.consecutive_nonfinite += 1
-                    warnings.warn(
-                        f"Non-finite gradients (epoch {epoch + 1}, batch {batch_idx + 1}, "
-                        f"train_mrae_eps={active_mrae_eps:.3g}, "
-                        f"loss_scale={self.scaler.get_scale():.3g}); skipping optimizer step."
-                    )
-                    if self.consecutive_nonfinite >= cfg.max_consecutive_nonfinite:
-                        raise RuntimeError("Too many consecutive non-finite grads; aborting.")
-                    continue
-                if cfg.gradient_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), cfg.gradient_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            if failed:
                 self.optimizer.zero_grad(set_to_none=True)
-                self.scheduler.step()
-                self._update_ema()
-                self.optimizer_step += 1
-                self.consecutive_nonfinite = 0
-                if (
-                    cfg.checkpoint_interval_steps > 0
-                    and self.optimizer_step % cfg.checkpoint_interval_steps == 0
-                ):
-                    # `epoch` is the count of fully completed epochs, so resuming this
-                    # mid-epoch checkpoint safely repeats the interrupted epoch.
-                    self._save_checkpoint(epoch, is_best=False)
-
-            running += loss.item()
+                self.consecutive_nonfinite += 1
+                warnings.warn(f"Non-finite loss/gradient at update {self.optimizer_step}; discarded accumulation group")
+                if self.consecutive_nonfinite >= cfg.max_consecutive_nonfinite:
+                    raise RuntimeError("Too many consecutive non-finite grads/losses; aborting.")
+                continue
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.model.parameters(), cfg.gradient_clip if cfg.gradient_clip > 0 else float('inf'),
+                error_if_nonfinite=True)
+            if sampled:
+                self.health.before_step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer_step += 1
+            self.scheduler.step()
+            self._update_ema()
+            self.consecutive_nonfinite = 0
+            running += group_loss
             counted += 1
-            self.iteration += 1
-            if self.iteration % cfg.log_interval == 0:
-                lr = self.optimizer.param_groups[0]["lr"]
-                print(
-                    f"  iter {self.iteration}: loss {loss.item():.6f}, lr {lr:.2e}",
-                    flush=True,
-                )
+            if sampled:
+                record = {"optimizer_step": self.optimizer_step, "loss": group_loss,
+                          "pre_clip_gradient_norm": float(grad_norm), "health": self.health.after_step()}
+                with (self.exp_dir / 'training_health.jsonl').open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(record) + '\n')
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.optimizer_step % cfg.log_interval == 0:
+                lr = self.optimizer.param_groups[0]['lr']
+                print(f"  update {self.optimizer_step}: loss {group_loss:.6f}, lr {lr:.2e}", flush=True)
                 if self.writer is not None:
-                    self.writer.add_scalar("train/loss", loss.item(), self.iteration)
-                    self.writer.add_scalar("train/lr", lr, self.iteration)
-                    self.writer.add_scalar(
-                        "train/mrae_epsilon", active_mrae_eps, self.iteration
-                    )
+                    self.writer.add_scalar('train/loss', group_loss, self.optimizer_step)
+                    self.writer.add_scalar('train/lr', lr, self.optimizer_step)
+                    self.writer.add_scalar('train/mrae_epsilon', active_mrae_eps, self.optimizer_step)
+            if (self.optimizer_step % cfg.val_interval_steps == 0
+                    or self.optimizer_step == self.total_optimizer_steps):
+                if self.health is not None:
+                    self.health.enabled = False
+                self._validate_and_checkpoint()
+                self.model.train()
+            elif cfg.checkpoint_interval_steps and self.optimizer_step % cfg.checkpoint_interval_steps == 0:
+                self._save_checkpoint(epoch, False)
         return running / max(1, counted)
 
     @torch.no_grad()
@@ -611,76 +711,84 @@ class UnifiedTrainer:
 
     # -------------------------------------------------------------- validate
     @torch.no_grad()
-    def validate(self, epoch: int) -> Dict[str, float]:
+    def validate(self, step: int) -> Dict[str, float]:
         cfg = self.config
         eval_model = self._orig_model
-        used_ema = False
-        backup: Optional[Dict[str, torch.Tensor]] = None
-        if self.ema_state is not None:
-            backup = {k: v.detach().clone() for k, v in eval_model.state_dict().items()}
-            eval_model.load_state_dict(self._ema_state_dict())
-            used_ema = True
-        eval_model.eval()
-
-        per_scene: Dict[str, List[Dict[str, float]]] = {"full": [], "crop": []}
+        was_training = eval_model.training
+        health_enabled = self.health.enabled if self.health is not None else False
+        backup = None
+        per_scene = {"full": [], "crop": []}
+        diagnostics = []
         crop_skipped = 0
         start = time.time()
-        for rgb, hsi in self.val_loader:
-            rgb = rgb.to(self.device, non_blocking=True)
-            # fp32 validation: the selection metric must be free of AMP rounding.
-            with self._autocast(enabled=False):
-                pred = forward_reconstruction(eval_model, rgb)
-            rows = evaluate_scene(pred, hsi, cfg.val_crop_border, cfg.mrae_eps)
-            per_scene["full"].append(rows["full"])
-            if "crop" in rows:
-                per_scene["crop"].append(rows["crop"])
-            else:
-                crop_skipped += 1
-        elapsed = time.time() - start
-
-        if backup is not None:
-            eval_model.load_state_dict(backup)
-
+        try:
+            if self.ema_state is not None:
+                backup = {k: v.detach().clone() for k, v in eval_model.state_dict().items()}
+                eval_model.load_state_dict(self._ema_state_dict())
+            eval_model.eval()
+            for index, (rgb, hsi) in enumerate(self.val_loader):
+                if self.health is not None:
+                    self.health.enabled = True
+                    self.health.activations.clear()
+                with self._autocast(enabled=False):
+                    pred = forward_reconstruction(eval_model, rgb.float().to(self.device))
+                rows = evaluate_scene(pred, hsi, cfg.val_crop_border, cfg.mrae_eps)
+                per_scene["full"].append(rows["full"])
+                if "crop" in rows:
+                    per_scene["crop"].append(rows["crop"])
+                else:
+                    crop_skipped += 1
+                name = Path(self.val_loader.dataset.hsi_files[index]).stem
+                for protocol in rows:
+                    prediction, target = pred.detach().float().cpu(), hsi.float()
+                    if protocol == 'crop':
+                        border = cfg.val_crop_border
+                        prediction = prediction[..., border:-border, border:-border]
+                        target = target[..., border:-border, border:-border]
+                    diagnostics.append({'scene': name, 'protocol': protocol,
+                                        'operators': {name: value for name, value in self.health.activations.items()
+                                                      if 'attention_operator' in value} if self.health is not None else {},
+                                        **mrae_breakdown(prediction, target, epsilon=cfg.mrae_eps)})
+        finally:
+            if backup is not None:
+                eval_model.load_state_dict(backup)
+            eval_model.train(was_training)
+            if self.health is not None:
+                self.health.enabled = health_enabled
+        if not per_scene['full']:
+            raise ValueError("Validation split has no scenes")
         if crop_skipped and cfg.val_crop_border > 0:
-            warnings.warn(
-                f"{crop_skipped} validation scene(s) too small for the MST++ "
-                f"{cfg.val_crop_border}-pixel border crop; falling back to full-frame "
-                "metrics for selection on those scenes."
-            )
-
-        protocols: Dict[str, Dict[str, float]] = {}
-        for name, rows in per_scene.items():
-            if rows:
-                protocols[name] = {
-                    key: float(np.mean([row[key] for row in rows])) for key in METRIC_KEYS
-                }
-        n_scenes = len(per_scene["full"])
-        print(
-            f"Validation @ epoch {epoch} ({n_scenes} scenes, {elapsed:.1f}s, "
-            f"EMA={'on' if used_ema else 'off'})"
-        )
+            if cfg.strict_selection_crop:
+                raise ValueError("Validation scene is too small for the required selection crop")
+            # A partial crop average would select checkpoints on a different population.
+            per_scene['crop'].clear()
+            warnings.warn(f"{crop_skipped} scene(s) too small for the {cfg.val_crop_border}-pixel "
+                          "selection crop; using full-frame selection for the entire split.")
+        protocols = {name: {key: float(np.mean([row[key] for row in rows])) for key in METRIC_KEYS}
+                     for name, rows in per_scene.items() if rows}
+        print(f"Validation @ update {step} ({len(per_scene['full'])} scenes, "
+              f"{time.time() - start:.1f}s, EMA={'on' if backup is not None else 'off'})")
         print(format_metric_table(protocols))
-
-        flat = {
-            f"{proto}/{key}": value
-            for proto, row in protocols.items()
-            for key, value in row.items()
-        }
+        flat = {f"{proto}/{key}": value for proto, row in protocols.items() for key, value in row.items()}
         if self.writer is not None:
             for key, value in flat.items():
-                self.writer.add_scalar(f"val/{key}", value, epoch)
-        with (self.exp_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"epoch": epoch, "ema": used_ema, **flat}) + "\n")
+                self.writer.add_scalar(f"val/{key}", value, step)
+        with (self.exp_dir / 'metrics.jsonl').open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({'optimizer_step': step, 'ema': backup is not None, **flat}) + '\n')
+        with (self.exp_dir / 'validation_diagnostics.jsonl').open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({'optimizer_step': step, 'scenes': diagnostics}) + '\n')
         return flat
 
     # ------------------------------------------------------------ checkpoint
     def _save_checkpoint(self, epoch: int, is_best: bool) -> None:
         payload = {
-            "unified_version": 1,
+            "unified_version": 2,
             "model": self.config.model,
             "model_size": self.config.model_size,
             "model_kwargs": self.config.model_kwargs,
             "config": dataclasses.asdict(self.config),
+            "resolved_model_config": self.resolved_model_config,
+            "run_manifest": self.run_manifest,
             "model_state_dict": self._orig_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
@@ -690,15 +798,24 @@ class UnifiedTrainer:
             "optimizer_step": self.optimizer_step,
             "best_mrae": self.best_mrae,
             "train_mrae_eps": float(self.criterion.eps),
+            "total_optimizer_steps": self.total_optimizer_steps,
+            "loader_cycles": self.loader_cycles,
+            "last_validation_step": self._last_validation_step,
+            "last_metrics": self._last_metrics,
         }
         ema_sd = self._ema_state_dict()
         if ema_sd is not None:
             payload["ema_model_state_dict"] = ema_sd
             payload["ema_shadow"] = self.ema_state
-        torch.save(payload, self.exp_dir / "last.pth")
+        def save_atomic(name):
+            destination = self.exp_dir / name
+            temporary = destination.with_suffix('.pth.tmp')
+            torch.save(payload, temporary)
+            temporary.replace(destination)
+        save_atomic("last.pth")
         if is_best:
-            torch.save(payload, self.exp_dir / "best.pth")
-            print(f"  Saved best checkpoint (epoch {epoch})")
+            save_atomic("best.pth")
+            print(f"  Saved best checkpoint (update {self.optimizer_step})")
 
     def _load_checkpoint(self, path: str) -> None:
         try:
@@ -710,6 +827,24 @@ class UnifiedTrainer:
                 f"Checkpoint model family {ckpt.get('model')!r} does not match "
                 f"--model {self.config.model!r}"
             )
+        if ckpt.get('unified_version') != 2:
+            raise ValueError("Legacy checkpoints use a different schedule; load them for inference or start a fresh run")
+        canonical = lambda value: json.dumps(value, sort_keys=True, default=str)
+        if canonical(ckpt.get('resolved_model_config')) != canonical(self.resolved_model_config):
+            raise ValueError("Resume architecture semantics differ from the saved resolved_model_config")
+        if canonical(ckpt.get('run_manifest', {}).get('data')) != canonical(self.run_manifest['data']):
+            raise ValueError("Resume data split/preprocessing/storage policy differs from checkpoint")
+        if canonical(ckpt.get('run_manifest', {}).get('protocol')) != canonical(self.run_manifest['protocol']):
+            raise ValueError("Resume effective precision/objective/selection policy differs from checkpoint")
+        fields = ('max_optimizer_steps', 'updates_per_epoch', 'accumulate_steps', 'batch_size',
+                  'learning_rate', 'eta_min', 'warmup_steps', 'optimizer', 'weight_decay',
+                  'gradient_clip', 'amp', 'ema_decay', 'loss_mode', 'auxiliary_loss',
+                  'train_mrae_eps_start', 'train_mrae_eps_end', 'train_mrae_eps_anneal_steps',
+                  'mrae_eps', 'val_crop_border', 'val_interval_steps', 'strict_selection_crop', 'seed')
+        current = dataclasses.asdict(self.config)
+        different = [name for name in fields if ckpt['config'].get(name) != current[name]]
+        if different:
+            raise ValueError("Resume training policy differs: " + ', '.join(different))
         self._orig_model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -720,9 +855,16 @@ class UnifiedTrainer:
             ckpt.get("optimizer_step", max(0, self.scheduler.last_epoch))
         )
         self.best_mrae = float(ckpt.get("best_mrae", math.inf))
+        self.loader_cycles = int(ckpt.get('loader_cycles', 0))
+        self._last_validation_step = int(ckpt.get('last_validation_step', -1))
+        self._last_metrics = ckpt.get('last_metrics', {})
         if self.ema_state is not None and "ema_shadow" in ckpt:
             self.ema_state = {k: v.float().cpu() for k, v in ckpt["ema_shadow"].items()}
-        print(f"Resumed from {path} at epoch {self.start_epoch}")
+        if self.scheduler.last_epoch != self.optimizer_step:
+            raise ValueError("Checkpoint scheduler and optimizer update counters disagree")
+        if self.optimizer_step > self.total_optimizer_steps:
+            raise ValueError("Checkpoint exceeds the requested optimizer budget")
+        print(f"Resumed from {path} at optimizer update {self.optimizer_step}")
 
 
 # ============================================================================
@@ -731,10 +873,11 @@ class UnifiedTrainer:
 
 def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
     parser = argparse.ArgumentParser(
-        description="Unified MST++/NTIRE-faithful trainer for HSIFusion and SHARP",
+        description="Unified optimizer-update trainer for HSIFusion and SHARP",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", type=str, default="sharp", choices=list(MODEL_CHOICES))
+    parser.add_argument("--recipe", type=Path, help="JSON training recipe; explicit CLI arguments override it")
     parser.add_argument("--model_size", type=str, default="base")
     parser.add_argument("--model_kwargs", type=str, default="{}",
                         help="JSON object of extra model-factory kwargs")
@@ -748,7 +891,16 @@ def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
     parser.add_argument("--memory_mode", type=str, default="float16",
                         choices=["standard", "float16", "lazy"])
     parser.add_argument("--cache_size", type=int, default=4)
+    parser.add_argument("--rgb_normalization", choices=['divide_255', 'scene_minmax'], default='divide_255')
+    parser.add_argument("--patch_grid", choices=['ceil', 'floor'], default='ceil')
+    parser.add_argument('--augmentation_policy', choices=['legacy', 'mst'], default='legacy')
+    parser.add_argument("--exclude_samples", nargs='*', default=[])
     parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--updates_per_epoch", type=int, default=1000,
+                        help="Successful updates per logical epoch, independent of loader length")
+    parser.add_argument("--max_optimizer_steps", type=int, default=None,
+                        help="Total successful optimizer updates; default epochs * 1000")
+    parser.add_argument("--warmup_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--eta_min", type=float, default=1e-6)
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"])
@@ -769,10 +921,15 @@ def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
     parser.add_argument("--train_mrae_eps_anneal_steps", type=int, default=50_000,
                         help="Optimizer steps for log-linear MRAE-floor annealing")
     parser.add_argument("--mrae_eps", type=float, default=1e-6,
-                        help="Exact validation/selection MRAE denominator floor")
+                        help="Validation/selection MRAE denominator floor; 0 requires positive targets")
     parser.add_argument("--max_consecutive_nonfinite", type=int, default=8,
                         help="Abort after this many failed optimizer attempts")
-    parser.add_argument("--val_interval", type=int, default=10)
+    parser.add_argument("--loss_mode", choices=['floored', 'exact'], default='floored')
+    parser.add_argument("--no_auxiliary_loss", action='store_false', dest='auxiliary_loss', default=True)
+    parser.add_argument("--health_interval_steps", type=int, default=0)
+    parser.add_argument("--val_interval", type=int, default=None, help="Deprecated cadence in logical epochs")
+    parser.add_argument("--val_interval_steps", type=int, default=1000)
+    parser.add_argument('--strict_selection_crop', action='store_true')
     parser.add_argument("--val_crop_border", type=int, default=128,
                         help="MST++ selection crop border (0 = full-frame selection)")
     parser.add_argument("--output_dir", type=str, default="./experiments/unified")
@@ -783,52 +940,31 @@ def parse_args(argv: Optional[List[str]] = None) -> UnifiedTrainingConfig:
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    preliminary, _ = parser.parse_known_args(argv)
+    if preliminary.recipe:
+        recipe = json.loads(preliminary.recipe.read_text(encoding='utf-8'))
+        known = {f.name for f in dataclasses.fields(UnifiedTrainingConfig) if f.init}
+        unknown = set(recipe) - known
+        if unknown:
+            parser.error('Unknown recipe fields: ' + ', '.join(sorted(unknown)))
+        rename = {'learning_rate': 'lr', 'resume_from': 'resume', 'augment': 'no_augment'}
+        defaults = {rename.get(k, k): (not v if k == 'augment' else v) for k, v in recipe.items()}
+        parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
 
     try:
-        model_kwargs = json.loads(args.model_kwargs)
+        model_kwargs = json.loads(args.model_kwargs) if isinstance(args.model_kwargs, str) else args.model_kwargs
     except json.JSONDecodeError as exc:
         raise SystemExit(f"--model_kwargs is not valid JSON: {exc}")
 
-    return UnifiedTrainingConfig(
-        model=args.model,
-        model_size=args.model_size,
-        model_kwargs=model_kwargs,
-        compile_model=args.compile_model,
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        patch_size=args.patch_size,
-        stride=args.stride,
-        augment=not args.no_augment,
-        num_workers=args.num_workers,
-        memory_mode=args.memory_mode,
-        cache_size=args.cache_size,
-        epochs=args.epochs,
-        learning_rate=args.lr,
-        eta_min=args.eta_min,
-        optimizer=args.optimizer,
-        weight_decay=args.weight_decay,
-        warmup_epochs=args.warmup_epochs,
-        accumulate_steps=args.accumulate_steps,
-        gradient_clip=args.gradient_clip,
-        ema_decay=args.ema_decay,
-        amp=args.amp,
-        fp16_init_scale=args.fp16_init_scale,
-        train_mrae_eps_start=args.train_mrae_eps_start,
-        train_mrae_eps_end=args.train_mrae_eps_end,
-        train_mrae_eps_anneal_steps=args.train_mrae_eps_anneal_steps,
-        mrae_eps=args.mrae_eps,
-        max_consecutive_nonfinite=args.max_consecutive_nonfinite,
-        val_interval=args.val_interval,
-        val_crop_border=args.val_crop_border,
-        output_dir=args.output_dir,
-        experiment_name=args.experiment_name,
-        resume_from=args.resume,
-        checkpoint_interval_steps=args.checkpoint_interval_steps,
-        log_interval=args.log_interval,
-        seed=args.seed,
-        device=args.device,
-    )
+    values = vars(args).copy()
+    values.pop('recipe')
+    values['model_kwargs'] = model_kwargs
+    values['learning_rate'] = values.pop('lr')
+    values['resume_from'] = values.pop('resume')
+    values['augment'] = not values.pop('no_augment')
+    return UnifiedTrainingConfig(**values)
+
 
 
 def main(argv: Optional[List[str]] = None) -> None:

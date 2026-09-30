@@ -1,5 +1,9 @@
 # MSWR Training Configs
 
+For the assessment controls, isolated full-resolution spectral/wavelet
+experiments, and shared MSWR/CSWIN/MST++ training loop, see
+[assessment experiments](../../ASSESSMENT_IMPROVEMENTS.md).
+
 Use one training entry point and one default config:
 
 ```bash

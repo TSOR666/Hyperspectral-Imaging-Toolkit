@@ -456,6 +456,19 @@ def resolve_resume_stage_position(
     return final_stage_idx, final_stage_iter
 
 
+def _check_residual_semantics(model: "torch.nn.Module", checkpoint: Dict[str, Any]) -> None:
+    """Residual semantics cannot be recovered from matching weight shapes."""
+    config = checkpoint.get("config") or {}
+    saved_mode = str(config.get("sstb_residual_mode", "legacy")).lower()
+    for module in model.modules():
+        current_mode = getattr(module, "residual_mode", None)
+        if current_mode is not None and current_mode != saved_mode:
+            raise ValueError(
+                f"Checkpoint residual mode {saved_mode!r} differs from current {current_mode!r}; "
+                "the correction architecture requires a fresh training experiment."
+            )
+
+
 def resume_training_state(
     checkpoint_path: str,
     model: "torch.nn.Module",
@@ -519,6 +532,7 @@ def resume_training_state(
             f"(looked for 'state_dict' and 'model_state_dict')."
         )
     target = model.module if hasattr(model, "module") else model
+    _check_residual_semantics(target, ck)
     target.load_state_dict(state_dict, strict=True)
 
     # Optimizers / schedulers / scalers — each block tolerates missing keys
@@ -637,6 +651,7 @@ def load_finetune_weights(
         )
 
     target = model.module if hasattr(model, "module") else model
+    _check_residual_semantics(target, ck)
     target.load_state_dict(state_dict, strict=True)
     if ema is not None:
         ema.reinit_from(target)

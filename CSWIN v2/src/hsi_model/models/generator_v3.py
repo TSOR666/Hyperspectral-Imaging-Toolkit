@@ -283,6 +283,9 @@ class DualTransformerBlock(nn.Module):
             raise ValueError("sstb_outer_residual_scale must be finite")
         if self.outer_residual_scale < 0.0:
             raise ValueError("sstb_outer_residual_scale must be non-negative")
+        self.residual_mode = str(config.get("sstb_residual_mode", "legacy")).lower()
+        if self.residual_mode not in {"legacy", "correction"}:
+            raise ValueError("sstb_residual_mode must be 'legacy' or 'correction'")
 
         self.gate = CBAMChannelGate(channels, reduction=int(config.get("cbam_reduction", 4)))
         self.norm1 = ChannelLayerNorm(channels)
@@ -352,7 +355,11 @@ class DualTransformerBlock(nn.Module):
         # near identity while retaining direct gradients through a normally
         # initialized output head.  The default remains 1.0 so existing
         # checkpoints preserve their exact function.
-        return x + self.outer_residual_scale * h       # Eq. 2 outer residual
+        # Fresh correction mode removes the gated identity already present in
+        # h. A block with zero learned corrections is then exactly x, rather
+        # than (1 + scale * gate) * x. Legacy keeps old checkpoints unchanged.
+        correction = h - g if self.residual_mode == "correction" else h
+        return x + self.outer_residual_scale * correction
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         should_checkpoint = (

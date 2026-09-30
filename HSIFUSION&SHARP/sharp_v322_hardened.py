@@ -37,6 +37,7 @@ from common_utils_v32 import (
     validate_model_config,
 )
 from training_stability import autocast_context, make_grad_scaler, resolve_amp_dtype
+from reconstruction_layers import FullResolutionSpectralBlock, unpack_grouped_projection
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ def sparse_attention_topk_streaming(
     spatial_shape: Optional[Tuple[int, int]] = None,
     exact_topk_max_tokens: int = 1024,
     landmark_tokens: int = 256,
+    attention_mode: str = "auto",
 ) -> torch.Tensor:
     """
     Sparse attention with exact streaming top-k only for short sequences.
@@ -205,6 +207,12 @@ def sparse_attention_topk_streaming(
         k_keep = min(k_keep, k_cap)
 
     exact_limit = min(max_tokens, exact_topk_max_tokens)
+    if attention_mode not in {"auto", "local_landmark", "exact_topk"}:
+        raise ValueError("Invalid sparse attention mode")
+    if attention_mode == "exact_topk" and N > exact_limit:
+        raise ValueError("Fixed exact_topk attention exceeds its configured token limit")
+    if attention_mode == "local_landmark":
+        exact_limit = 0
     
     # v3.2.2: Short-circuit to dense attention when k_keep == N
     if k_keep >= N and N <= exact_limit:
@@ -658,13 +666,14 @@ class MultiScaleAttention(nn.Module):
     """Multi-scale attention with local and global branches."""
     def __init__(self, dim: int, num_heads: int = 8, 
                  local_window: int = 7, use_conv_proj: bool = True,
-                 max_global_tokens: Optional[int] = None):
+                 max_global_tokens: Optional[int] = None, qkv_layout: str = "legacy"):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.local_window = local_window
         self.max_global_tokens = max_global_tokens
+        self.qkv_layout = qkv_layout
         
         groups = get_optimal_groups(dim, dim * 3)
         if use_conv_proj:
@@ -689,8 +698,11 @@ class MultiScaleAttention(nn.Module):
         
         local_out = self.local_attn(x)
         
-        qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H*W)
-        q, k, v = qkv.unbind(1)
+        if isinstance(self.qkv, nn.Conv2d):
+            q, k, v = unpack_grouped_projection(self.qkv(x), self.qkv.groups, 3, self.qkv_layout)
+        else:
+            q, k, v = self.qkv(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).chunk(3, dim=1)
+        q, k, v = [t.reshape(B, self.num_heads, self.head_dim, H*W) for t in (q, k, v)]
         q = q.permute(0, 1, 3, 2)
         pooled_h, pooled_w = _pooled_spatial_size(H, W, self.max_global_tokens)
         if (pooled_h, pooled_w) != (H, W):
@@ -704,7 +716,10 @@ class MultiScaleAttention(nn.Module):
         
         global_out = sdpa_unified(q, k, v, scale=self.scale)
         global_out = global_out.permute(0, 1, 3, 2).reshape(B, C, H, W)
-        global_out = self.proj(global_out)
+        if isinstance(self.proj, nn.Linear):
+            global_out = self.proj(global_out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        else:
+            global_out = self.proj(global_out)
         
         mix = torch.sigmoid(self.mix)
         return local_out * mix + global_out * (1 - mix)
@@ -726,7 +741,8 @@ class OptimizedSparseAttention(nn.Module):
                  key_rbf_mode: str = KeyRBFMode.LINEAR,
                  sparsemax_pad_value: Optional[float] = None,
                  exact_topk_max_tokens: int = 1024,
-                 landmark_tokens: int = 256):
+                 landmark_tokens: int = 256,
+                 attention_mode: str = "auto", qkv_layout: str = "legacy"):
         super().__init__()
 
         # Proper input validation (not assert - works with python -O)
@@ -767,6 +783,10 @@ class OptimizedSparseAttention(nn.Module):
         self.q_block_size = q_block_size
         self.exact_topk_max_tokens = exact_topk_max_tokens
         self.landmark_tokens = landmark_tokens
+        if attention_mode not in {"auto", "local_landmark", "exact_topk"}:
+            raise ValueError("attention_mode must be auto/local_landmark/exact_topk")
+        self.attention_mode = attention_mode
+        self.qkv_layout = qkv_layout
         
         groups = get_optimal_groups(dim, dim * 3)
         self.qkv = nn.Conv2d(dim, dim * 3, 1, groups=groups, bias=False)
@@ -818,12 +838,19 @@ class OptimizedSparseAttention(nn.Module):
             k_proj = k.mean(dim=-1, keepdim=True).expand(-1, -1, -1, self.centers_per_head)
             return q_rbf, k_proj
         
+    def attention_operator(self, height, width):
+        if not self.use_topk:
+            return "dense"
+        if self.attention_mode != "auto":
+            return self.attention_mode
+        return "exact_topk" if height * width <= min(self.max_tokens, self.exact_topk_max_tokens) else "local_landmark"
+
     def forward(self, x):
         B, C, H, W = x.shape
         N = H * W
         
-        qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, N)
-        q, k, v = qkv.unbind(1)
+        q, k, v = unpack_grouped_projection(self.qkv(x), self.qkv.groups, 3, self.qkv_layout)
+        q, k, v = [t.reshape(B, self.num_heads, self.head_dim, N) for t in (q, k, v)]
         q, k, v = [t.permute(0, 1, 3, 2).contiguous() for t in (q, k, v)]
         
         if self.use_rbf and self.key_rbf_mode != KeyRBFMode.NONE:
@@ -835,6 +862,9 @@ class OptimizedSparseAttention(nn.Module):
             k_flat = k.reshape(B * self.num_heads, N, -1)
             v_flat = v.reshape(B * self.num_heads, N, -1)
             
+            operator = self.attention_operator(H, W)
+            if operator == "exact_topk" and N > min(self.max_tokens, self.exact_topk_max_tokens):
+                raise ValueError("Fixed exact_topk attention exceeds its configured token limit")
             out_flat = sparse_attention_topk_streaming(
                 q_flat, k_flat, v_flat, 
                 sparsity_ratio=self.sparsity_ratio, 
@@ -847,6 +877,7 @@ class OptimizedSparseAttention(nn.Module):
                 spatial_shape=(H, W),
                 exact_topk_max_tokens=self.exact_topk_max_tokens,
                 landmark_tokens=self.landmark_tokens,
+                attention_mode=operator,
             )
             out = out_flat.reshape(B, self.num_heads, N, -1)
         else:
@@ -897,7 +928,7 @@ class EnhancedDualAttentionBlock(nn.Module):
                  drop_path: float = 0., use_checkpoint: bool = False,
                  sparse_config: Optional[dict] = None,
                  max_global_tokens: Optional[int] = None,
-                 attn2_prenorm: bool = True):
+                 attn2_prenorm: bool = True, qkv_layout: str = "legacy"):
         super().__init__()
         self.use_checkpoint = use_checkpoint
 
@@ -910,7 +941,7 @@ class EnhancedDualAttentionBlock(nn.Module):
         self.norm2 = ChannelRMSNorm(dim) if attn2_prenorm else None
 
         self.attn1 = MultiScaleAttention(
-            dim, num_heads, max_global_tokens=max_global_tokens
+            dim, num_heads, max_global_tokens=max_global_tokens, qkv_layout=qkv_layout
         )
 
         # Use sparse config if provided
@@ -920,6 +951,7 @@ class EnhancedDualAttentionBlock(nn.Module):
             use_sparsemax=True,
             use_rbf=True,
             use_topk=True,
+            qkv_layout=qkv_layout,
             sparsity_ratio=sparse_kwargs.get('sparsity_ratio', 0.9),
             rbf_centers_per_head=sparse_kwargs.get('rbf_centers_per_head', 32),
             key_rbf_mode=sparse_kwargs.get('key_rbf_mode', KeyRBFMode.LINEAR),
@@ -962,12 +994,16 @@ class ImprovedCrossAttentionFusion(nn.Module):
         dim: int,
         num_heads: int = 8,
         max_global_tokens: Optional[int] = None,
+        qkv_layout: str = "legacy",
+        aligned_skip: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.max_global_tokens = max_global_tokens
+        self.qkv_layout = qkv_layout
+        self.skip_proj = nn.Conv2d(dim, dim, 1) if aligned_skip else None
         
         self.norm1 = ChannelRMSNorm(dim)
         self.norm2 = ChannelRMSNorm(dim)
@@ -989,8 +1025,8 @@ class ImprovedCrossAttentionFusion(nn.Module):
         skip_norm = self.norm2(skip)
         
         q = self.q(x_norm).reshape(B, self.num_heads, self.head_dim, H*W).permute(0, 1, 3, 2)
-        kv = self.kv(skip_norm).reshape(B, 2, self.num_heads, self.head_dim, H*W)
-        k, v = kv.unbind(1)
+        k, v = unpack_grouped_projection(self.kv(skip_norm), self.kv.groups, 2, self.qkv_layout)
+        k, v = [t.reshape(B, self.num_heads, self.head_dim, H*W) for t in (k, v)]
         pooled_h, pooled_w = _pooled_spatial_size(H, W, self.max_global_tokens)
         if (pooled_h, pooled_w) != (H, W):
             k = F.adaptive_avg_pool2d(
@@ -1006,6 +1042,8 @@ class ImprovedCrossAttentionFusion(nn.Module):
         out = self.proj(out)
         
         gate = self.gate(torch.cat([x, out], dim=1))
+        if self.skip_proj is not None:
+            return x + self.skip_proj(skip) + out * gate
         return x * (1 - gate) + out * gate
 
 # ============================================================================
@@ -1063,8 +1101,23 @@ class SHARPv32Config:
     output_activation: str = "sigmoid"
     # EMA parameters
     ema_update_every: int = 1
+    # Opt-in repairs have explicit semantics for existing state dictionaries.
+    qkv_layout: str = "legacy"
+    sparse_attention_mode: str = "auto"
+    conv_norm: bool = True
+    rgb_skip: bool = False
+    aligned_skip: bool = False
+    head_mode: str = "gated"
+    fullres_spectral: bool = False
+    spectral_gate_init: float = 0.01
 
     def __post_init__(self):
+        if self.qkv_layout not in {"legacy", "group_major"}:
+            raise ValueError("qkv_layout must be legacy/group_major")
+        if self.sparse_attention_mode not in {"auto", "local_landmark", "exact_topk"}:
+            raise ValueError("sparse_attention_mode must be auto/local_landmark/exact_topk")
+        if self.head_mode not in {"gated", "linear"}:
+            raise ValueError("head_mode must be gated/linear")
         valid_acts = {"sigmoid", "tanh", "relu", "softplus", "none"}
         if self.output_activation not in valid_acts:
             raise ValueError(
@@ -1111,6 +1164,8 @@ class SHARPv32(nn.Module):
     def __init__(self, config: SHARPv32Config):
         super().__init__()
         self.config = config
+        conv_norm = getattr(config, "conv_norm", True)
+        norm = lambda channels: ChannelRMSNorm(channels) if conv_norm else nn.Identity()
         
         # v3.2.2: Cache for spectral basis by device/dtype
         self._spectral_basis_cache = {}
@@ -1119,11 +1174,11 @@ class SHARPv32(nn.Module):
         groups_stem = get_optimal_groups(config.in_channels, config.base_dim // 2) if config.in_channels > 1 else 1
         self.stem = nn.Sequential(
             nn.Conv2d(config.in_channels, config.base_dim // 2, 3, padding=1, groups=groups_stem),
-            ChannelRMSNorm(config.base_dim // 2),
+            norm(config.base_dim // 2),
             nn.GELU(),
             nn.Conv2d(config.base_dim // 2, config.base_dim, 3, padding=1, 
                      groups=get_optimal_groups(config.base_dim // 2, config.base_dim)),
-            ChannelRMSNorm(config.base_dim),
+            norm(config.base_dim),
             nn.GELU()
         )
         
@@ -1144,7 +1199,8 @@ class SHARPv32(nn.Module):
             'landmark_tokens': config.sparse_landmark_tokens,
             'rbf_centers_per_head': config.rbf_centers_per_head,
             'key_rbf_mode': config.key_rbf_mode,
-            'sparsemax_pad_value': config.sparsemax_pad_value
+            'sparsemax_pad_value': config.sparsemax_pad_value,
+            'attention_mode': getattr(config, 'sparse_attention_mode', 'auto'),
         }
         
         cur_depth = 0
@@ -1162,6 +1218,7 @@ class SHARPv32(nn.Module):
                     max_global_tokens=config.max_global_tokens,
                     # getattr: old pickled configs predate the field -> legacy arch (no norm2)
                     attn2_prenorm=getattr(config, 'attn2_prenorm', False),
+                    qkv_layout=getattr(config, 'qkv_layout', 'legacy'),
                 )
                 for j in range(config.depths[i])
             ])
@@ -1171,7 +1228,7 @@ class SHARPv32(nn.Module):
             if i < len(config.depths) - 1:
                 downsample = nn.Sequential(
                     nn.Conv2d(dim, dim * 2, 2, stride=2),
-                    ChannelRMSNorm(dim * 2)
+                    norm(dim * 2)
                 )
                 self.downsample.append(downsample)
         
@@ -1184,7 +1241,7 @@ class SHARPv32(nn.Module):
             
             self.upsample.append(nn.Sequential(
                 nn.ConvTranspose2d(down_dim, up_dim, 2, stride=2),
-                ChannelRMSNorm(up_dim),
+                norm(up_dim),
                 nn.GELU()
             ))
             
@@ -1193,15 +1250,20 @@ class SHARPv32(nn.Module):
                     up_dim,
                     config.heads[i-1],
                     max_global_tokens=config.max_global_tokens,
+                    qkv_layout=getattr(config, 'qkv_layout', 'legacy'),
+                    aligned_skip=getattr(config, 'aligned_skip', False),
                 )
             )
         
         self.head = nn.Sequential(
             nn.Conv2d(config.base_dim, config.base_dim, 3, padding=1),
-            ChannelRMSNorm(config.base_dim),
+            norm(config.base_dim),
             nn.GELU(),
-            nn.Conv2d(config.base_dim, config.out_channels * 2, 1)
+            nn.Conv2d(config.base_dim, config.out_channels * (2 if getattr(config, 'head_mode', 'gated') == 'gated' else 1), 1)
         )
+        self.input_skip = nn.Conv2d(config.in_channels, config.out_channels, 1) if getattr(config, 'rgb_skip', False) else None
+        self.spectral_output = (FullResolutionSpectralBlock(config.base_dim, gate_init=config.spectral_gate_init)
+                                if getattr(config, 'fullres_spectral', False) else None)
 
         # Smooth spectral refinement head (pass 5). The spectral_basis buffer used to be
         # generated but never consumed anywhere in forward, i.e. the model had NO spectral
@@ -1291,6 +1353,7 @@ class SHARPv32(nn.Module):
         return features
         
     def forward(self, x):
+        rgb = x
         features = self.forward_features(x)
         
         x = features[-1]
@@ -1308,9 +1371,14 @@ class SHARPv32(nn.Module):
                 x = up(x)
             x = fuse(x, skip)
         
+        if self.spectral_output is not None:
+            x = self.spectral_output(x)
         out = self.head(x)
-        out, gate = out.chunk(2, dim=1)
-        out = out * torch.sigmoid(gate)
+        if getattr(self.config, 'head_mode', 'gated') == 'gated':
+            out, gate = out.chunk(2, dim=1)
+            out = out * torch.sigmoid(gate)
+        if self.input_skip is not None:
+            out = out + self.input_skip(rgb)
 
         # Smooth spectral refinement: out += B @ c(x), with B an orthonormal low-frequency
         # cosine basis over the 31 bands and c(x) per-pixel coefficients from the decoder
@@ -1401,12 +1469,11 @@ def create_sharp_v32(
     if model_size not in configs:
         raise ValueError(f"Unknown model size: {model_size}")
     
-    model_config = configs[model_size]
+    model_config = {**configs[model_size], **kwargs}
     config = SHARPv32Config(
         in_channels=in_channels,
         out_channels=out_channels,
         **model_config,
-        **kwargs
     )
     
     validate_model_config(config, f"SHARP-{model_size}")
