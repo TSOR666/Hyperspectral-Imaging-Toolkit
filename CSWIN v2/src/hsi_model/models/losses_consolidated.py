@@ -162,23 +162,30 @@ class RelativeMRAELoss(nn.Module):
 
 class MRAELoss(nn.Module):
     """
-    Mean Relative Absolute Error — the exact objective the ARAD-1K leaderboard
-    scores, and MST++'s training loss (``Loss_MRAE``).
+    Mean Relative Absolute Error with an explicit denominator policy.
 
         MRAE = mean( |pred - target| / max(|target|, epsilon) )
 
     Unlike :class:`RelativeMRAELoss` (a Charbonnier-smoothed surrogate that
     floors the denominator at 1e-2 and so underweights dark pixels), this
-    matches ``utils.metrics.compute_mrae`` term-for-term, so training on it
-    directly optimizes the reported metric. ``epsilon`` defaults to 1e-8 to
-    match the metric; raise it if near-zero targets cause gradient spikes under
-    mixed precision.
+    matches ``utils.metrics.compute_mrae`` when both use the same epsilon.
+    ``epsilon=0`` is the unfloored positive-target reference objective and
+    rejects undefined/non-finite data. The legacy default is a 1e-8 floor;
+    larger floors are stabilization surrogates and underweight dark targets.
     """
     def __init__(self, epsilon: float = 1e-8):
         super().__init__()
-        self.epsilon = max(float(epsilon), 1e-12)
+        self.epsilon = float(epsilon)
+        if not math.isfinite(self.epsilon) or self.epsilon < 0:
+            raise ValueError("MRAE epsilon must be finite and non-negative")
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred, target = pred.float(), target.float()
+        if self.epsilon == 0:
+            if not torch.isfinite(pred).all() or not torch.isfinite(target).all():
+                raise FloatingPointError("Exact MRAE requires finite predictions and targets")
+            if (target <= 0).any():
+                raise ValueError("Exact MRAE requires strictly positive targets; choose an explicit floor for zeros")
         denominator = target.abs().clamp_min(self.epsilon)
         return torch.mean(torch.abs(pred - target) / denominator)
 

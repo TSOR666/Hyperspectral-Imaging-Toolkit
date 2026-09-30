@@ -398,7 +398,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-batch-size", type=int, default=1)
     parser.add_argument("--ensemble", choices=["none", "d4"], default="none")
     parser.add_argument("--crop-border", type=int, default=0)
-    parser.add_argument("--mrae-epsilon", type=float, default=1e-6)
+    parser.add_argument("--mrae-epsilon", type=float, default=1e-6,
+                        help="Denominator floor; 0 uses exact positive-target MRAE and rejects zeros")
     parser.add_argument("--sampling-steps", type=int, default=20)
     parser.add_argument("--latent-mode", choices=["direct", "diffusion"], default="direct")
 

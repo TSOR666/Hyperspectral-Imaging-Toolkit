@@ -193,6 +193,9 @@ ffn_expansion: 2.66              # GDFN/SGFN hidden-channel expansion
 # 12 residual-heavy blocks from amplifying activations and starving the body
 # behind an artificially tiny output projection.
 sstb_outer_residual_scale: 1.0
+# Preserve historical residual semantics. Fresh assessment ablations can use
+# correction to remove the duplicated gated identity in the outer branch.
+sstb_residual_mode: legacy
 # Legacy stabilizer. Disable only in a fresh run: the transformer blocks are
 # already pre-normed, and extra GroupNorm after embedding/down/up convolutions
 # can erase low-frequency radiometric offsets that MRAE/PSNR need.

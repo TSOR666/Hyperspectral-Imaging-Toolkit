@@ -189,7 +189,8 @@ _RESUME_MODEL_CONFIG_FIELDS = (
     'wavelet_levels', 'wavelet_detail_processing', 'wavelet_detail_gain_mode',
     'use_spectral_attn', 'spectral_attn_heads', 'spectral_ffn',
     'spectral_ffn_mult', 'multistage_refine', 'refine_hidden',
-    'spectral_prelayer', 'blocks_per_stage', 'mlp_ratio', 'ffn_type',
+    'spectral_prelayer', 'spectral_output_block', 'spectral_output_gate_init',
+    'blocks_per_stage', 'mlp_ratio', 'ffn_type',
     'use_multi_scale_input', 'use_skip_init',
     # Parameters can have the same state-dict keys but different semantics when
     # any of these values changes, so a key-count check alone is not enough.
@@ -517,6 +518,11 @@ class TrainingConfig:
         self.multistage_refine = getattr(args, 'multistage_refine', False)
         self.refine_hidden = getattr(args, 'refine_hidden', 64)
         self.spectral_prelayer = getattr(args, 'spectral_prelayer', False)
+        self.spectral_output_block = getattr(args, 'spectral_output_block', False)
+        self.spectral_output_gate_init = getattr(args, 'spectral_output_gate_init', 1e-2)
+        self.mrae_epsilon = getattr(args, 'mrae_epsilon', 1e-6)
+        self.validation_clamp_output = getattr(args, 'validation_clamp_output', True)
+        self.validation_crop_border = getattr(args, 'validation_crop_border', None)
         self.blocks_per_stage = getattr(args, 'blocks_per_stage', 1)
         # Keep transformer pre-norm and convolutional normalization independent:
         # RGB-to-HSI radiometry is particularly sensitive to per-pixel channel
@@ -695,6 +701,15 @@ def parse_arguments():
                             "each transformer block, so band-to-band attention sees the block's full "
                             "token grid instead of only the wavelet LL band. Zero-init gated (exact "
                             "identity at init), checkpoint-safe. Heads follow --spectral_attn_heads.")
+    parser.add_argument("--spectral_output_block", action='store_true', default=False,
+                       help="One full-resolution spectral attention/FFN residual before reconstruction")
+    parser.add_argument("--spectral_output_gate_init", type=float, default=1e-2,
+                       help="Independent initial gate for the final spectral residual (fresh runs)")
+    parser.add_argument("--mrae_epsilon", type=float, default=1e-6,
+                       help="Training and scoring denominator floor; 0 uses exact positive-target MRAE")
+    parser.add_argument("--validation_clamp_output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validation_crop_border", type=int, default=None,
+                       help="Explicit scoring border; 128 matches the reference; omit for legacy geometry")
     parser.add_argument("--blocks_per_stage", type=int, default=1,
                        help="Transformer blocks per encoder/decoder stage. 1 = legacy layout "
                             "(old checkpoints load unchanged); >1 stacks blocks per stage "
@@ -1372,6 +1387,8 @@ class EnhancedTrainer:
                 'multistage_refine': self.config.multistage_refine,
                 'refine_hidden': self.config.refine_hidden,
                 'spectral_prelayer': self.config.spectral_prelayer,
+                'spectral_output_block': self.config.spectral_output_block,
+                'spectral_output_gate_init': self.config.spectral_output_gate_init,
                 'blocks_per_stage': self.config.blocks_per_stage,
                 'norm_type': self.config.norm_type,
                 'conv_norm_type': self.config.conv_norm_type,
@@ -1421,6 +1438,8 @@ class EnhancedTrainer:
                 multistage_refine=self.config.multistage_refine,
                 refine_hidden=self.config.refine_hidden,
                 spectral_prelayer=self.config.spectral_prelayer,
+                spectral_output_block=self.config.spectral_output_block,
+                spectral_output_gate_init=self.config.spectral_output_gate_init,
                 blocks_per_stage=self.config.blocks_per_stage,
                 norm_type=self.config.norm_type,
                 conv_norm_type=self.config.conv_norm_type,
@@ -1691,11 +1710,11 @@ class EnhancedTrainer:
             
             self.logger.info(f"Using enhanced loss: {' + '.join(active_losses)}")
         else:
-            self.criterion = Loss_MRAE().to(self.device)
+            self.criterion = Loss_MRAE(epsilon=self.config.mrae_epsilon).to(self.device)
             self.logger.info("Using MRAE loss")
         
         # Validation metrics (always use these from utils)
-        self.criterion_mrae = Loss_MRAE().to(self.device)
+        self.criterion_mrae = Loss_MRAE(epsilon=self.config.mrae_epsilon).to(self.device)
         self.criterion_rmse = Loss_RMSE().to(self.device)
         self.criterion_psnr = Loss_PSNR().to(self.device)
         self.criterion_ssim = Loss_SSIM(data_range=1.0).to(self.device)
@@ -2238,6 +2257,13 @@ class EnhancedTrainer:
         return result
     
     def _validation_pass(self, model: nn.Module, desc: str) -> Dict[str, float]:
+        was_training = model.training
+        try:
+            return self._validation_pass_impl(model, desc)
+        finally:
+            model.train(was_training)
+
+    def _validation_pass_impl(self, model: nn.Module, desc: str) -> Dict[str, float]:
         model.eval()
         metrics = {
             'mrae': AverageMeter(),
@@ -2261,7 +2287,16 @@ class EnhancedTrainer:
             else:
                 output = model(images)
             
-            if output.shape[-1] > 256:
+            explicit_border = getattr(self.config, 'validation_crop_border', None)
+            if explicit_border is not None:
+                if explicit_border < 0 or min(output.shape[-2:]) <= 2 * explicit_border:
+                    raise ValueError("validation_crop_border leaves an empty scoring region")
+                if explicit_border:
+                    output_crop = output[..., explicit_border:-explicit_border, explicit_border:-explicit_border]
+                    labels_crop = labels[..., explicit_border:-explicit_border, explicit_border:-explicit_border]
+                else:
+                    output_crop, labels_crop = output, labels
+            elif output.shape[-1] > 256:
                 crop_size = min(128, output.shape[-1] // 4)
                 output_crop = output[:, :, crop_size:-crop_size, crop_size:-crop_size]
                 labels_crop = labels[:, :, crop_size:-crop_size, crop_size:-crop_size]
@@ -2278,7 +2313,8 @@ class EnhancedTrainer:
             # clamp), so the clamped value below is NOT MST++-comparable —
             # track the unclamped variant alongside for benchmark reporting.
             mrae_unclamped = self.criterion_mrae(output_crop, labels_crop)
-            output_crop = output_crop.clamp(0.0, 1.0)
+            if getattr(self.config, 'validation_clamp_output', True):
+                output_crop = output_crop.clamp(0.0, 1.0)
 
             mrae = self.criterion_mrae(output_crop, labels_crop)
             rmse = self.criterion_rmse(output_crop, labels_crop)
@@ -2296,7 +2332,9 @@ class EnhancedTrainer:
                 metrics['sam'].update(sam.item() * 180.0 / np.pi)
 
             if self.config.mrae_diagnostics:
-                for key, value in mrae_diagnostics(output_crop, labels_crop).items():
+                for key, value in mrae_diagnostics(
+                    output_crop, labels_crop, epsilon=getattr(self.config, 'mrae_epsilon', 1e-6)
+                ).items():
                     meter_key = f'mrae_diag_{key}'
                     if meter_key not in diag_meters:
                         diag_meters[meter_key] = AverageMeter()
@@ -2323,6 +2361,13 @@ class EnhancedTrainer:
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
+        was_training = self.model.training
+        try:
+            return self._validate_impl()
+        finally:
+            self.model.train(was_training)
+
+    def _validate_impl(self) -> Dict[str, float]:
         eval_mode = self.config.ema_eval_mode
         ema_ready = self.ema is not None and self.epoch >= self.config.ema_start_epoch
         

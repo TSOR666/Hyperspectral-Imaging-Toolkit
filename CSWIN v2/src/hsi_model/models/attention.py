@@ -219,9 +219,9 @@ class CSWinAttentionBlock(nn.Module):
         )
         if self._attention_mode == "cross_shaped":
             self._attention_mode = "cswin"
-        if self._attention_mode not in ("axial", "local_global", "cswin"):
+        if self._attention_mode not in ("axial", "local", "local_global", "cswin"):
             raise ValueError(
-                "cswin_attention_mode must be 'axial', 'local_global', or 'cswin', "
+                "cswin_attention_mode must be 'axial', 'local', 'local_global', or 'cswin', "
                 f"got {self._attention_mode!r}"
             )
         self._global_token_threshold = (
@@ -927,6 +927,19 @@ class CSWinAttentionBlock(nn.Module):
         
         return out_v
         
+    def attention_operator(self, height: int, width: int) -> str:
+        """Report the operator selected for a feature grid, without a forward.
+
+        ``local`` fixes the operator across training and full-image evaluation;
+        ``local_global`` preserves the historical resolution-dependent switch.
+        """
+        if self._attention_mode == "local_global":
+            return (
+                "global" if self._global_token_threshold > 0
+                and height * width <= self._global_token_threshold else "local"
+            )
+        return self._attention_mode
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Perform cross-shaped window attention.
@@ -982,12 +995,8 @@ class CSWinAttentionBlock(nn.Module):
                 return checkpoint(self._compute_cross_shaped_attention, x)
             return self._compute_cross_shaped_attention(x)
         
-        use_global = (
-            self._attention_mode == "local_global"
-            and self._global_token_threshold > 0
-            and padded_H * padded_W <= self._global_token_threshold
-        )
-        if self._attention_mode == "local_global":
+        use_global = self.attention_operator(padded_H, padded_W) == "global"
+        if self._attention_mode in ("local", "local_global"):
             horizontal_fn = (
                 self._compute_global_attention_h
                 if use_global

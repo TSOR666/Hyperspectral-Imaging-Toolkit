@@ -1,0 +1,29 @@
+{
+  "model_size": "base",
+  "max_optimizer_steps": 300000,
+  "updates_per_epoch": 1000,
+  "val_interval_steps": 1000,
+  "checkpoint_interval_steps": 5000,
+  "memory_mode": "lazy",
+  "cache_size": 32,
+  "rgb_normalization": "scene_minmax",
+  "patch_grid": "floor",
+  "strict_files": true,
+  "loss_mode": "exact",
+  "mrae_eps": 0.0,
+  "amp": "off",
+  "gradient_clip": 0.0,
+  "ema_decay": 0.0,
+  "warmup_steps": 0,
+  "auxiliary_loss": false,
+  "health_interval_steps": 1000,
+  "output_dir": "./experiments/assessment",
+  "model": "sharp",
+  "model_kwargs": {
+    "drop_path_rate": 0.0,
+    "aligned_skip": true
+  },
+  "experiment_name": "sharp_aligned_skip",
+  "augmentation_policy": "mst",
+  "strict_selection_crop": true
+}

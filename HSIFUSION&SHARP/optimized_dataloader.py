@@ -68,6 +68,41 @@ def _resolve_rgb_path(rgb_dir: str, name: str) -> Optional[str]:
     return None
 
 
+def normalize_rgb(rgb: np.ndarray, policy: str = "divide_255") -> np.ndarray:
+    rgb = rgb.astype(np.float32)
+    if policy == "divide_255":
+        return rgb / 255.0
+    if policy == "scene_minmax":
+        low, high = float(rgb.min()), float(rgb.max())
+        return (rgb - low) / (high - low) if high > low else np.zeros_like(rgb)
+    raise ValueError("rgb_normalization must be divide_255/scene_minmax")
+
+
+def _paired_paths(root, split, strict_files=True, exclude_samples=()):
+    with open(os.path.join(root, 'split_txt', split + '_list.txt'), encoding='utf-8') as handle:
+        names = [line.strip() for line in handle if line.strip()]
+    if len(names) != len(set(names)):
+        raise ValueError(f"Duplicate scene IDs in {split}_list.txt")
+    excluded = set(exclude_samples)
+    rgb_files, hsi_files = [], []
+    for name in names:
+        if name in excluded:
+            continue
+        rgb = _resolve_rgb_path(os.path.join(root, 'Train_RGB'), name)
+        hsi = os.path.join(root, 'Train_Spec', name + '.mat')
+        if rgb is None or not os.path.isfile(hsi):
+            message = f"Missing RGB/HSI pair for {name} in {split} split"
+            if strict_files:
+                raise FileNotFoundError(message)
+            logger.warning(message)
+            continue
+        rgb_files.append(rgb)
+        hsi_files.append(hsi)
+    if not rgb_files:
+        raise FileNotFoundError(f"No matched {split} RGB/HSI pairs under {root}")
+    return rgb_files, hsi_files
+
+
 _HSI_RANGE_WARNED = False
 
 
@@ -115,13 +150,25 @@ class OptimizedTrainDataset(Dataset):
                  stride: int = 8,
                  memory_mode: str = 'float16',
                  augment: bool = True,
-                 cache_size: int = 4):
+                 cache_size: int = 4, rgb_normalization: str = 'divide_255',
+                 patch_grid: str = 'ceil', strict_files: bool = True,
+                 exclude_samples=(), augmentation_policy: str = 'legacy'):
         
         self.data_root = data_root
         self.crop_size = crop_size
         self.stride = stride
         self.memory_mode = memory_mode
         self.augment = augment
+        self.rgb_normalization = rgb_normalization
+        self.patch_grid = patch_grid
+        self.strict_files = strict_files
+        self.exclude_samples = tuple(exclude_samples)
+        self.augmentation_policy = augmentation_policy
+        if augmentation_policy not in {'legacy', 'mst'}:
+            raise ValueError("augmentation_policy must be legacy/mst")
+        normalize_rgb(np.zeros((1, 1, 3)), rgb_normalization)
+        if crop_size <= 0 or stride <= 0 or patch_grid not in {'floor', 'ceil'}:
+            raise ValueError("Positive crop/stride and floor/ceil patch_grid are required")
         if memory_mode not in {"standard", "float16", "lazy"}:
             raise ValueError(
                 f"memory_mode must be one of standard/float16/lazy, got {memory_mode!r}"
@@ -147,28 +194,9 @@ class OptimizedTrainDataset(Dataset):
     
     def _load_file_lists(self) -> None:
         """Load train file lists"""
-        train_list_path = os.path.join(self.data_root, 'split_txt', 'train_list.txt')
-        
-        with open(train_list_path, 'r') as f:
-            file_names = [line.strip() for line in f]
-        
-        rgb_dir = os.path.join(self.data_root, 'Train_RGB')
-        hsi_dir = os.path.join(self.data_root, 'Train_Spec')
-
-        for name in file_names:
-            rgb_path = _resolve_rgb_path(rgb_dir, name)
-            hsi_path = os.path.join(hsi_dir, f"{name}.mat")
-            
-            if rgb_path is not None and os.path.exists(hsi_path):
-                self.rgb_files.append(rgb_path)
-                self.hsi_files.append(hsi_path)
-
-        if not self.rgb_files:
-            raise FileNotFoundError(
-                f"No matched training RGB/HSI pairs found under {self.data_root}. "
-                f"Expected RGB extensions {RGB_EXTENSIONS} and HSI '.mat' files."
-            )
-        logger.info(f"Found {len(self.rgb_files)} training images")
+        self.rgb_files, self.hsi_files = _paired_paths(
+            self.data_root, 'train', self.strict_files, self.exclude_samples)
+        logger.info("Found %d training images", len(self.rgb_files))
 
     def _infer_image_shape(self, idx: int) -> Tuple[int, int]:
         """Return (height, width) for the idx-th sample without assuming ARAD defaults."""
@@ -195,8 +223,11 @@ class OptimizedTrainDataset(Dataset):
         for i in range(len(self.rgb_files)):
             h, w = self._infer_image_shape(i)
             # Fix: ensure we don't go beyond image boundaries
-            n_patches_h = max(1, math.ceil((h - self.crop_size) / self.stride) + 1)
-            n_patches_w = max(1, math.ceil((w - self.crop_size) / self.stride) + 1)
+            rounding = math.floor if self.patch_grid == 'floor' else math.ceil
+            if self.patch_grid == 'floor' and min(h, w) < self.crop_size:
+                raise ValueError("Reference patch grid requires scenes at least as large as crop_size")
+            n_patches_h = max(1, rounding((h - self.crop_size) / self.stride) + 1)
+            n_patches_w = max(1, rounding((w - self.crop_size) / self.stride) + 1)
             n_patches = n_patches_h * n_patches_w
             
             self.image_shapes.append((h, w))
@@ -239,7 +270,7 @@ class OptimizedTrainDataset(Dataset):
         if rgb is None:
             raise RuntimeError(f"Failed to load RGB image: {self.rgb_files[idx]}")
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        rgb = rgb.astype(np.float32) / 255.0
+        rgb = normalize_rgb(rgb, self.rgb_normalization)
         
         # Load HSI
         with h5py.File(self.hsi_files[idx], 'r') as f:
@@ -262,7 +293,7 @@ class OptimizedTrainDataset(Dataset):
             )
 
         # Apply memory mode
-        if self.memory_mode in {'float16', 'lazy'}:
+        if self.memory_mode == 'float16':
             rgb = rgb.astype(np.float16)
             hsi = hsi.astype(np.float16)
         
@@ -291,7 +322,8 @@ class OptimizedTrainDataset(Dataset):
         
         # Get patch coordinates
         h, w = self.image_shapes[img_idx]
-        patches_per_row = max(1, math.ceil((w - self.crop_size) / self.stride) + 1)
+        rounding = math.floor if self.patch_grid == 'floor' else math.ceil
+        patches_per_row = max(1, rounding((w - self.crop_size) / self.stride) + 1)
         
         patch_row = patch_idx // patches_per_row
         patch_col = patch_idx % patches_per_row
@@ -307,6 +339,15 @@ class OptimizedTrainDataset(Dataset):
     
     def _augment(self, rgb_patch: np.ndarray, hsi_patch: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Apply data augmentation"""
+        if self.augmentation_policy == 'mst':
+            k, vertical, horizontal = random.randint(0, 3), random.randint(0, 1), random.randint(0, 1)
+            rgb_patch = np.rot90(rgb_patch, k, axes=(0, 1))
+            hsi_patch = np.rot90(hsi_patch, k, axes=(1, 2))
+            if vertical:
+                rgb_patch, hsi_patch = np.flip(rgb_patch, 0), np.flip(hsi_patch, 1)
+            if horizontal:
+                rgb_patch, hsi_patch = np.flip(rgb_patch, 1), np.flip(hsi_patch, 2)
+            return np.ascontiguousarray(rgb_patch), np.ascontiguousarray(hsi_patch)
         # Random horizontal flip
         if random.random() < 0.5:
             rgb_patch = np.fliplr(rgb_patch).copy()
@@ -420,9 +461,15 @@ class OptimizedTrainDataset(Dataset):
 class OptimizedValDataset(Dataset):
     """Optimized validation dataset"""
     
-    def __init__(self, data_root: str, memory_mode: str = 'float16'):
+    def __init__(self, data_root: str, memory_mode: str = 'standard',
+                 rgb_normalization: str = 'divide_255', strict_files: bool = True,
+                 exclude_samples=()):
         self.data_root = data_root
         self.memory_mode = memory_mode
+        self.rgb_normalization = rgb_normalization
+        self.strict_files = strict_files
+        self.exclude_samples = tuple(exclude_samples)
+        normalize_rgb(np.zeros((1, 1, 3)), rgb_normalization)
         
         # Load file lists
         self.rgb_files = []
@@ -434,29 +481,10 @@ class OptimizedValDataset(Dataset):
     
     def _load_file_lists(self) -> None:
         """Load validation file lists"""
-        val_list_path = os.path.join(self.data_root, 'split_txt', 'valid_list.txt')
-        
-        with open(val_list_path, 'r') as f:
-            file_names = [line.strip() for line in f]
-        
-        rgb_dir = os.path.join(self.data_root, 'Train_RGB')
-        hsi_dir = os.path.join(self.data_root, 'Train_Spec')
+        self.rgb_files, self.hsi_files = _paired_paths(
+            self.data_root, 'valid', self.strict_files, self.exclude_samples)
+        logger.info("Found %d validation images", len(self.rgb_files))
 
-        for name in file_names:
-            rgb_path = _resolve_rgb_path(rgb_dir, name)
-            hsi_path = os.path.join(hsi_dir, f"{name}.mat")
-            
-            if rgb_path is not None and os.path.exists(hsi_path):
-                self.rgb_files.append(rgb_path)
-                self.hsi_files.append(hsi_path)
-
-        if not self.rgb_files:
-            raise FileNotFoundError(
-                f"No matched validation RGB/HSI pairs found under {self.data_root}. "
-                f"Expected RGB extensions {RGB_EXTENSIONS} and HSI '.mat' files."
-            )
-        logger.info(f"Found {len(self.rgb_files)} validation images")
-    
     def _preload_data(self):
         """Preload all validation data"""
         self.rgb_data = []
@@ -465,8 +493,10 @@ class OptimizedValDataset(Dataset):
         for i in range(len(self.rgb_files)):
             # Load RGB
             rgb = cv2.imread(self.rgb_files[i])
+            if rgb is None:
+                raise RuntimeError(f"Failed to read RGB image {self.rgb_files[i]}")
             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            rgb = rgb.astype(np.float32) / 255.0
+            rgb = normalize_rgb(rgb, self.rgb_normalization)
             
             # Load HSI
             with h5py.File(self.hsi_files[i], 'r') as f:
@@ -475,10 +505,9 @@ class OptimizedValDataset(Dataset):
             _validate_hsi_is_finite(hsi, self.hsi_files[i])
             _warn_if_hsi_out_of_range(hsi, self.hsi_files[i])
 
-            # Apply memory mode
-            if self.memory_mode == 'float16':
-                rgb = rgb.astype(np.float16)
-                hsi = hsi.astype(np.float16)
+            if rgb.shape[:2] != hsi.shape[1:]:
+                raise ValueError(f"RGB/HSI spatial mismatch in {self.hsi_files[i]}")
+            # Validation remains FP32 even if the training cache is FP16.
             
             self.rgb_data.append(rgb)
             self.hsi_data.append(hsi)
@@ -507,14 +536,17 @@ class MSTPlusPlusLoss(torch.nn.Module):
     
     def __init__(self, eps: float = 1e-6):
         super().__init__()
-        if not math.isfinite(eps) or eps <= 0:
-            raise ValueError("MRAE epsilon must be a finite positive number")
+        if not math.isfinite(eps) or eps < 0:
+            raise ValueError("MRAE epsilon must be finite and nonnegative")
         self.eps = float(eps)
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute MRAE in FP32 so AMP cannot overflow the relative-error reduction."""
         pred_fp32 = pred.float()
         target_fp32 = target.float()
+        if self.eps == 0:
+            if not torch.isfinite(target_fp32).all() or (target_fp32 <= 0).any():
+                raise ValueError("Exact MRAE requires finite, strictly positive targets")
         denom = torch.clamp_min(torch.abs(target_fp32), self.eps)
         return torch.mean(torch.abs(pred_fp32 - target_fp32) / denom)
 
@@ -545,11 +577,19 @@ def create_optimized_dataloaders(config: Dict, memory_mode: Optional[str] = None
         memory_mode=memory_mode,
         augment=augment,
         cache_size=cache_size,
+        rgb_normalization=getattr(config, 'rgb_normalization', 'divide_255'),
+        patch_grid=getattr(config, 'patch_grid', 'ceil'),
+        strict_files=getattr(config, 'strict_files', True),
+        exclude_samples=getattr(config, 'exclude_samples', ()),
+        augmentation_policy=getattr(config, 'augmentation_policy', 'legacy'),
     )
     
     val_dataset = OptimizedValDataset(
         data_root=data_root,
-        memory_mode=memory_mode
+        memory_mode='standard',
+        rgb_normalization=getattr(config, 'rgb_normalization', 'divide_255'),
+        strict_files=getattr(config, 'strict_files', True),
+        exclude_samples=getattr(config, 'exclude_samples', ()),
     )
     
     worker_init_fn = partial(

@@ -1,0 +1,1303 @@
+{
+  "purpose": "Synthetic mechanism check, not an ARAD accuracy benchmark",
+  "seed": 42,
+  "patches": 4,
+  "patch_size": 64,
+  "steps": 50,
+  "optimizer": "Adam FP32, lr=4e-4, no clipping/EMA/weight decay",
+  "models": {
+    "hsifusion": {
+      "resolved_config": {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_channels": 8,
+        "depths": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "num_heads": 1,
+        "window_size": 8,
+        "mlp_ratio": 2.0,
+        "use_sliding_window": true,
+        "use_sparse_attention": false,
+        "use_moe": false,
+        "num_experts": 2,
+        "use_rope": true,
+        "use_cross_attention": true,
+        "cross_attention_max_tokens": 16,
+        "enable_spectral": true,
+        "spectral_basis_rank": null,
+        "standard_attn_rope": true,
+        "spectral_min_bands_per_group": 4,
+        "dropout": 0.0,
+        "drop_path": 0.0,
+        "estimate_uncertainty": false,
+        "auxiliary_loss_weight": 0.01,
+        "spectral_failure_weight": 0.1,
+        "gradient_clip_val": 1.0,
+        "compile_model": true,
+        "compile_backend": "inductor",
+        "use_checkpoint": false,
+        "use_channels_last": true,
+        "min_input_size": 64,
+        "qkv_layout": "group_major",
+        "strict_spectral_failures": true,
+        "conv_norm": false,
+        "rgb_skip": true,
+        "fullres_spectral": true,
+        "spectral_gate_init": 0.01,
+        "layer_scale_init": 0.01
+      },
+      "history": [
+        {
+          "step": 0,
+          "mrae": 0.9617576599121094,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 0.9617576599121094,
+            "clamped_mrae": 0.733228862285614,
+            "out_of_range_fraction": 0.47913187742233276,
+            "per_band_mrae": [
+              0.2749532461166382,
+              1.2797677516937256,
+              1.145365595817566,
+              1.2887579202651978,
+              1.4673110246658325,
+              1.4684269428253174,
+              0.8438222408294678,
+              0.39996713399887085,
+              0.8226876854896545,
+              1.6393301486968994,
+              0.4302518963813782,
+              1.8331201076507568,
+              1.4169905185699463,
+              0.31485939025878906,
+              0.30413585901260376,
+              0.7667361497879028,
+              1.0175296068191528,
+              0.6142936944961548,
+              1.4654288291931152,
+              0.5682876110076904,
+              1.4451836347579956,
+              1.8582346439361572,
+              1.336912989616394,
+              0.40842679142951965,
+              0.9993683695793152,
+              0.17952772974967957,
+              0.3906670808792114,
+              1.0498286485671997,
+              0.4046851396560669,
+              1.3301233053207397,
+              1.0495063066482544
+            ],
+            "per_scene_mrae": [
+              0.9615719318389893,
+              0.9632103443145752,
+              0.9612061381340027,
+              0.9610423445701599
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 0.9617576599121094,
+                "contribution": 0.9617576625537416
+              }
+            ]
+          },
+          "pre_clip_gradient_norm": 0.9756875038146973,
+          "health": {
+            "groups": {
+              "model": {
+                "update_ratio": 0.0018676097569651545,
+                "gradient_norm": 0.9756875191758668
+              },
+              "stem": {
+                "update_ratio": 0.002068397009210095,
+                "gradient_norm": 0.3562761999705151
+              },
+              "encoder_stages.0": {
+                "update_ratio": 0.0012196889125838173,
+                "gradient_norm": 0.22515462018498184
+              },
+              "encoder_stages.0.0": {
+                "update_ratio": 0.0012196889125838173,
+                "gradient_norm": 0.22515462018498184
+              },
+              "encoder_stages.1": {
+                "update_ratio": 0.0012785425458749298,
+                "gradient_norm": 0.0028794847925273457
+              },
+              "encoder_stages.1.0": {
+                "update_ratio": 0.0012785425458749298,
+                "gradient_norm": 0.0028794847925273457
+              },
+              "encoder_stages.2": {
+                "update_ratio": 0.00092604515241461,
+                "gradient_norm": 0.00012489639598444051
+              },
+              "encoder_stages.2.0": {
+                "update_ratio": 0.00092604515241461,
+                "gradient_norm": 0.00012489639598444051
+              },
+              "encoder_stages.3": {
+                "update_ratio": 0.00048617982993937,
+                "gradient_norm": 1.7100155676857885e-05
+              },
+              "encoder_stages.3.0": {
+                "update_ratio": 0.00048617982993937,
+                "gradient_norm": 1.7100155676857885e-05
+              },
+              "decoder_stages.0": {
+                "update_ratio": 0.004638512199866512,
+                "gradient_norm": 0.0006414647633822846
+              },
+              "decoder_stages.1": {
+                "update_ratio": 0.0033749008721527195,
+                "gradient_norm": 0.010108313720541098
+              },
+              "decoder_stages.2": {
+                "update_ratio": 0.0023971334483612098,
+                "gradient_norm": 0.24895137230300368
+              },
+              "output_head": {
+                "update_ratio": 0.00172634811575175,
+                "gradient_norm": 0.5520574026420935
+              },
+              "input_skip": {
+                "update_ratio": 0.002064546582602968,
+                "gradient_norm": 0.6272088833420046
+              },
+              "spectral_output": {
+                "update_ratio": 0.0013559500468497594,
+                "gradient_norm": 0.03159881327299081
+              }
+            },
+            "activations": {
+              "stem": {
+                "output_rms": 0.1734764128923416,
+                "input_rms": 0.5781216025352478
+              },
+              "encoder_stages.0.0": {
+                "output_rms": 0.18343164026737213,
+                "input_rms": 0.1734764128923416,
+                "residual_ratio": 0.05766957958805614
+              },
+              "encoder_stages.1.0": {
+                "output_rms": 0.17052008211612701,
+                "input_rms": 0.1611003577709198,
+                "residual_ratio": 0.062075558338687394
+              },
+              "encoder_stages.2.0": {
+                "output_rms": 0.15884709358215332,
+                "input_rms": 0.1491822451353073,
+                "residual_ratio": 0.06699968491035951
+              },
+              "encoder_stages.3.0": {
+                "output_rms": 0.16163593530654907,
+                "input_rms": 0.15202076733112335,
+                "residual_ratio": 0.06571818049090754
+              },
+              "decoder_stages.0": {
+                "output_rms": 0.08196800202131271,
+                "input_rms": 0.11595162004232407
+              },
+              "decoder_stages.1": {
+                "output_rms": 0.08063724637031555,
+                "input_rms": 0.1235717311501503
+              },
+              "decoder_stages.2": {
+                "output_rms": 0.12754292786121368,
+                "input_rms": 0.1334110051393509
+              },
+              "spectral_output": {
+                "output_rms": 0.12724585831165314,
+                "input_rms": 0.12754292786121368,
+                "residual_ratio": 0.012163279925589807
+              },
+              "output_head": {
+                "output_rms": 0.10436676442623138,
+                "input_rms": 0.12724585831165314
+              },
+              "input_skip": {
+                "output_rms": 0.2352755069732666,
+                "input_rms": 0.5781216025352478
+              },
+              "model": {
+                "output_rms": 0.23509278893470764,
+                "input_rms": 0.5781216025352478
+              }
+            },
+            "gates": {
+              "encoder_stages.0.0.ls1": {
+                "mean": 0.010000091977417469,
+                "max_abs": 0.01039999071508646
+              },
+              "encoder_stages.0.0.ls2": {
+                "mean": 0.009999998845160007,
+                "max_abs": 0.010400000028312206
+              },
+              "encoder_stages.0.0.ls3": {
+                "mean": 0.009900001809000969,
+                "max_abs": 0.0103999562561512
+              },
+              "encoder_stages.1.0.ls1": {
+                "mean": 0.009938712231814861,
+                "max_abs": 0.010399848222732544
+              },
+              "encoder_stages.1.0.ls2": {
+                "mean": 0.009950004518032074,
+                "max_abs": 0.010399997234344482
+              },
+              "encoder_stages.1.0.ls3": {
+                "mean": 0.009990764781832695,
+                "max_abs": 0.010398712940514088
+              },
+              "encoder_stages.2.0.ls1": {
+                "mean": 0.01010596938431263,
+                "max_abs": 0.010396289639174938
+              },
+              "encoder_stages.2.0.ls2": {
+                "mean": 0.009875215590000153,
+                "max_abs": 0.010399922728538513
+              },
+              "encoder_stages.2.0.ls3": {
+                "mean": 0.01003663707524538,
+                "max_abs": 0.010393551550805569
+              },
+              "encoder_stages.3.0.ls1": {
+                "mean": 0.009977852925658226,
+                "max_abs": 0.01038900576531887
+              },
+              "encoder_stages.3.0.ls2": {
+                "mean": 0.009958474896848202,
+                "max_abs": 0.01039891317486763
+              },
+              "encoder_stages.3.0.ls3": {
+                "mean": 0.010002304799854755,
+                "max_abs": 0.01038142666220665
+              },
+              "spectral_output.gamma": {
+                "mean": 0.00989999808371067,
+                "max_abs": 0.010400000028312206
+              },
+              "spectral_output.gamma2": {
+                "mean": 0.00989999994635582,
+                "max_abs": 0.010399999096989632
+              }
+            }
+          }
+        },
+        {
+          "step": 25,
+          "mrae": 0.8243363499641418,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 0.8243363499641418,
+            "clamped_mrae": 0.649529218673706,
+            "out_of_range_fraction": 0.36158013343811035,
+            "per_band_mrae": [
+              0.1690843403339386,
+              0.9607324004173279,
+              0.8818674683570862,
+              1.1024354696273804,
+              1.4295297861099243,
+              1.6593093872070312,
+              0.37001997232437134,
+              0.33834657073020935,
+              0.6232346296310425,
+              1.6657710075378418,
+              0.3379058241844177,
+              1.4380903244018555,
+              1.4229986667633057,
+              0.2930592894554138,
+              0.3451327085494995,
+              0.4631071090698242,
+              0.4978843331336975,
+              0.5751506090164185,
+              1.3233963251113892,
+              0.4037203788757324,
+              0.9423947930335999,
+              1.638022780418396,
+              1.6789449453353882,
+              0.6471655964851379,
+              0.9227067232131958,
+              0.15322358906269073,
+              0.27255111932754517,
+              0.8203704953193665,
+              0.2858486473560333,
+              1.2577286958694458,
+              0.6346921324729919
+            ],
+            "per_scene_mrae": [
+              0.8239179253578186,
+              0.8250510692596436,
+              0.8237130641937256,
+              0.8246631622314453
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 0.8243364095687866,
+                "contribution": 0.824336320851659
+              }
+            ]
+          },
+          "pre_clip_gradient_norm": 0.7604174613952637,
+          "health": {
+            "groups": {
+              "model": {
+                "update_ratio": 0.001126425604876692,
+                "gradient_norm": 0.760417443038008
+              },
+              "stem": {
+                "update_ratio": 0.0010692174017372462,
+                "gradient_norm": 0.06547087480157891
+              },
+              "encoder_stages.0": {
+                "update_ratio": 0.0006022274481401633,
+                "gradient_norm": 0.04054465849726091
+              },
+              "encoder_stages.0.0": {
+                "update_ratio": 0.0006022274481401633,
+                "gradient_norm": 0.04054465849726091
+              },
+              "encoder_stages.1": {
+                "update_ratio": 0.0005297776537783519,
+                "gradient_norm": 0.0003774720993133973
+              },
+              "encoder_stages.1.0": {
+                "update_ratio": 0.0005297776537783519,
+                "gradient_norm": 0.0003774720993133973
+              },
+              "encoder_stages.2": {
+                "update_ratio": 0.0003062335130997278,
+                "gradient_norm": 9.310752463679664e-05
+              },
+              "encoder_stages.2.0": {
+                "update_ratio": 0.0003062335130997278,
+                "gradient_norm": 9.310752463679664e-05
+              },
+              "encoder_stages.3": {
+                "update_ratio": 0.0002669393406326528,
+                "gradient_norm": 1.861052423120574e-05
+              },
+              "encoder_stages.3.0": {
+                "update_ratio": 0.0002669393406326528,
+                "gradient_norm": 1.861052423120574e-05
+              },
+              "decoder_stages.0": {
+                "update_ratio": 0.0026757919713889067,
+                "gradient_norm": 0.0001807826954290951
+              },
+              "decoder_stages.1": {
+                "update_ratio": 0.001521566657749573,
+                "gradient_norm": 0.0013714521272074059
+              },
+              "decoder_stages.2": {
+                "update_ratio": 0.0011531812974856284,
+                "gradient_norm": 0.03502542989987539
+              },
+              "output_head": {
+                "update_ratio": 0.0012900800084958445,
+                "gradient_norm": 0.5072031174890325
+              },
+              "input_skip": {
+                "update_ratio": 0.0019224174988079774,
+                "gradient_norm": 0.5598569205904419
+              },
+              "spectral_output": {
+                "update_ratio": 0.0008254668905834982,
+                "gradient_norm": 0.010308760749075814
+              }
+            },
+            "activations": {
+              "stem": {
+                "output_rms": 0.17901016771793365,
+                "input_rms": 0.5781216025352478
+              },
+              "encoder_stages.0.0": {
+                "output_rms": 0.1880597174167633,
+                "input_rms": 0.17901016771793365,
+                "residual_ratio": 0.05373615404864394
+              },
+              "encoder_stages.1.0": {
+                "output_rms": 0.18996742367744446,
+                "input_rms": 0.18014800548553467,
+                "residual_ratio": 0.06505036321481157
+              },
+              "encoder_stages.2.0": {
+                "output_rms": 0.19801561534404755,
+                "input_rms": 0.18591775000095367,
+                "residual_ratio": 0.0729965963030135
+              },
+              "encoder_stages.3.0": {
+                "output_rms": 0.2798507511615753,
+                "input_rms": 0.26507747173309326,
+                "residual_ratio": 0.06014596733877854
+              },
+              "decoder_stages.0": {
+                "output_rms": 0.2714684307575226,
+                "input_rms": 0.15422983467578888
+              },
+              "decoder_stages.1": {
+                "output_rms": 0.1658315509557724,
+                "input_rms": 0.145874485373497
+              },
+              "decoder_stages.2": {
+                "output_rms": 0.16825342178344727,
+                "input_rms": 0.13757406175136566
+              },
+              "spectral_output": {
+                "output_rms": 0.1693238466978073,
+                "input_rms": 0.16825342178344727,
+                "residual_ratio": 0.02754091791129661
+              },
+              "output_head": {
+                "output_rms": 0.17764565348625183,
+                "input_rms": 0.1693238466978073
+              },
+              "input_skip": {
+                "output_rms": 0.2298329621553421,
+                "input_rms": 0.5781216025352478
+              },
+              "model": {
+                "output_rms": 0.2675347924232483,
+                "input_rms": 0.5781216025352478
+              }
+            },
+            "gates": {
+              "encoder_stages.0.0.ls1": {
+                "mean": 0.01302009541541338,
+                "max_abs": 0.018901264294981956
+              },
+              "encoder_stages.0.0.ls2": {
+                "mean": 0.00657481187954545,
+                "max_abs": 0.011148297227919102
+              },
+              "encoder_stages.0.0.ls3": {
+                "mean": 0.010438225232064724,
+                "max_abs": 0.01619323156774044
+              },
+              "encoder_stages.1.0.ls1": {
+                "mean": 0.01020874548703432,
+                "max_abs": 0.01753118820488453
+              },
+              "encoder_stages.1.0.ls2": {
+                "mean": 0.009298170916736126,
+                "max_abs": 0.01660500094294548
+              },
+              "encoder_stages.1.0.ls3": {
+                "mean": 0.012102745473384857,
+                "max_abs": 0.020621512085199356
+              },
+              "encoder_stages.2.0.ls1": {
+                "mean": 0.01014651358127594,
+                "max_abs": 0.01857205480337143
+              },
+              "encoder_stages.2.0.ls2": {
+                "mean": 0.010440362617373466,
+                "max_abs": 0.020364388823509216
+              },
+              "encoder_stages.2.0.ls3": {
+                "mean": 0.0104178162291646,
+                "max_abs": 0.018593935295939445
+              },
+              "encoder_stages.3.0.ls1": {
+                "mean": 0.010268181562423706,
+                "max_abs": 0.01727103441953659
+              },
+              "encoder_stages.3.0.ls2": {
+                "mean": 0.012423597276210785,
+                "max_abs": 0.020909789949655533
+              },
+              "encoder_stages.3.0.ls3": {
+                "mean": 0.010798651725053787,
+                "max_abs": 0.017641689628362656
+              },
+              "spectral_output.gamma": {
+                "mean": 0.009750391356647015,
+                "max_abs": 0.02041538432240486
+              },
+              "spectral_output.gamma2": {
+                "mean": 0.010684537701308727,
+                "max_abs": 0.019064942374825478
+              }
+            }
+          }
+        },
+        {
+          "step": 50,
+          "mrae": 0.7230918407440186,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 0.7230918407440186,
+            "clamped_mrae": 0.6012145280838013,
+            "out_of_range_fraction": 0.2977412939071655,
+            "per_band_mrae": [
+              0.16363292932510376,
+              0.7913670539855957,
+              0.6744626760482788,
+              0.9864306449890137,
+              1.4094057083129883,
+              1.3970932960510254,
+              0.33660227060317993,
+              0.31654393672943115,
+              0.5766702890396118,
+              1.3922374248504639,
+              0.28260666131973267,
+              1.3123557567596436,
+              1.28878653049469,
+              0.27735117077827454,
+              0.27495402097702026,
+              0.39218348264694214,
+              0.41393905878067017,
+              0.48985809087753296,
+              1.1394989490509033,
+              0.34294649958610535,
+              0.7539647817611694,
+              1.4364193677902222,
+              1.504513144493103,
+              0.6619707942008972,
+              0.9159440398216248,
+              0.1285315752029419,
+              0.23053231835365295,
+              0.5444827079772949,
+              0.2552110552787781,
+              1.1774837970733643,
+              0.5478646755218506
+            ],
+            "per_scene_mrae": [
+              0.7229878306388855,
+              0.7230883836746216,
+              0.7225284576416016,
+              0.7237625122070312
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 0.723091721534729,
+                "contribution": 0.7230917712648839
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "sharp": {
+      "resolved_config": {
+        "in_channels": 3,
+        "out_channels": 31,
+        "base_dim": 8,
+        "depths": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "heads": [
+          1,
+          2,
+          4,
+          8
+        ],
+        "mlp_ratios": [
+          2.0,
+          2.0,
+          2.0,
+          2.0
+        ],
+        "drop_path_rate": 0.0,
+        "use_checkpoint": false,
+        "compile_mode": "reduce-overhead",
+        "sparse_block_size": 2048,
+        "sparse_max_tokens": 8192,
+        "sparse_window_size": 9,
+        "sparse_k_cap": 1024,
+        "sparse_q_block_size": 64,
+        "sparse_sparsity_ratio": 0.9,
+        "sparse_exact_topk_max_tokens": 1024,
+        "sparse_landmark_tokens": 4,
+        "max_global_tokens": 16,
+        "rbf_centers_per_head": 32,
+        "key_rbf_mode": "linear",
+        "sparsemax_pad_value": null,
+        "attn2_prenorm": true,
+        "spectral_head_rank": 0,
+        "output_activation": "none",
+        "ema_update_every": 1,
+        "qkv_layout": "group_major",
+        "sparse_attention_mode": "local_landmark",
+        "conv_norm": false,
+        "rgb_skip": true,
+        "aligned_skip": true,
+        "head_mode": "linear",
+        "fullres_spectral": true,
+        "spectral_gate_init": 0.01
+      },
+      "history": [
+        {
+          "step": 0,
+          "mrae": 1.472140908241272,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 1.472140908241272,
+            "clamped_mrae": 0.8802880644798279,
+            "out_of_range_fraction": 0.48550906777381897,
+            "per_band_mrae": [
+              1.0498719215393066,
+              1.5261638164520264,
+              0.9197698831558228,
+              2.2637510299682617,
+              0.9008859395980835,
+              1.1743448972702026,
+              1.048195719718933,
+              1.0116002559661865,
+              1.3618913888931274,
+              1.2424156665802002,
+              1.674371600151062,
+              1.4762752056121826,
+              0.7136654853820801,
+              0.6478027105331421,
+              0.8967681527137756,
+              0.7009179592132568,
+              2.433155059814453,
+              1.4596166610717773,
+              1.6371164321899414,
+              1.6804075241088867,
+              1.0458786487579346,
+              0.6448551416397095,
+              1.508960485458374,
+              2.590208053588867,
+              1.420687198638916,
+              2.6037821769714355,
+              1.8921961784362793,
+              2.3522677421569824,
+              1.0151562690734863,
+              2.8750219345092773,
+              1.8683661222457886
+            ],
+            "per_scene_mrae": [
+              1.4622018337249756,
+              1.482454538345337,
+              1.4757415056228638,
+              1.4681657552719116
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 1.472140908241272,
+                "contribution": 1.4721408910496305
+              }
+            ]
+          },
+          "pre_clip_gradient_norm": 8.672959327697754,
+          "health": {
+            "groups": {
+              "model": {
+                "update_ratio": 0.0018029246234671748,
+                "gradient_norm": 8.672960696723038
+              },
+              "stem": {
+                "update_ratio": 0.0019213993389805267,
+                "gradient_norm": 3.367094525427703
+              },
+              "stages.0.0": {
+                "update_ratio": 0.0006431816542407148,
+                "gradient_norm": 7.373706128034287
+              },
+              "stages.1.0": {
+                "update_ratio": 0.0009942021207696957,
+                "gradient_norm": 0.46248887085142726
+              },
+              "stages.2.0": {
+                "update_ratio": 0.0014511275282392455,
+                "gradient_norm": 0.081798683439593
+              },
+              "stages.3.0": {
+                "update_ratio": 0.0022055126864832294,
+                "gradient_norm": 0.011803427414175362
+              },
+              "fusion.0": {
+                "update_ratio": 0.0010307543192906877,
+                "gradient_norm": 0.052424314154778724
+              },
+              "fusion.1": {
+                "update_ratio": 0.0007558885366315086,
+                "gradient_norm": 0.35646621402565987
+              },
+              "fusion.2": {
+                "update_ratio": 0.0005528389364243286,
+                "gradient_norm": 1.1593124702071267
+              },
+              "head": {
+                "update_ratio": 0.00207724635826472,
+                "gradient_norm": 2.4953770511521123
+              },
+              "input_skip": {
+                "update_ratio": 0.001709264312878634,
+                "gradient_norm": 0.46533475316663586
+              },
+              "spectral_output": {
+                "update_ratio": 0.0014315421383256617,
+                "gradient_norm": 0.03939544841460371
+              }
+            },
+            "activations": {
+              "stem": {
+                "output_rms": 0.11626181751489639,
+                "input_rms": 0.5781216025352478
+              },
+              "stages.0.0.attn2": {
+                "height": 64,
+                "width": 64,
+                "attention_operator": "local_landmark"
+              },
+              "stages.0.0": {
+                "output_rms": 0.8167552351951599,
+                "input_rms": 0.11626181751489639,
+                "residual_ratio": 6.876274680724739
+              },
+              "stages.1.0.attn2": {
+                "height": 32,
+                "width": 32,
+                "attention_operator": "local_landmark"
+              },
+              "stages.1.0": {
+                "output_rms": 0.9105534553527832,
+                "input_rms": 0.8839007616043091,
+                "residual_ratio": 0.4593642194679225
+              },
+              "stages.2.0.attn2": {
+                "height": 16,
+                "width": 16,
+                "attention_operator": "local_landmark"
+              },
+              "stages.2.0": {
+                "output_rms": 0.9144722819328308,
+                "input_rms": 0.8472145199775696,
+                "residual_ratio": 0.4779000500982793
+              },
+              "stages.3.0.attn2": {
+                "height": 8,
+                "width": 8,
+                "attention_operator": "local_landmark"
+              },
+              "stages.3.0": {
+                "output_rms": 1.0264933109283447,
+                "input_rms": 0.9125002026557922,
+                "residual_ratio": 0.5822455406421109
+              },
+              "fusion.0": {
+                "output_rms": 1.2617638111114502,
+                "input_rms": 0.2453092634677887,
+                "residual_ratio": 5.0691731582975565
+              },
+              "fusion.1": {
+                "output_rms": 1.4279438257217407,
+                "input_rms": 0.3273152709007263,
+                "residual_ratio": 4.2603350414943195
+              },
+              "fusion.2": {
+                "output_rms": 0.9712105989456177,
+                "input_rms": 0.4105154573917389,
+                "residual_ratio": 2.4175243253599126
+              },
+              "spectral_output": {
+                "output_rms": 0.9710877537727356,
+                "input_rms": 0.9712105989456177,
+                "residual_ratio": 0.0021093394237103004
+              },
+              "head": {
+                "output_rms": 0.49854767322540283,
+                "input_rms": 0.9710877537727356
+              },
+              "input_skip": {
+                "output_rms": 0.2632453441619873,
+                "input_rms": 0.5781216025352478
+              },
+              "model": {
+                "output_rms": 0.555357813835144,
+                "input_rms": 0.5781216025352478
+              }
+            },
+            "gates": {
+              "spectral_output.gamma": {
+                "mean": 0.010099997743964195,
+                "max_abs": 0.010399999096989632
+              },
+              "spectral_output.gamma2": {
+                "mean": 0.00999999139457941,
+                "max_abs": 0.010399999096989632
+              }
+            }
+          }
+        },
+        {
+          "step": 25,
+          "mrae": 0.8382100462913513,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 0.8382100462913513,
+            "clamped_mrae": 0.649427592754364,
+            "out_of_range_fraction": 0.3190484941005707,
+            "per_band_mrae": [
+              0.5649599432945251,
+              2.113319158554077,
+              0.42245906591415405,
+              1.6139025688171387,
+              0.36561453342437744,
+              0.4179382622241974,
+              0.4864192605018616,
+              0.703960657119751,
+              1.8416519165039062,
+              0.9908915758132935,
+              1.192063808441162,
+              1.124735713005066,
+              0.5675074458122253,
+              0.5138090252876282,
+              0.6755382418632507,
+              0.7989379167556763,
+              0.29429447650909424,
+              0.6110951900482178,
+              0.7199745178222656,
+              0.9009402990341187,
+              0.44059330224990845,
+              0.32350197434425354,
+              0.6848535537719727,
+              0.6883313655853271,
+              0.5595906972885132,
+              1.4031710624694824,
+              1.0873464345932007,
+              1.0232117176055908,
+              0.9515566229820251,
+              1.1510207653045654,
+              0.7513204216957092
+            ],
+            "per_scene_mrae": [
+              0.8384965062141418,
+              0.8396304845809937,
+              0.8376216888427734,
+              0.8370916247367859
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 0.8382100462913513,
+                "contribution": 0.8382100574580162
+              }
+            ]
+          },
+          "pre_clip_gradient_norm": 1.0916571617126465,
+          "health": {
+            "groups": {
+              "model": {
+                "update_ratio": 0.000764556507944899,
+                "gradient_norm": 1.0916570448750418
+              },
+              "stem": {
+                "update_ratio": 0.0009699011345360092,
+                "gradient_norm": 0.4110697586927572
+              },
+              "stages.0.0": {
+                "update_ratio": 0.00033745448585978594,
+                "gradient_norm": 0.6285875658288015
+              },
+              "stages.1.0": {
+                "update_ratio": 0.0004363222629939669,
+                "gradient_norm": 0.05492659204684487
+              },
+              "stages.2.0": {
+                "update_ratio": 0.0005819090158014274,
+                "gradient_norm": 0.016608032793115908
+              },
+              "stages.3.0": {
+                "update_ratio": 0.0009253572337449066,
+                "gradient_norm": 0.0017764047086293545
+              },
+              "fusion.0": {
+                "update_ratio": 0.0003112736023679228,
+                "gradient_norm": 0.004461039659011501
+              },
+              "fusion.1": {
+                "update_ratio": 0.0003205983108747946,
+                "gradient_norm": 0.03087368120848489
+              },
+              "fusion.2": {
+                "update_ratio": 0.0003367600584773693,
+                "gradient_norm": 0.17719170207748416
+              },
+              "head": {
+                "update_ratio": 0.0014400341124314892,
+                "gradient_norm": 0.5592460962135248
+              },
+              "input_skip": {
+                "update_ratio": 0.0017300375980401834,
+                "gradient_norm": 0.5144783984140747
+              },
+              "spectral_output": {
+                "update_ratio": 0.0007207792121424577,
+                "gradient_norm": 0.012521192155826914
+              }
+            },
+            "activations": {
+              "stem": {
+                "output_rms": 0.0989551916718483,
+                "input_rms": 0.5781216025352478
+              },
+              "stages.0.0.attn2": {
+                "height": 64,
+                "width": 64,
+                "attention_operator": "local_landmark"
+              },
+              "stages.0.0": {
+                "output_rms": 0.666167676448822,
+                "input_rms": 0.0989551916718483,
+                "residual_ratio": 6.813120856916043
+              },
+              "stages.1.0.attn2": {
+                "height": 32,
+                "width": 32,
+                "attention_operator": "local_landmark"
+              },
+              "stages.1.0": {
+                "output_rms": 0.8073114156723022,
+                "input_rms": 0.6610628962516785,
+                "residual_ratio": 0.48729586111652273
+              },
+              "stages.2.0.attn2": {
+                "height": 16,
+                "width": 16,
+                "attention_operator": "local_landmark"
+              },
+              "stages.2.0": {
+                "output_rms": 0.8390681147575378,
+                "input_rms": 0.6994037628173828,
+                "residual_ratio": 0.7047299874679375
+              },
+              "stages.3.0.attn2": {
+                "height": 8,
+                "width": 8,
+                "attention_operator": "local_landmark"
+              },
+              "stages.3.0": {
+                "output_rms": 1.1075047254562378,
+                "input_rms": 0.8645055890083313,
+                "residual_ratio": 0.7806493616888437
+              },
+              "fusion.0": {
+                "output_rms": 1.2553390264511108,
+                "input_rms": 0.27979832887649536,
+                "residual_ratio": 4.38194066467596
+              },
+              "fusion.1": {
+                "output_rms": 1.1043814420700073,
+                "input_rms": 0.29665547609329224,
+                "residual_ratio": 3.5617306064332137
+              },
+              "fusion.2": {
+                "output_rms": 0.8500073552131653,
+                "input_rms": 0.28420132398605347,
+                "residual_ratio": 2.764051645643361
+              },
+              "spectral_output": {
+                "output_rms": 0.8500268459320068,
+                "input_rms": 0.8500073552131653,
+                "residual_ratio": 0.002716600342022827
+              },
+              "head": {
+                "output_rms": 0.18271054327487946,
+                "input_rms": 0.8500268459320068
+              },
+              "input_skip": {
+                "output_rms": 0.26270678639411926,
+                "input_rms": 0.5781216025352478
+              },
+              "model": {
+                "output_rms": 0.2985396087169647,
+                "input_rms": 0.5781216025352478
+              }
+            },
+            "gates": {
+              "spectral_output.gamma": {
+                "mean": 0.012729569338262081,
+                "max_abs": 0.019122295081615448
+              },
+              "spectral_output.gamma2": {
+                "mean": 0.012031594291329384,
+                "max_abs": 0.019566860049962997
+              }
+            }
+          }
+        },
+        {
+          "step": 50,
+          "mrae": 0.6780940890312195,
+          "metrics": {
+            "epsilon": 0.0,
+            "raw_mrae": 0.6780940890312195,
+            "clamped_mrae": 0.5622711181640625,
+            "out_of_range_fraction": 0.22518034279346466,
+            "per_band_mrae": [
+              0.3557489514350891,
+              1.930228352546692,
+              0.2984713912010193,
+              1.405550479888916,
+              0.23436082899570465,
+              0.3020775318145752,
+              0.29612740874290466,
+              0.6764652729034424,
+              1.449479341506958,
+              0.7600948810577393,
+              0.7592669129371643,
+              0.7821029424667358,
+              0.4597104787826538,
+              0.3920093774795532,
+              0.48252853751182556,
+              0.47483283281326294,
+              0.23614129424095154,
+              0.5436521768569946,
+              0.6474453210830688,
+              0.8012768030166626,
+              0.418529212474823,
+              0.2821975350379944,
+              0.3933665454387665,
+              0.6847931146621704,
+              0.4421289563179016,
+              1.1471220254898071,
+              0.6923744082450867,
+              1.0954666137695312,
+              1.0262006521224976,
+              0.8003858923912048,
+              0.750778079032898
+            ],
+            "per_scene_mrae": [
+              0.6774662137031555,
+              0.6787768006324768,
+              0.676401674747467,
+              0.6797313690185547
+            ],
+            "intensity_buckets": [
+              {
+                "lower": 0.0,
+                "upper": 0.0001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.0001,
+                "upper": 0.001,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.001,
+                "upper": 0.01,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.01,
+                "upper": 0.1,
+                "count": 0,
+                "fraction": 0.0,
+                "mean_mrae": 0.0,
+                "contribution": 0.0
+              },
+              {
+                "lower": 0.1,
+                "upper": null,
+                "count": 507904,
+                "fraction": 1.0,
+                "mean_mrae": 0.6780940890312195,
+                "contribution": 0.6780940044601943
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

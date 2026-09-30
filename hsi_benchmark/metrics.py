@@ -16,6 +16,55 @@ def _as_bchw(value: np.ndarray | torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def relative_absolute_error(
+    prediction: torch.Tensor, target: torch.Tensor, *, epsilon: float = 0.0
+) -> torch.Tensor:
+    """FP32 relative errors; epsilon=0 is the positive-target reference policy.
+
+    Exact MRAE is undefined for zero targets. Reject them explicitly rather than
+    silently changing the objective, dropping pixels, or replacing infinities.
+    """
+    if not np.isfinite(epsilon) or epsilon < 0:
+        raise ValueError("MRAE epsilon must be finite and non-negative")
+    if prediction.shape != target.shape or target.numel() == 0:
+        raise ValueError("MRAE requires aligned, nonempty prediction and target tensors")
+    prediction, target = prediction.float(), target.float()
+    if not torch.isfinite(prediction).all() or not torch.isfinite(target).all():
+        raise FloatingPointError("MRAE requires finite predictions and targets")
+    if epsilon == 0 and (target <= 0).any():
+        raise ValueError("Exact MRAE requires strictly positive targets; choose an explicit floor for zeros")
+    return (prediction - target).abs() / target.abs().clamp_min(epsilon)
+
+
+def mrae_breakdown(
+    prediction: torch.Tensor, target: torch.Tensor, *, epsilon: float = 0.0
+) -> Dict[str, object]:
+    """Raw/clamped MRAE, per-scene/band errors, and additive intensity contributions."""
+    pred, truth = _as_bchw(prediction), _as_bchw(target)
+    error = relative_absolute_error(pred, truth, epsilon=epsilon)
+    buckets = []
+    limits = (0.0, 1e-4, 1e-3, 1e-2, 1e-1, float("inf"))
+    for low, high in zip(limits[:-1], limits[1:]):
+        mask = (truth.abs() >= low) & (truth.abs() < high)
+        count = int(mask.sum().item())
+        selected = error[mask]
+        buckets.append({
+            "lower": low, "upper": high if np.isfinite(high) else None,
+            "count": count, "fraction": count / error.numel(),
+            "mean_mrae": float(selected.mean().item()) if count else 0.0,
+            "contribution": float(selected.double().sum().item() / error.numel()),
+        })
+    return {
+        "epsilon": epsilon,
+        "raw_mrae": float(error.mean().item()),
+        "clamped_mrae": float(relative_absolute_error(pred.clamp(0, 1), truth, epsilon=epsilon).mean().item()),
+        "out_of_range_fraction": float(((pred < 0) | (pred > 1)).float().mean().item()),
+        "per_band_mrae": error.mean(dim=(0, 2, 3)).detach().cpu().tolist(),
+        "per_scene_mrae": error.mean(dim=(1, 2, 3)).detach().cpu().tolist(),
+        "intensity_buckets": buckets,
+    }
+
+
 def _ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> torch.Tensor:
     if min(pred.shape[-2:]) < window_size:
         window_size = max(3, min(pred.shape[-2:]) | 1)
@@ -77,8 +126,9 @@ def compute_hsi_metrics(
     mse = error.square().mean()
     rmse = mse.sqrt()
     psnr = torch.tensor(100.0) if mse <= 1e-12 else -10.0 * torch.log10(mse)
-    mrae = (abs_error / truth.abs().clamp_min(epsilon)).mean()
-    sam_map = _sam_map(pred, truth, epsilon)
+    relative_error = relative_absolute_error(pred, truth, epsilon=epsilon)
+    mrae = relative_error.mean()
+    sam_map = _sam_map(pred, truth, max(epsilon, 1e-12))
 
     metrics = {
         "mrae": float(mrae),
@@ -96,7 +146,7 @@ def compute_hsi_metrics(
         -10.0 * torch.log10(band_mse.clamp_min(1e-12)),
     )
     per_band = {
-        "mrae": (abs_error / truth.abs().clamp_min(epsilon))
+        "mrae": relative_error
         .mean(dim=(0, 2, 3))
         .numpy(),
         "rmse": band_mse.sqrt().numpy(),

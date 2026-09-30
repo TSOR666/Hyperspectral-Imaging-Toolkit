@@ -389,6 +389,9 @@ class WaveDiffAdapter(ModelAdapter):
 def _checkpoint_kind(checkpoint: Any) -> str:
     if not isinstance(checkpoint, Mapping):
         return ""
+    family = checkpoint.get('model')
+    if isinstance(family, str) and family in {'hsifusion', 'sharp'}:
+        return family
     config = _mapping(checkpoint.get("config"))
     if "model_type" in config and any(
         token in str(config["model_type"]).lower() for token in ("wavelet", "base")
@@ -466,6 +469,17 @@ def _build_hsifusion(
     module = _import_from_root(
         root / "HSIFUSION&SHARP", "hsifusion_v252_complete"
     )
+    resolved = _mapping(checkpoint.get('resolved_model_config'))
+    if resolved:
+        if variant and variant != checkpoint.get('model_size'):
+            raise ValueError("Requested model size conflicts with resolved checkpoint architecture")
+        model = module.HSIFusionNetV25LightningPro(module.LightningProConfig(**resolved))
+        return model, 8, max(64, int(model.config.min_input_size))
+    if checkpoint.get('unified_version'):
+        unified = _import_from_root(root / 'HSIFUSION&SHARP', 'unified_training')
+        model = unified.build_model('hsifusion', variant or checkpoint.get('model_size', 'base'),
+                                    checkpoint.get('model_kwargs', {}), False)
+        return model, 8, 64
     config = _mapping(checkpoint.get("config"))
     size = variant or str(config.get("model_size", "base"))
     kwargs = {
@@ -489,6 +503,15 @@ def _build_sharp(
     root: Path, checkpoint: Mapping[str, Any], variant: Optional[str]
 ) -> Tuple[nn.Module, int, int]:
     module = _import_from_root(root / "HSIFUSION&SHARP", "sharp_v322_hardened")
+    resolved = _mapping(checkpoint.get('resolved_model_config'))
+    if resolved:
+        if variant and variant != checkpoint.get('model_size'):
+            raise ValueError("Requested model size conflicts with resolved checkpoint architecture")
+        return module.SHARPv32(module.SHARPv32Config(**resolved)), 8, 64
+    if checkpoint.get('unified_version'):
+        unified = _import_from_root(root / 'HSIFUSION&SHARP', 'unified_training')
+        return unified.build_model('sharp', variant or checkpoint.get('model_size', 'base'),
+                                    checkpoint.get('model_kwargs', {}), False), 8, 64
     config = _mapping(checkpoint.get("config"))
     size = variant or str(config.get("model_size", "base"))
     names = (
@@ -634,6 +657,10 @@ def load_model_adapter(
         allow_partial=allow_partial,
     )
     default_normalization = "mst"
+    if family in {'hsifusion', 'sharp'}:
+        data_policy = _mapping(_mapping(checkpoint_mapping.get('run_manifest')).get('data'))
+        if data_policy.get('rgb_normalization') == 'divide_255':
+            default_normalization = 'unit'
     normalization = (
         normalization_override
         if normalization_override != "auto"

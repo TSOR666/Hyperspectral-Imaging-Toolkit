@@ -44,6 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import logging
+import math
 from typing import Optional, Tuple, List, Dict, Literal, Any
 from dataclasses import dataclass, asdict
 import torch.utils.checkpoint as checkpoint
@@ -391,8 +392,8 @@ class SpectralGatedFFNBlock(nn.Module):
     weights receive useful gradients on the first optimizer step.
 
     Added params per block ~ 2*mult*C^2 (the two 1x1 convs); at mult=2 this is
-    the non-redundant lever once SpectralMSA2D is already full-rank (heads=1),
-    where a second attention would merely duplicate the existing one.
+    a separate nonlinear mixing path alongside dense channel attention
+    (heads=1). A dense attention map does not guarantee mathematical full rank.
     """
 
     def __init__(self, dim: int, mult: int = 2, gate_init: float = 0.0) -> None:
@@ -629,10 +630,12 @@ class MSWRDualConfig:
     # from num_heads. The shared num_heads=8 makes the spectral attention map
     # block-diagonal (per-head C/heads x C/heads), so at C=64 each of 8 heads sees
     # only an 8x8 sub-block of the 64x64 cross-band covariance. 0 = fall back to
-    # num_heads (exact legacy behavior); 1 = FULL-RANK C x C band-to-band attention.
+    # num_heads (exact legacy behavior); 1 = dense C x C channel attention.
+    # Learned projections mix features; heads do not permanently isolate bands,
+    # and a dense attention map does not guarantee mathematical full rank.
     # Must divide every stage channel width when nonzero. No projection/FFN params
     # are added; only the per-head rescale temperature changes shape (heads,1,1), so
-    # full-rank (heads=1) is actually a few params LIGHTER than the 8-head default.
+    # one-head attention is actually a few params LIGHTER than the 8-head default.
     spectral_attn_heads: int = 0
 
     # CNN Wavelet Configuration
@@ -655,7 +658,7 @@ class MSWRDualConfig:
     # GDFN spectral FFN residual (SpectralGatedFFNBlock) -> exact identity at init,
     # checkpoint-safe. spectral_ffn_mult sets the hidden expansion (2 ~ +0.44M on
     # base, 4 ~ +0.85M). This is the non-redundant addition once spectral_attn_heads=1
-    # (a second attention would just duplicate the now-full-rank SpectralMSA2D).
+    # (the FFN adds nonlinear mixing alongside SpectralMSA2D).
     spectral_ffn: bool = False
     spectral_ffn_mult: int = 2
     # MPRNet-style multistage refinement on the final output-channel reconstruction.
@@ -674,11 +677,17 @@ class MSWRDualConfig:
     # an MST++-style MSAB (SpectralMSA2D + spectral gated-FFN) operating at the
     # block's INPUT resolution, zero-init gated -> exact identity at init,
     # checkpoint-safe. Head count follows spectral_attn_heads (0 = num_heads,
-    # 1 = full-rank C x C); FFN expansion follows spectral_ffn_mult.
+    # 1 = dense C x C); FFN expansion follows spectral_ffn_mult.
     spectral_prelayer: bool = False
+    # One spectral residual at the final full-resolution feature grid, outside
+    # all wavelet paths. Independent gates isolate this experiment from the
+    # prelayers and refinement branches. Disabled preserves legacy checkpoints.
+    spectral_output_block: bool = False
+    spectral_output_gate_init: float = 1e-2
     # Transformer blocks per encoder/decoder stage. The legacy architecture has
     # exactly ONE block per stage (5 blocks total at num_stages=3) versus the
-    # ~21 MSABs of MST++ -- depth, not width, is the missing capacity axis.
+    # ~21 MSABs of MST++. Depth is an independent experiment, not a guaranteed
+    # remedy for spectral or optimization failures.
     # 1 = exact legacy module tree (old checkpoints load unchanged); >1 stacks
     # blocks in nn.Sequential (state_dict keys gain a block index -> fresh runs).
     blocks_per_stage: int = 1
@@ -759,7 +768,7 @@ class MSWRDualConfig:
                 raise ValueError(
                     f"stage {stage_idx} channels ({channels}) must be divisible by "
                     f"spectral_attn_heads ({self.spectral_attn_heads}); set 0 to reuse "
-                    f"num_heads, or 1 for full-rank band-to-band attention."
+                    f"num_heads, or 1 for dense channel attention."
                 )
             if stage_idx < self.num_stages - 1:
                 channels = int(channels * self.channel_expansion)
@@ -795,6 +804,8 @@ class MSWRDualConfig:
         assert 0.0 <= self.drop_path <= 1.0, "drop_path must be in [0, 1]"
         assert self.layer_scale_init >= 0.0, "layer_scale_init must be non-negative"
         assert self.residual_gate_init >= 0.0, "residual_gate_init must be non-negative"
+        if not math.isfinite(self.spectral_output_gate_init) or self.spectral_output_gate_init < 0:
+            raise ValueError("spectral_output_gate_init must be finite and non-negative")
         assert self.num_heads > 0, "num_heads must be positive"
         assert self.spectral_attn_heads >= 0, "spectral_attn_heads must be >= 0 (0 reuses num_heads)"
         assert self.spectral_ffn_mult >= 1, "spectral_ffn_mult must be >= 1"
@@ -1990,6 +2001,17 @@ class IntegratedMSWRNet(nn.Module):
             )
             channels = out_ch
         
+        self.spectral_output = (
+            SpectralMSABlock(
+                config.base_channels,
+                config.spectral_attn_heads or config.num_heads,
+                dropout=config.attention_dropout,
+                ffn_mult=config.spectral_ffn_mult,
+                gate_init=config.spectral_output_gate_init,
+            )
+            if config.spectral_output_block else None
+        )
+
         # Enhanced output projection
         self.output_proj = EnhancedOutputProjection(config.base_channels, config.output_channels)
 
@@ -2250,6 +2272,8 @@ class IntegratedMSWRNet(nn.Module):
         
         # Output projection
         self.perf_monitor.start_stage("output")
+        if self.spectral_output is not None:
+            x = self.spectral_output(x)
         x = self.output_proj(x)  # (B, C_base, H, W) -> (B, C_out, H, W)
         
         # Add input skip connection
@@ -2313,6 +2337,8 @@ class IntegratedMSWRNet(nn.Module):
                 'conv_norm_type': getattr(self.config, 'conv_norm_type', None) or self.config.norm_type,
                 'layer_scale_init': self.config.layer_scale_init,
                 'residual_gate_init': getattr(self.config, 'residual_gate_init', 0.0),
+                'spectral_output_block': self.config.spectral_output_block,
+                'spectral_output_gate_init': self.config.spectral_output_gate_init,
             },
             'optimization': {
                 'use_checkpoint': self.config.use_checkpoint,

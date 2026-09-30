@@ -1,0 +1,61 @@
+defaults:
+  - sota_cascade
+  - _self_
+
+# Fresh residual-balanced control with exact positive-target MRAE in FP32.
+# Keep the legacy residual function and size-dependent attention for this
+# control; the correction and fixed-local experiments each change one knob.
+training_contract: null
+block_variant: sstb
+base_channels: 48
+num_heads: 4
+stage_num_heads: [4, 4, 4, 4, 4]
+stage_depths: [2, 2, 2, 2, 4]
+split_sizes: [7, 7, 7]
+decoder1_compress_first: false
+spectral_attention_type: s_msa
+spectral_attention_force_fp32: true
+spectral_attention_sanitize_nonfinite: false
+sampling: pixelshuffle
+cswin_attention_mode: local_global
+cswin_global_tokens: 1024
+sstb_residual_mode: legacy
+sstb_outer_residual_scale: 0.1
+output_head_init_scale: 1.0
+use_feature_norm: false
+use_input_denoising: false
+smsa_output_norm: false
+use_spectral_input_skip: true
+spectral_input_skip_hidden: 0
+spectral_input_skip_init: 0.03
+refinement_blocks: 0
+cascade_stages: 1
+thick_output_head: false
+ffn_expansion: 2.66
+cbam_reduction: 4
+output_activation: none
+# Disable training-time output clipping for the strict objective control.
+clamp_after_iters: -1
+objective: exact_mrae
+mrae_epsilon: 0.0
+validation_mrae_epsilon: 0.0
+validation_clamp_output: false
+validation_report_raw_mrae: false
+validation_tiled_inference: false
+validation_crop_border: 128
+memory_mode: standard
+mixed_precision: false
+allow_tf32: false
+optimizer: adam
+weight_decay: 0.0
+gradient_clip_norm: 0.0
+warmup_steps: 0
+use_ema: false
+early_stopping_patience: 0
+divergence_guard_enabled: false
+max_consecutive_nonfinite: 1
+finite_check_interval: 1
+progressive_stages:
+  - {patch_size: 128, iterations: 300000, init_lr: 4.0e-4, batch_size: 20, warmup_steps: 0}
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/assessment_control
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/assessment_control

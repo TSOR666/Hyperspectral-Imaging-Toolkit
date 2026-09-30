@@ -1,0 +1,9 @@
+defaults:
+  - assessment_control
+  - _self_
+
+# Interaction experiment after evaluating the isolated ablations.
+sstb_residual_mode: correction
+cswin_attention_mode: local
+log_dir: ${oc.env:HSI_LOG_DIR,./artifacts/logs}/assessment_candidate
+checkpoint_dir: ${oc.env:HSI_CKPT_DIR,./artifacts/checkpoints}/assessment_candidate
